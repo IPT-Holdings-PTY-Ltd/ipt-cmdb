@@ -1,6 +1,6 @@
 """Asset (Configuration Item) views."""
 
-from flask import Blueprint, render_template, redirect, url_for, flash, abort
+from flask import Blueprint, render_template, redirect, url_for, flash
 from ..extensions import db
 from ..models import Asset
 from ..forms import AssetForm
