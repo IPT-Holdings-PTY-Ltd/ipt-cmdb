@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}{{ record.title }} – IPT CMDB{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center my-3">
+  <h2>{{ record.title }}</h2>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('changes.edit', record_id=record.id) }}" class="btn btn-outline-secondary">Edit</a>
+    <form method="post" action="{{ url_for('changes.delete', record_id=record.id) }}"
+          onsubmit="return confirm('Delete this change record?')">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit" class="btn btn-outline-danger">Delete</button>
+    </form>
+  </div>
+</div>
+
+<div class="row g-4">
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-header fw-semibold">Change Details</div>
+      <div class="card-body">
+        <dl class="row mb-0">
+          <dt class="col-sm-4">Primary Asset</dt>
+          <dd class="col-sm-8">
+            <a href="{{ url_for('assets.detail', asset_id=record.asset.id) }}">{{ record.asset.name }}</a>
+          </dd>
+
+          <dt class="col-sm-4">Change Type</dt>
+          <dd class="col-sm-8">{{ record.change_type|capitalize }}</dd>
+
+          <dt class="col-sm-4">Status</dt>
+          <dd class="col-sm-8">
+            <span class="badge
+              {% if record.status == 'completed' %}bg-success
+              {% elif record.status == 'failed' %}bg-danger
+              {% elif record.status == 'in_progress' %}bg-warning text-dark
+              {% else %}bg-secondary{% endif %}">
+              {{ record.status }}
+            </span>
+          </dd>
+
+          <dt class="col-sm-4">Change Date</dt>
+          <dd class="col-sm-8">{{ record.change_date.strftime('%Y-%m-%d %H:%M') }}</dd>
+
+          <dt class="col-sm-4">Changed By</dt>
+          <dd class="col-sm-8">{{ record.changed_by or '–' }}</dd>
+
+          <dt class="col-sm-4">Description</dt>
+          <dd class="col-sm-8">{{ record.description or '–' }}</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-header fw-semibold">Impacted Assets</div>
+      <ul class="list-group list-group-flush">
+        {% for asset in record.impacted_assets %}
+        <li class="list-group-item">
+          <a href="{{ url_for('assets.detail', asset_id=asset.id) }}">{{ asset.name }}</a>
+          <span class="badge bg-secondary ms-1">{{ asset.asset_type }}</span>
+        </li>
+        {% else %}
+        <li class="list-group-item text-muted">No impacted assets recorded.</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="mt-2">
+  <a href="{{ url_for('changes.index') }}" class="btn btn-link ps-0">&larr; Back to Change Records</a>
+</div>
+{% endblock %}

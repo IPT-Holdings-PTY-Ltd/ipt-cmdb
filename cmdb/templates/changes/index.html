@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Change Records – IPT CMDB{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center my-3">
+  <h2>Change Records</h2>
+  <a href="{{ url_for('changes.create') }}" class="btn btn-primary">+ New Change Record</a>
+</div>
+
+{% if records %}
+<div class="table-responsive">
+  <table class="table table-striped table-hover align-middle">
+    <thead class="table-dark">
+      <tr>
+        <th>Title</th>
+        <th>Asset</th>
+        <th>Type</th>
+        <th>Date</th>
+        <th>Status</th>
+        <th>Changed By</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for cr in records %}
+      <tr>
+        <td><a href="{{ url_for('changes.detail', record_id=cr.id) }}">{{ cr.title }}</a></td>
+        <td><a href="{{ url_for('assets.detail', asset_id=cr.asset.id) }}">{{ cr.asset.name }}</a></td>
+        <td>{{ cr.change_type|capitalize }}</td>
+        <td>{{ cr.change_date.strftime('%Y-%m-%d %H:%M') }}</td>
+        <td>
+          <span class="badge
+            {% if cr.status == 'completed' %}bg-success
+            {% elif cr.status == 'failed' %}bg-danger
+            {% elif cr.status == 'in_progress' %}bg-warning text-dark
+            {% else %}bg-secondary{% endif %}">
+            {{ cr.status }}
+          </span>
+        </td>
+        <td>{{ cr.changed_by }}</td>
+        <td><a href="{{ url_for('changes.edit', record_id=cr.id) }}" class="btn btn-sm btn-outline-secondary">Edit</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="text-muted mt-4">No change records yet. <a href="{{ url_for('changes.create') }}">Create one</a>.</p>
+{% endif %}
+{% endblock %}

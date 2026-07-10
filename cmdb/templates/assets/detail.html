@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}{{ asset.name }} – IPT CMDB{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center my-3">
+  <h2>{{ asset.name }}</h2>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('assets.edit', asset_id=asset.id) }}" class="btn btn-outline-secondary">Edit</a>
+    <a href="{{ url_for('impact.index', asset_id=asset.id) }}" class="btn btn-outline-info">Impact Analysis</a>
+    <form method="post" action="{{ url_for('assets.delete', asset_id=asset.id) }}"
+          onsubmit="return confirm('Delete {{ asset.name }}?')">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit" class="btn btn-outline-danger">Delete</button>
+    </form>
+  </div>
+</div>
+
+<div class="row g-4">
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-header fw-semibold">Details</div>
+      <div class="card-body">
+        <dl class="row mb-0">
+          <dt class="col-sm-4">Type</dt>
+          <dd class="col-sm-8">{{ asset.asset_type|capitalize }}</dd>
+
+          <dt class="col-sm-4">Status</dt>
+          <dd class="col-sm-8">
+            <span class="badge
+              {% if asset.status == 'active' %}bg-success
+              {% elif asset.status == 'inactive' %}bg-secondary
+              {% else %}bg-danger{% endif %}">
+              {{ asset.status|capitalize }}
+            </span>
+          </dd>
+
+          <dt class="col-sm-4">Environment</dt>
+          <dd class="col-sm-8">{{ asset.environment|capitalize }}</dd>
+
+          <dt class="col-sm-4">Owner</dt>
+          <dd class="col-sm-8">{{ asset.owner or '–' }}</dd>
+
+          <dt class="col-sm-4">Location</dt>
+          <dd class="col-sm-8">{{ asset.location or '–' }}</dd>
+
+          <dt class="col-sm-4">IP Address</dt>
+          <dd class="col-sm-8">{{ asset.ip_address or '–' }}</dd>
+
+          <dt class="col-sm-4">Description</dt>
+          <dd class="col-sm-8">{{ asset.description or '–' }}</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-md-6">
+    <div class="card mb-3">
+      <div class="card-header fw-semibold">Relationships</div>
+      <ul class="list-group list-group-flush">
+        {% for rel in asset.outgoing %}
+        <li class="list-group-item">
+          <span class="badge bg-secondary">{{ rel.rel_type }}</span>
+          → <a href="{{ url_for('assets.detail', asset_id=rel.target.id) }}">{{ rel.target.name }}</a>
+        </li>
+        {% endfor %}
+        {% for rel in asset.incoming %}
+        <li class="list-group-item">
+          ← <a href="{{ url_for('assets.detail', asset_id=rel.source.id) }}">{{ rel.source.name }}</a>
+          <span class="badge bg-secondary">{{ rel.rel_type }}</span>
+        </li>
+        {% endfor %}
+        {% if not asset.outgoing and not asset.incoming %}
+        <li class="list-group-item text-muted">No relationships.</li>
+        {% endif %}
+      </ul>
+    </div>
+
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center fw-semibold">
+        Recent Changes
+        <a href="{{ url_for('changes.create') }}" class="btn btn-sm btn-outline-primary">+ Add</a>
+      </div>
+      <ul class="list-group list-group-flush">
+        {% for cr in asset.change_records|sort(attribute='change_date', reverse=True) %}
+        <li class="list-group-item">
+          <a href="{{ url_for('changes.detail', record_id=cr.id) }}">{{ cr.title }}</a>
+          <small class="text-muted ms-2">{{ cr.change_date.strftime('%Y-%m-%d') }}</small>
+          <span class="badge
+            {% if cr.status == 'completed' %}bg-success
+            {% elif cr.status == 'failed' %}bg-danger
+            {% elif cr.status == 'in_progress' %}bg-warning text-dark
+            {% else %}bg-secondary{% endif %} float-end">
+            {{ cr.status }}
+          </span>
+        </li>
+        {% else %}
+        <li class="list-group-item text-muted">No change records.</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="mt-2">
+  <a href="{{ url_for('assets.index') }}" class="btn btn-link ps-0">&larr; Back to Assets</a>
+</div>
+{% endblock %}

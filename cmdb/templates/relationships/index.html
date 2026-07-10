@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Relationships – IPT CMDB{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center my-3">
+  <h2>Relationships</h2>
+  <a href="{{ url_for('relationships.create') }}" class="btn btn-primary">+ New Relationship</a>
+</div>
+
+{% if relationships %}
+<div class="table-responsive">
+  <table class="table table-striped table-hover align-middle">
+    <thead class="table-dark">
+      <tr>
+        <th>Source Asset</th>
+        <th>Relationship</th>
+        <th>Target Asset</th>
+        <th>Notes</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for rel in relationships %}
+      <tr>
+        <td><a href="{{ url_for('assets.detail', asset_id=rel.source.id) }}">{{ rel.source.name }}</a></td>
+        <td><span class="badge bg-secondary">{{ rel.rel_type }}</span></td>
+        <td><a href="{{ url_for('assets.detail', asset_id=rel.target.id) }}">{{ rel.target.name }}</a></td>
+        <td>{{ rel.notes }}</td>
+        <td>
+          <form method="post" action="{{ url_for('relationships.delete', rel_id=rel.id) }}"
+                onsubmit="return confirm('Delete this relationship?')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="text-muted mt-4">No relationships yet. <a href="{{ url_for('relationships.create') }}">Create one</a>.</p>
+{% endif %}
+{% endblock %}

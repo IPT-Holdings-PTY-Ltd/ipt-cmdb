@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}IPT CMDB{% endblock %}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+  <style>
+    body { padding-top: 4.5rem; }
+    .navbar-brand { font-weight: 700; }
+    .badge-active      { background-color: #198754; }
+    .badge-inactive    { background-color: #6c757d; }
+    .badge-decommissioned { background-color: #dc3545; }
+  </style>
+</head>
+<body>
+  <nav class="navbar navbar-expand-md navbar-dark bg-dark fixed-top">
+    <div class="container-fluid">
+      <a class="navbar-brand" href="{{ url_for('assets.index') }}">IPT CMDB</a>
+      <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarMain">
+        <span class="navbar-toggler-icon"></span>
+      </button>
+      <div class="collapse navbar-collapse" id="navbarMain">
+        <ul class="navbar-nav me-auto mb-2 mb-md-0">
+          <li class="nav-item">
+            <a class="nav-link {% if request.blueprint == 'assets' %}active{% endif %}"
+               href="{{ url_for('assets.index') }}">Assets</a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link {% if request.blueprint == 'relationships' %}active{% endif %}"
+               href="{{ url_for('relationships.index') }}">Relationships</a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link {% if request.blueprint == 'changes' %}active{% endif %}"
+               href="{{ url_for('changes.index') }}">Changes</a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link {% if request.blueprint == 'impact' %}active{% endif %}"
+               href="{{ url_for('impact.index') }}">Impact Analysis</a>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container-fluid px-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}
+        <div class="alert alert-{{ category }} alert-dismissible fade show mt-3" role="alert">
+          {{ message }}
+          <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+      {% endfor %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

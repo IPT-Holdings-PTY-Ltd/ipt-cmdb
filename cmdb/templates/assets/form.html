@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} – IPT CMDB{% endblock %}
+
+{% block content %}
+<div class="my-3">
+  <h2>{{ title }}</h2>
+</div>
+
+<div class="row">
+  <div class="col-md-8">
+    <form method="post" novalidate>
+      {{ form.hidden_tag() }}
+
+      {% for field in form if field.widget.input_type != 'hidden' %}
+      <div class="mb-3">
+        {{ field.label(class="form-label fw-semibold") }}
+        {% if field.type == 'TextAreaField' %}
+          {{ field(class="form-control", rows=3) }}
+        {% elif field.type == 'SelectField' %}
+          {{ field(class="form-select") }}
+        {% else %}
+          {{ field(class="form-control") }}
+        {% endif %}
+        {% for error in field.errors %}
+          <div class="invalid-feedback d-block">{{ error }}</div>
+        {% endfor %}
+      </div>
+      {% endfor %}
+
+      <div class="d-flex gap-2">
+        <button type="submit" class="btn btn-primary">Save</button>
+        {% if asset %}
+          <a href="{{ url_for('assets.detail', asset_id=asset.id) }}" class="btn btn-outline-secondary">Cancel</a>
+        {% else %}
+          <a href="{{ url_for('assets.index') }}" class="btn btn-outline-secondary">Cancel</a>
+        {% endif %}
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

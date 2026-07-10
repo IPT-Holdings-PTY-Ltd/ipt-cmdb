@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Assets – IPT CMDB{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center my-3">
+  <h2>Configuration Items</h2>
+  <a href="{{ url_for('assets.create') }}" class="btn btn-primary">+ New Asset</a>
+</div>
+
+{% if assets %}
+<div class="table-responsive">
+  <table class="table table-striped table-hover align-middle">
+    <thead class="table-dark">
+      <tr>
+        <th>Name</th>
+        <th>Type</th>
+        <th>Environment</th>
+        <th>Status</th>
+        <th>Owner</th>
+        <th>IP Address</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for asset in assets %}
+      <tr>
+        <td><a href="{{ url_for('assets.detail', asset_id=asset.id) }}">{{ asset.name }}</a></td>
+        <td>{{ asset.asset_type|capitalize }}</td>
+        <td>{{ asset.environment|capitalize }}</td>
+        <td>
+          <span class="badge
+            {% if asset.status == 'active' %}bg-success
+            {% elif asset.status == 'inactive' %}bg-secondary
+            {% else %}bg-danger{% endif %}">
+            {{ asset.status|capitalize }}
+          </span>
+        </td>
+        <td>{{ asset.owner }}</td>
+        <td>{{ asset.ip_address }}</td>
+        <td>
+          <a href="{{ url_for('assets.edit', asset_id=asset.id) }}" class="btn btn-sm btn-outline-secondary">Edit</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="text-muted mt-4">No assets yet. <a href="{{ url_for('assets.create') }}">Create one</a>.</p>
+{% endif %}
+{% endblock %}

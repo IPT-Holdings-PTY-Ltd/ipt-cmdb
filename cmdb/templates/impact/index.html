@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Impact Analysis – IPT CMDB{% endblock %}
+
+{% block content %}
+<div class="my-3">
+  <h2>Impact Analysis</h2>
+  <p class="text-muted">Select a Configuration Item to see which assets would be affected if it changes.</p>
+</div>
+
+<form method="get" class="row g-3 align-items-end mb-4">
+  <div class="col-md-6">
+    <label for="asset_id" class="form-label fw-semibold">Configuration Item</label>
+    <select name="asset_id" id="asset_id" class="form-select">
+      <option value="">-- Select an asset --</option>
+      {% for asset in assets %}
+      <option value="{{ asset.id }}" {% if selected_asset and selected_asset.id == asset.id %}selected{% endif %}>
+        {{ asset.name }} ({{ asset.asset_type }})
+      </option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <button type="submit" class="btn btn-primary">Analyse</button>
+  </div>
+</form>
+
+{% if selected_asset %}
+  <h4>
+    If <strong>{{ selected_asset.name }}</strong> changes…
+  </h4>
+
+  {% if impacted %}
+  <div class="table-responsive mt-3">
+    <table class="table table-striped align-middle">
+      <thead class="table-dark">
+        <tr>
+          <th>Impacted Asset</th>
+          <th>Type</th>
+          <th>Environment</th>
+          <th>Status</th>
+          <th>Owner</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for asset in impacted %}
+        <tr>
+          <td><a href="{{ url_for('assets.detail', asset_id=asset.id) }}">{{ asset.name }}</a></td>
+          <td>{{ asset.asset_type|capitalize }}</td>
+          <td>{{ asset.environment|capitalize }}</td>
+          <td>
+            <span class="badge
+              {% if asset.status == 'active' %}bg-success
+              {% elif asset.status == 'inactive' %}bg-secondary
+              {% else %}bg-danger{% endif %}">
+              {{ asset.status|capitalize }}
+            </span>
+          </td>
+          <td>{{ asset.owner or '–' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="text-muted">{{ impacted|length }} asset(s) would be impacted.</p>
+  {% else %}
+  <div class="alert alert-info mt-3">
+    No other assets depend on <strong>{{ selected_asset.name }}</strong> — no downstream impact detected.
+  </div>
+  {% endif %}
+{% endif %}
+{% endblock %}
