@@ -1,0 +1,2 @@
+# PostgreSQL driver used by the production repository and migration command.
+psycopg[binary]>=3.2,<4

@@ -1,0 +1,6 @@
+name: msp-cmdb-hub
+services:
+  api:
+    project: .
+    host: containerapp
+    language: js

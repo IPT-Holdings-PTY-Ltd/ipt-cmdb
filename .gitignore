@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# IPT CMDB runtime state and sensitive local configuration
+data/
+work/
+.env
+.env.*
+!.env.example
+*.backup.json
+cmdb-hub-backup-*.json

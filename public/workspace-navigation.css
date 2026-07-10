@@ -1,0 +1,17 @@
+/* Scope-aware navigation groups keep the MSP workspace legible as it grows. */
+#workspaceNav .nav-section {
+  margin: 14px 9px 3px;
+  color: #6f83a4;
+  font-size: .64rem;
+  font-weight: 800;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+}
+
+#workspaceNav .nav-section:first-child {
+  margin-top: 0;
+}
+
+#workspaceNav .nav-section[hidden] {
+  display: none;
+}

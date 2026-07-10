@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+__pycache__
+*.py[cod]
+data
+work
+test
+node_modules
+npm-debug.log*
+.env
+.env.*
+!.env.example
+README.md
+CONTRIBUTING.md
+SECURITY.md
+CHANGELOG.md
