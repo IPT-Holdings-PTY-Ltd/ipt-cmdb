@@ -1,5 +1,13 @@
 # CMDB Hub architecture
 
+## Incremental web-platform migration
+
+The public container runs FastAPI and serves a compiled React/TypeScript application built with React Admin, Material UI and React Flow. The retired browser UI, its static bundle and the internal compatibility HTTP server have been removed. Every active browser endpoint is now handled directly by a typed FastAPI route.
+
+New API work belongs in typed FastAPI routes with Pydantic request/response models and PostgreSQL repositories. The remaining transition boundary is storage-only: `app.py` contains domain helpers and the temporary state repository, but no HTTP handler. Customers, users, access groups, configuration items, relationships, change packages, integration connections and sync history are read and written through `PostgresCmdbRepository` when PostgreSQL is available. Their canonical UUID records and write audit events live in normalized tables; the state document is refreshed as a portable fallback/backup mirror.
+
+Azure Container Apps Easy Auth is the production identity boundary. With `AUTH_MODE=easy_auth`, FastAPI reads the platform-injected Entra principal and maps the email claim to an assigned CMDB user. Tenant and record authorization remains enforced by the Python API. Local-development and break-glass credentials are stored separately as salted PBKDF2-SHA256 hashes; plaintext passwords are never persisted.
+
 The browser is a separate, static frontend. It calls an authenticated API and never receives a database connection string or integration credential. The API owns authorization, canonical CMDB writes and audit events. Integration workers run separately from the web process; they obtain provider credentials from Key Vault, write normalised observations, and enqueue review work where identity is uncertain.
 
 ```text
@@ -32,6 +40,10 @@ Each source observation is retained with a timestamp and payload hash. `ci_field
 
 ## Local development
 
-The current browser demo can still run from JSON without Docker. When `DATABASE_URL` is set, the API runs against PostgreSQL and writes its current API state to `application_state`; the browser still has no database access. This is a deliberately temporary compatibility store while each endpoint moves to the canonical tables. Start PostgreSQL with `docker compose up -d postgres`, install `requirements.txt`, set `DATABASE_URL=postgresql://cmdb:cmdb@localhost:5432/cmdb`, then run `python scripts/migrate_postgres.py`. To retain an existing prototype dataset, run `python scripts/import_json_state.py` once before starting the PostgreSQL-backed API.
+The browser demo can still run from JSON without Docker. When `DATABASE_URL` is set, startup takes an advisory migration lock, applies the idempotent schema before querying any table, records the schema version, then seeds an uninitialised database according to `DATABASE_SEED_MODE`. All tenant, identity, CMDB, change-control, integration operational records and the MSP brand profile then use canonical tables. Change scope, frozen impact paths, immutable revisions and external publishing state are stored separately from live CI records. Integration rows store only environment or Key Vault credential references—never secret values—and allow either MSP-wide or future customer-scoped connections. Small PNG/JPEG MSP logos are stored as constrained data URLs so portable exports stay self-contained; this contract can later be backed by Azure Blob Storage. The API keeps a synchronized mirror for portable export and fallback during the remaining customer-theme migration. The browser never has database access.
 
-The next API migration replaces the JSON repository endpoint-by-endpoint behind a repository interface; it must not expose PostgreSQL to the frontend or use `external_id` fields as canonical keys.
+The application initialises schemas and operational seed data; it does not create PostgreSQL servers or databases. Docker Compose owns local provisioning, while Azure infrastructure-as-code owns production provisioning. `DATABASE_URL` supplied by the environment is treated as managed configuration and cannot be overwritten in the browser unless the explicit local-only `ALLOW_UI_DATABASE_CONFIG` override is enabled.
+
+Portable export format version 2 includes an integrity checksum and a restore preview. It intentionally excludes PostgreSQL roles/grants, canonical audit history, raw source observations and transaction history. Production recovery uses Azure PostgreSQL point-in-time restore or independently scheduled `pg_dump`/`pg_restore`.
+
+The final application-state migration moves separately permissioned customer theme overrides into normalized tables. It must not expose PostgreSQL to the frontend or use provider `external_id` values as canonical keys.

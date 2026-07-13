@@ -1,4 +1,24 @@
 services:
+  cmdb:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      DATA_DIR: /app/data
+      DATABASE_URL: postgresql://cmdb:cmdb@postgres:5432/cmdb
+      DATABASE_SEED_MODE: demo
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3000/api/v2/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -14,6 +34,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+    restart: unless-stopped
 
 volumes:
   cmdb-postgres:
