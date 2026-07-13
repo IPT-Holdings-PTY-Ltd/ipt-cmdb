@@ -1,0 +1,33 @@
+:root { color-scheme: dark; background: #080f1d; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 80% 0%, #152440 0, #080f1d 36%); }
+.login-page { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: radial-gradient(circle at 18% 16%, #17304d 0, #080f1d 42%); }
+.login-card { width: min(440px, 100%); padding: 38px; }
+.login-card > img,.login-card > [aria-label$="logo fallback"] { margin-bottom: 24px; }
+.attention-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-top: 1px solid #243552; }
+.form-section { width: 100%; margin: 24px 0 4px !important; padding-bottom: 8px; border-bottom: 1px solid #2b3d5d; }
+.relationship-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px; margin-bottom: 10px; background: #101a2d !important; }
+.relationship-toolbar .MuiTextField-root { min-width: 220px; flex: 1; }
+.relationship-filter-row { margin: 0 0 12px; }
+.relationship-loading { min-height: 360px; display: grid; place-items: center; align-content: center; gap: 16px; color: #9eacc2; }
+.relationship-canvas { width: 100%; height: calc(100vh - 330px); min-height: 660px; overflow: hidden; border: 1px solid #2b3d5d; border-radius: 12px; background: #0a1323; }
+.ci-react-node { width: 230px; padding: 11px 13px; border: 1px solid #365175; border-left: 4px solid #4cc7b1; border-radius: 10px; background: #121f34; box-shadow: 0 10px 24px #0006; transition: opacity .16s ease, border-color .16s ease, box-shadow .16s ease; }
+.ci-node-heading { min-width: 0; }
+.ci-node-icon { width: 30px; height: 30px; flex: none; display: grid; place-items: center; border-radius: 8px; color: #c9d8f0; background: #263957; }
+.ci-node-label { min-width: 0; flex: 1; }
+.ci-vendor-mark { min-width: 27px; height: 24px; display: grid; place-items: center; padding: 0 5px; border-radius: 6px; background: #e7edf8; color: #172238; font-size: 9px; font-weight: 900; }
+.ci-react-node.kind-network { border-left-color: #50d5b9; background: #123238; }
+.ci-react-node.kind-server,.ci-react-node.kind-compute { border-left-color: #6798e8; background: #152842; }
+.ci-react-node.kind-software { border-left-color: #a68cf0; background: #282142; }
+.ci-react-node.kind-licence { border-left-color: #efc46b; background: #39301e; }
+.ci-react-node.kind-person { border-left-color: #71c5d4; background: #15343e; }
+.ci-react-node.selected,.ci-react-node.impact-selected { border-color: #f1d372; box-shadow: 0 0 0 2px #f1d37270, 0 12px 26px #0008; }
+.ci-react-node.impact-upstream { border-color: #7997ff; box-shadow: 0 0 0 1px #7997ff75, 0 10px 24px #0006; }
+.ci-react-node.impact-downstream { border-color: #f0a45d; box-shadow: 0 0 0 1px #f0a45d75, 0 10px 24px #0006; }
+.ci-react-node.dimmed { opacity: .18; }
+.ci-react-node .react-flow__handle { width: 11px; height: 11px; border: 2px solid #0a1323; background: #86a7d8; }
+.ci-react-node:hover .react-flow__handle { background: #4cc7b1; transform: scale(1.15); }
+.relationship-inspector { width: min(340px, calc(100vw - 90px)); max-height: calc(100vh - 390px); overflow: auto; padding: 18px; background: #111b2ef2 !important; backdrop-filter: blur(12px); }
+.react-flow__edge-text { fill: #c5d2e8; font-size: 10px; }
+.react-flow__edge-textbg { fill: #0b1424; }
+@media (max-width: 900px) { .relationship-canvas { height: 680px; } .relationship-toolbar .MuiTextField-root { flex-basis: 100%; } }

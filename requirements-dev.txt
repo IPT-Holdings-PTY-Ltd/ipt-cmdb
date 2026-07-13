@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Test-only PDF inspection dependency.
+pypdf>=5,<7

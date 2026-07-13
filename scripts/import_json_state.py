@@ -1,4 +1,4 @@
-"""One-time local migration from the legacy JSON demo store into PostgreSQL."""
+"""One-time local migration from the original JSON demo store into PostgreSQL."""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,7 @@ def main() -> None:
         raise SystemExit("DATABASE_URL is required.")
     source = Path(os.environ.get("DATA_DIR", Path(__file__).parents[1] / "data")) / "cmdb.json"
     if not source.exists():
-        raise SystemExit(f"Legacy state not found: {source}")
+        raise SystemExit(f"JSON state not found: {source}")
     try:
         import psycopg
     except ImportError as error:

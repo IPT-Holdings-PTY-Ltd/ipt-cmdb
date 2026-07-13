@@ -5,10 +5,17 @@ A Python browser-based CMDB designed for ConnectWise-centric MSPs. It has a work
 ## Run locally
 
 ```powershell
-python app.py
+docker compose up --build -d
 ```
 
-Open `http://localhost:3000`. The seeded demo identities all use `ChangeMe!`:
+Open `http://localhost:3000`. The modular React Admin workspace is served by FastAPI. The seeded demo identities all use `ChangeMe!`:
+
+For frontend-only development with API proxying:
+
+```powershell
+npm install
+npm run dev
+```
 
 | Login | Role | Scope |
 |---|---|---|
@@ -34,9 +41,15 @@ The overview also provides a 90-day attention queue for overdue and upcoming sub
 
 Platform administrators and MSP operators also receive an MSP overview that aggregates those attention items across only the customers they are permitted to manage. Branding is hidden from customer-only users, while database configuration remains platform-admin only.
 
+### Change control
+
+From a customer relationship map, select a CI and choose **Create change package**. The four-stage workflow combines technician-entered scope, schedule, business impact, implementation, validation, rollback and communication details with a CMDB-derived downstream impact snapshot. The saved record freezes CI names, criticality, environment, site and owners so the historical form does not change when the live CMDB changes.
+
+The backend generates a branded A4 PDF with the MSP logo, document footer, confidentiality label, impact table, transparent risk factors, execution plan, integration status and approval block. The same MSP brand profile drives the login page, workspace header and application colours. Change records already carry a provider-neutral external reference and a `connectwise.not_published` state; no ConnectWise ticket is created yet. A future publisher can populate that envelope idempotently without changing the form or frontend contract.
+
 ### Authorization model
 
-Every asset carries `companyId`; every read filters against the caller's permitted company IDs. `platform_admin` sees all companies, `msp_operator` sees an explicit MSP customer list, and `client_reader` sees only their company. Sync requires MSP operator or platform admin. Production authentication should replace the demo password login with Microsoft Entra ID (OIDC), mapping Entra group/app roles to these roles and customer claims.
+Every asset carries `companyId`; every read filters against the caller's permitted company IDs. `platform_admin` sees all companies, `msp_operator` sees assigned customers and customer groups, and `client_reader` sees only their company. Sync requires MSP operator or platform admin. Production authentication uses Microsoft Entra ID through Azure Easy Auth and maps the Entra identity to these persisted roles and customer assignments. Local-development credentials are stored only as salted PBKDF2 hashes.
 
 ### Provider approach
 
@@ -49,19 +62,23 @@ Every asset carries `companyId`; every read filters against the caller's permitt
 
 The included `Dockerfile` and `azure.yaml` work with Azure Developer CLI (`azd up`) and Azure Container Apps. For production:
 
-1. Use Azure Database for PostgreSQL (replace local JSON persistence), Blob Storage for exports, and Key Vault for integration credentials.
+1. Use Azure Database for PostgreSQL, Blob Storage for larger exports, and Key Vault for database and integration credentials. The app applies its versioned schema automatically after the server and database exist.
 2. Enable a managed identity for the container and grant it Key Vault Secrets User; inject secret references as the environment variables shown in `.env.example`.
 3. Put Entra ID authentication in front of the API and configure redirect URL `https://<your-cmdb-domain>/auth/callback`.
 4. Run sync jobs using Container Apps Jobs or Azure Functions/Service Bus—not the web request process—and save an immutable run/audit record.
 5. Configure a custom domain, HTTPS, Application Insights, backups, private endpoints, and least-privilege ConnectWise API member permissions.
 
+The app can initialise an existing blank PostgreSQL database with either the current workspace, a platform-only seed, or demo data. Infrastructure provisioning remains outside the web process: Docker Compose creates the local server/database, while Azure deployments should use Bicep/Terraform or an equivalent controlled deployment. Environment-managed database connections are read-only in the UI.
+
+The Database and recovery screen deliberately separates a checksum-protected **portable operational export/import** from a real database backup. Use Azure PostgreSQL point-in-time restore or scheduled `pg_dump`/`pg_restore` for disaster recovery; portable imports merge operational records and do not delete records absent from the file.
+
 ## Next delivery increments
 
-1. Replace the PostgreSQL `application_state` compatibility store with endpoint-specific repositories over the canonical CI, mapping, relationship and audit tables. The running API already uses PostgreSQL whenever `DATABASE_URL` is set; the schema, migration command, cross-source ID mapping and reconciliation rules are included in `db/schema.sql`, `scripts/migrate_postgres.py` and `ARCHITECTURE.md`.
+1. Add separately permissioned customer theme overrides. MSP branding now uses its own canonical PostgreSQL profile with audited writes; customer-specific themes still use the synchronized application-state fallback.
 2. Add Entra OIDC, invite flow, MFA/conditional access and company-to-group mapping UI.
-3. Implement ConnectWise company/configuration/ticket matching with a review queue and idempotent upserts.
+3. Implement ConnectWise company/configuration/ticket matching and publish approved change packages as tickets using the existing external-reference envelope and an idempotency key.
 4. Implement N-central device/customer ingestion and Passportal metadata association.
-5. Add relationship explorer, lifecycle/warranty tracking, CSV/API exports, webhooks and per-company audit logs.
+5. Add change approvals/revisions, CSV/API exports, webhooks and per-company audit logs.
 
 ## Security boundaries
 

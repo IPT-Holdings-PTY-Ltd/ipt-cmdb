@@ -10,9 +10,13 @@ CREATE TABLE IF NOT EXISTS companies (
     slug text NOT NULL UNIQUE,
     name text NOT NULL,
     status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'prospect')),
+    attributes jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE companies
+    ADD COLUMN IF NOT EXISTS attributes jsonb NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS users (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -20,7 +24,19 @@ CREATE TABLE IF NOT EXISTS users (
     display_name text,
     identity_provider_subject text UNIQUE,
     status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'invited', 'disabled')),
+    attributes jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS attributes jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+-- Local credentials exist only for development/break-glass mode. Production
+-- authentication is delegated to Entra Easy Auth and never stores passwords.
+CREATE TABLE IF NOT EXISTS local_auth_credentials (
+    user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    password_hash text NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS user_company_roles (
@@ -37,8 +53,30 @@ CREATE TABLE IF NOT EXISTS user_platform_roles (
     PRIMARY KEY (user_id, role)
 );
 
+CREATE TABLE IF NOT EXISTS access_groups (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug text NOT NULL UNIQUE,
+    name text NOT NULL,
+    system boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS access_group_companies (
+    access_group_id uuid NOT NULL REFERENCES access_groups(id) ON DELETE CASCADE,
+    company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    PRIMARY KEY (access_group_id, company_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_access_groups (
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    access_group_id uuid NOT NULL REFERENCES access_groups(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, access_group_id)
+);
+
 CREATE TABLE IF NOT EXISTS integration_connections (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug text NOT NULL UNIQUE,
     company_id uuid REFERENCES companies(id) ON DELETE CASCADE,
     provider text NOT NULL CHECK (provider IN ('connectwise_manage', 'ncentral', 'passportal', 'future')),
     name text NOT NULL,
@@ -49,6 +87,12 @@ CREATE TABLE IF NOT EXISTS integration_connections (
     updated_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE NULLS NOT DISTINCT (company_id, provider, name)
 );
+ALTER TABLE integration_connections ADD COLUMN IF NOT EXISTS slug text;
+UPDATE integration_connections
+SET slug = CASE provider WHEN 'connectwise_manage' THEN 'connectwise' ELSE provider END || '-' || left(id::text, 8)
+WHERE slug IS NULL;
+ALTER TABLE integration_connections ALTER COLUMN slug SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS integration_connections_slug_idx ON integration_connections(slug);
 
 CREATE TABLE IF NOT EXISTS configuration_items (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -135,7 +179,7 @@ CREATE TABLE IF NOT EXISTS ci_relationships (
     company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
     from_ci_id uuid NOT NULL REFERENCES configuration_items(id) ON DELETE CASCADE,
     to_ci_id uuid NOT NULL REFERENCES configuration_items(id) ON DELETE CASCADE,
-    relationship_type text NOT NULL CHECK (relationship_type IN ('depends_on', 'connected_to', 'installed_on', 'used_by', 'licensed_to', 'hosts', 'backs_up', 'managed_by')),
+    relationship_type text NOT NULL CHECK (relationship_type IN ('depends_on', 'connected_to', 'installed_on', 'used_by', 'licensed_to', 'related_to', 'hosts', 'backs_up', 'managed_by')),
     source_mapping_id uuid REFERENCES external_object_mappings(id) ON DELETE SET NULL,
     confidence numeric(4,3) NOT NULL DEFAULT 1 CHECK (confidence >= 0 AND confidence <= 1),
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -143,21 +187,137 @@ CREATE TABLE IF NOT EXISTS ci_relationships (
     CHECK (from_ci_id <> to_ci_id),
     UNIQUE (from_ci_id, to_ci_id, relationship_type)
 );
+
+ALTER TABLE ci_relationships
+    DROP CONSTRAINT IF EXISTS ci_relationships_relationship_type_check;
+ALTER TABLE ci_relationships
+    ADD CONSTRAINT ci_relationships_relationship_type_check
+    CHECK (relationship_type IN ('depends_on', 'connected_to', 'installed_on', 'used_by', 'licensed_to', 'related_to', 'hosts', 'backs_up', 'managed_by'));
 CREATE INDEX IF NOT EXISTS ci_relationships_from_idx ON ci_relationships(from_ci_id) WHERE retired_at IS NULL;
 CREATE INDEX IF NOT EXISTS ci_relationships_to_idx ON ci_relationships(to_ci_id) WHERE retired_at IS NULL;
+
+-- Change packages freeze the CMDB impact seen during approval. Live CI links are
+-- retained for navigation, while snapshot JSON keeps the historical record stable.
+CREATE TABLE IF NOT EXISTS change_requests (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id uuid NOT NULL REFERENCES companies(id) ON DELETE RESTRICT,
+    change_number text NOT NULL UNIQUE,
+    title text NOT NULL,
+    status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'impact_review', 'awaiting_approval', 'approved', 'scheduled', 'implementing', 'completed', 'failed', 'backed_out', 'closed')),
+    change_type text NOT NULL CHECK (change_type IN ('standard', 'normal', 'emergency')),
+    category text NOT NULL,
+    priority text NOT NULL CHECK (priority IN ('low', 'medium', 'high', 'critical')),
+    risk_level text NOT NULL CHECK (risk_level IN ('low', 'medium', 'high', 'critical')),
+    risk_source text NOT NULL DEFAULT 'cmdb_suggestion' CHECK (risk_source IN ('cmdb_suggestion', 'technician')),
+    outage_expected boolean NOT NULL DEFAULT false,
+    -- Change windows are customer-local wall times. Audit timestamps remain UTC.
+    planned_start timestamp without time zone,
+    planned_end timestamp without time zone,
+    reason text NOT NULL,
+    business_impact text,
+    implementation_plan text NOT NULL,
+    validation_plan text NOT NULL,
+    rollback_plan text NOT NULL,
+    communication_status text NOT NULL DEFAULT 'required' CHECK (communication_status IN ('required', 'not_required', 'completed')),
+    communication_plan text,
+    assigned_technician text,
+    approver text,
+    notes text,
+    impact_summary jsonb NOT NULL DEFAULT '{}'::jsonb,
+    risk_assessment jsonb NOT NULL DEFAULT '{}'::jsonb,
+    revision integer NOT NULL DEFAULT 1 CHECK (revision > 0),
+    created_by uuid REFERENCES users(id) ON DELETE SET NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS change_requests_company_created_idx ON change_requests(company_id, created_at DESC);
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'change_requests' AND column_name = 'planned_start'
+          AND data_type = 'timestamp with time zone'
+    ) THEN
+        ALTER TABLE change_requests
+            ALTER COLUMN planned_start TYPE timestamp without time zone USING planned_start AT TIME ZONE 'UTC',
+            ALTER COLUMN planned_end TYPE timestamp without time zone USING planned_end AT TIME ZONE 'UTC';
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS change_scope_items (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    change_id uuid NOT NULL REFERENCES change_requests(id) ON DELETE CASCADE,
+    ci_id uuid REFERENCES configuration_items(id) ON DELETE SET NULL,
+    ci_snapshot jsonb NOT NULL,
+    ordinal integer NOT NULL DEFAULT 0,
+    UNIQUE (change_id, ci_id)
+);
+ALTER TABLE change_scope_items ADD COLUMN IF NOT EXISTS ordinal integer NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS change_impact_snapshots (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    change_id uuid NOT NULL REFERENCES change_requests(id) ON DELETE CASCADE,
+    ci_id uuid REFERENCES configuration_items(id) ON DELETE SET NULL,
+    impact_role text NOT NULL CHECK (impact_role IN ('scope', 'direct', 'downstream')),
+    depth integer NOT NULL CHECK (depth >= 0),
+    relationship_path jsonb NOT NULL DEFAULT '[]'::jsonb,
+    ci_snapshot jsonb NOT NULL,
+    automatically_detected boolean NOT NULL DEFAULT true,
+    included boolean NOT NULL DEFAULT true,
+    decision_reason text,
+    ordinal integer NOT NULL DEFAULT 0,
+    UNIQUE (change_id, ci_id)
+);
+ALTER TABLE change_impact_snapshots ADD COLUMN IF NOT EXISTS ordinal integer NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS change_impact_change_idx ON change_impact_snapshots(change_id, depth);
+
+CREATE TABLE IF NOT EXISTS change_revisions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    change_id uuid NOT NULL REFERENCES change_requests(id) ON DELETE CASCADE,
+    revision integer NOT NULL,
+    document jsonb NOT NULL,
+    created_by uuid REFERENCES users(id) ON DELETE SET NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (change_id, revision)
+);
+
+-- A provider-neutral external envelope prevents the PDF workflow from being
+-- coupled to ConnectWise. A future publisher can populate this idempotently.
+CREATE TABLE IF NOT EXISTS change_external_links (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    change_id uuid NOT NULL REFERENCES change_requests(id) ON DELETE CASCADE,
+    provider text NOT NULL,
+    external_type text NOT NULL DEFAULT 'ticket',
+    external_id text,
+    external_url text,
+    sync_status text NOT NULL DEFAULT 'not_published' CHECK (sync_status IN ('not_published', 'queued', 'published', 'failed')),
+    idempotency_key text NOT NULL UNIQUE,
+    last_attempt_at timestamptz,
+    last_error text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (change_id, provider, external_type)
+);
 
 CREATE TABLE IF NOT EXISTS sync_runs (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     integration_connection_id uuid NOT NULL REFERENCES integration_connections(id) ON DELETE CASCADE,
-    status text NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'review_required')),
+    status text NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'blocked', 'failed', 'review_required')),
     started_at timestamptz NOT NULL DEFAULT now(),
     finished_at timestamptz,
     discovered_count integer NOT NULL DEFAULT 0,
     created_count integer NOT NULL DEFAULT 0,
     updated_count integer NOT NULL DEFAULT 0,
     review_count integer NOT NULL DEFAULT 0,
-    error_summary text
+    error_summary text,
+    message text,
+    attributes jsonb NOT NULL DEFAULT '{}'::jsonb
 );
+ALTER TABLE sync_runs DROP CONSTRAINT IF EXISTS sync_runs_status_check;
+ALTER TABLE sync_runs ADD CONSTRAINT sync_runs_status_check
+    CHECK (status IN ('queued', 'running', 'succeeded', 'blocked', 'failed', 'review_required'));
+ALTER TABLE sync_runs ADD COLUMN IF NOT EXISTS message text;
+ALTER TABLE sync_runs ADD COLUMN IF NOT EXISTS attributes jsonb NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS reconciliation_candidates (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -184,6 +344,28 @@ CREATE TABLE IF NOT EXISTS audit_events (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- MSP presentation settings are application-owned configuration. Small logo
+-- images are kept as a constrained data URL so backups remain self-contained;
+-- larger document assets can move to Azure Blob Storage without changing the
+-- public branding contract.
+CREATE TABLE IF NOT EXISTS msp_branding (
+    id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    display_name text NOT NULL DEFAULT 'CMDB Hub',
+    logo_text varchar(3) NOT NULL DEFAULT 'C',
+    accent_color varchar(16) NOT NULL DEFAULT '#50d5b9',
+    secondary_color varchar(16) NOT NULL DEFAULT '#7997ff',
+    logo_data_url text,
+    logo_file_name text,
+    support_email text,
+    support_url text,
+    support_phone text,
+    welcome_message text,
+    report_footer text,
+    confidentiality_label text,
+    updated_by uuid REFERENCES users(id) ON DELETE SET NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 -- Transitional application state store. It keeps the current demo API operational
 -- while endpoint-by-endpoint repositories move to the canonical tables above.
 -- This is API-owned state; it is never accessed by the frontend.
@@ -192,3 +374,12 @@ CREATE TABLE IF NOT EXISTS application_state (
     state jsonb NOT NULL,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version text PRIMARY KEY,
+    description text NOT NULL,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO schema_migrations (version, description)
+VALUES ('2026.07.13.1', 'Canonical CMDB, integration, change control and MSP branding baseline')
+ON CONFLICT (version) DO NOTHING;

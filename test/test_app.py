@@ -1,6 +1,6 @@
 import unittest
 from datetime import date
-from app import allowed, asset_metadata, attention_items, backup_document, can_manage, customer_overview, normalise_metadata, restore_backup
+from app import allowed, asset_metadata, attention_items, backup_document, build_seed_state, can_manage, customer_overview, normalise_metadata, preview_backup, relationship_exists, restore_backup, would_create_dependency_cycle
 
 class CompanyScopeTests(unittest.TestCase):
     def test_client_is_limited_to_its_assigned_company(self):
@@ -14,7 +14,7 @@ class CompanyScopeTests(unittest.TestCase):
     def test_client_cannot_manage_their_company(self):
         self.assertFalse(can_manage({"role": "client_reader", "companyIds": ["acme"]}, "acme"))
 
-    def test_legacy_asset_receives_safe_itil_metadata_defaults(self):
+    def test_asset_without_metadata_receives_safe_itil_defaults(self):
         metadata = asset_metadata({"status": "Active"})
         self.assertEqual(metadata["lifecycle"], "in_service")
         self.assertEqual(metadata["operationalStatus"], "healthy")
@@ -50,11 +50,43 @@ class CompanyScopeTests(unittest.TestCase):
     def test_backup_document_has_versioned_portable_shape(self):
         backup = backup_document()
         self.assertEqual(backup["format"], "cmdb-hub-backup")
-        self.assertEqual(backup["version"], 1)
+        self.assertEqual(backup["version"], 2)
         self.assertIn("assets", backup["state"])
+        self.assertTrue(backup["checksum"].startswith("sha256:"))
+        self.assertIn("canonical audit history", backup["excluded"])
+
+    def test_empty_seed_keeps_platform_admin_without_demo_tenants(self):
+        state = build_seed_state("empty")
+        self.assertEqual(state["companies"], [])
+        self.assertEqual(state["assets"], [])
+        self.assertTrue(any(user["role"] == "platform_admin" for user in state["users"]))
+
+    def test_portable_backup_preview_detects_tampering(self):
+        backup = backup_document()
+        preview = preview_backup(backup)
+        self.assertTrue(preview["valid"])
+        backup["state"]["assets"].append({"id": "tampered"})
+        with self.assertRaises(ValueError):
+            preview_backup(backup)
 
     def test_restore_rejects_backup_without_platform_admin(self):
         invalid = {"format": "cmdb-hub-backup", "version": 1, "state": {"companies": [], "users": [], "assets": [], "relationships": [], "integrations": [], "syncRuns": []}}
         with self.assertRaises(ValueError): restore_backup(invalid)
+
+    def test_symmetric_relationship_rejects_reverse_duplicate(self):
+        relationships = [{"fromId": "switch", "toId": "server", "type": "connected_to"}]
+        self.assertTrue(relationship_exists(relationships, "server", "switch", "connected_to"))
+
+    def test_directional_relationship_allows_reverse_edge(self):
+        relationships = [{"fromId": "app", "toId": "database", "type": "depends_on"}]
+        self.assertFalse(relationship_exists(relationships, "database", "app", "depends_on"))
+
+    def test_dependency_cycle_is_detected(self):
+        relationships = [
+            {"fromId": "app", "toId": "database", "type": "depends_on"},
+            {"fromId": "portal", "toId": "app", "type": "depends_on"},
+        ]
+        self.assertTrue(would_create_dependency_cycle(relationships, "database", "portal"))
+        self.assertFalse(would_create_dependency_cycle(relationships, "reporting", "database"))
 
 if __name__ == "__main__": unittest.main()
