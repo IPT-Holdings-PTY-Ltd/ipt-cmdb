@@ -29,6 +29,7 @@ import { apiFetch, getSession } from './session';
 import { businessApplicationMemberships, displayLayer, displayLayerColors, displayLayerLabels, displayLayerOrder, type DisplayLayer } from './topology';
 import type { Asset, Relationship } from './types';
 import { useWorkspace } from './workspace';
+import { AuditTimeline } from './Governance';
 
 const types = [
   'Business system', 'Device', 'Server', 'Virtual machine', 'Hypervisor host', 'Virtualization cluster',
@@ -344,6 +345,7 @@ function AssetShowContent() {
       <Grid size={{ xs: 12, md: 6, lg: 3 }}><Paper className="asset-detail-card"><Typography variant="overline" color="primary">Lifecycle dates</Typography><Typography variant="caption" color="text.secondary" display="block">Purchased</Typography><Typography variant="body2">{asset.metadata?.purchaseDate || 'Not recorded'}</Typography><Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>Warranty / renewal</Typography><Typography variant="body2">{asset.metadata?.warrantyEnd || '—'} / {asset.metadata?.renewalDate || '—'}</Typography><Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>End of life</Typography><Typography variant="body2" color={dateAttention(asset) ? 'warning.main' : 'text.primary'}>{asset.metadata?.endOfLifeDate || 'Not recorded'}</Typography></Paper></Grid>
       <Grid size={{ xs: 12, md: 6, lg: 3 }}><Paper className="asset-detail-card"><Typography variant="overline" color="primary">Source and identity</Typography><Chip size="small" variant="outlined" label={asset.source || 'unknown'} /><Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1.5 }}>External identifier</Typography><Typography variant="body2" sx={{ wordBreak: 'break-all' }}>{asset.externalId || 'Not recorded'}</Typography><Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>Last seen</Typography><Typography variant="body2" color={isStale(asset) ? 'warning.main' : 'text.primary'}>{freshness(asset)}</Typography></Paper></Grid>
     </Grid>
+    <AuditTimeline entityType="configuration_item" entityId={asset.id} companyId={asset.companyId} />
   </Box>;
 }
 

@@ -201,3 +201,43 @@ export type ChangePackage = {
   impactSummary: ChangeImpactPreview['summary'];
   integrationState: { connectwise: { status: string; ticketId: string | null; ticketUrl: string | null } };
 };
+
+export type AuditChange = { field: string; before: unknown; after: unknown };
+
+export type AuditEvent = {
+  id: string;
+  companyId?: string | null;
+  actorUserId?: string | null;
+  actorLabel: string;
+  actorType: string;
+  sourceSystem: string;
+  category: string;
+  entityType: string;
+  entityId?: string | null;
+  entityName: string;
+  action: string;
+  outcome: 'success' | 'denied' | 'failed';
+  severity: 'informational' | 'warning' | 'critical';
+  requestId: string;
+  correlationId: string;
+  before?: Record<string, unknown> | null;
+  after?: Record<string, unknown> | null;
+  changes: AuditChange[];
+  reason?: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type ReportDefinition = { id: string; title: string; description: string };
+export type ReportColumn = { key: string; label: string };
+export type ReportPreview = {
+  id: string;
+  title: string;
+  description: string;
+  generatedAt: string;
+  companyId?: string | null;
+  columns: ReportColumn[];
+  rows: Array<Record<string, unknown>>;
+  summary: { rowCount: number; customerCount: number };
+  previewLimited: boolean;
+};

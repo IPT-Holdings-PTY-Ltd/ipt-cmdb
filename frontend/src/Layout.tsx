@@ -8,6 +8,8 @@ import PaletteOutlined from '@mui/icons-material/PaletteOutlined';
 import SecurityOutlined from '@mui/icons-material/SecurityOutlined';
 import StorageOutlined from '@mui/icons-material/StorageOutlined';
 import BusinessCenterOutlined from '@mui/icons-material/BusinessCenterOutlined';
+import AssessmentOutlined from '@mui/icons-material/AssessmentOutlined';
+import HistoryOutlined from '@mui/icons-material/HistoryOutlined';
 import { Box, FormControl, MenuItem, Select, Stack, Typography } from '@mui/material';
 import { AppBar, Layout, Menu, useRefresh, type LayoutProps } from 'react-admin';
 import { useWorkspace } from './workspace';
@@ -48,6 +50,9 @@ function WorkspaceMenu() {
       <Menu.ResourceItem name="assets" />
       <Menu.Item to="/relationships" primaryText="Relationships" leftIcon={<AccountTreeOutlined />} />
       <Menu.Item to="/changes" primaryText="Change control" leftIcon={<AssignmentOutlined />} />
+      {section('Governance')}
+      <Menu.Item to="/governance/audit" primaryText="Audit activity" leftIcon={<HistoryOutlined />} />
+      <Menu.Item to="/governance/reports" primaryText="Reports" leftIcon={<AssessmentOutlined />} />
       {rootRole && <>{section('Access')}<Menu.Item to="/customer/users" primaryText="Users & permissions" leftIcon={<ManageAccountsOutlined />} /></>}
     </>}
     {workspace.isRoot && rootRole && <>
@@ -59,6 +64,9 @@ function WorkspaceMenu() {
       {platformAdmin && <Menu.Item to="/admin/rbac" primaryText="Access control" leftIcon={<SecurityOutlined />} />}
       {section('Operations')}
       <Menu.Item to="/admin/integrations" primaryText="Integrations" leftIcon={<CloudSyncOutlined />} />
+      {section('Governance')}
+      <Menu.Item to="/governance/audit" primaryText="Audit activity" leftIcon={<HistoryOutlined />} />
+      <Menu.Item to="/governance/reports" primaryText="Reports" leftIcon={<AssessmentOutlined />} />
       {section('Settings')}
       <Menu.Item to="/admin/branding" primaryText="Branding" leftIcon={<PaletteOutlined />} />
       {platformAdmin && <Menu.Item to="/admin/database" primaryText="Database & recovery" leftIcon={<StorageOutlined />} />}

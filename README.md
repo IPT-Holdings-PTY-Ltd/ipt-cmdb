@@ -27,6 +27,8 @@ IPT CMDB combines a tenant-aware asset inventory, business-system modelling, int
 | PostgreSQL | Canonical repository, forward-only checksum migrations, blank-database bootstrap and upgrade verification |
 | Recovery | Portable checksum-protected export/import plus operational guidance for PostgreSQL PITR or `pg_dump` |
 | Branding | MSP identity, logo, colours and report footer; tenant-scoped customer branding storage |
+| Governance | Append-only attributable audit ledger, request correlation, tenant-aware Audit Center and CI activity timelines |
+| Reports | Controlled MSP/customer report catalogue with branded PDF, filterable XLSX and UTF-8 CSV exports |
 | Integrations | Root control plane and connectivity boundary; production ingestion/mapping is the next delivery increment |
 
 Passportal passwords, secure notes and credential values are explicitly out of scope. Only approved metadata associations should enter the CMDB.
@@ -117,6 +119,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime, tenancy, identity and re
 - [Local development](docs/LOCAL_DEVELOPMENT.md)
 - [Architecture](ARCHITECTURE.md)
 - [Data model and relationship semantics](docs/DATA_MODEL.md)
+- [Governance, audit and reporting](docs/GOVERNANCE.md)
 - [Integration design and provider boundaries](docs/INTEGRATIONS.md)
 - [Azure/container deployment](docs/DEPLOYMENT.md)
 - [Operations, upgrades and recovery](docs/OPERATIONS.md)

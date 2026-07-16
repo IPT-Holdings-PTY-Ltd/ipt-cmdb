@@ -99,10 +99,70 @@ class FastApiMigrationTests(unittest.TestCase):
     def test_openapi_identifies_the_direct_fastapi_surface(self):
         schema = api.openapi()
         self.assertEqual(schema["info"]["title"], "CMDB Hub API")
-        self.assertEqual(schema["info"]["version"], "0.3.0")
+        self.assertEqual(schema["info"]["version"], "0.4.0")
         self.assertIn("/api/assets", schema["paths"])
         self.assertIn("/api/relationships", schema["paths"])
         self.assertIn("/api/changes/{change_id}/pdf", schema["paths"])
+        self.assertIn("/api/audit-events", schema["paths"])
+        self.assertIn("/api/reports/{report_id}/download", schema["paths"])
+
+    def test_audit_center_is_tenant_scoped_and_contains_attribution(self):
+        admin = self._login("admin@example.com")
+        headers = {"Authorization": f"Bearer {admin}", "X-Correlation-ID": "change-4451"}
+        created = self.client.post(
+            "/api/assets",
+            headers=headers,
+            json={"companyId": "acme", "name": "ACME-AUDIT-01", "type": "Server", "status": "Active"},
+        )
+        self.assertEqual(created.status_code, 201)
+        events = self.client.get(
+            f"/api/audit-events?companyId=acme&entityId={created.json()['id']}",
+            headers=headers,
+        )
+        self.assertEqual(events.status_code, 200)
+        event = events.json()[0]
+        self.assertEqual(event["actorLabel"], "admin@example.com")
+        self.assertEqual(event["correlationId"], "change-4451")
+        self.assertEqual(event["entityName"], "ACME-AUDIT-01")
+        self.assertTrue(any(change["field"] == "name" for change in event["changes"]))
+
+        client = self._login("client@acme.example")
+        client_headers = {"Authorization": f"Bearer {client}"}
+        visible = self.client.get("/api/audit-events?companyId=acme", headers=client_headers)
+        self.assertEqual(visible.status_code, 200)
+        self.assertTrue(all(item.get("companyId") == "acme" for item in visible.json()))
+        self.assertEqual(self.client.get("/api/audit-events?companyId=northwind", headers=client_headers).status_code, 403)
+        self.assertEqual(self.client.get("/api/audit-events", headers=client_headers).status_code, 403)
+
+    def test_authentication_events_never_capture_passwords(self):
+        failed = self.client.post("/api/login", json={"email": "admin@example.com", "password": "incorrect-secret"})
+        self.assertEqual(failed.status_code, 401)
+        event = core.DB["auditEvents"][0]
+        self.assertEqual(event["action"], "login_failed")
+        self.assertEqual(event["outcome"], "failed")
+        self.assertNotIn("incorrect-secret", json.dumps(event))
+
+    def test_governance_reports_preview_and_download_in_customer_scope(self):
+        client = self._login("client@acme.example")
+        headers = {"Authorization": f"Bearer {client}"}
+        catalog = self.client.get("/api/reports/catalog?companyId=acme", headers=headers)
+        self.assertEqual(catalog.status_code, 200)
+        self.assertIn("asset-register", {item["id"] for item in catalog.json()})
+        self.assertNotIn("access-review", {item["id"] for item in catalog.json()})
+        preview = self.client.get("/api/reports/asset-register/preview?companyId=acme", headers=headers)
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.json()["summary"]["rowCount"], 1)
+        self.assertEqual(preview.json()["rows"][0]["customer"], "Acme Manufacturing")
+        export = self.client.get("/api/reports/asset-register/download?companyId=acme&format=csv", headers=headers)
+        self.assertEqual(export.status_code, 200)
+        self.assertIn("text/csv", export.headers["content-type"])
+        self.assertIn("ACME-DC01", export.content.decode("utf-8-sig"))
+        xlsx = self.client.get("/api/reports/asset-register/download?companyId=acme&format=xlsx", headers=headers)
+        self.assertEqual(xlsx.status_code, 200)
+        self.assertTrue(xlsx.content.startswith(b"PK"))
+        pdf = self.client.get("/api/reports/asset-register/download?companyId=acme&format=pdf", headers=headers)
+        self.assertEqual(pdf.status_code, 200)
+        self.assertTrue(pdf.content.startswith(b"%PDF"))
 
     def test_easy_auth_is_container_configured_and_does_not_fall_back_to_passwords(self):
         claims = {

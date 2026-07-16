@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import secrets
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,18 +24,62 @@ from pydantic import BaseModel, ConfigDict, Field
 
 import app as core
 from src.cmdb.change_control import change_pdf_filename, create_change_record, preview_change_impact, render_change_pdf
+from src.cmdb.audit import AuditContext, reset_audit_context, set_audit_context
 from src.cmdb.repository import PostgresCmdbRepository, StateRepository, canonical_uuid
+from src.cmdb.reports import build_report, render_csv, render_pdf, render_xlsx, report_catalog, report_filename
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST", ROOT / "frontend" / "dist"))
+LOGGER = logging.getLogger("cmdb.api")
 
 
 api = FastAPI(
     title="CMDB Hub API",
-    version="0.3.0",
+    version="0.4.0",
     description="Tenant-aware CMDB API served directly by FastAPI.",
 )
+
+
+@api.middleware("http")
+async def audit_and_correlation_context(request: Request, call_next):
+    """Correlate diagnostics and audit evidence without logging credentials."""
+    requested_id = request.headers.get("x-request-id", "").strip()
+    request_id = requested_id[:100] if re.fullmatch(r"[A-Za-z0-9._:-]{1,100}", requested_id) else str(uuid.uuid4())
+    correlation = request.headers.get("x-correlation-id", "").strip()[:100] or request_id
+    forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    client_address = forwarded or (request.client.host if request.client else "")
+    token = set_audit_context(AuditContext(
+        request_id=request_id,
+        correlation_id=correlation,
+        source_system=request.headers.get("x-cmdb-source", "web")[:80] or "web",
+        client_address=client_address[:120],
+        user_agent=request.headers.get("user-agent", "")[:500],
+    ))
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Correlation-ID"] = correlation
+        if request.url.path.startswith("/api/") and response.status_code in {401, 403} and request.url.path != "/api/login":
+            actor = getattr(request.state, "current_user", None)
+            try:
+                REPOSITORY.record_audit_event(
+                    None, actor.get("id") if actor else None, "authorization", canonical_uuid("authorization", f"{request.method}:{request.url.path}"),
+                    "access_denied", outcome="denied", severity="warning",
+                    metadata={"method": request.method, "path": request.url.path, "statusCode": response.status_code},
+                )
+            except Exception:
+                LOGGER.exception("audit_denial_record_failed")
+        LOGGER.info(
+            "request_complete",
+            extra={"request_id": request_id, "correlation_id": correlation, "method": request.method,
+                   "path": request.url.path, "status_code": response.status_code,
+                   "duration_ms": round((time.perf_counter() - started) * 1000, 2)},
+        )
+        return response
+    finally:
+        reset_audit_context(token)
 
 
 @api.middleware("http")
@@ -124,6 +170,7 @@ def current_user(request: Request) -> dict:
             user = next((item for item in users if item["email"].lower() == email.lower()), None)
             if not user:
                 raise HTTPException(403, "Your Entra identity has not been assigned CMDB access")
+            request.state.current_user = user
             return user
         if not _local_login_enabled():
             raise HTTPException(401, "Microsoft sign-in is required")
@@ -136,6 +183,7 @@ def current_user(request: Request) -> dict:
     user = next((item for item in users if item["id"] == session["userId"]), None)
     if not user:
         raise HTTPException(401, "Sign in required")
+    request.state.current_user = user
     return user
 
 
@@ -291,16 +339,25 @@ def health() -> dict:
 
 
 @api.post("/api/login", tags=["authentication"])
-def login(payload: LoginRequest) -> dict:
+def login(payload: LoginRequest, request: Request) -> dict:
     if not _local_login_enabled():
         raise HTTPException(403, "Local password login is disabled; use Microsoft sign-in")
     email = payload.email.strip().lower()
     user = REPOSITORY.authenticate(email, payload.password)
     if not user:
+        REPOSITORY.record_audit_event(
+            None, None, "authentication", canonical_uuid("authentication", email), "login_failed",
+            outcome="failed", severity="warning", actor_type="anonymous", metadata={"email": email, "mode": "local"},
+        )
         raise HTTPException(401, "Invalid credentials")
     token = secrets.token_urlsafe(32)
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=core.SESSION_TTL_SECONDS)
     core.SESSIONS[token] = {"userId": user["id"], "expiresAt": expires_at}
+    request.state.current_user = user
+    REPOSITORY.record_audit_event(
+        None, user["id"], "authentication", user["id"], "login_succeeded",
+        after={"email": user["email"], "role": user["role"]}, metadata={"mode": "local"},
+    )
     return {
         "token": token,
         "expiresAt": expires_at.isoformat().replace("+00:00", "Z"),
@@ -323,7 +380,15 @@ def auth_config() -> dict:
 
 @api.post("/api/logout", status_code=204, tags=["authentication"])
 def logout(request: Request) -> Response:
-    core.SESSIONS.pop(request.headers.get("authorization", "").removeprefix("Bearer "), None)
+    bearer = request.headers.get("authorization", "").removeprefix("Bearer ")
+    session = core.SESSIONS.get(bearer)
+    user = None
+    if session:
+        user = next((item for item in REPOSITORY.list_users() if item["id"] == session["userId"]), None)
+    core.SESSIONS.pop(bearer, None)
+    if user:
+        request.state.current_user = user
+        REPOSITORY.record_audit_event(None, user["id"], "session", user["id"], "logout", after={"email": user["email"]})
     return Response(status_code=204)
 
 
@@ -384,7 +449,9 @@ def database_config(payload: DatabaseSettingsRequest, request: Request) -> dict:
 def database_backup(request: Request) -> dict:
     user = current_user(request)
     _require_role(user, {"platform_admin"}, "Database backup requires platform admin role")
-    return core.backup_document(REPOSITORY.export_state())
+    document = core.backup_document(REPOSITORY.export_state())
+    REPOSITORY.record_audit_event(None, user["id"], "portable_export", canonical_uuid("portable_export", document["createdAt"]), "exported", after={"createdAt": document["createdAt"], "format": document["format"], "version": document["version"]})
+    return document
 
 
 @api.post("/api/database/restore/preview", tags=["platform"])
@@ -411,6 +478,7 @@ def database_restore(payload: BackupRestoreRequest, request: Request) -> dict:
         state.setdefault("changes", [])
         with core.LOCK:
             imported = REPOSITORY.import_state(state, user["id"])
+        REPOSITORY.record_audit_event(None, user["id"], "recovery", canonical_uuid("recovery", payload.createdAt or str(uuid.uuid4())), "portable_import_completed", after={"restoredFrom": payload.createdAt, "companies": imported.get("companies"), "assets": imported.get("assets")}, severity="warning")
         return {
             "message": "Portable backup imported successfully.",
             "companies": imported.get("companies", len(state["companies"])),
@@ -1033,6 +1101,119 @@ def download_change_pdf(change_id: str, request: Request) -> Response:
 @api.get("/api/changes/{change_id}", tags=["change control"])
 def get_change(change_id: str, request: Request) -> dict:
     return _change_for_user(change_id, current_user(request))
+
+
+@api.get("/api/audit-events", tags=["governance"])
+def list_audit_events(
+    request: Request,
+    companyId: str | None = None,
+    actorId: str | None = None,
+    category: str | None = None,
+    action: str | None = None,
+    entityType: str | None = None,
+    entityId: str | None = None,
+    outcome: str | None = None,
+    search: str | None = None,
+    dateFrom: str | None = None,
+    dateTo: str | None = None,
+    limit: int = 250,
+) -> list[dict]:
+    user = current_user(request)
+    if companyId:
+        _company_for_user(companyId, user)
+    else:
+        _require_role(user, {"platform_admin", "msp_operator"}, "MSP audit requires root or MSP role")
+    records = REPOSITORY.list_audit_events(
+        companyId, actor_id=actorId, category=category, action=action,
+        entity_type=entityType, entity_id=entityId, outcome=outcome,
+        search=search, limit=max(1, min(limit, 1000)),
+    )
+    if not companyId and user["role"] != "platform_admin":
+        records = [item for item in records if item.get("companyId") is None or core.allowed(user, item["companyId"])]
+    if dateFrom:
+        records = [item for item in records if item.get("createdAt", "") >= dateFrom]
+    if dateTo:
+        upper = dateTo if "T" in dateTo else f"{dateTo}T23:59:59.999Z"
+        records = [item for item in records if item.get("createdAt", "") <= upper]
+    return records
+
+
+def _governance_report(report_id: str, user: dict, company_id: str | None) -> dict:
+    root_scope = company_id is None
+    if company_id:
+        _company_for_user(company_id, user)
+    else:
+        _require_role(user, {"platform_admin", "msp_operator"}, "MSP reports require root or MSP role")
+    if report_id == "access-review" and user["role"] != "platform_admin":
+        raise HTTPException(403, "Effective access reporting requires platform admin role")
+    if report_id == "integration-health" and not root_scope:
+        raise HTTPException(400, "Integration health is an MSP-level report")
+    companies = [item for item in REPOSITORY.list_companies() if core.allowed(user, item["id"])]
+    assets = [item for item in REPOSITORY.list_assets() if core.allowed(user, item["companyId"])]
+    asset_ids = {item["id"] for item in assets if not company_id or item["companyId"] == company_id}
+    relationships = [item for item in REPOSITORY.list_relationships() if item["fromId"] in asset_ids and item["toId"] in asset_ids]
+    changes = [item for item in REPOSITORY.list_changes() if core.allowed(user, item["companyId"])]
+    audit_events = REPOSITORY.list_audit_events(company_id, limit=1000)
+    if root_scope and user["role"] != "platform_admin":
+        audit_events = [item for item in audit_events if item.get("companyId") is None or core.allowed(user, item["companyId"])]
+    return build_report(
+        report_id,
+        companies=companies,
+        assets=assets,
+        relationships=relationships,
+        changes=changes,
+        users=REPOSITORY.list_users() if root_scope else [],
+        integrations=REPOSITORY.list_integrations() if root_scope else [],
+        sync_runs=REPOSITORY.list_sync_runs() if root_scope else [],
+        audit_events=audit_events,
+        company_id=company_id,
+    )
+
+
+@api.get("/api/reports/catalog", tags=["governance"])
+def reports_catalog(request: Request, companyId: str | None = None) -> list[dict]:
+    user = current_user(request)
+    if companyId:
+        _company_for_user(companyId, user)
+    else:
+        _require_role(user, {"platform_admin", "msp_operator"}, "MSP reports require root or MSP role")
+    records = report_catalog(companyId is None)
+    if user["role"] != "platform_admin":
+        records = [item for item in records if item["id"] != "access-review"]
+    return records
+
+
+@api.get("/api/reports/{report_id}/preview", tags=["governance"])
+def preview_report(report_id: str, request: Request, companyId: str | None = None) -> dict:
+    user = current_user(request)
+    try:
+        report = _governance_report(report_id, user, companyId)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+    return {**report, "rows": report["rows"][:100], "previewLimited": len(report["rows"]) > 100}
+
+
+@api.get("/api/reports/{report_id}/download", tags=["governance"])
+def download_report(report_id: str, request: Request, format: str = "pdf", companyId: str | None = None) -> Response:
+    user = current_user(request)
+    if format not in {"pdf", "xlsx", "csv"}:
+        raise HTTPException(400, "Choose PDF, XLSX or CSV")
+    try:
+        report = _governance_report(report_id, user, companyId)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+    branding = REPOSITORY.get_msp_branding()
+    if format == "csv":
+        content, media_type = render_csv(report), "text/csv; charset=utf-8"
+    elif format == "xlsx":
+        content, media_type = render_xlsx(report, branding), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        content, media_type = render_pdf(report, branding), "application/pdf"
+    REPOSITORY.record_audit_event(
+        companyId, user["id"], "report", canonical_uuid("report", f"{report_id}:{report['generatedAt']}"),
+        "downloaded", after={"reportId": report_id, "title": report["title"], "format": format, "rowCount": report["summary"]["rowCount"]},
+    )
+    return Response(content, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{report_filename(report, format)}"'})
 
 
 @api.get("/{path:path}", include_in_schema=False)

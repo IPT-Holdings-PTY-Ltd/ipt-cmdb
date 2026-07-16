@@ -43,6 +43,8 @@ Major UI areas are:
 
 FastAPI owns all public routes, authentication resolution, tenant authorization, validation and audit-producing writes. Pydantic request models validate mutation inputs. Every operational entity is evaluated against the current user's allowed `companyId` set.
 
+Request middleware assigns request and correlation identifiers, returns them to callers and makes them available to repository audit writes. Diagnostic request logs remain separate from the append-only governance ledger.
+
 Roles currently exposed by the application are:
 
 | Role | Intended scope |
@@ -67,6 +69,8 @@ The API continues to enforce tenant and role authorization after external authen
 ## PostgreSQL and migrations
 
 PostgreSQL is the production source of truth. The repository stores customers, users, access groups, CIs, identifiers, relationships, integration connections, mappings, observations, changes, branding, sync runs, reconciliation candidates and audit events in normalized tables.
+
+Audit rows are append-only and contain sanitised before/after values, field changes, actor attribution, source, outcome and correlation context. Tenant-aware reporting is assembled through controlled report templates rather than allowing arbitrary SQL from the web tier.
 
 At startup the application:
 
