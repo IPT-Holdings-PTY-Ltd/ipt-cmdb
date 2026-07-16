@@ -196,115 +196,181 @@ export function AssetList() {
     const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = `cmdb-assets-${workspace.companyId}.csv`; link.click(); URL.revokeObjectURL(url);
   };
 
-  return <Box className="asset-inventory">
-    <Title title="Configuration items" />
-    <Stack direction={{ xs: 'column', lg: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', lg: 'flex-end' }} spacing={2} sx={{ mb: 2.5 }}>
-      <Box><Typography variant="overline" color="primary">Configuration management</Typography><Typography variant="h3">Asset inventory</Typography><Typography color="text.secondary">Find CIs by full-stack layer, business application, ownership and operational attention.</Typography></Box>
-      <Stack direction="row" spacing={1}>{canEdit && <Button variant="contained" startIcon={<AddOutlined />} onClick={() => navigate('/assets/create')}>Add asset</Button>}<Button variant="outlined" startIcon={<FileDownloadOutlined />} disabled={!filteredAssets.length} onClick={exportCsv}>Export view</Button></Stack>
-    </Stack>
-    {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
-    <Grid container spacing={1.5} sx={{ mb: 2 }}>
-      {[['Visible CIs', filteredAssets.length, '#7997ff'], ['Layers', summary.layers, '#50d5b9'], ['Needs attention', summary.attention, '#f0a45d'], ['Unassigned', summary.unassigned, '#efc46b'], ['Shared across apps', summary.shared, '#a68cf0']].map(([label, value, color]) => <Grid key={String(label)} size={{ xs: 6, md: 2.4 }}><Paper className="asset-summary-card" sx={{ borderTopColor: color }}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography variant="h5">{value}</Typography></Paper></Grid>)}
-    </Grid>
-    <Paper className="asset-filter-toolbar" variant="outlined">
-      <MuiTextField size="small" label="Search" value={search} onChange={event => setSearch(event.target.value)} InputProps={{ startAdornment: <InputAdornment position="start"><SearchOutlined fontSize="small" /></InputAdornment> }} />
-      <FormControl size="small"><InputLabel>Layer</InputLabel><Select label="Layer" value={layerFilter} onChange={event => setLayerFilter(event.target.value as DisplayLayer | '')}><MenuItem value="">All layers</MenuItem>{displayLayerOrder.map(layer => <MenuItem key={layer} value={layer}>{displayLayerLabels[layer]}</MenuItem>)}</Select></FormControl>
-      <FormControl size="small"><InputLabel>Business application</InputLabel><Select label="Business application" value={businessFilter} onChange={event => setBusinessFilter(event.target.value)}><MenuItem value="">All applications</MenuItem>{businessSystems.map(system => <MenuItem key={system.id} value={system.id}>{system.name}</MenuItem>)}</Select></FormControl>
-      <FormControl size="small"><InputLabel>CI type</InputLabel><Select label="CI type" value={typeFilter} onChange={event => setTypeFilter(event.target.value)}><MenuItem value="">All types</MenuItem>{visibleTypes.map(type => <MenuItem key={type} value={type}>{type}</MenuItem>)}</Select></FormControl>
-      <FormControl size="small"><InputLabel>Attention</InputLabel><Select label="Attention" value={attentionFilter} onChange={event => setAttentionFilter(event.target.value as AttentionFilter)}>{(Object.keys(attentionLabels) as AttentionFilter[]).map(value => <MenuItem key={value} value={value}>{attentionLabels[value]}</MenuItem>)}</Select></FormControl>
-      <FormControl size="small"><InputLabel>Group by</InputLabel><Select label="Group by" value={groupBy} onChange={event => setGroupBy(event.target.value as AssetGroup)}>{(Object.keys(groupLabels) as AssetGroup[]).map(value => <MenuItem key={value} value={value}>{groupLabels[value]}</MenuItem>)}</Select></FormControl>
-      <Button color="inherit" onClick={clearFilters}>Clear</Button>
-    </Paper>
-    {loading ? <Stack alignItems="center" spacing={2} sx={{ py: 8 }}><CircularProgress /><Typography color="text.secondary">Loading configuration items and relationships…</Typography></Stack> : !filteredAssets.length ? <Alert severity="info">No configuration items match these filters.</Alert> : <Stack spacing={1.5}>
-      {groups.map(([group, records]) => <Paper key={group || 'all'} className="asset-group" variant="outlined">
-        {group && <Stack className="asset-group-heading" direction="row" justifyContent="space-between" alignItems="center"><Stack direction="row" spacing={1} alignItems="center"><Inventory2Outlined sx={{ color: groupBy === 'layer' ? displayLayerColors[displayLayerOrder.find(layer => displayLayerLabels[layer] === group) || 'foundation'] : 'primary.main' }} /><Typography variant="h6">{group}</Typography></Stack><Chip size="small" label={`${records.length} CI${records.length === 1 ? '' : 's'}`} /></Stack>}
-        <TableContainer><Table size="small"><TableHead><TableRow><TableCell>Name / type</TableCell>{workspace.isRoot && <TableCell>Customer</TableCell>}<TableCell>Layer</TableCell><TableCell>Business applications</TableCell><TableCell>State</TableCell><TableCell>Accountable owner</TableCell><TableCell>Source / freshness</TableCell><TableCell align="right">Actions</TableCell></TableRow></TableHead><TableBody>
-          {records.map(asset => {
-            const layer = displayLayer(asset); const applications = memberships.get(asset.id) || []; const reasons = attentionReasons(asset, relationshipCounts.get(asset.id) || 0); const health = asset.metadata?.operationalStatus || 'unknown';
-            return <TableRow key={`${group}-${asset.id}`} hover className="asset-inventory-row">
-              <TableCell><Button className="asset-name-button" color="inherit" onClick={() => navigate(`/assets/${asset.id}/show`)}><Box textAlign="left"><Typography fontWeight={800}>{asset.name}</Typography><Typography variant="caption" color="text.secondary">{asset.type}{asset.metadata?.site ? ` · ${asset.metadata.site}` : ''}{asset.metadata?.ipAddress ? ` · ${asset.metadata.ipAddress}` : ''}</Typography></Box></Button></TableCell>
-              {workspace.isRoot && <TableCell>{workspace.companies.find(company => company.id === asset.companyId)?.name || asset.companyId}</TableCell>}
-              <TableCell><Chip size="small" variant="outlined" label={displayLayerLabels[layer]} sx={{ color: displayLayerColors[layer], borderColor: `${displayLayerColors[layer]}99` }} /></TableCell>
-              <TableCell><Stack direction="row" spacing={0.5} useFlexGap flexWrap="wrap">{applications.slice(0, 2).map(system => <Chip key={system.id} size="small" clickable label={system.name} onClick={() => navigate(`/relationships?view=stack&businessAppId=${encodeURIComponent(system.id)}`)} />)}{applications.length > 2 && <Chip size="small" label={`+${applications.length - 2}`} />}{!applications.length && <Typography variant="caption" color="text.secondary">Not mapped</Typography>}</Stack></TableCell>
-              <TableCell><Stack direction="row" spacing={0.5} alignItems="center"><Chip size="small" color={health === 'healthy' ? 'success' : ['critical', 'offline'].includes(health) ? 'error' : health === 'warning' ? 'warning' : 'default'} label={health} /><Chip size="small" variant="outlined" label={asset.metadata?.criticality || 'medium'} />{reasons.length > 0 && <Tooltip title={reasons.join(' · ')}><Chip size="small" color="warning" variant="outlined" icon={<WarningAmberOutlined />} label={reasons.length} /></Tooltip>}</Stack><Typography variant="caption" color="text.secondary">{(asset.metadata?.lifecycle || 'unknown').replaceAll('_', ' ')}</Typography></TableCell>
-              <TableCell><Typography variant="body2">{primaryOwner(asset) || 'Unassigned'}</Typography><Typography variant="caption" color={primaryOwner(asset) ? 'text.secondary' : 'warning.main'}>{ownerRole(asset)}</Typography></TableCell>
-              <TableCell><Chip size="small" variant="outlined" label={asset.source || 'unknown'} /><Typography variant="caption" display="block" color={isStale(asset) ? 'warning.main' : 'text.secondary'}>{freshness(asset)}</Typography></TableCell>
-              <TableCell align="right"><Tooltip title="View details"><IconButton size="small" onClick={() => navigate(`/assets/${asset.id}/show`)}><VisibilityOutlined fontSize="small" /></IconButton></Tooltip><Tooltip title="View relationships"><IconButton size="small" onClick={() => navigate(`/relationships?view=technical&assetId=${encodeURIComponent(asset.id)}`)}><AccountTreeOutlined fontSize="small" /></IconButton></Tooltip>{canEdit && <Tooltip title="Edit asset"><IconButton size="small" onClick={() => navigate(`/assets/${asset.id}`)}><EditOutlined fontSize="small" /></IconButton></Tooltip>}</TableCell>
-            </TableRow>;
-          })}
-        </TableBody></Table></TableContainer>
-      </Paper>)}
-    </Stack>}
-  </Box>;
+  return (
+    <Box className="asset-inventory">
+      <Title title="Configuration items" />
+      <Stack
+        direction={{ xs: 'column', lg: 'row' }}
+        spacing={2}
+        sx={{
+          justifyContent: "space-between",
+          alignItems: { xs: 'stretch', lg: 'flex-end' },
+          mb: 2.5
+        }}>
+        <Box><Typography variant="overline" color="primary">Configuration management</Typography><Typography variant="h3">Asset inventory</Typography><Typography sx={{
+          color: "text.secondary"
+        }}>Find CIs by full-stack layer, business application, ownership and operational attention.</Typography></Box>
+        <Stack direction="row" spacing={1}>{canEdit && <Button variant="contained" startIcon={<AddOutlined />} onClick={() => navigate('/assets/create')}>Add asset</Button>}<Button variant="outlined" startIcon={<FileDownloadOutlined />} disabled={!filteredAssets.length} onClick={exportCsv}>Export view</Button></Stack>
+      </Stack>
+      {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+      <Grid container spacing={1.5} sx={{ mb: 2 }}>
+        {[['Visible CIs', filteredAssets.length, '#7997ff'], ['Layers', summary.layers, '#50d5b9'], ['Needs attention', summary.attention, '#f0a45d'], ['Unassigned', summary.unassigned, '#efc46b'], ['Shared across apps', summary.shared, '#a68cf0']].map(([label, value, color]) => <Grid key={String(label)} size={{ xs: 6, md: 2.4 }}><Paper className="asset-summary-card" sx={{ borderTopColor: color }}><Typography variant="caption" sx={{
+          color: "text.secondary"
+        }}>{label}</Typography><Typography variant="h5">{value}</Typography></Paper></Grid>)}
+      </Grid>
+      <Paper className="asset-filter-toolbar" variant="outlined">
+        <MuiTextField size="small" label="Search" value={search} onChange={event => setSearch(event.target.value)} slotProps={{ input: { startAdornment: <InputAdornment position="start"><SearchOutlined fontSize="small" /></InputAdornment> } }} />
+        <FormControl size="small"><InputLabel>Layer</InputLabel><Select label="Layer" value={layerFilter} onChange={event => setLayerFilter(event.target.value as DisplayLayer | '')}><MenuItem value="">All layers</MenuItem>{displayLayerOrder.map(layer => <MenuItem key={layer} value={layer}>{displayLayerLabels[layer]}</MenuItem>)}</Select></FormControl>
+        <FormControl size="small"><InputLabel>Business application</InputLabel><Select label="Business application" value={businessFilter} onChange={event => setBusinessFilter(event.target.value)}><MenuItem value="">All applications</MenuItem>{businessSystems.map(system => <MenuItem key={system.id} value={system.id}>{system.name}</MenuItem>)}</Select></FormControl>
+        <FormControl size="small"><InputLabel>CI type</InputLabel><Select label="CI type" value={typeFilter} onChange={event => setTypeFilter(event.target.value)}><MenuItem value="">All types</MenuItem>{visibleTypes.map(type => <MenuItem key={type} value={type}>{type}</MenuItem>)}</Select></FormControl>
+        <FormControl size="small"><InputLabel>Attention</InputLabel><Select label="Attention" value={attentionFilter} onChange={event => setAttentionFilter(event.target.value as AttentionFilter)}>{(Object.keys(attentionLabels) as AttentionFilter[]).map(value => <MenuItem key={value} value={value}>{attentionLabels[value]}</MenuItem>)}</Select></FormControl>
+        <FormControl size="small"><InputLabel>Group by</InputLabel><Select label="Group by" value={groupBy} onChange={event => setGroupBy(event.target.value as AssetGroup)}>{(Object.keys(groupLabels) as AssetGroup[]).map(value => <MenuItem key={value} value={value}>{groupLabels[value]}</MenuItem>)}</Select></FormControl>
+        <Button color="inherit" onClick={clearFilters}>Clear</Button>
+      </Paper>
+      {loading ? <Stack
+        spacing={2}
+        sx={{
+          alignItems: "center",
+          py: 8
+        }}><CircularProgress /><Typography sx={{
+        color: "text.secondary"
+      }}>Loading configuration items and relationships…</Typography></Stack> : !filteredAssets.length ? <Alert severity="info">No configuration items match these filters.</Alert> : <Stack spacing={1.5}>
+        {groups.map(([group, records]) => <Paper key={group || 'all'} className="asset-group" variant="outlined">
+          {group && <Stack
+            className="asset-group-heading"
+            direction="row"
+            sx={{
+              justifyContent: "space-between",
+              alignItems: "center"
+            }}><Stack direction="row" spacing={1} sx={{
+            alignItems: "center"
+          }}><Inventory2Outlined sx={{ color: groupBy === 'layer' ? displayLayerColors[displayLayerOrder.find(layer => displayLayerLabels[layer] === group) || 'foundation'] : 'primary.main' }} /><Typography variant="h6">{group}</Typography></Stack><Chip size="small" label={`${records.length} CI${records.length === 1 ? '' : 's'}`} /></Stack>}
+          <TableContainer><Table size="small"><TableHead><TableRow><TableCell>Name / type</TableCell>{workspace.isRoot && <TableCell>Customer</TableCell>}<TableCell>Layer</TableCell><TableCell>Business applications</TableCell><TableCell>State</TableCell><TableCell>Accountable owner</TableCell><TableCell>Source / freshness</TableCell><TableCell align="right">Actions</TableCell></TableRow></TableHead><TableBody>
+            {records.map(asset => {
+              const layer = displayLayer(asset); const applications = memberships.get(asset.id) || []; const reasons = attentionReasons(asset, relationshipCounts.get(asset.id) || 0); const health = asset.metadata?.operationalStatus || 'unknown';
+              return (
+                <TableRow key={`${group}-${asset.id}`} hover className="asset-inventory-row">
+                  <TableCell><Button className="asset-name-button" color="inherit" onClick={() => navigate(`/assets/${asset.id}/show`)}><Box sx={{
+                    textAlign: "left"
+                  }}><Typography sx={{
+                    fontWeight: 800
+                  }}>{asset.name}</Typography><Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>{asset.type}{asset.metadata?.site ? ` · ${asset.metadata.site}` : ''}{asset.metadata?.ipAddress ? ` · ${asset.metadata.ipAddress}` : ''}</Typography></Box></Button></TableCell>
+                  {workspace.isRoot && <TableCell>{workspace.companies.find(company => company.id === asset.companyId)?.name || asset.companyId}</TableCell>}
+                  <TableCell><Chip size="small" variant="outlined" label={displayLayerLabels[layer]} sx={{ color: displayLayerColors[layer], borderColor: `${displayLayerColors[layer]}99` }} /></TableCell>
+                  <TableCell><Stack direction="row" spacing={0.5} useFlexGap sx={{
+                    flexWrap: "wrap"
+                  }}>{applications.slice(0, 2).map(system => <Chip key={system.id} size="small" clickable label={system.name} onClick={() => navigate(`/relationships?view=stack&businessAppId=${encodeURIComponent(system.id)}`)} />)}{applications.length > 2 && <Chip size="small" label={`+${applications.length - 2}`} />}{!applications.length && <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>Not mapped</Typography>}</Stack></TableCell>
+                  <TableCell><Stack direction="row" spacing={0.5} sx={{
+                    alignItems: "center"
+                  }}><Chip size="small" color={health === 'healthy' ? 'success' : ['critical', 'offline'].includes(health) ? 'error' : health === 'warning' ? 'warning' : 'default'} label={health} /><Chip size="small" variant="outlined" label={asset.metadata?.criticality || 'medium'} />{reasons.length > 0 && <Tooltip title={reasons.join(' · ')}><Chip size="small" color="warning" variant="outlined" icon={<WarningAmberOutlined />} label={reasons.length} /></Tooltip>}</Stack><Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>{(asset.metadata?.lifecycle || 'unknown').replaceAll('_', ' ')}</Typography></TableCell>
+                  <TableCell><Typography variant="body2">{primaryOwner(asset) || 'Unassigned'}</Typography><Typography variant="caption" color={primaryOwner(asset) ? 'text.secondary' : 'warning.main'}>{ownerRole(asset)}</Typography></TableCell>
+                  <TableCell><Chip size="small" variant="outlined" label={asset.source || 'unknown'} /><Typography variant="caption" color={isStale(asset) ? 'warning.main' : 'text.secondary'} sx={{
+                    display: "block"
+                  }}>{freshness(asset)}</Typography></TableCell>
+                  <TableCell align="right"><Tooltip title="View details"><IconButton size="small" onClick={() => navigate(`/assets/${asset.id}/show`)}><VisibilityOutlined fontSize="small" /></IconButton></Tooltip><Tooltip title="View relationships"><IconButton size="small" onClick={() => navigate(`/relationships?view=technical&assetId=${encodeURIComponent(asset.id)}`)}><AccountTreeOutlined fontSize="small" /></IconButton></Tooltip>{canEdit && <Tooltip title="Edit asset"><IconButton size="small" onClick={() => navigate(`/assets/${asset.id}`)}><EditOutlined fontSize="small" /></IconButton></Tooltip>}</TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody></Table></TableContainer>
+        </Paper>)}
+      </Stack>}
+    </Box>
+  );
 }
 
 function AssetForm() {
-  return <SimpleForm defaultValues={{ status: 'Active', type: 'Device', metadata: { lifecycle: 'in_service', operationalStatus: 'healthy', criticality: 'medium', environment: 'production' } }}>
-    <Typography variant="h6" className="form-section">Identity and classification</Typography>
-    <Grid container spacing={2} width="100%">
-      <Grid size={{ xs: 12, md: 6 }}><TextInput source="name" fullWidth required /></Grid>
-      <Grid size={{ xs: 12, md: 3 }}><SelectInput source="type" choices={types} fullWidth required /></Grid>
-      <Grid size={{ xs: 12, md: 3 }}><SelectInput source="status" choices={statuses} fullWidth required /></Grid>
-    </Grid>
-    <Typography variant="h6" className="form-section">Lifecycle and service health</Typography>
-    <Grid container spacing={2} width="100%">
-      <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.lifecycle" choices={lifecycle} fullWidth /></Grid>
-      <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.operationalStatus" label="Operational status" choices={operational} fullWidth /></Grid>
-      <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.criticality" choices={criticality} fullWidth /></Grid>
-      <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.environment" choices={environments} fullWidth /></Grid>
-    </Grid>
-    <Typography variant="h6" className="form-section">Ownership and location</Typography>
-    <Grid container spacing={2} width="100%">
-      <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.technicalOwner" label="Technical owner" fullWidth /></Grid>
-      <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.serviceOwner" label="Service owner" fullWidth /></Grid>
-      <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.custodian" fullWidth /></Grid>
-      <Grid size={{ xs: 12, md: 6 }}><TextInput source="metadata.site" fullWidth /></Grid>
-      <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.vendor" fullWidth /></Grid>
-      <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.model" fullWidth /></Grid>
-    </Grid>
-    <Typography variant="h6" className="form-section">Relationship display</Typography>
-    <Grid container spacing={2} width="100%">
-      <Grid size={{ xs: 12, md: 4 }}><SelectInput source="metadata.displayLayer" label="Display layer" choices={displayLayers} helperText="Leave automatic unless this CI belongs in another full-stack lane." fullWidth /></Grid>
-    </Grid>
-    <FormDataConsumer>{({ formData }) => networkTypes.has(formData?.type) ? <Box width="100%">
-      <Typography variant="h6" className="form-section">Network placement</Typography>
-      <Grid container spacing={2} width="100%">
-        <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.networkZone" label="Zone" helperText="For example WAN, Edge, Core, Access or Finance." fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.networkRole" label="Network role" fullWidth /></Grid>
-        <Grid size={{ xs: 6, md: 2 }}><TextInput source="metadata.vlanId" label="VLAN" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.subnet" label="Subnet / prefix" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.ipAddress" label="Management / primary IP" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.redundancyGroup" label="Redundancy group" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.redundancyRole" label="Redundancy role" helperText="For example active, passive or member 1." fullWidth /></Grid>
+  return (
+    <SimpleForm defaultValues={{ status: 'Active', type: 'Device', metadata: { lifecycle: 'in_service', operationalStatus: 'healthy', criticality: 'medium', environment: 'production' } }}>
+      <Typography variant="h6" className="form-section">Identity and classification</Typography>
+      <Grid container spacing={2} sx={{
+        width: "100%"
+      }}>
+        <Grid size={{ xs: 12, md: 6 }}><TextInput source="name" fullWidth required /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="type" choices={types} fullWidth required /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="status" choices={statuses} fullWidth required /></Grid>
       </Grid>
-    </Box> : null}</FormDataConsumer>
-    <Typography variant="h6" className="form-section">Commercial and review dates</Typography>
-    <Grid container spacing={2} width="100%">
-      <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.purchaseDate" label="Purchase date" fullWidth /></Grid>
-      <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.warrantyEnd" label="Warranty end" fullWidth /></Grid>
-      <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.renewalDate" label="Renewal date" fullWidth /></Grid>
-      <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.endOfLifeDate" label="End-of-life date" fullWidth /></Grid>
-      <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.reviewDate" label="Review date" fullWidth /></Grid>
-    </Grid>
-    <FormDataConsumer>{({ formData }) => virtualizationTypes.has(formData?.type) ? <Box width="100%">
-      <Typography variant="h6" className="form-section">Virtualization and resilience</Typography>
-      <Grid container spacing={2} width="100%">
-        <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.virtualizationPlatform" label="Platform" helperText="For example VMware vSphere, Hyper-V or Azure." fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.clusterName" label="Cluster" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 4 }}><SelectInput source="metadata.powerState" label="Power state" choices={powerStates} fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.haEnabled" label="HA enabled" choices={[{ id: 'yes', name: 'Yes' }, { id: 'no', name: 'No' }]} fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.protectionStatus" label="Protection" choices={protectionStates} fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.mobility" label="Mobility" choices={mobilityStates} fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.capacityStatus" label="Failover capacity" choices={capacityStates} fullWidth /></Grid>
-        <Grid size={{ xs: 6, md: 3 }}><TextInput source="metadata.minimumHosts" label="Minimum surviving hosts" fullWidth /></Grid>
-        <Grid size={{ xs: 6, md: 3 }}><SelectInput source="metadata.maintenanceMode" label="Maintenance mode" choices={[{ id: 'yes', name: 'Yes' }, { id: 'no', name: 'No' }]} fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 6 }}><TextInput source="metadata.guestOs" label="Guest operating system" fullWidth /></Grid>
-        <Grid size={{ xs: 4 }}><TextInput source="metadata.cpuCount" label="vCPU" fullWidth /></Grid>
-        <Grid size={{ xs: 4 }}><TextInput source="metadata.memoryGb" label="Memory (GB)" fullWidth /></Grid>
-        <Grid size={{ xs: 4 }}><TextInput source="metadata.storageGb" label="Storage (GB)" fullWidth /></Grid>
+      <Typography variant="h6" className="form-section">Lifecycle and service health</Typography>
+      <Grid container spacing={2} sx={{
+        width: "100%"
+      }}>
+        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.lifecycle" choices={lifecycle} fullWidth /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.operationalStatus" label="Operational status" choices={operational} fullWidth /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.criticality" choices={criticality} fullWidth /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.environment" choices={environments} fullWidth /></Grid>
       </Grid>
-    </Box> : null}</FormDataConsumer>
-  </SimpleForm>;
+      <Typography variant="h6" className="form-section">Ownership and location</Typography>
+      <Grid container spacing={2} sx={{
+        width: "100%"
+      }}>
+        <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.technicalOwner" label="Technical owner" fullWidth /></Grid>
+        <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.serviceOwner" label="Service owner" fullWidth /></Grid>
+        <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.custodian" fullWidth /></Grid>
+        <Grid size={{ xs: 12, md: 6 }}><TextInput source="metadata.site" fullWidth /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.vendor" fullWidth /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.model" fullWidth /></Grid>
+      </Grid>
+      <Typography variant="h6" className="form-section">Relationship display</Typography>
+      <Grid container spacing={2} sx={{
+        width: "100%"
+      }}>
+        <Grid size={{ xs: 12, md: 4 }}><SelectInput source="metadata.displayLayer" label="Display layer" choices={displayLayers} helperText="Leave automatic unless this CI belongs in another full-stack lane." fullWidth /></Grid>
+      </Grid>
+      <FormDataConsumer>{({ formData }) => networkTypes.has(formData?.type) ? <Box sx={{
+        width: "100%"
+      }}>
+        <Typography variant="h6" className="form-section">Network placement</Typography>
+        <Grid container spacing={2} sx={{
+          width: "100%"
+        }}>
+          <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.networkZone" label="Zone" helperText="For example WAN, Edge, Core, Access or Finance." fullWidth /></Grid>
+          <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.networkRole" label="Network role" fullWidth /></Grid>
+          <Grid size={{ xs: 6, md: 2 }}><TextInput source="metadata.vlanId" label="VLAN" fullWidth /></Grid>
+          <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.subnet" label="Subnet / prefix" fullWidth /></Grid>
+          <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.ipAddress" label="Management / primary IP" fullWidth /></Grid>
+          <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.redundancyGroup" label="Redundancy group" fullWidth /></Grid>
+          <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.redundancyRole" label="Redundancy role" helperText="For example active, passive or member 1." fullWidth /></Grid>
+        </Grid>
+      </Box> : null}</FormDataConsumer>
+      <Typography variant="h6" className="form-section">Commercial and review dates</Typography>
+      <Grid container spacing={2} sx={{
+        width: "100%"
+      }}>
+        <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.purchaseDate" label="Purchase date" fullWidth /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.warrantyEnd" label="Warranty end" fullWidth /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.renewalDate" label="Renewal date" fullWidth /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.endOfLifeDate" label="End-of-life date" fullWidth /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.reviewDate" label="Review date" fullWidth /></Grid>
+      </Grid>
+      <FormDataConsumer>{({ formData }) => virtualizationTypes.has(formData?.type) ? <Box sx={{
+        width: "100%"
+      }}>
+        <Typography variant="h6" className="form-section">Virtualization and resilience</Typography>
+        <Grid container spacing={2} sx={{
+          width: "100%"
+        }}>
+          <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.virtualizationPlatform" label="Platform" helperText="For example VMware vSphere, Hyper-V or Azure." fullWidth /></Grid>
+          <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.clusterName" label="Cluster" fullWidth /></Grid>
+          <Grid size={{ xs: 12, md: 4 }}><SelectInput source="metadata.powerState" label="Power state" choices={powerStates} fullWidth /></Grid>
+          <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.haEnabled" label="HA enabled" choices={[{ id: 'yes', name: 'Yes' }, { id: 'no', name: 'No' }]} fullWidth /></Grid>
+          <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.protectionStatus" label="Protection" choices={protectionStates} fullWidth /></Grid>
+          <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.mobility" label="Mobility" choices={mobilityStates} fullWidth /></Grid>
+          <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.capacityStatus" label="Failover capacity" choices={capacityStates} fullWidth /></Grid>
+          <Grid size={{ xs: 6, md: 3 }}><TextInput source="metadata.minimumHosts" label="Minimum surviving hosts" fullWidth /></Grid>
+          <Grid size={{ xs: 6, md: 3 }}><SelectInput source="metadata.maintenanceMode" label="Maintenance mode" choices={[{ id: 'yes', name: 'Yes' }, { id: 'no', name: 'No' }]} fullWidth /></Grid>
+          <Grid size={{ xs: 12, md: 6 }}><TextInput source="metadata.guestOs" label="Guest operating system" fullWidth /></Grid>
+          <Grid size={{ xs: 4 }}><TextInput source="metadata.cpuCount" label="vCPU" fullWidth /></Grid>
+          <Grid size={{ xs: 4 }}><TextInput source="metadata.memoryGb" label="Memory (GB)" fullWidth /></Grid>
+          <Grid size={{ xs: 4 }}><TextInput source="metadata.storageGb" label="Storage (GB)" fullWidth /></Grid>
+        </Grid>
+      </Box> : null}</FormDataConsumer>
+    </SimpleForm>
+  );
 }
 
 export function AssetCreate() { return <Create redirect="list"><AssetForm /></Create>; }
@@ -334,19 +400,93 @@ function AssetShowContent() {
   }, [asset?.id, workspace.companyId, workspace.isRoot]);
   if (!asset) return null;
   const layer = displayLayer(asset); const health = asset.metadata?.operationalStatus || 'unknown'; const owner = primaryOwner(asset);
-  return <Box className="asset-detail">
-    <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', md: 'flex-start' }} spacing={2} sx={{ mb: 2 }}>
-      <Box><Typography variant="overline" sx={{ color: displayLayerColors[layer] }}>{displayLayerLabels[layer]}</Typography><Typography variant="h3">{asset.name}</Typography><Typography color="text.secondary">{asset.type}{asset.metadata?.vendor ? ` · ${asset.metadata.vendor}` : ''}{asset.metadata?.model ? ` ${asset.metadata.model}` : ''}</Typography><Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 1.5 }}><Chip size="small" color={health === 'healthy' ? 'success' : ['critical', 'offline'].includes(health) ? 'error' : 'warning'} label={health} /><Chip size="small" variant="outlined" label={`${asset.metadata?.criticality || 'medium'} criticality`} /><Chip size="small" variant="outlined" label={(asset.metadata?.lifecycle || 'unknown').replaceAll('_', ' ')} />{applications.map(system => <Chip key={system.id} size="small" clickable label={system.name} onClick={() => navigate(`/relationships?view=stack&businessAppId=${encodeURIComponent(system.id)}`)} />)}</Stack></Box>
-      <Stack direction="row" spacing={1}><Button variant="outlined" startIcon={<AccountTreeOutlined />} onClick={() => navigate(`/relationships?view=technical&assetId=${encodeURIComponent(asset.id)}`)}>Relationships ({directRelationships})</Button><Button variant="outlined" onClick={() => navigate(`/changes?assetId=${encodeURIComponent(asset.id)}`)}>Create change</Button>{canEdit && <Button variant="contained" startIcon={<EditOutlined />} onClick={() => navigate(`/assets/${asset.id}`)}>Edit</Button>}</Stack>
-    </Stack>
-    <Grid container spacing={2}>
-      <Grid size={{ xs: 12, md: 6, lg: 3 }}><Paper className="asset-detail-card"><Typography variant="overline" color="primary">Ownership</Typography><Typography variant="h6">{owner || 'Unassigned'}</Typography><Typography variant="body2" color="text.secondary">{ownerRole(asset)}</Typography><Divider sx={{ my: 1.5 }} /><Typography variant="caption" color="text.secondary">Service owner</Typography><Typography variant="body2">{asset.metadata?.serviceOwner || 'Not recorded'}</Typography><Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>Custodian</Typography><Typography variant="body2">{asset.metadata?.custodian || 'Not recorded'}</Typography></Paper></Grid>
-      <Grid size={{ xs: 12, md: 6, lg: 3 }}><Paper className="asset-detail-card"><Typography variant="overline" color="primary">Placement</Typography><Typography variant="caption" color="text.secondary" display="block">Environment</Typography><Typography variant="body2">{asset.metadata?.environment || 'Not recorded'}</Typography><Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>Site</Typography><Typography variant="body2">{asset.metadata?.site || 'Not recorded'}</Typography><Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>Network</Typography><Typography variant="body2">{[asset.metadata?.networkZone, asset.metadata?.vlanId ? `VLAN ${asset.metadata.vlanId}` : '', asset.metadata?.ipAddress].filter(Boolean).join(' · ') || 'Not recorded'}</Typography></Paper></Grid>
-      <Grid size={{ xs: 12, md: 6, lg: 3 }}><Paper className="asset-detail-card"><Typography variant="overline" color="primary">Lifecycle dates</Typography><Typography variant="caption" color="text.secondary" display="block">Purchased</Typography><Typography variant="body2">{asset.metadata?.purchaseDate || 'Not recorded'}</Typography><Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>Warranty / renewal</Typography><Typography variant="body2">{asset.metadata?.warrantyEnd || '—'} / {asset.metadata?.renewalDate || '—'}</Typography><Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>End of life</Typography><Typography variant="body2" color={dateAttention(asset) ? 'warning.main' : 'text.primary'}>{asset.metadata?.endOfLifeDate || 'Not recorded'}</Typography></Paper></Grid>
-      <Grid size={{ xs: 12, md: 6, lg: 3 }}><Paper className="asset-detail-card"><Typography variant="overline" color="primary">Source and identity</Typography><Chip size="small" variant="outlined" label={asset.source || 'unknown'} /><Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1.5 }}>External identifier</Typography><Typography variant="body2" sx={{ wordBreak: 'break-all' }}>{asset.externalId || 'Not recorded'}</Typography><Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>Last seen</Typography><Typography variant="body2" color={isStale(asset) ? 'warning.main' : 'text.primary'}>{freshness(asset)}</Typography></Paper></Grid>
-    </Grid>
-    <AuditTimeline entityType="configuration_item" entityId={asset.id} companyId={asset.companyId} />
-  </Box>;
+  return (
+    <Box className="asset-detail">
+      <Stack
+        direction={{ xs: 'column', md: 'row' }}
+        spacing={2}
+        sx={{
+          justifyContent: "space-between",
+          alignItems: { xs: 'stretch', md: 'flex-start' },
+          mb: 2
+        }}>
+        <Box><Typography variant="overline" sx={{ color: displayLayerColors[layer] }}>{displayLayerLabels[layer]}</Typography><Typography variant="h3">{asset.name}</Typography><Typography sx={{
+          color: "text.secondary"
+        }}>{asset.type}{asset.metadata?.vendor ? ` · ${asset.metadata.vendor}` : ''}{asset.metadata?.model ? ` ${asset.metadata.model}` : ''}</Typography><Stack
+          direction="row"
+          spacing={0.75}
+          useFlexGap
+          sx={{
+            flexWrap: "wrap",
+            mt: 1.5
+          }}><Chip size="small" color={health === 'healthy' ? 'success' : ['critical', 'offline'].includes(health) ? 'error' : 'warning'} label={health} /><Chip size="small" variant="outlined" label={`${asset.metadata?.criticality || 'medium'} criticality`} /><Chip size="small" variant="outlined" label={(asset.metadata?.lifecycle || 'unknown').replaceAll('_', ' ')} />{applications.map(system => <Chip key={system.id} size="small" clickable label={system.name} onClick={() => navigate(`/relationships?view=stack&businessAppId=${encodeURIComponent(system.id)}`)} />)}</Stack></Box>
+        <Stack direction="row" spacing={1}><Button variant="outlined" startIcon={<AccountTreeOutlined />} onClick={() => navigate(`/relationships?view=technical&assetId=${encodeURIComponent(asset.id)}`)}>Relationships ({directRelationships})</Button><Button variant="outlined" onClick={() => navigate(`/changes?assetId=${encodeURIComponent(asset.id)}`)}>Create change</Button>{canEdit && <Button variant="contained" startIcon={<EditOutlined />} onClick={() => navigate(`/assets/${asset.id}`)}>Edit</Button>}</Stack>
+      </Stack>
+      <Grid container spacing={2}>
+        <Grid size={{ xs: 12, md: 6, lg: 3 }}><Paper className="asset-detail-card"><Typography variant="overline" color="primary">Ownership</Typography><Typography variant="h6">{owner || 'Unassigned'}</Typography><Typography variant="body2" sx={{
+          color: "text.secondary"
+        }}>{ownerRole(asset)}</Typography><Divider sx={{ my: 1.5 }} /><Typography variant="caption" sx={{
+          color: "text.secondary"
+        }}>Service owner</Typography><Typography variant="body2">{asset.metadata?.serviceOwner || 'Not recorded'}</Typography><Typography
+          variant="caption"
+          sx={{
+            color: "text.secondary",
+            display: "block",
+            mt: 1
+          }}>Custodian</Typography><Typography variant="body2">{asset.metadata?.custodian || 'Not recorded'}</Typography></Paper></Grid>
+        <Grid size={{ xs: 12, md: 6, lg: 3 }}><Paper className="asset-detail-card"><Typography variant="overline" color="primary">Placement</Typography><Typography
+          variant="caption"
+          sx={{
+            color: "text.secondary",
+            display: "block"
+          }}>Environment</Typography><Typography variant="body2">{asset.metadata?.environment || 'Not recorded'}</Typography><Typography
+          variant="caption"
+          sx={{
+            color: "text.secondary",
+            display: "block",
+            mt: 1
+          }}>Site</Typography><Typography variant="body2">{asset.metadata?.site || 'Not recorded'}</Typography><Typography
+          variant="caption"
+          sx={{
+            color: "text.secondary",
+            display: "block",
+            mt: 1
+          }}>Network</Typography><Typography variant="body2">{[asset.metadata?.networkZone, asset.metadata?.vlanId ? `VLAN ${asset.metadata.vlanId}` : '', asset.metadata?.ipAddress].filter(Boolean).join(' · ') || 'Not recorded'}</Typography></Paper></Grid>
+        <Grid size={{ xs: 12, md: 6, lg: 3 }}><Paper className="asset-detail-card"><Typography variant="overline" color="primary">Lifecycle dates</Typography><Typography
+          variant="caption"
+          sx={{
+            color: "text.secondary",
+            display: "block"
+          }}>Purchased</Typography><Typography variant="body2">{asset.metadata?.purchaseDate || 'Not recorded'}</Typography><Typography
+          variant="caption"
+          sx={{
+            color: "text.secondary",
+            display: "block",
+            mt: 1
+          }}>Warranty / renewal</Typography><Typography variant="body2">{asset.metadata?.warrantyEnd || '—'} / {asset.metadata?.renewalDate || '—'}</Typography><Typography
+          variant="caption"
+          sx={{
+            color: "text.secondary",
+            display: "block",
+            mt: 1
+          }}>End of life</Typography><Typography variant="body2" color={dateAttention(asset) ? 'warning.main' : 'text.primary'}>{asset.metadata?.endOfLifeDate || 'Not recorded'}</Typography></Paper></Grid>
+        <Grid size={{ xs: 12, md: 6, lg: 3 }}><Paper className="asset-detail-card"><Typography variant="overline" color="primary">Source and identity</Typography><Chip size="small" variant="outlined" label={asset.source || 'unknown'} /><Typography
+          variant="caption"
+          sx={{
+            color: "text.secondary",
+            display: "block",
+            mt: 1.5
+          }}>External identifier</Typography><Typography variant="body2" sx={{ wordBreak: 'break-all' }}>{asset.externalId || 'Not recorded'}</Typography><Typography
+          variant="caption"
+          sx={{
+            color: "text.secondary",
+            display: "block",
+            mt: 1
+          }}>Last seen</Typography><Typography variant="body2" color={isStale(asset) ? 'warning.main' : 'text.primary'}>{freshness(asset)}</Typography></Paper></Grid>
+      </Grid>
+      <AuditTimeline entityType="configuration_item" entityId={asset.id} companyId={asset.companyId} />
+    </Box>
+  );
 }
 
 export function AssetShow() { return <Show actions={false}><AssetShowContent /></Show>; }

@@ -10,6 +10,7 @@ import StorageOutlined from '@mui/icons-material/StorageOutlined';
 import BusinessCenterOutlined from '@mui/icons-material/BusinessCenterOutlined';
 import AssessmentOutlined from '@mui/icons-material/AssessmentOutlined';
 import HistoryOutlined from '@mui/icons-material/HistoryOutlined';
+import FactCheckOutlined from '@mui/icons-material/FactCheckOutlined';
 import { Box, FormControl, MenuItem, Select, Stack, Typography } from '@mui/material';
 import { AppBar, Layout, Menu, useRefresh, type LayoutProps } from 'react-admin';
 import { useWorkspace } from './workspace';
@@ -21,18 +22,29 @@ function WorkspaceAppBar() {
   const { brand } = useMspBranding();
   const refresh = useRefresh();
   const rootAllowed = ['platform_admin', 'msp_operator'].includes(getSession()?.user.role || '');
-  return <AppBar color="inherit" elevation={0}>
-    <Stack direction="row" spacing={1.5} alignItems="center" sx={{ flex: 1, minWidth: 0 }}><BrandLogo size={38} borderRadius={8} /><Box sx={{ minWidth: 0 }}>
-      <Typography variant="caption" color="text.secondary">{brand.name.toUpperCase()} · {workspace.isRoot ? 'MSP WORKSPACE' : 'CUSTOMER WORKSPACE'}</Typography>
-      <Typography variant="h6" noWrap>{workspace.companyName}</Typography>
-    </Box></Stack>
-    <FormControl size="small" sx={{ minWidth: 230 }}>
-      <Select value={workspace.companyId} onChange={event => { workspace.setCompanyId(event.target.value); refresh(); }} aria-label="Workspace">
-        {rootAllowed && <MenuItem value="__root__">MSP / Root level</MenuItem>}
-        {workspace.companies.map(company => <MenuItem key={company.id} value={company.id}>{company.name}</MenuItem>)}
-      </Select>
-    </FormControl>
-  </AppBar>;
+  return (
+    <AppBar color="inherit" elevation={0}>
+      <Stack
+        direction="row"
+        spacing={1.5}
+        sx={{
+          alignItems: "center",
+          flex: 1,
+          minWidth: 0
+        }}><BrandLogo size={38} borderRadius={8} /><Box sx={{ minWidth: 0 }}>
+        <Typography variant="caption" sx={{
+          color: "text.secondary"
+        }}>{brand.name.toUpperCase()} · {workspace.isRoot ? 'MSP WORKSPACE' : 'CUSTOMER WORKSPACE'}</Typography>
+        <Typography variant="h6" noWrap>{workspace.companyName}</Typography>
+      </Box></Stack>
+      <FormControl size="small" sx={{ minWidth: 230 }}>
+        <Select value={workspace.companyId} onChange={event => { workspace.setCompanyId(event.target.value); refresh(); }} aria-label="Workspace">
+          {rootAllowed && <MenuItem value="__root__">MSP / Root level</MenuItem>}
+          {workspace.companies.map(company => <MenuItem key={company.id} value={company.id}>{company.name}</MenuItem>)}
+        </Select>
+      </FormControl>
+    </AppBar>
+  );
 }
 
 function WorkspaceMenu() {
@@ -40,7 +52,18 @@ function WorkspaceMenu() {
   const role = getSession()?.user.role;
   const platformAdmin = role === 'platform_admin';
   const rootRole = ['platform_admin', 'msp_operator'].includes(role || '');
-  const section = (label: string) => <Typography key={label} variant="overline" color="text.secondary" sx={{ px: 2, pt: 2, pb: 0.5, display: 'block', fontSize: '0.65rem', letterSpacing: '0.12em' }}>{label}</Typography>;
+  const section = (label: string) => <Typography
+    key={label}
+    variant="overline"
+    sx={{
+      color: "text.secondary",
+      px: 2,
+      pt: 2,
+      pb: 0.5,
+      display: 'block',
+      fontSize: '0.65rem',
+      letterSpacing: '0.12em'
+    }}>{label}</Typography>;
   return <Menu>
     {section('Monitor')}
     <Menu.DashboardItem />
@@ -52,6 +75,7 @@ function WorkspaceMenu() {
       <Menu.Item to="/changes" primaryText="Change control" leftIcon={<AssignmentOutlined />} />
       {section('Governance')}
       <Menu.Item to="/governance/audit" primaryText="Audit activity" leftIcon={<HistoryOutlined />} />
+      <Menu.Item to="/governance/data-quality" primaryText="Data quality" leftIcon={<FactCheckOutlined />} />
       <Menu.Item to="/governance/reports" primaryText="Reports" leftIcon={<AssessmentOutlined />} />
       {rootRole && <>{section('Access')}<Menu.Item to="/customer/users" primaryText="Users & permissions" leftIcon={<ManageAccountsOutlined />} /></>}
     </>}
@@ -66,6 +90,7 @@ function WorkspaceMenu() {
       <Menu.Item to="/admin/integrations" primaryText="Integrations" leftIcon={<CloudSyncOutlined />} />
       {section('Governance')}
       <Menu.Item to="/governance/audit" primaryText="Audit activity" leftIcon={<HistoryOutlined />} />
+      <Menu.Item to="/governance/data-quality" primaryText="Data quality" leftIcon={<FactCheckOutlined />} />
       <Menu.Item to="/governance/reports" primaryText="Reports" leftIcon={<AssessmentOutlined />} />
       {section('Settings')}
       <Menu.Item to="/admin/branding" primaryText="Branding" leftIcon={<PaletteOutlined />} />

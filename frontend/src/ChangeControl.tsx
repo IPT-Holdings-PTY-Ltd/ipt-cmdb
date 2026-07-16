@@ -161,77 +161,163 @@ export function ChangeControlPage() {
 
   if (workspace.isRoot) return <Box><Title title="Change control" /><Typography variant="overline" color="primary">Operations</Typography><Typography variant="h3" sx={{ mb: 3 }}>Change control</Typography><Alert severity="info">Select a customer workspace to create or review customer change packages.</Alert></Box>;
 
-  return <Box>
-    <Title title={`${workspace.companyName} change control`} />
-    <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" alignItems={{ md: 'flex-end' }} spacing={2} sx={{ mb: 3 }}>
-      <Box><Typography variant="overline" color="primary">Change enablement</Typography><Typography variant="h3">Change control</Typography><Typography color="text.secondary">Create an impact-aware, customer-ready change package from CMDB relationships.</Typography></Box>
-      <Button variant="outlined" startIcon={<RestartAltOutlined />} onClick={reset}>New change</Button>
-    </Stack>
-    {notice && <Alert severity={notice.severity} onClose={() => setNotice(null)} sx={{ mb: 2 }}>{notice.message}</Alert>}
-    {!canCreate && <Alert severity="info" sx={{ mb: 2 }}>You can review and download existing change packages. An MSP operator or platform administrator must generate new packages.</Alert>}
+  return (
+    <Box>
+      <Title title={`${workspace.companyName} change control`} />
+      <Stack
+        direction={{ xs: 'column', md: 'row' }}
+        spacing={2}
+        sx={{
+          justifyContent: "space-between",
+          alignItems: { md: 'flex-end' },
+          mb: 3
+        }}>
+        <Box><Typography variant="overline" color="primary">Change enablement</Typography><Typography variant="h3">Change control</Typography><Typography sx={{
+          color: "text.secondary"
+        }}>Create an impact-aware, customer-ready change package from CMDB relationships.</Typography></Box>
+        <Button variant="outlined" startIcon={<RestartAltOutlined />} onClick={reset}>New change</Button>
+      </Stack>
+      {notice && <Alert severity={notice.severity} onClose={() => setNotice(null)} sx={{ mb: 2 }}>{notice.message}</Alert>}
+      {!canCreate && <Alert severity="info" sx={{ mb: 2 }}>You can review and download existing change packages. An MSP operator or platform administrator must generate new packages.</Alert>}
 
-    {canCreate && <Card className="change-wizard">
-      <CardContent>
-        <Stepper activeStep={activeStep} alternativeLabel sx={{ mb: 4 }}>{steps.map(label => <Step key={label}><StepLabel>{label}</StepLabel></Step>)}</Stepper>
+      {canCreate && <Card className="change-wizard">
+        <CardContent>
+          <Stepper activeStep={activeStep} alternativeLabel sx={{ mb: 4 }}>{steps.map(label => <Step key={label}><StepLabel>{label}</StepLabel></Step>)}</Stepper>
 
-        {activeStep === 0 && <Grid container spacing={2.5}>
-          <Grid size={{ xs: 12 }}><TextField fullWidth required label="Change title" value={form.title} onChange={event => update('title', event.target.value)} helperText="Use a short outcome-focused title that will also work as a future ConnectWise ticket summary." /></Grid>
-          <Grid size={{ xs: 12 }}><Autocomplete multiple options={assets} value={scopeAssets} getOptionLabel={option => `${option.name} (${option.type})`} isOptionEqualToValue={(option, value) => option.id === value.id} onChange={(_, value) => { setSaved(null); setScopeAssets(value); }} renderInput={params => <TextField {...params} required label="Configuration items in scope" helperText="Downstream impact is calculated automatically from the relationship map." />} /></Grid>
-          <Grid size={{ xs: 12, sm: 6, lg: 3 }}><FormControl fullWidth><InputLabel>Change type</InputLabel><Select label="Change type" value={form.changeType} onChange={event => update('changeType', event.target.value)}><MenuItem value="standard">Standard</MenuItem><MenuItem value="normal">Normal</MenuItem><MenuItem value="emergency">Emergency</MenuItem></Select></FormControl></Grid>
-          <Grid size={{ xs: 12, sm: 6, lg: 3 }}><FormControl fullWidth><InputLabel>Category</InputLabel><Select label="Category" value={form.category} onChange={event => update('category', event.target.value)}>{['infrastructure', 'network', 'software', 'database', 'security', 'cloud', 'other'].map(value => <MenuItem key={value} value={value}>{sentence(value)}</MenuItem>)}</Select></FormControl></Grid>
-          <Grid size={{ xs: 12, sm: 6, lg: 3 }}><FormControl fullWidth><InputLabel>Priority</InputLabel><Select label="Priority" value={form.priority} onChange={event => update('priority', event.target.value)}>{['low', 'medium', 'high', 'critical'].map(value => <MenuItem key={value} value={value}>{sentence(value)}</MenuItem>)}</Select></FormControl></Grid>
-          <Grid size={{ xs: 12, sm: 6, lg: 3 }}><FormControl fullWidth><InputLabel>Expected outage</InputLabel><Select label="Expected outage" value={form.outageExpected} onChange={event => update('outageExpected', event.target.value)}><MenuItem value="no">No</MenuItem><MenuItem value="yes">Yes</MenuItem></Select></FormControl></Grid>
-          <Grid size={{ xs: 12, md: 6 }}><TextField fullWidth label="Planned start" type="datetime-local" value={form.plannedStart} onChange={event => update('plannedStart', event.target.value)} slotProps={{ inputLabel: { shrink: true } }} /></Grid>
-          <Grid size={{ xs: 12, md: 6 }}><TextField fullWidth label="Planned end" type="datetime-local" value={form.plannedEnd} onChange={event => update('plannedEnd', event.target.value)} slotProps={{ inputLabel: { shrink: true } }} error={Boolean(form.plannedStart && form.plannedEnd && form.plannedEnd <= form.plannedStart)} helperText={form.plannedStart && form.plannedEnd && form.plannedEnd <= form.plannedStart ? 'Planned end must be after planned start.' : 'Optional while timing is still being agreed.'} /></Grid>
-        </Grid>}
+          {activeStep === 0 && <Grid container spacing={2.5}>
+            <Grid size={{ xs: 12 }}><TextField fullWidth required label="Change title" value={form.title} onChange={event => update('title', event.target.value)} helperText="Use a short outcome-focused title that will also work as a future ConnectWise ticket summary." /></Grid>
+            <Grid size={{ xs: 12 }}><Autocomplete multiple options={assets} value={scopeAssets} getOptionLabel={option => `${option.name} (${option.type})`} isOptionEqualToValue={(option, value) => option.id === value.id} onChange={(_, value) => { setSaved(null); setScopeAssets(value); }} renderInput={params => <TextField {...params} required label="Configuration items in scope" helperText="Downstream impact is calculated automatically from the relationship map." />} /></Grid>
+            <Grid size={{ xs: 12, sm: 6, lg: 3 }}><FormControl fullWidth><InputLabel>Change type</InputLabel><Select label="Change type" value={form.changeType} onChange={event => update('changeType', event.target.value)}><MenuItem value="standard">Standard</MenuItem><MenuItem value="normal">Normal</MenuItem><MenuItem value="emergency">Emergency</MenuItem></Select></FormControl></Grid>
+            <Grid size={{ xs: 12, sm: 6, lg: 3 }}><FormControl fullWidth><InputLabel>Category</InputLabel><Select label="Category" value={form.category} onChange={event => update('category', event.target.value)}>{['infrastructure', 'network', 'software', 'database', 'security', 'cloud', 'other'].map(value => <MenuItem key={value} value={value}>{sentence(value)}</MenuItem>)}</Select></FormControl></Grid>
+            <Grid size={{ xs: 12, sm: 6, lg: 3 }}><FormControl fullWidth><InputLabel>Priority</InputLabel><Select label="Priority" value={form.priority} onChange={event => update('priority', event.target.value)}>{['low', 'medium', 'high', 'critical'].map(value => <MenuItem key={value} value={value}>{sentence(value)}</MenuItem>)}</Select></FormControl></Grid>
+            <Grid size={{ xs: 12, sm: 6, lg: 3 }}><FormControl fullWidth><InputLabel>Expected outage</InputLabel><Select label="Expected outage" value={form.outageExpected} onChange={event => update('outageExpected', event.target.value)}><MenuItem value="no">No</MenuItem><MenuItem value="yes">Yes</MenuItem></Select></FormControl></Grid>
+            <Grid size={{ xs: 12, md: 6 }}><TextField fullWidth label="Planned start" type="datetime-local" value={form.plannedStart} onChange={event => update('plannedStart', event.target.value)} slotProps={{ inputLabel: { shrink: true } }} /></Grid>
+            <Grid size={{ xs: 12, md: 6 }}><TextField fullWidth label="Planned end" type="datetime-local" value={form.plannedEnd} onChange={event => update('plannedEnd', event.target.value)} slotProps={{ inputLabel: { shrink: true } }} error={Boolean(form.plannedStart && form.plannedEnd && form.plannedEnd <= form.plannedStart)} helperText={form.plannedStart && form.plannedEnd && form.plannedEnd <= form.plannedStart ? 'Planned end must be after planned start.' : 'Optional while timing is still being agreed.'} /></Grid>
+          </Grid>}
 
-        {activeStep === 1 && <Box>
-          {previewLoading && <Stack alignItems="center" spacing={1} sx={{ py: 5 }}><CircularProgress /><Typography color="text.secondary">Calculating downstream impact…</Typography></Stack>}
-          {!previewLoading && preview && <>
-            <Grid container spacing={2} sx={{ mb: 2 }}>{[
-              ['Scope', preview.summary.scopeCount], ['Direct impact', preview.summary.directCount], ['Downstream', preview.summary.downstreamCount], ['Missing owners', preview.summary.missingOwnerCount],
-            ].map(([label, value]) => <Grid key={String(label)} size={{ xs: 6, md: 3 }}><Paper variant="outlined" sx={{ p: 2 }}><Typography color="text.secondary" variant="body2">{label}</Typography><Typography variant="h4">{value}</Typography></Paper></Grid>)}</Grid>
-            <Alert severity={preview.summary.missingOwnerCount ? 'warning' : 'success'} sx={{ mb: 2 }}>{preview.summary.missingOwnerCount ? `${preview.summary.missingOwnerCount} impacted item(s) have no owner recorded. The PDF will flag them.` : 'All impacted configuration items have an owner recorded.'}</Alert>
-            {preview.summary.businessSystems.length > 0 && <Paper variant="outlined" sx={{ p: 2, mb: 2, borderColor: 'primary.main', bgcolor: 'rgba(80,213,185,.04)' }}>
-              <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" spacing={1} sx={{ mb: 1.5 }}><Box><Typography variant="overline" color="primary">Business impact and signoff</Typography><Typography variant="h6">{preview.summary.businessSystemCount} business system(s) assessed</Typography></Box>{preview.summary.missingBusinessOwnerCount > 0 && <Chip color="warning" label={`${preview.summary.missingBusinessOwnerCount} missing business owner`} />}</Stack>
-              <Grid container spacing={1.5}>{preview.summary.businessSystems.map(system => <Grid key={system.assetId} size={{ xs: 12, md: 6 }}><Paper variant="outlined" sx={{ p: 1.5 }}><Stack direction="row" justifyContent="space-between" spacing={1}><Box><Typography fontWeight={800}>{system.name}</Typography><Typography variant="caption" color="text.secondary">{system.department || 'Department not recorded'} · {system.userPopulation || 'User population not recorded'}</Typography></Box><Chip size="small" color={system.impactSeverity === 'outage' ? 'error' : system.impactSeverity === 'degraded' ? 'warning' : 'success'} label={sentence(system.impactSeverity)} /></Stack><Typography variant="body2" sx={{ mt: 1 }}>Owner: {system.businessOwner || 'Not recorded'}</Typography><Typography variant="body2">Signoff: {system.signoffRequired === 'no' ? 'Not required' : system.signoffDelegate || system.businessOwner || 'Not assigned'}</Typography><Typography variant="caption" color="text.secondary">RTO {system.rtoHours || '?'}h · RPO {system.rpoHours || '?'}h</Typography></Paper></Grid>)}</Grid>
-            </Paper>}
-            {preview.summary.virtualizationAssessments.length > 0 && <Paper variant="outlined" sx={{ p: 2, mb: 2, borderColor: '#56b4e9', bgcolor: 'rgba(86,180,233,.04)' }}>
-              <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" spacing={1} sx={{ mb: 1.5 }}><Box><Typography variant="overline" color="info.main">Virtualization resilience</Typography><Typography variant="h6">{preview.summary.protectedVmCount} protected · {preview.summary.degradedVmCount} degraded · {preview.summary.outageVmCount} outage</Typography></Box></Stack>
-              <Grid container spacing={1.5}>{preview.summary.virtualizationAssessments.map(vm => <Grid key={vm.assetId} size={{ xs: 12, md: 6 }}><Paper variant="outlined" sx={{ p: 1.5 }}><Stack direction="row" justifyContent="space-between" spacing={1}><Box><Typography fontWeight={800}>{vm.name}</Typography><Typography variant="caption" color="text.secondary">{vm.virtualizationPlatform || 'Platform not recorded'} · {vm.clusterName || 'Cluster not recorded'}</Typography></Box><Chip size="small" color={vm.impactSeverity === 'outage' ? 'error' : vm.impactSeverity === 'degraded' ? 'warning' : 'success'} label={sentence(vm.impactSeverity)} /></Stack><Typography variant="body2" sx={{ mt: 1 }}>{vm.virtualizationDecision || 'No HA decision was required for this impact path.'}</Typography></Paper></Grid>)}</Grid>
-            </Paper>}
-            <Grid container spacing={2.5}>
-              <Grid size={{ xs: 12, lg: 8 }}><TableContainer component={Paper} variant="outlined" sx={{ maxHeight: 390 }}><Table stickyHeader size="small"><TableHead><TableRow><TableCell>Impact</TableCell><TableCell>Configuration item</TableCell><TableCell>Criticality</TableCell><TableCell>Owner</TableCell><TableCell>Site</TableCell></TableRow></TableHead><TableBody>{preview.items.map(item => <TableRow key={item.assetId} hover><TableCell><Chip size="small" color={item.role === 'Scope' ? 'primary' : item.impactSeverity === 'outage' ? 'error' : item.impactSeverity === 'degraded' ? 'warning' : item.impactSeverity === 'protected' ? 'success' : 'default'} label={item.role === 'Scope' ? item.role : `${item.role} · ${sentence(item.impactSeverity)}`} /></TableCell><TableCell><Typography fontWeight={750}>{item.name}</Typography><Typography variant="caption" color="text.secondary">{item.type} · depth {item.depth}</Typography></TableCell><TableCell>{sentence(item.criticality)}</TableCell><TableCell>{item.owner}</TableCell><TableCell>{item.site || 'Not recorded'}</TableCell></TableRow>)}</TableBody></Table></TableContainer></Grid>
-              <Grid size={{ xs: 12, lg: 4 }}><Stack spacing={2}><Paper variant="outlined" sx={{ p: 2 }}><Typography variant="overline" color="primary">Suggested risk</Typography><Stack direction="row" spacing={1} alignItems="center"><Typography variant="h4">{sentence(preview.summary.suggestedRisk.level)}</Typography><Chip label={`Score ${preview.summary.suggestedRisk.score}`} /></Stack><Divider sx={{ my: 1.5 }} />{preview.summary.suggestedRisk.factors.map(factor => <Typography key={factor} variant="body2" color="text.secondary" sx={{ mb: 0.75 }}>• {factor}</Typography>)}</Paper><FormControl fullWidth><InputLabel>Recorded risk</InputLabel><Select label="Recorded risk" value={form.riskLevel} onChange={event => update('riskLevel', event.target.value)}><MenuItem value="suggested">Use CMDB suggestion ({sentence(preview.summary.suggestedRisk.level)})</MenuItem>{['low', 'medium', 'high', 'critical'].map(value => <MenuItem key={value} value={value}>{sentence(value)}</MenuItem>)}</Select></FormControl></Stack></Grid>
-              <Grid size={{ xs: 12 }}><TextField fullWidth required multiline minRows={3} label="Business and user impact" value={form.businessImpact} onChange={event => update('businessImpact', event.target.value)} helperText="Add what the graph cannot know: affected users, business processes, service expectations and acceptable disruption." /></Grid>
-            </Grid>
-          </>}
-        </Box>}
+          {activeStep === 1 && <Box>
+            {previewLoading && <Stack
+              spacing={1}
+              sx={{
+                alignItems: "center",
+                py: 5
+              }}><CircularProgress /><Typography sx={{
+              color: "text.secondary"
+            }}>Calculating downstream impact…</Typography></Stack>}
+            {!previewLoading && preview && <>
+              <Grid container spacing={2} sx={{ mb: 2 }}>{[
+                ['Scope', preview.summary.scopeCount], ['Direct impact', preview.summary.directCount], ['Downstream', preview.summary.downstreamCount], ['Missing owners', preview.summary.missingOwnerCount],
+              ].map(([label, value]) => <Grid key={String(label)} size={{ xs: 6, md: 3 }}><Paper variant="outlined" sx={{ p: 2 }}><Typography variant="body2" sx={{
+                color: "text.secondary"
+              }}>{label}</Typography><Typography variant="h4">{value}</Typography></Paper></Grid>)}</Grid>
+              <Alert severity={preview.summary.missingOwnerCount ? 'warning' : 'success'} sx={{ mb: 2 }}>{preview.summary.missingOwnerCount ? `${preview.summary.missingOwnerCount} impacted item(s) have no owner recorded. The PDF will flag them.` : 'All impacted configuration items have an owner recorded.'}</Alert>
+              {preview.summary.businessSystems.length > 0 && <Paper variant="outlined" sx={{ p: 2, mb: 2, borderColor: 'primary.main', bgcolor: 'rgba(80,213,185,.04)' }}>
+                <Stack
+                  direction={{ xs: 'column', md: 'row' }}
+                  spacing={1}
+                  sx={{
+                    justifyContent: "space-between",
+                    mb: 1.5
+                  }}><Box><Typography variant="overline" color="primary">Business impact and signoff</Typography><Typography variant="h6">{preview.summary.businessSystemCount} business system(s) assessed</Typography></Box>{preview.summary.missingBusinessOwnerCount > 0 && <Chip color="warning" label={`${preview.summary.missingBusinessOwnerCount} missing business owner`} />}</Stack>
+                <Grid container spacing={1.5}>{preview.summary.businessSystems.map(system => <Grid key={system.assetId} size={{ xs: 12, md: 6 }}><Paper variant="outlined" sx={{ p: 1.5 }}><Stack direction="row" spacing={1} sx={{
+                  justifyContent: "space-between"
+                }}><Box><Typography sx={{
+                  fontWeight: 800
+                }}>{system.name}</Typography><Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>{system.department || 'Department not recorded'} · {system.userPopulation || 'User population not recorded'}</Typography></Box><Chip size="small" color={system.impactSeverity === 'outage' ? 'error' : system.impactSeverity === 'degraded' ? 'warning' : 'success'} label={sentence(system.impactSeverity)} /></Stack><Typography variant="body2" sx={{ mt: 1 }}>Owner: {system.businessOwner || 'Not recorded'}</Typography><Typography variant="body2">Signoff: {system.signoffRequired === 'no' ? 'Not required' : system.signoffDelegate || system.businessOwner || 'Not assigned'}</Typography><Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>RTO {system.rtoHours || '?'}h · RPO {system.rpoHours || '?'}h</Typography></Paper></Grid>)}</Grid>
+              </Paper>}
+              {preview.summary.virtualizationAssessments.length > 0 && <Paper variant="outlined" sx={{ p: 2, mb: 2, borderColor: '#56b4e9', bgcolor: 'rgba(86,180,233,.04)' }}>
+                <Stack
+                  direction={{ xs: 'column', md: 'row' }}
+                  spacing={1}
+                  sx={{
+                    justifyContent: "space-between",
+                    mb: 1.5
+                  }}><Box><Typography variant="overline" sx={{
+                  color: "info.main"
+                }}>Virtualization resilience</Typography><Typography variant="h6">{preview.summary.protectedVmCount} protected · {preview.summary.degradedVmCount} degraded · {preview.summary.outageVmCount} outage</Typography></Box></Stack>
+                <Grid container spacing={1.5}>{preview.summary.virtualizationAssessments.map(vm => <Grid key={vm.assetId} size={{ xs: 12, md: 6 }}><Paper variant="outlined" sx={{ p: 1.5 }}><Stack direction="row" spacing={1} sx={{
+                  justifyContent: "space-between"
+                }}><Box><Typography sx={{
+                  fontWeight: 800
+                }}>{vm.name}</Typography><Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>{vm.virtualizationPlatform || 'Platform not recorded'} · {vm.clusterName || 'Cluster not recorded'}</Typography></Box><Chip size="small" color={vm.impactSeverity === 'outage' ? 'error' : vm.impactSeverity === 'degraded' ? 'warning' : 'success'} label={sentence(vm.impactSeverity)} /></Stack><Typography variant="body2" sx={{ mt: 1 }}>{vm.virtualizationDecision || 'No HA decision was required for this impact path.'}</Typography></Paper></Grid>)}</Grid>
+              </Paper>}
+              <Grid container spacing={2.5}>
+                <Grid size={{ xs: 12, lg: 8 }}><TableContainer component={Paper} variant="outlined" sx={{ maxHeight: 390 }}><Table stickyHeader size="small"><TableHead><TableRow><TableCell>Impact</TableCell><TableCell>Configuration item</TableCell><TableCell>Criticality</TableCell><TableCell>Owner</TableCell><TableCell>Site</TableCell></TableRow></TableHead><TableBody>{preview.items.map(item => <TableRow key={item.assetId} hover><TableCell><Chip size="small" color={item.role === 'Scope' ? 'primary' : item.impactSeverity === 'outage' ? 'error' : item.impactSeverity === 'degraded' ? 'warning' : item.impactSeverity === 'protected' ? 'success' : 'default'} label={item.role === 'Scope' ? item.role : `${item.role} · ${sentence(item.impactSeverity)}`} /></TableCell><TableCell><Typography sx={{
+                  fontWeight: 750
+                }}>{item.name}</Typography><Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>{item.type} · depth {item.depth}</Typography></TableCell><TableCell>{sentence(item.criticality)}</TableCell><TableCell>{item.owner}</TableCell><TableCell>{item.site || 'Not recorded'}</TableCell></TableRow>)}</TableBody></Table></TableContainer></Grid>
+                <Grid size={{ xs: 12, lg: 4 }}><Stack spacing={2}><Paper variant="outlined" sx={{ p: 2 }}><Typography variant="overline" color="primary">Suggested risk</Typography><Stack direction="row" spacing={1} sx={{
+                  alignItems: "center"
+                }}><Typography variant="h4">{sentence(preview.summary.suggestedRisk.level)}</Typography><Chip label={`Score ${preview.summary.suggestedRisk.score}`} /></Stack><Divider sx={{ my: 1.5 }} />{preview.summary.suggestedRisk.factors.map(factor => <Typography
+                  key={factor}
+                  variant="body2"
+                  sx={{
+                    color: "text.secondary",
+                    mb: 0.75
+                  }}>• {factor}</Typography>)}</Paper><FormControl fullWidth><InputLabel>Recorded risk</InputLabel><Select label="Recorded risk" value={form.riskLevel} onChange={event => update('riskLevel', event.target.value)}><MenuItem value="suggested">Use CMDB suggestion ({sentence(preview.summary.suggestedRisk.level)})</MenuItem>{['low', 'medium', 'high', 'critical'].map(value => <MenuItem key={value} value={value}>{sentence(value)}</MenuItem>)}</Select></FormControl></Stack></Grid>
+                <Grid size={{ xs: 12 }}><TextField fullWidth required multiline minRows={3} label="Business and user impact" value={form.businessImpact} onChange={event => update('businessImpact', event.target.value)} helperText="Add what the graph cannot know: affected users, business processes, service expectations and acceptable disruption." /></Grid>
+              </Grid>
+            </>}
+          </Box>}
 
-        {activeStep === 2 && <Grid container spacing={2.5}>
-          <Grid size={{ xs: 12 }}><TextField fullWidth required multiline minRows={2} label="Reason for change" value={form.reason} onChange={event => update('reason', event.target.value)} /></Grid>
-          <Grid size={{ xs: 12 }}><TextField fullWidth required multiline minRows={5} label="Implementation plan" value={form.implementationPlan} onChange={event => update('implementationPlan', event.target.value)} helperText="Use numbered, executable steps including pre-checks." /></Grid>
-          <Grid size={{ xs: 12, lg: 6 }}><TextField fullWidth required multiline minRows={4} label="Validation and success criteria" value={form.validationPlan} onChange={event => update('validationPlan', event.target.value)} helperText="State how the technician will prove the service is healthy." /></Grid>
-          <Grid size={{ xs: 12, lg: 6 }}><TextField fullWidth required multiline minRows={4} label="Rollback plan" value={form.rollbackPlan} onChange={event => update('rollbackPlan', event.target.value)} helperText="Include the trigger, recovery steps and expected recovery time." /></Grid>
-          <Grid size={{ xs: 12, md: 4 }}><FormControl fullWidth><InputLabel>Customer communication</InputLabel><Select label="Customer communication" value={form.communicationStatus} onChange={event => update('communicationStatus', event.target.value)}><MenuItem value="required">Required</MenuItem><MenuItem value="not_required">Not required</MenuItem><MenuItem value="completed">Completed</MenuItem></Select></FormControl></Grid>
-          <Grid size={{ xs: 12, md: 4 }}><TextField fullWidth label="Assigned technician" value={form.assignedTechnician} onChange={event => update('assignedTechnician', event.target.value)} /></Grid>
-          <Grid size={{ xs: 12, md: 4 }}><TextField fullWidth label="Approver / CAB owner" value={form.approver} onChange={event => update('approver', event.target.value)} /></Grid>
-          <Grid size={{ xs: 12, lg: 6 }}><TextField fullWidth multiline minRows={3} label="Communication plan" value={form.communicationPlan} onChange={event => update('communicationPlan', event.target.value)} helperText="Audience, timing, method and responsible person." /></Grid>
-          <Grid size={{ xs: 12, lg: 6 }}><TextField fullWidth multiline minRows={3} label="Additional notes" value={form.notes} onChange={event => update('notes', event.target.value)} /></Grid>
-        </Grid>}
+          {activeStep === 2 && <Grid container spacing={2.5}>
+            <Grid size={{ xs: 12 }}><TextField fullWidth required multiline minRows={2} label="Reason for change" value={form.reason} onChange={event => update('reason', event.target.value)} /></Grid>
+            <Grid size={{ xs: 12 }}><TextField fullWidth required multiline minRows={5} label="Implementation plan" value={form.implementationPlan} onChange={event => update('implementationPlan', event.target.value)} helperText="Use numbered, executable steps including pre-checks." /></Grid>
+            <Grid size={{ xs: 12, lg: 6 }}><TextField fullWidth required multiline minRows={4} label="Validation and success criteria" value={form.validationPlan} onChange={event => update('validationPlan', event.target.value)} helperText="State how the technician will prove the service is healthy." /></Grid>
+            <Grid size={{ xs: 12, lg: 6 }}><TextField fullWidth required multiline minRows={4} label="Rollback plan" value={form.rollbackPlan} onChange={event => update('rollbackPlan', event.target.value)} helperText="Include the trigger, recovery steps and expected recovery time." /></Grid>
+            <Grid size={{ xs: 12, md: 4 }}><FormControl fullWidth><InputLabel>Customer communication</InputLabel><Select label="Customer communication" value={form.communicationStatus} onChange={event => update('communicationStatus', event.target.value)}><MenuItem value="required">Required</MenuItem><MenuItem value="not_required">Not required</MenuItem><MenuItem value="completed">Completed</MenuItem></Select></FormControl></Grid>
+            <Grid size={{ xs: 12, md: 4 }}><TextField fullWidth label="Assigned technician" value={form.assignedTechnician} onChange={event => update('assignedTechnician', event.target.value)} /></Grid>
+            <Grid size={{ xs: 12, md: 4 }}><TextField fullWidth label="Approver / CAB owner" value={form.approver} onChange={event => update('approver', event.target.value)} /></Grid>
+            <Grid size={{ xs: 12, lg: 6 }}><TextField fullWidth multiline minRows={3} label="Communication plan" value={form.communicationPlan} onChange={event => update('communicationPlan', event.target.value)} helperText="Audience, timing, method and responsible person." /></Grid>
+            <Grid size={{ xs: 12, lg: 6 }}><TextField fullWidth multiline minRows={3} label="Additional notes" value={form.notes} onChange={event => update('notes', event.target.value)} /></Grid>
+          </Grid>}
 
-        {activeStep === 3 && preview && <Grid container spacing={2.5}>
-          <Grid size={{ xs: 12, lg: 8 }}><Paper variant="outlined" sx={{ p: 3 }}><Stack direction="row" justifyContent="space-between" spacing={2}><Box><Typography variant="overline" color="primary">{saved?.number || 'Draft change package'}</Typography><Typography variant="h4">{form.title}</Typography></Box><Chip color="info" label={sentence(form.changeType)} /></Stack><Divider sx={{ my: 2 }} /><Grid container spacing={2}>{[
-            ['Customer', workspace.companyName], ['Schedule', `${formatDate(form.plannedStart)} - ${formatDate(form.plannedEnd)}`], ['Scope', `${preview.summary.scopeCount} selected CI(s)`], ['Calculated impact', `${preview.summary.directCount + preview.summary.downstreamCount} downstream CI(s)`], ['Business systems', `${preview.summary.businessSystemCount} affected`], ['Business owners', preview.summary.businessOwners.join(', ') || 'None recorded'], ['Risk', form.riskLevel === 'suggested' ? sentence(preview.summary.suggestedRisk.level) : sentence(form.riskLevel)], ['Expected outage', form.outageExpected === 'yes' ? 'Yes' : 'No'], ['Technician', form.assignedTechnician || 'Not assigned'], ['Approver', form.approver || 'Not assigned'],
-          ].map(([label, value]) => <Grid key={label} size={{ xs: 12, md: 6 }}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography fontWeight={700}>{value}</Typography></Grid>)}</Grid><Divider sx={{ my: 2 }} /><Typography variant="subtitle2">Business impact</Typography><Typography color="text.secondary">{form.businessImpact}</Typography></Paper></Grid>
-          <Grid size={{ xs: 12, lg: 4 }}><Paper variant="outlined" sx={{ p: 3, height: '100%' }}><DescriptionOutlined color="primary" sx={{ fontSize: 40 }} /><Typography variant="h5" sx={{ mt: 1 }}>PDF change package</Typography><Typography color="text.secondary" sx={{ my: 2 }}>The generated document freezes the impact list, owners, risk factors and technician plan. It also reserves a ConnectWise ticket reference for the future publisher.</Typography>{saved ? <Button fullWidth variant="contained" startIcon={<DownloadOutlined />} onClick={() => void downloadChange(saved)}>Download {saved.number}</Button> : <Button fullWidth variant="contained" startIcon={<AssignmentTurnedInOutlined />} disabled={saving} onClick={() => void saveAndDownload()}>{saving ? 'Generating…' : 'Save & generate PDF'}</Button>}</Paper></Grid>
-        </Grid>}
+          {activeStep === 3 && preview && <Grid container spacing={2.5}>
+            <Grid size={{ xs: 12, lg: 8 }}><Paper variant="outlined" sx={{ p: 3 }}><Stack direction="row" spacing={2} sx={{
+              justifyContent: "space-between"
+            }}><Box><Typography variant="overline" color="primary">{saved?.number || 'Draft change package'}</Typography><Typography variant="h4">{form.title}</Typography></Box><Chip color="info" label={sentence(form.changeType)} /></Stack><Divider sx={{ my: 2 }} /><Grid container spacing={2}>{[
+              ['Customer', workspace.companyName], ['Schedule', `${formatDate(form.plannedStart)} - ${formatDate(form.plannedEnd)}`], ['Scope', `${preview.summary.scopeCount} selected CI(s)`], ['Calculated impact', `${preview.summary.directCount + preview.summary.downstreamCount} downstream CI(s)`], ['Business systems', `${preview.summary.businessSystemCount} affected`], ['Business owners', preview.summary.businessOwners.join(', ') || 'None recorded'], ['Risk', form.riskLevel === 'suggested' ? sentence(preview.summary.suggestedRisk.level) : sentence(form.riskLevel)], ['Expected outage', form.outageExpected === 'yes' ? 'Yes' : 'No'], ['Technician', form.assignedTechnician || 'Not assigned'], ['Approver', form.approver || 'Not assigned'],
+            ].map(([label, value]) => <Grid key={label} size={{ xs: 12, md: 6 }}><Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>{label}</Typography><Typography sx={{
+              fontWeight: 700
+            }}>{value}</Typography></Grid>)}</Grid><Divider sx={{ my: 2 }} /><Typography variant="subtitle2">Business impact</Typography><Typography sx={{
+              color: "text.secondary"
+            }}>{form.businessImpact}</Typography></Paper></Grid>
+            <Grid size={{ xs: 12, lg: 4 }}><Paper variant="outlined" sx={{ p: 3, height: '100%' }}><DescriptionOutlined color="primary" sx={{ fontSize: 40 }} /><Typography variant="h5" sx={{ mt: 1 }}>PDF change package</Typography><Typography
+              sx={{
+                color: "text.secondary",
+                my: 2
+              }}>The generated document freezes the impact list, owners, risk factors and technician plan. It also reserves a ConnectWise ticket reference for the future publisher.</Typography>{saved ? <Button fullWidth variant="contained" startIcon={<DownloadOutlined />} onClick={() => void downloadChange(saved)}>Download {saved.number}</Button> : <Button fullWidth variant="contained" startIcon={<AssignmentTurnedInOutlined />} disabled={saving} onClick={() => void saveAndDownload()}>{saving ? 'Generating…' : 'Save & generate PDF'}</Button>}</Paper></Grid>
+          </Grid>}
 
-        <Divider sx={{ my: 3 }} />
-        <Stack direction="row" justifyContent="space-between"><Button disabled={activeStep === 0 || saving} onClick={() => setActiveStep(step => step - 1)}>Back</Button>{activeStep < steps.length - 1 && <Button variant="contained" disabled={!stepComplete || previewLoading} onClick={() => setActiveStep(step => step + 1)}>Continue</Button>}</Stack>
-      </CardContent>
-    </Card>}
+          <Divider sx={{ my: 3 }} />
+          <Stack direction="row" sx={{
+            justifyContent: "space-between"
+          }}><Button disabled={activeStep === 0 || saving} onClick={() => setActiveStep(step => step - 1)}>Back</Button>{activeStep < steps.length - 1 && <Button variant="contained" disabled={!stepComplete || previewLoading} onClick={() => setActiveStep(step => step + 1)}>Continue</Button>}</Stack>
+        </CardContent>
+      </Card>}
 
-    <Card sx={{ mt: 3 }}><CardContent><Typography variant="h5">Recent change packages</Typography><Typography color="text.secondary" sx={{ mb: 2 }}>Saved impact snapshots remain available even when CI names, owners or relationships later change.</Typography>{!changes.length ? <Alert severity="info">No change packages have been created for this customer.</Alert> : <TableContainer><Table size="small"><TableHead><TableRow><TableCell>Reference</TableCell><TableCell>Change</TableCell><TableCell>Schedule</TableCell><TableCell>Risk</TableCell><TableCell>Impact</TableCell><TableCell align="right">Document</TableCell></TableRow></TableHead><TableBody>{changes.slice(0, 20).map(change => <TableRow key={change.id} hover><TableCell><Typography fontWeight={800}>{change.number}</Typography><Typography variant="caption" color="text.secondary">{sentence(change.status)}</Typography></TableCell><TableCell><Typography fontWeight={700}>{change.title}</Typography><Typography variant="caption" color="text.secondary">{sentence(change.changeType)} · {sentence(change.category)}</Typography></TableCell><TableCell>{formatDate(change.plannedStart)}</TableCell><TableCell><Chip size="small" color={change.riskLevel === 'critical' ? 'error' : change.riskLevel === 'high' ? 'warning' : 'default'} label={sentence(change.riskLevel)} /></TableCell><TableCell>{change.impactSnapshot.length} CI(s)</TableCell><TableCell align="right"><Button size="small" startIcon={<DownloadOutlined />} onClick={() => void downloadChange(change)}>PDF</Button></TableCell></TableRow>)}</TableBody></Table></TableContainer>}</CardContent></Card>
-  </Box>;
+      <Card sx={{ mt: 3 }}><CardContent><Typography variant="h5">Recent change packages</Typography><Typography
+        sx={{
+          color: "text.secondary",
+          mb: 2
+        }}>Saved impact snapshots remain available even when CI names, owners or relationships later change.</Typography>{!changes.length ? <Alert severity="info">No change packages have been created for this customer.</Alert> : <TableContainer><Table size="small"><TableHead><TableRow><TableCell>Reference</TableCell><TableCell>Change</TableCell><TableCell>Schedule</TableCell><TableCell>Risk</TableCell><TableCell>Impact</TableCell><TableCell align="right">Document</TableCell></TableRow></TableHead><TableBody>{changes.slice(0, 20).map(change => <TableRow key={change.id} hover><TableCell><Typography sx={{
+        fontWeight: 800
+      }}>{change.number}</Typography><Typography variant="caption" sx={{
+        color: "text.secondary"
+      }}>{sentence(change.status)}</Typography></TableCell><TableCell><Typography sx={{
+        fontWeight: 700
+      }}>{change.title}</Typography><Typography variant="caption" sx={{
+        color: "text.secondary"
+      }}>{sentence(change.changeType)} · {sentence(change.category)}</Typography></TableCell><TableCell>{formatDate(change.plannedStart)}</TableCell><TableCell><Chip size="small" color={change.riskLevel === 'critical' ? 'error' : change.riskLevel === 'high' ? 'warning' : 'default'} label={sentence(change.riskLevel)} /></TableCell><TableCell>{change.impactSnapshot.length} CI(s)</TableCell><TableCell align="right"><Button size="small" startIcon={<DownloadOutlined />} onClick={() => void downloadChange(change)}>PDF</Button></TableCell></TableRow>)}</TableBody></Table></TableContainer>}</CardContent></Card>
+    </Box>
+  );
 }

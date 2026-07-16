@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import app as core
 from src.cmdb.change_control import change_pdf_filename, create_change_record, preview_change_impact, render_change_pdf
 from src.cmdb.audit import AuditContext, reset_audit_context, set_audit_context
+from src.cmdb.data_quality import RULES as DATA_QUALITY_RULES, evaluate_data_quality
 from src.cmdb.repository import PostgresCmdbRepository, StateRepository, canonical_uuid
 from src.cmdb.reports import build_report, render_csv, render_pdf, render_xlsx, report_catalog, report_filename
 
@@ -279,6 +280,28 @@ class RelationshipCreateRequest(BaseModel):
     toId: str = Field(min_length=1)
     type: str = "related_to"
     impactPolicy: str = "required"
+
+
+class DataQualityExceptionRequest(BaseModel):
+    companyId: str = Field(min_length=1)
+    ruleKey: str = Field(min_length=1, max_length=80)
+    entityId: str = Field(min_length=1)
+    reason: str = Field(min_length=4, max_length=2000)
+    expiresAt: str | None = None
+
+
+class ReconciliationDecisionRequest(BaseModel):
+    decision: str = Field(pattern="^(use_existing|create_new|ignore)$")
+    notes: str = Field(min_length=4, max_length=2000)
+    targetAssetId: str | None = None
+
+
+class FieldAuthorityRequest(BaseModel):
+    companyId: str = Field(min_length=1)
+    ciType: str = Field(default="*", min_length=1, max_length=120)
+    fieldName: str = Field(min_length=1, max_length=160)
+    provider: str = Field(pattern="^(connectwise|ncentral|passportal|future)$")
+    priority: int = Field(default=100, ge=0, le=32767)
 
 
 class BrandingRequest(BaseModel):
@@ -973,6 +996,127 @@ def delete_relationship(relationship_id: str, request: Request) -> dict:
     if not deleted:
         raise HTTPException(404, "Relationship not found")
     return {"deletedId": relationship_id}
+
+
+def _quality_company_scope(company_id: str | None, user: dict, *, require_manage: bool = False) -> list[dict]:
+    if company_id:
+        return [_company_for_user(company_id, user, require_manage=require_manage)]
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP data quality requires a root role")
+    return [company for company in REPOSITORY.list_companies() if core.allowed(user, company["id"])]
+
+
+@api.get("/api/data-quality", tags=["governance"])
+def get_data_quality(request: Request, companyId: str | None = None) -> dict:
+    user = current_user(request)
+    companies = _quality_company_scope(companyId, user)
+    company_ids = {company["id"] for company in companies}
+    assets = [core.asset_view(item) for item in REPOSITORY.list_assets() if item["companyId"] in company_ids]
+    asset_ids = {item["id"] for item in assets}
+    relationships = [item for item in REPOSITORY.list_relationships() if item["fromId"] in asset_ids and item["toId"] in asset_ids]
+    exceptions = [item for item in REPOSITORY.list_data_quality_exceptions(companyId) if item["companyId"] in company_ids]
+    result = evaluate_data_quality(companies, assets, relationships, exceptions)
+    candidates = [item for item in REPOSITORY.list_reconciliation_candidates(companyId, "pending") if item.get("companyId") in company_ids]
+    result["summary"]["pendingReconciliationCount"] = len(candidates)
+    result["candidates"] = candidates
+    result["exceptions"] = [item for item in exceptions if item.get("state") == "active"]
+    result["fieldAuthority"] = [item for item in REPOSITORY.list_field_authority(companyId) if item["companyId"] in company_ids]
+    return result
+
+
+@api.post("/api/data-quality/exceptions", status_code=201, tags=["governance"])
+def create_data_quality_exception(payload: DataQualityExceptionRequest, request: Request) -> dict:
+    user = current_user(request)
+    _company_for_user(payload.companyId, user, require_manage=True)
+    if payload.ruleKey not in DATA_QUALITY_RULES:
+        raise HTTPException(400, "Choose a valid data-quality rule")
+    asset = _asset_for_user(payload.entityId, user, require_manage=True)
+    if asset["companyId"] != payload.companyId:
+        raise HTTPException(400, "The CI does not belong to that customer")
+    if payload.expiresAt:
+        try:
+            datetime.fromisoformat(payload.expiresAt.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise HTTPException(400, "Choose a valid exception expiry") from error
+    with core.LOCK:
+        return REPOSITORY.create_data_quality_exception({
+            "id": str(uuid.uuid4()), "companyId": payload.companyId, "ruleKey": payload.ruleKey,
+            "entityType": "configuration_item", "entityId": asset["id"],
+            "reason": payload.reason.strip(), "expiresAt": payload.expiresAt,
+        }, user["id"])
+
+
+@api.delete("/api/data-quality/exceptions/{exception_id}", tags=["governance"])
+def resolve_data_quality_exception(exception_id: str, request: Request) -> dict:
+    user = current_user(request)
+    current = next((item for item in REPOSITORY.list_data_quality_exceptions() if item["id"] == exception_id), None)
+    if not current:
+        raise HTTPException(404, "Exception not found")
+    _company_for_user(current["companyId"], user, require_manage=True)
+    with core.LOCK:
+        result = REPOSITORY.resolve_data_quality_exception(exception_id, user["id"])
+    if not result:
+        raise HTTPException(409, "The exception is no longer active")
+    return result
+
+
+@api.get("/api/reconciliation-candidates", tags=["integrations"])
+def list_reconciliation_candidates(request: Request, companyId: str | None = None, state: str | None = "pending") -> list[dict]:
+    user = current_user(request)
+    companies = _quality_company_scope(companyId, user)
+    company_ids = {item["id"] for item in companies}
+    return [item for item in REPOSITORY.list_reconciliation_candidates(companyId, state) if item.get("companyId") in company_ids]
+
+
+@api.patch("/api/reconciliation-candidates/{candidate_id}", tags=["integrations"])
+def decide_reconciliation_candidate(candidate_id: str, payload: ReconciliationDecisionRequest, request: Request) -> dict:
+    user = current_user(request)
+    candidate = next((item for item in REPOSITORY.list_reconciliation_candidates() if item["id"] == candidate_id), None)
+    if not candidate:
+        raise HTTPException(404, "Reconciliation candidate not found")
+    company_id = candidate.get("companyId")
+    if not company_id:
+        raise HTTPException(409, "The candidate has no customer scope")
+    _company_for_user(company_id, user, require_manage=True)
+    if payload.decision == "use_existing":
+        if not payload.targetAssetId:
+            raise HTTPException(400, "Choose the existing CI to use")
+        target = _asset_for_user(payload.targetAssetId, user, require_manage=True)
+        if target["companyId"] != company_id:
+            raise HTTPException(400, "The target CI must belong to the same customer")
+    elif payload.targetAssetId:
+        raise HTTPException(400, "A target CI is only valid for an existing-CI decision")
+    with core.LOCK:
+        result = REPOSITORY.resolve_reconciliation_candidate(candidate_id, payload.decision, payload.notes.strip(), payload.targetAssetId, user["id"])
+    if not result:
+        raise HTTPException(409, "That candidate has already been reviewed")
+    return result
+
+
+@api.get("/api/field-authority", tags=["integrations"])
+def list_field_authority(request: Request, companyId: str | None = None) -> list[dict]:
+    user = current_user(request)
+    companies = _quality_company_scope(companyId, user)
+    company_ids = {item["id"] for item in companies}
+    return [item for item in REPOSITORY.list_field_authority(companyId) if item["companyId"] in company_ids]
+
+
+@api.put("/api/field-authority", tags=["integrations"])
+def upsert_field_authority(payload: FieldAuthorityRequest, request: Request) -> dict:
+    user = current_user(request)
+    _company_for_user(payload.companyId, user, require_manage=True)
+    with core.LOCK:
+        return REPOSITORY.upsert_field_authority(payload.model_dump(), user["id"])
+
+
+@api.delete("/api/field-authority", tags=["integrations"])
+def delete_field_authority(request: Request, companyId: str, ciType: str, fieldName: str, provider: str) -> dict:
+    user = current_user(request)
+    _company_for_user(companyId, user, require_manage=True)
+    with core.LOCK:
+        deleted = REPOSITORY.delete_field_authority(companyId, ciType, fieldName, provider, user["id"])
+    if not deleted:
+        raise HTTPException(404, "Source authority rule not found")
+    return {"deleted": True}
 
 
 @api.get("/api/integrations", tags=["integrations"])

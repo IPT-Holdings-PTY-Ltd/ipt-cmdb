@@ -50,14 +50,14 @@ class FakeConnection:
 class MigrationTests(unittest.TestCase):
     def test_plan_is_ordered_and_latest_version_is_incremental_migration(self):
         plan = migration_plan(ROOT)
-        self.assertEqual([item.version for item in plan], ["2026.07.13.1", "2026.07.15.1", "2026.07.15.2", "2026.07.15.3", "2026.07.16.1"])
-        self.assertEqual(latest_schema_version(ROOT), "2026.07.16.1")
+        self.assertEqual([item.version for item in plan], ["2026.07.13.1", "2026.07.15.1", "2026.07.15.2", "2026.07.15.3", "2026.07.16.1", "2026.07.16.2"])
+        self.assertEqual(latest_schema_version(ROOT), "2026.07.16.2")
         self.assertTrue(all(len(item.checksum) == 64 for item in plan))
 
     def test_migrations_apply_once_and_reject_checksum_drift(self):
         history = {}
         factory = lambda: FakeConnection(history)
-        self.assertEqual(apply_migrations(factory, ROOT), ["2026.07.13.1", "2026.07.15.1", "2026.07.15.2", "2026.07.15.3", "2026.07.16.1"])
+        self.assertEqual(apply_migrations(factory, ROOT), ["2026.07.13.1", "2026.07.15.1", "2026.07.15.2", "2026.07.15.3", "2026.07.16.1", "2026.07.16.2"])
         self.assertEqual(apply_migrations(factory, ROOT), [])
         history["2026.07.15.1"] = "0" * 64
         with self.assertRaisesRegex(RuntimeError, "changed on disk"):

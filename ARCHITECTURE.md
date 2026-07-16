@@ -68,7 +68,7 @@ The API continues to enforce tenant and role authorization after external authen
 
 ## PostgreSQL and migrations
 
-PostgreSQL is the production source of truth. The repository stores customers, users, access groups, CIs, identifiers, relationships, integration connections, mappings, observations, changes, branding, sync runs, reconciliation candidates and audit events in normalized tables.
+PostgreSQL is the production source of truth. The repository stores customers, users, access groups, CIs, identifiers, relationships, integration connections, mappings, observations, changes, branding, sync runs, reconciliation candidates, data-quality exceptions, field-authority rules and audit events in normalized tables.
 
 Audit rows are append-only and contain sanitised before/after values, field changes, actor attribution, source, outcome and correlation context. Tenant-aware reporting is assembled through controlled report templates rather than allowing arbitrary SQL from the web tier.
 
@@ -104,6 +104,8 @@ Matching follows this order:
 4. a new canonical CI only when no safe match exists.
 
 Names, IP addresses and mutable descriptions are evidence, not identity. `ci_field_authority` determines which source can update a canonical field. Lower-authority observations remain visible without silently overwriting the authoritative value.
+
+The Data Quality Center calculates deterministic findings from canonical CIs and relationships at read time. This allows rule improvements without rebuilding a findings table. Deliberately accepted conditions are stored as scoped, expiring `data_quality_exceptions` rows with mandatory reasons. Reconciliation decisions and authority changes are persisted and audited but do not perform provider writes.
 
 ## Relationship and impact model
 

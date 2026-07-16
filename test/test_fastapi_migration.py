@@ -105,6 +105,7 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertIn("/api/changes/{change_id}/pdf", schema["paths"])
         self.assertIn("/api/audit-events", schema["paths"])
         self.assertIn("/api/reports/{report_id}/download", schema["paths"])
+        self.assertIn("/api/data-quality", schema["paths"])
 
     def test_audit_center_is_tenant_scoped_and_contains_attribution(self):
         admin = self._login("admin@example.com")
@@ -163,6 +164,34 @@ class FastApiMigrationTests(unittest.TestCase):
         pdf = self.client.get("/api/reports/asset-register/download?companyId=acme&format=pdf", headers=headers)
         self.assertEqual(pdf.status_code, 200)
         self.assertTrue(pdf.content.startswith(b"%PDF"))
+
+    def test_data_quality_is_tenant_scoped_and_exceptions_are_audited(self):
+        client = self._login("client@acme.example")
+        client_headers = {"Authorization": f"Bearer {client}"}
+        visible = self.client.get("/api/data-quality?companyId=acme", headers=client_headers)
+        self.assertEqual(visible.status_code, 200)
+        self.assertEqual({item["companyId"] for item in visible.json()["findings"]}, {"acme"})
+        self.assertEqual(self.client.get("/api/data-quality?companyId=northwind", headers=client_headers).status_code, 403)
+        self.assertEqual(self.client.get("/api/data-quality", headers=client_headers).status_code, 403)
+        denied = self.client.post("/api/data-quality/exceptions", headers=client_headers, json={"companyId": "acme", "ruleKey": "missing_owner", "entityId": "asset-1", "reason": "Approved temporary exception"})
+        self.assertEqual(denied.status_code, 403)
+
+        admin = self._login("admin@example.com")
+        headers = {"Authorization": f"Bearer {admin}"}
+        created = self.client.post("/api/data-quality/exceptions", headers=headers, json={"companyId": "acme", "ruleKey": "missing_owner", "entityId": "asset-1", "reason": "Owner assignment is in progress"})
+        self.assertEqual(created.status_code, 201)
+        refreshed = self.client.get("/api/data-quality?companyId=acme", headers=headers)
+        self.assertNotIn("missing_owner", {item["ruleKey"] for item in refreshed.json()["findings"]})
+        self.assertEqual(core.DB["auditEvents"][0]["entityType"], "data_quality_exception")
+
+    def test_source_authority_is_customer_scoped_and_audited(self):
+        token = self._login("admin@example.com")
+        headers = {"Authorization": f"Bearer {token}"}
+        saved = self.client.put("/api/field-authority", headers=headers, json={"companyId": "acme", "ciType": "Server", "fieldName": "display_name", "provider": "ncentral", "priority": 10})
+        self.assertEqual(saved.status_code, 200)
+        rules = self.client.get("/api/field-authority?companyId=acme", headers=headers)
+        self.assertEqual(rules.json()[0]["priority"], 10)
+        self.assertEqual(core.DB["auditEvents"][0]["entityType"], "field_authority")
 
     def test_easy_auth_is_container_configured_and_does_not_fall_back_to_passwords(self):
         claims = {
