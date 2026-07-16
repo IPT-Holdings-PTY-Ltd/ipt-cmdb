@@ -1,0 +1,56 @@
+name: Bug report
+description: Report a reproducible product defect using non-sensitive information.
+title: "[Bug]: "
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include customer data, credentials, database URLs, Easy Auth payloads or Passportal content. Report security issues privately according to SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.2.0 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker Compose
+        - Azure Container Apps
+        - Local hot reload
+        - Other container platform
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the visible problem and expected behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Select the demo customer...
+        2. Open...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Include browser, container status, schema version and sanitized logs. Remove internal names and secrets.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Sensitive-data check
+      options:
+        - label: I have removed credentials, customer data, exports and private provider payloads.
+          required: true

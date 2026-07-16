@@ -19,8 +19,12 @@ CHANGE_CATEGORIES = {"infrastructure", "network", "software", "database", "secur
 CHANGE_PRIORITIES = {"low", "medium", "high", "critical"}
 RISK_LEVELS = {"low", "medium", "high", "critical"}
 COMMUNICATION_STATES = {"required", "not_required", "completed"}
-NON_PROPAGATING_RELATIONSHIPS = {"related_to"}
-REVERSED_IMPACT_RELATIONSHIPS = {"depends_on", "installed_on"}
+NON_PROPAGATING_RELATIONSHIPS = {"related_to", "member_of", "backs_up"}
+REVERSED_IMPACT_RELATIONSHIPS = {
+    "depends_on", "installed_on", "stored_on", "provided_by", "managed_by", "protected_by",
+}
+VIRTUAL_MACHINE_TYPES = {"virtual machine"}
+HYPERVISOR_HOST_TYPES = {"hypervisor host"}
 
 
 def utc_now() -> str:
@@ -30,14 +34,83 @@ def utc_now() -> str:
 def _impact_edge(relationship: dict) -> tuple[str, str] | None:
     """Return the supporting-to-affected direction used by outage analysis."""
     relationship_type = relationship.get("type", "related_to")
-    if relationship_type in NON_PROPAGATING_RELATIONSHIPS:
+    if relationship_type in NON_PROPAGATING_RELATIONSHIPS or relationship.get("impactPolicy") == "informational":
         return None
     if relationship_type in REVERSED_IMPACT_RELATIONSHIPS:
         return relationship.get("toId", ""), relationship.get("fromId", "")
     return relationship.get("fromId", ""), relationship.get("toId", "")
 
 
-def _asset_snapshot(asset: dict, role: str, depth: int, path: list[str], relationship_path: list[str]) -> dict:
+def _impact_severity(impact_policy_path: list[str]) -> str:
+    # A protected or degraded hop limits the effect that can continue further
+    # down that path. A required application dependency after an HA failover
+    # does not turn a protected VM into an outage.
+    if "redundant" in impact_policy_path:
+        return "protected"
+    if "degraded" in impact_policy_path:
+        return "degraded"
+    if "required" in impact_policy_path:
+        return "outage"
+    return "scope"
+
+
+def _virtualization_policy(
+    relationship: dict, assets_by_id: dict[str, dict], relationships: list[dict], scope_ids: set[str],
+) -> tuple[str, str]:
+    """Resolve a host-to-VM edge using current cluster HA and capacity evidence."""
+    configured = relationship.get("impactPolicy", "required")
+    if relationship.get("type") != "hosts":
+        return configured, ""
+    host = assets_by_id.get(relationship.get("fromId"))
+    vm = assets_by_id.get(relationship.get("toId"))
+    if not host or not vm or host.get("type", "").lower() not in HYPERVISOR_HOST_TYPES or vm.get("type", "").lower() not in VIRTUAL_MACHINE_TYPES:
+        return configured, ""
+
+    vm_metadata = vm.get("metadata") or {}
+    if vm_metadata.get("haEnabled") != "yes" or vm_metadata.get("mobility", "automatic") != "automatic":
+        return "required", "HA restart unavailable: the VM is not automatically movable."
+    if vm_metadata.get("protectionStatus") == "unprotected":
+        return "required", "HA restart unavailable: the VM is marked unprotected."
+
+    memberships: dict[str, set[str]] = {}
+    for item in relationships:
+        if item.get("type") == "member_of":
+            memberships.setdefault(item.get("fromId", ""), set()).add(item.get("toId", ""))
+    common_clusters = memberships.get(host["id"], set()) & memberships.get(vm["id"], set())
+    if not common_clusters:
+        return "required", "HA restart unavailable: host and VM have no common cluster membership."
+    cluster_id = sorted(common_clusters)[0]
+    cluster = assets_by_id.get(cluster_id) or {}
+    cluster_metadata = cluster.get("metadata") or {}
+    candidate_hosts = []
+    for candidate_id, candidate_clusters in memberships.items():
+        candidate = assets_by_id.get(candidate_id)
+        candidate_metadata = (candidate or {}).get("metadata") or {}
+        if (
+            candidate and candidate.get("type", "").lower() in HYPERVISOR_HOST_TYPES
+            and cluster_id in candidate_clusters and candidate_id != host["id"] and candidate_id not in scope_ids
+            and candidate_metadata.get("powerState", "running") == "running"
+            and candidate_metadata.get("maintenanceMode", "no") != "yes"
+            and candidate_metadata.get("operationalStatus", "unknown") not in {"critical", "offline"}
+        ):
+            candidate_hosts.append(candidate)
+    try:
+        minimum_hosts = max(1, int(cluster_metadata.get("minimumHosts") or 1))
+    except (TypeError, ValueError):
+        minimum_hosts = 1
+    capacity = cluster_metadata.get("capacityStatus", "unknown")
+    cluster_name = cluster.get("name") or vm_metadata.get("clusterName") or "virtualization cluster"
+    if len(candidate_hosts) < minimum_hosts or capacity == "insufficient":
+        return "required", f"HA restart unavailable in {cluster_name}: surviving host capacity is insufficient."
+    if capacity in {"constrained", "unknown"} or vm_metadata.get("protectionStatus") == "degraded":
+        return "degraded", f"HA restart is possible in {cluster_name}, but remaining capacity is constrained or unverified."
+    return "redundant", f"Protected by {cluster_name}: {len(candidate_hosts)} eligible host(s) remain with sufficient capacity."
+
+
+def _asset_snapshot(
+    asset: dict, role: str, depth: int, path: list[str], relationship_path: list[str],
+    impact_policy_path: list[str], impact_notes: list[str],
+) -> dict:
     metadata = asset.get("metadata") or {}
     service_owner = str(metadata.get("serviceOwner") or "").strip()
     technical_owner = str(metadata.get("technicalOwner") or "").strip()
@@ -50,6 +123,9 @@ def _asset_snapshot(asset: dict, role: str, depth: int, path: list[str], relatio
         "depth": depth,
         "pathAssetIds": path,
         "relationshipPath": relationship_path,
+        "impactPolicyPath": impact_policy_path,
+        "impactSeverity": _impact_severity(impact_policy_path),
+        "impactNotes": [value for value in impact_notes if value],
         "criticality": metadata.get("criticality", "medium"),
         "environment": metadata.get("environment", "production"),
         "site": metadata.get("site", ""),
@@ -58,7 +134,22 @@ def _asset_snapshot(asset: dict, role: str, depth: int, path: list[str], relatio
         "serviceOwner": service_owner,
         "technicalOwner": technical_owner,
         "custodian": custodian,
-        "owner": technical_owner or service_owner or custodian or "No owner recorded",
+        "businessOwner": str(metadata.get("businessOwner") or "").strip(),
+        "signoffDelegate": str(metadata.get("signoffDelegate") or "").strip(),
+        "signoffRequired": str(metadata.get("signoffRequired") or "yes").strip(),
+        "department": str(metadata.get("department") or "").strip(),
+        "userPopulation": str(metadata.get("userPopulation") or "").strip(),
+        "rtoHours": str(metadata.get("rtoHours") or "").strip(),
+        "rpoHours": str(metadata.get("rpoHours") or "").strip(),
+        "virtualizationPlatform": str(metadata.get("virtualizationPlatform") or "").strip(),
+        "clusterName": str(metadata.get("clusterName") or "").strip(),
+        "haEnabled": str(metadata.get("haEnabled") or "no").strip(),
+        "capacityStatus": str(metadata.get("capacityStatus") or "unknown").strip(),
+        "mobility": str(metadata.get("mobility") or "automatic").strip(),
+        "powerState": str(metadata.get("powerState") or "unknown").strip(),
+        "protectionStatus": str(metadata.get("protectionStatus") or "unknown").strip(),
+        "virtualizationDecision": next((value for value in reversed(impact_notes) if value), ""),
+        "owner": technical_owner or service_owner or str(metadata.get("businessOwner") or "").strip() or custodian or "No owner recorded",
         "source": asset.get("source", "manual"),
         "externalId": asset.get("externalId"),
     }
@@ -74,48 +165,52 @@ def build_impact_snapshot(company_id: str, scope_asset_ids: list[str], assets: l
     if missing:
         raise ValueError("One or more selected configuration items are unavailable in this customer")
 
-    adjacency: dict[str, list[tuple[str, str]]] = {}
+    scope_set = set(unique_scope)
+    adjacency: dict[str, list[tuple[str, str, str, str]]] = {}
     for relationship in relationships:
         edge = _impact_edge(relationship)
         if not edge or edge[0] not in company_assets or edge[1] not in company_assets:
             continue
-        adjacency.setdefault(edge[0], []).append((edge[1], relationship.get("type", "related_to")))
+        impact_policy, impact_note = _virtualization_policy(relationship, company_assets, relationships, scope_set)
+        adjacency.setdefault(edge[0], []).append((edge[1], relationship.get("type", "related_to"), impact_policy, impact_note))
 
-    paths: dict[str, tuple[int, list[str], list[str]]] = {}
-    queue: deque[tuple[str, int, list[str], list[str]]] = deque()
+    paths: dict[str, tuple[int, list[str], list[str], list[str], list[str]]] = {}
+    queue: deque[tuple[str, int, list[str], list[str], list[str], list[str]]] = deque()
     for asset_id in unique_scope:
-        paths[asset_id] = (0, [asset_id], [])
-        queue.append((asset_id, 0, [asset_id], []))
+        paths[asset_id] = (0, [asset_id], [], [], [])
+        queue.append((asset_id, 0, [asset_id], [], [], []))
 
     while queue:
-        current, depth, path, relationship_path = queue.popleft()
-        for target, relationship_type in adjacency.get(current, []):
+        current, depth, path, relationship_path, impact_policy_path, impact_notes = queue.popleft()
+        for target, relationship_type, impact_policy, impact_note in adjacency.get(current, []):
             if target in paths:
                 continue
             next_path = [*path, target]
             next_relationships = [*relationship_path, relationship_type]
-            paths[target] = (depth + 1, next_path, next_relationships)
-            queue.append((target, depth + 1, next_path, next_relationships))
+            next_policies = [*impact_policy_path, impact_policy]
+            next_notes = [*impact_notes, impact_note]
+            paths[target] = (depth + 1, next_path, next_relationships, next_policies, next_notes)
+            queue.append((target, depth + 1, next_path, next_relationships, next_policies, next_notes))
 
     snapshots = []
-    scope_set = set(unique_scope)
-    for asset_id, (depth, path, relationship_path) in paths.items():
+    for asset_id, (depth, path, relationship_path, impact_policy_path, impact_notes) in paths.items():
         role = "Scope" if asset_id in scope_set else "Direct impact" if depth == 1 else "Downstream impact"
-        snapshots.append(_asset_snapshot(company_assets[asset_id], role, depth, path, relationship_path))
+        snapshots.append(_asset_snapshot(company_assets[asset_id], role, depth, path, relationship_path, impact_policy_path, impact_notes))
     return sorted(snapshots, key=lambda item: (item["depth"], item["name"].lower()))
 
 
 def calculate_risk(snapshot: list[dict], outage_expected: bool) -> dict:
     score = 0
     factors: list[str] = []
-    criticalities = {item.get("criticality") for item in snapshot}
+    active_impact = [item for item in snapshot if item.get("role") == "Scope" or item.get("impactSeverity") != "protected"]
+    criticalities = {item.get("criticality") for item in active_impact}
     if "critical" in criticalities:
         score += 4
         factors.append("Critical CI in scope or impact path")
     elif "high" in criticalities:
         score += 2
         factors.append("High-criticality CI in scope or impact path")
-    downstream_count = sum(item.get("role") != "Scope" for item in snapshot)
+    downstream_count = sum(item.get("role") != "Scope" and item.get("impactSeverity") != "protected" for item in snapshot)
     if downstream_count:
         addition = min(4, 1 + downstream_count // 4)
         score += addition
@@ -126,16 +221,53 @@ def calculate_risk(snapshot: list[dict], outage_expected: bool) -> dict:
     if outage_expected:
         score += 2
         factors.append("Service interruption expected")
-    missing_owners = sum(item.get("owner") == "No owner recorded" for item in snapshot)
+    missing_owners = sum(item.get("owner") == "No owner recorded" for item in active_impact)
     if missing_owners:
         score += 2
         factors.append(f"{missing_owners} impacted item(s) have no recorded owner")
+    critical_business_systems = sum(
+        item.get("type") == "Business system" and item.get("criticality") in {"high", "critical"}
+        and item.get("impactSeverity") != "protected"
+        for item in snapshot
+    )
+    if critical_business_systems:
+        score += min(3, critical_business_systems)
+        factors.append(f"{critical_business_systems} high-criticality business system(s) affected")
+    missing_business_owners = sum(
+        item.get("type") == "Business system" and item.get("impactSeverity") != "protected" and not item.get("businessOwner") for item in snapshot
+    )
+    if missing_business_owners:
+        score += 2
+        factors.append(f"{missing_business_owners} business system(s) have no recorded business owner")
+    protected_vms = sum(item.get("type", "").lower() in VIRTUAL_MACHINE_TYPES and item.get("impactSeverity") == "protected" for item in snapshot)
+    if protected_vms:
+        factors.append(f"{protected_vms} virtual machine(s) protected by verified HA capacity")
     level = "critical" if score >= 10 else "high" if score >= 7 else "medium" if score >= 4 else "low"
     return {"score": score, "level": level, "factors": factors or ["No elevated CMDB risk factors detected"]}
 
 
 def impact_summary(snapshot: list[dict], risk: dict) -> dict:
     owners = sorted({item["owner"] for item in snapshot if item["owner"] != "No owner recorded"})
+    business_systems = [
+        {
+            key: item.get(key, "") for key in (
+                "assetId", "name", "criticality", "operationalStatus", "businessOwner",
+                "serviceOwner", "signoffDelegate", "signoffRequired", "department",
+                "userPopulation", "rtoHours", "rpoHours", "impactSeverity",
+            )
+        }
+        for item in snapshot if item.get("type") == "Business system"
+    ]
+    business_owners = sorted({
+        item.get("businessOwner") for item in business_systems if item.get("businessOwner")
+    })
+    virtualization = [
+        {key: item.get(key, "") for key in (
+            "assetId", "name", "role", "impactSeverity", "virtualizationPlatform", "clusterName",
+            "haEnabled", "powerState", "protectionStatus", "virtualizationDecision",
+        )}
+        for item in snapshot if item.get("type", "").lower() in VIRTUAL_MACHINE_TYPES
+    ]
     return {
         "scopeCount": sum(item["role"] == "Scope" for item in snapshot),
         "directCount": sum(item["role"] == "Direct impact" for item in snapshot),
@@ -143,6 +275,14 @@ def impact_summary(snapshot: list[dict], risk: dict) -> dict:
         "criticalCount": sum(item["criticality"] == "critical" for item in snapshot),
         "missingOwnerCount": sum(item["owner"] == "No owner recorded" for item in snapshot),
         "owners": owners,
+        "businessSystemCount": len(business_systems),
+        "businessSystems": business_systems,
+        "businessOwners": business_owners,
+        "missingBusinessOwnerCount": sum(not item.get("businessOwner") for item in business_systems),
+        "virtualizationAssessments": virtualization,
+        "protectedVmCount": sum(item.get("impactSeverity") == "protected" for item in virtualization),
+        "degradedVmCount": sum(item.get("impactSeverity") == "degraded" for item in virtualization),
+        "outageVmCount": sum(item.get("impactSeverity") == "outage" for item in virtualization),
         "suggestedRisk": risk,
     }
 
@@ -339,6 +479,52 @@ def render_change_pdf(change: dict, company: dict, branding: dict) -> bytes:
 
     impact = change.get("impactSnapshot") or []
     impact_summary_value = change.get("impactSummary") or {}
+    business_systems = impact_summary_value.get("businessSystems") or []
+    if business_systems:
+        story.append(Paragraph("Business systems and signoff", styles["Section"]))
+        business_rows = [[Paragraph(value, styles["CellHead"]) for value in (
+            "Business system", "Impact", "Business owner", "Signoff", "Recovery objective",
+        )]]
+        for item in business_systems:
+            signoff = item.get("signoffDelegate") or item.get("businessOwner") or "Owner not recorded"
+            if item.get("signoffRequired") == "no":
+                signoff = "Not required"
+            business_rows.append([
+                Paragraph(f"<b>{_safe(item.get('name'))}</b><br/>{_safe(item.get('department') or 'Department not recorded')}", styles["Cell"]),
+                Paragraph(f"{_safe(_label(item.get('impactSeverity')))}<br/>{_safe(_label(item.get('criticality')))} criticality", styles["Cell"]),
+                Paragraph(_safe(item.get("businessOwner") or "Not recorded"), styles["Cell"]),
+                Paragraph(_safe(signoff), styles["Cell"]),
+                Paragraph(f"RTO {_safe(item.get('rtoHours') or '?')}h<br/>RPO {_safe(item.get('rpoHours') or '?')}h", styles["Cell"]),
+            ])
+        business_table = Table(business_rows, repeatRows=1, colWidths=[43 * mm, 31 * mm, 39 * mm, 39 * mm, 26 * mm])
+        business_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), navy), ("GRID", (0, 0), (-1, -1), 0.35, line),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 2 * mm),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 2 * mm), ("TOPPADDING", (0, 0), (-1, -1), 2 * mm),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2 * mm),
+        ]))
+        story.extend([business_table, Spacer(1, 2 * mm)])
+    virtualization = impact_summary_value.get("virtualizationAssessments") or []
+    if virtualization:
+        story.append(Paragraph("Virtualization resilience", styles["Section"]))
+        virtualization_rows = [[Paragraph(value, styles["CellHead"]) for value in (
+            "Virtual machine", "Impact", "Platform / cluster", "HA decision",
+        )]]
+        for item in virtualization:
+            virtualization_rows.append([
+                Paragraph(f"<b>{_safe(item.get('name'))}</b><br/>{_safe(_label(item.get('powerState')))}", styles["Cell"]),
+                Paragraph(_safe(_label(item.get("impactSeverity"))), styles["Cell"]),
+                Paragraph(f"{_safe(item.get('virtualizationPlatform') or 'Not recorded')}<br/>{_safe(item.get('clusterName') or 'No cluster recorded')}", styles["Cell"]),
+                Paragraph(_safe(item.get("virtualizationDecision") or "No HA decision was required for this path."), styles["Cell"]),
+            ])
+        virtualization_table = Table(virtualization_rows, repeatRows=1, colWidths=[38 * mm, 24 * mm, 42 * mm, 74 * mm])
+        virtualization_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), navy), ("GRID", (0, 0), (-1, -1), 0.35, line),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 2 * mm),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 2 * mm), ("TOPPADDING", (0, 0), (-1, -1), 2 * mm),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2 * mm),
+        ]))
+        story.extend([virtualization_table, Spacer(1, 2 * mm)])
     story.append(Paragraph("CMDB impact snapshot", styles["Section"]))
     metrics = Table([
         [Paragraph(f"<b>{impact_summary_value.get('scopeCount', 0)}</b><br/>Scope", styles["BodySmall"]), Paragraph(f"<b>{impact_summary_value.get('directCount', 0)}</b><br/>Direct", styles["BodySmall"]), Paragraph(f"<b>{impact_summary_value.get('downstreamCount', 0)}</b><br/>Downstream", styles["BodySmall"]), Paragraph(f"<b>{impact_summary_value.get('missingOwnerCount', 0)}</b><br/>Missing owner", styles["BodySmall"])],
@@ -349,7 +535,7 @@ def render_change_pdf(change: dict, company: dict, branding: dict) -> bytes:
     impact_rows = [[Paragraph(value, styles["CellHead"]) for value in ("Impact", "Configuration item", "Type / environment", "Criticality", "Owner / site")]]
     for item in impact:
         impact_rows.append([
-            Paragraph(_safe(item.get("role")), styles["Cell"]),
+            Paragraph(f"{_safe(item.get('role'))}<br/>{_safe(_label(item.get('impactSeverity')))}", styles["Cell"]),
             Paragraph(f"<b>{_safe(item.get('name'))}</b><br/>Depth {item.get('depth', 0)}", styles["Cell"]),
             Paragraph(f"{_safe(item.get('type'))}<br/>{_safe(_label(item.get('environment')))}", styles["Cell"]),
             Paragraph(_safe(_label(item.get("criticality"))), styles["Cell"]),
@@ -396,8 +582,18 @@ def render_change_pdf(change: dict, company: dict, branding: dict) -> bytes:
     story.append(record_table)
 
     story.extend([Spacer(1, 8 * mm), Paragraph("Approval", styles["Section"])])
-    approval = Table([["Approver", "Signature", "Decision", "Date"], [change.get("approver") or "", "", "Approved / Rejected", ""]], colWidths=[50 * mm, 48 * mm, 48 * mm, 32 * mm], rowHeights=[8 * mm, 16 * mm])
-    approval.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), navy), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTNAME", (0, 1), (-1, 1), "Helvetica"), ("FONTSIZE", (0, 0), (-1, -1), 8), ("GRID", (0, 0), (-1, -1), 0.5, line), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 2.5 * mm)]))
+    approval_rows = [["Approver", "Signature", "Decision", "Date"], [change.get("approver") or "Change approver", "", "Approved / Rejected", ""]]
+    recorded_approvers = {str(change.get("approver") or "").strip().lower()}
+    for item in business_systems:
+        if item.get("signoffRequired") == "no":
+            continue
+        approver = str(item.get("signoffDelegate") or item.get("businessOwner") or "Business owner not recorded").strip()
+        if approver.lower() in recorded_approvers:
+            continue
+        recorded_approvers.add(approver.lower())
+        approval_rows.append([approver, "", f"{item.get('name')} signoff", ""])
+    approval = Table(approval_rows, colWidths=[50 * mm, 48 * mm, 48 * mm, 32 * mm], rowHeights=[8 * mm] + [16 * mm] * (len(approval_rows) - 1))
+    approval.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), navy), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTNAME", (0, 1), (-1, -1), "Helvetica"), ("FONTSIZE", (0, 0), (-1, -1), 8), ("GRID", (0, 0), (-1, -1), 0.5, line), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 2.5 * mm)]))
     story.append(approval)
 
     document.build(story, onFirstPage=footer, onLaterPages=footer)

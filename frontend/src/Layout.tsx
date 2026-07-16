@@ -7,6 +7,7 @@ import ManageAccountsOutlined from '@mui/icons-material/ManageAccountsOutlined';
 import PaletteOutlined from '@mui/icons-material/PaletteOutlined';
 import SecurityOutlined from '@mui/icons-material/SecurityOutlined';
 import StorageOutlined from '@mui/icons-material/StorageOutlined';
+import BusinessCenterOutlined from '@mui/icons-material/BusinessCenterOutlined';
 import { Box, FormControl, MenuItem, Select, Stack, Typography } from '@mui/material';
 import { AppBar, Layout, Menu, useRefresh, type LayoutProps } from 'react-admin';
 import { useWorkspace } from './workspace';
@@ -43,6 +44,7 @@ function WorkspaceMenu() {
     <Menu.DashboardItem />
     {!workspace.isRoot && <>
       {section('CMDB')}
+      <Menu.Item to="/business-systems" primaryText="Business systems" leftIcon={<BusinessCenterOutlined />} />
       <Menu.ResourceItem name="assets" />
       <Menu.Item to="/relationships" primaryText="Relationships" leftIcon={<AccountTreeOutlined />} />
       <Menu.Item to="/changes" primaryText="Change control" leftIcon={<AssignmentOutlined />} />

@@ -3,4 +3,7 @@ services:
   api:
     project: .
     host: containerapp
-    language: js
+    language: docker
+    docker:
+      path: ./Dockerfile
+      context: .

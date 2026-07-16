@@ -28,6 +28,39 @@ export type AssetMetadata = {
   renewalDate: string;
   endOfLifeDate: string;
   reviewDate: string;
+  businessOwner: string;
+  signoffDelegate: string;
+  department: string;
+  userPopulation: string;
+  rtoHours: string;
+  rpoHours: string;
+  supportHours: string;
+  dataClassification: string;
+  customerFacing: string;
+  signoffRequired: string;
+  aliases: string;
+  businessDescription: string;
+  virtualizationPlatform: string;
+  clusterName: string;
+  haEnabled: string;
+  minimumHosts: string;
+  capacityStatus: string;
+  mobility: string;
+  powerState: string;
+  guestOs: string;
+  cpuCount: string;
+  memoryGb: string;
+  storageGb: string;
+  maintenanceMode: string;
+  protectionStatus: string;
+  displayLayer: string;
+  networkZone: string;
+  vlanId: string;
+  subnet: string;
+  ipAddress: string;
+  networkRole: string;
+  redundancyGroup: string;
+  redundancyRole: string;
 };
 
 export type Asset = {
@@ -48,6 +81,7 @@ export type Relationship = {
   fromId: string;
   toId: string;
   type: string;
+  impactPolicy: 'required' | 'degraded' | 'redundant' | 'informational';
 };
 
 export type AccessGroup = {
@@ -94,6 +128,9 @@ export type ChangeImpactItem = {
   depth: number;
   pathAssetIds: string[];
   relationshipPath: string[];
+  impactPolicyPath: string[];
+  impactSeverity: 'scope' | 'outage' | 'degraded' | 'protected';
+  impactNotes: string[];
   criticality: string;
   environment: string;
   site: string;
@@ -102,6 +139,21 @@ export type ChangeImpactItem = {
   serviceOwner: string;
   technicalOwner: string;
   custodian: string;
+  businessOwner: string;
+  signoffDelegate: string;
+  signoffRequired: string;
+  department: string;
+  userPopulation: string;
+  rtoHours: string;
+  rpoHours: string;
+  virtualizationPlatform: string;
+  clusterName: string;
+  haEnabled: string;
+  capacityStatus: string;
+  mobility: string;
+  powerState: string;
+  protectionStatus: string;
+  virtualizationDecision: string;
   owner: string;
   source: string;
   externalId?: string | null;
@@ -116,6 +168,14 @@ export type ChangeImpactPreview = {
     criticalCount: number;
     missingOwnerCount: number;
     owners: string[];
+    businessSystemCount: number;
+    businessSystems: Array<Pick<ChangeImpactItem, 'assetId' | 'name' | 'criticality' | 'operationalStatus' | 'businessOwner' | 'serviceOwner' | 'signoffDelegate' | 'signoffRequired' | 'department' | 'userPopulation' | 'rtoHours' | 'rpoHours' | 'impactSeverity'>>;
+    businessOwners: string[];
+    missingBusinessOwnerCount: number;
+    virtualizationAssessments: Array<Pick<ChangeImpactItem, 'assetId' | 'name' | 'role' | 'impactSeverity' | 'virtualizationPlatform' | 'clusterName' | 'haEnabled' | 'powerState' | 'protectionStatus' | 'virtualizationDecision'>>;
+    protectedVmCount: number;
+    degradedVmCount: number;
+    outageVmCount: number;
     suggestedRisk: { score: number; level: string; factors: string[] };
   };
 };

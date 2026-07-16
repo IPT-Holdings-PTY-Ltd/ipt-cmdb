@@ -1,4 +1,7 @@
 import unittest
+import base64
+import json
+import os
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -14,6 +17,8 @@ api = backend_main.api
 class FastApiMigrationTests(unittest.TestCase):
     def setUp(self):
         self.original_db = core.DB
+        self.original_database_mode = core.DATABASE_MODE
+        core.DATABASE_MODE = "local development state"
         core.DB = {
             "companies": [
                 {"id": "acme", "name": "Acme Manufacturing", "externalIds": {}},
@@ -48,6 +53,7 @@ class FastApiMigrationTests(unittest.TestCase):
         self.save_patcher.stop()
         backend_main.REPOSITORY = self.original_repository
         core.DB = self.original_db
+        core.DATABASE_MODE = self.original_database_mode
         core.SESSIONS.clear()
 
     def _login(self, email: str) -> str:
@@ -68,10 +74,27 @@ class FastApiMigrationTests(unittest.TestCase):
             "/api/integrations",
             "/api/changes",
             "/api/changes/{change_id}/pdf",
+            "/api/dashboard",
             "/api/database/restore/preview",
         }
         self.assertTrue(expected.issubset(paths))
         self.assertNotIn("/api/{path:path}", paths)
+
+    def test_dashboard_is_role_and_customer_scoped(self):
+        client_token = self._login("client@acme.example")
+        client_headers = {"Authorization": f"Bearer {client_token}"}
+        root_forbidden = self.client.get("/api/dashboard", headers=client_headers)
+        self.assertEqual(root_forbidden.status_code, 403)
+        customer = self.client.get("/api/dashboard?companyId=acme", headers=client_headers)
+        self.assertEqual(customer.status_code, 200)
+        self.assertEqual(customer.json()["scope"], "customer")
+        self.assertEqual(customer.json()["summary"]["assets"], 1)
+
+        admin_token = self._login("admin@example.com")
+        root = self.client.get("/api/dashboard", headers={"Authorization": f"Bearer {admin_token}"})
+        self.assertEqual(root.status_code, 200)
+        self.assertEqual(root.json()["scope"], "msp")
+        self.assertEqual(root.json()["summary"]["customers"], 2)
 
     def test_openapi_identifies_the_direct_fastapi_surface(self):
         schema = api.openapi()
@@ -80,6 +103,37 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertIn("/api/assets", schema["paths"])
         self.assertIn("/api/relationships", schema["paths"])
         self.assertIn("/api/changes/{change_id}/pdf", schema["paths"])
+
+    def test_easy_auth_is_container_configured_and_does_not_fall_back_to_passwords(self):
+        claims = {
+            "claims": [
+                {"typ": "preferred_username", "val": "admin@example.com"},
+            ]
+        }
+        principal = base64.b64encode(json.dumps(claims).encode("utf-8")).decode("ascii")
+        with patch.dict(os.environ, {"AUTH_MODE": "easy_auth", "ALLOW_LOCAL_BREAK_GLASS": "false"}):
+            config = self.client.get("/api/auth/config")
+            self.assertEqual(config.status_code, 200)
+            self.assertTrue(config.json()["external"])
+            self.assertFalse(config.json()["localLoginEnabled"])
+            me = self.client.get("/api/me", headers={"x-ms-client-principal": principal})
+            self.assertEqual(me.status_code, 200)
+            self.assertEqual(me.json()["email"], "admin@example.com")
+            local = self.client.post("/api/login", json={"email": "admin@example.com", "password": "ChangeMe!"})
+            self.assertEqual(local.status_code, 403)
+
+    def test_easy_auth_principal_name_header_is_configurable(self):
+        with patch.dict(
+            os.environ,
+            {
+                "AUTH_MODE": "easy_auth",
+                "ALLOW_LOCAL_BREAK_GLASS": "false",
+                "ENTRA_PRINCIPAL_NAME_HEADER": "x-authenticated-email",
+            },
+        ):
+            response = self.client.get("/api/me", headers={"x-authenticated-email": "admin@example.com"})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["role"], "platform_admin")
 
     def test_portable_backup_can_be_previewed_before_import(self):
         token = self._login("admin@example.com")
@@ -116,6 +170,37 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(updated.status_code, 200)
         self.assertEqual(updated.json()["name"], "IPT CMDB")
         self.assertEqual(core.DB["mspBranding"]["confidentialityLabel"], "Customer confidential")
+
+    def test_customer_branding_uses_repository_and_respects_customer_scope(self):
+        admin = self._login("admin@example.com")
+        headers = {"Authorization": f"Bearer {admin}"}
+        updated = self.client.put(
+            "/api/branding",
+            headers=headers,
+            json={
+                "scope": "customer",
+                "companyId": "acme",
+                "name": "Acme Portal",
+                "logoText": "AC",
+                "accent": "#123456",
+                "secondaryAccent": "#654321",
+            },
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["secondaryAccent"], "#654321")
+
+        client = self._login("client@acme.example")
+        visible = self.client.get(
+            "/api/branding?companyId=acme",
+            headers={"Authorization": f"Bearer {client}"},
+        )
+        self.assertEqual(visible.status_code, 200)
+        self.assertEqual(visible.json()["name"], "Acme Portal")
+        blocked = self.client.get(
+            "/api/branding?companyId=northwind",
+            headers={"Authorization": f"Bearer {client}"},
+        )
+        self.assertEqual(blocked.status_code, 403)
 
     def test_customer_asset_list_is_tenant_scoped(self):
         token = self._login("client@acme.example")
@@ -160,6 +245,7 @@ class FastApiMigrationTests(unittest.TestCase):
             json={"fromId": "asset-3", "toId": "asset-1", "type": "depends_on"},
         )
         self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.json()["impactPolicy"], "required")
         deleted = self.client.delete(f"/api/relationships/{created.json()['id']}", headers=headers)
         self.assertEqual(deleted.status_code, 200)
         self.assertEqual(deleted.json()["deletedId"], created.json()["id"])
