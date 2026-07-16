@@ -4,6 +4,16 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ## [Unreleased]
 
+### Added
+
+- Governance navigation with MSP- and customer-scoped Audit Center and Reports Center.
+- Append-only audit v2 schema with actor attribution, source, outcome, severity, sanitised field changes and request correlation.
+- Authentication, authorization-denial, portable-export, recovery and report-download audit coverage.
+- Configuration-item activity timelines.
+- Asset, lifecycle, ownership, business-system, change, audit, access-review and integration-health report templates.
+- Branded PDF, filterable XLSX and UTF-8 CSV report downloads.
+- Blank-database and forward-upgrade coverage for schema `2026.07.16.1`.
+
 ### Planned
 
 - Read-only ConnectWise customer and configuration ingestion with mapping review.

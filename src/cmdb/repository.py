@@ -16,6 +16,14 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from src.cmdb.audit import (
+    current_audit_context,
+    entity_name,
+    event_category,
+    field_changes,
+    sanitize_audit_value,
+)
+
 
 CMDB_NAMESPACE = uuid.UUID("a12d44c4-64a7-4d6f-b829-3a8b691f0fa4")
 PROVIDER_TO_DB = {
@@ -533,6 +541,80 @@ class StateRepository:
     def list_sync_runs(self) -> list[dict]:
         return deepcopy(self.state.get("syncRuns", []))
 
+    def list_audit_events(
+        self,
+        company_id: str | None = None,
+        *,
+        actor_id: str | None = None,
+        category: str | None = None,
+        action: str | None = None,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        outcome: str | None = None,
+        search: str | None = None,
+        limit: int = 250,
+    ) -> list[dict]:
+        users = {item["id"]: item for item in self.state.get("users", [])}
+        records = []
+        for raw in self.state.get("auditEvents", []):
+            event = deepcopy(raw)
+            event.setdefault("actorUserId", event.get("actorId"))
+            event.setdefault("actorLabel", (users.get(event.get("actorUserId")) or {}).get("email", "System"))
+            event.setdefault("actorType", "user" if event.get("actorUserId") else "system")
+            event.setdefault("sourceSystem", "web")
+            event.setdefault("category", event_category(event.get("entityType", "data"), event.get("action", "viewed")))
+            event.setdefault("outcome", "success")
+            event.setdefault("severity", "informational")
+            event.setdefault("requestId", "")
+            event.setdefault("correlationId", event.get("requestId", ""))
+            event.setdefault("entityName", entity_name(event.get("before"), event.get("after"), event.get("entityId", "")))
+            event.setdefault("changes", field_changes(event.get("before"), event.get("after")))
+            event.setdefault("metadata", {})
+            haystack = " ".join(str(event.get(key, "")) for key in ("actorLabel", "entityName", "entityType", "action", "correlationId")).casefold()
+            if company_id is not None and event.get("companyId") != company_id:
+                continue
+            if actor_id and event.get("actorUserId") != actor_id:
+                continue
+            if category and event.get("category") != category:
+                continue
+            if action and event.get("action") != action:
+                continue
+            if entity_type and event.get("entityType") != entity_type:
+                continue
+            if entity_id and event.get("entityId") != entity_id:
+                continue
+            if outcome and event.get("outcome") != outcome:
+                continue
+            if search and search.casefold() not in haystack:
+                continue
+            records.append(event)
+        return sorted(records, key=lambda item: item.get("createdAt", ""), reverse=True)[:max(1, min(limit, 1000))]
+
+    def record_audit_event(
+        self,
+        company_id: str | None,
+        actor_id: str | None,
+        entity_type: str,
+        entity_id: str,
+        action: str,
+        *,
+        before: dict | None = None,
+        after: dict | None = None,
+        outcome: str = "success",
+        severity: str = "informational",
+        reason: str = "",
+        metadata: dict | None = None,
+        actor_type: str = "user",
+        source_system: str | None = None,
+    ) -> dict:
+        self._audit(
+            company_id, actor_id, entity_type, entity_id, action, before, after,
+            outcome=outcome, severity=severity, reason=reason, metadata=metadata,
+            actor_type=actor_type, source_system=source_system,
+        )
+        self.save_state(self.state)
+        return deepcopy(self.state["auditEvents"][0])
+
     def record_sync_run(
         self,
         kind: str,
@@ -608,20 +690,48 @@ class StateRepository:
         action: str,
         before: dict | None,
         after: dict | None,
+        *,
+        outcome: str = "success",
+        severity: str = "informational",
+        reason: str = "",
+        metadata: dict | None = None,
+        actor_type: str = "user",
+        source_system: str | None = None,
     ) -> None:
+        context = current_audit_context()
+        safe_before = sanitize_audit_value(deepcopy(before)) if before is not None else None
+        safe_after = sanitize_audit_value(deepcopy(after)) if after is not None else None
+        actor = next((item for item in self.state.get("users", []) if item.get("id") == actor_id), None)
+        event = {
+            "id": str(uuid.uuid4()),
+            "companyId": company_id,
+            "actorUserId": actor_id,
+            "actorLabel": actor.get("email") if actor else ("System" if not actor_id else actor_id),
+            "actorType": actor_type if actor_id else "system",
+            "sourceSystem": source_system or context.source_system,
+            "category": event_category(entity_type, action),
+            "entityType": entity_type,
+            "entityId": entity_id,
+            "entityName": entity_name(before, after, entity_id),
+            "action": action,
+            "outcome": outcome,
+            "severity": severity,
+            "requestId": context.request_id,
+            "correlationId": context.correlation_id or context.request_id,
+            "before": safe_before,
+            "after": safe_after,
+            "changes": field_changes(before, after),
+            "reason": reason[:1000],
+            "metadata": sanitize_audit_value({
+                **(metadata or {}),
+                "clientAddress": context.client_address,
+                "userAgent": context.user_agent,
+            }),
+            "createdAt": utc_now(),
+        }
         self.state["auditEvents"] = [
-            {
-                "id": str(uuid.uuid4()),
-                "companyId": company_id,
-                "actorId": actor_id,
-                "entityType": entity_type,
-                "entityId": entity_id,
-                "action": action,
-                "before": deepcopy(before),
-                "after": deepcopy(after),
-                "createdAt": utc_now(),
-            },
-            *self.state["auditEvents"][:999],
+            event,
+            *self.state["auditEvents"][:9999],
         ]
 
 
@@ -1798,6 +1908,98 @@ class PostgresCmdbRepository(StateRepository):
                 impact["assetId"] = mapping.get(impact.get("assetId"), impact.get("assetId"))
                 impact["pathAssetIds"] = [mapping.get(item, item) for item in impact.get("pathAssetIds", [])]
 
+    def list_audit_events(
+        self,
+        company_id: str | None = None,
+        *,
+        actor_id: str | None = None,
+        category: str | None = None,
+        action: str | None = None,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        outcome: str | None = None,
+        search: str | None = None,
+        limit: int = 250,
+    ) -> list[dict]:
+        clauses = ["(%s::text IS NULL OR c.slug = %s::text)"]
+        parameters: list[Any] = [company_id, company_id]
+        optional = [
+            (actor_id, "ae.actor_user_id = %s::uuid"),
+            (category, "ae.event_category = %s"),
+            (action, "ae.action = %s"),
+            (entity_type, "ae.entity_type = %s"),
+            (entity_id, "ae.entity_id = %s::uuid"),
+            (outcome, "ae.outcome = %s"),
+        ]
+        for value, clause in optional:
+            if value:
+                try:
+                    parameters.append(str(uuid.UUID(value))) if "::uuid" in clause else parameters.append(value)
+                except (ValueError, TypeError):
+                    return []
+                clauses.append(clause)
+        if search:
+            clauses.append("concat_ws(' ', ae.actor_label, ae.entity_name, ae.entity_type, ae.action, ae.correlation_id) ILIKE %s")
+            parameters.append(f"%{search[:200]}%")
+        parameters.append(max(1, min(limit, 1000)))
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT ae.id, c.slug, ae.actor_user_id, ae.actor_label, ae.actor_type,
+                       ae.source_system, ae.event_category, ae.entity_type, ae.entity_id,
+                       ae.entity_name, ae.action, ae.outcome, ae.severity, ae.request_id,
+                       ae.correlation_id, ae.before_value, ae.after_value, ae.changes,
+                       ae.reason, ae.metadata, ae.created_at
+                FROM audit_events ae
+                LEFT JOIN companies c ON c.id = ae.company_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY ae.created_at DESC, ae.id DESC
+                LIMIT %s
+                """,
+                tuple(parameters),
+            )
+            return [
+                {
+                    "id": str(row[0]), "companyId": row[1],
+                    "actorUserId": str(row[2]) if row[2] else None,
+                    "actorLabel": row[3] or "System", "actorType": row[4],
+                    "sourceSystem": row[5], "category": row[6],
+                    "entityType": row[7], "entityId": str(row[8]) if row[8] else None,
+                    "entityName": row[9] or "", "action": row[10],
+                    "outcome": row[11], "severity": row[12], "requestId": row[13] or "",
+                    "correlationId": row[14] or "", "before": row[15], "after": row[16],
+                    "changes": row[17] or [], "reason": row[18] or "",
+                    "metadata": row[19] or {}, "createdAt": self._timestamp(row[20]),
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def record_audit_event(
+        self,
+        company_id: str | None,
+        actor_id: str | None,
+        entity_type: str,
+        entity_id: str,
+        action: str,
+        *,
+        before: dict | None = None,
+        after: dict | None = None,
+        outcome: str = "success",
+        severity: str = "informational",
+        reason: str = "",
+        metadata: dict | None = None,
+        actor_type: str = "user",
+        source_system: str | None = None,
+    ) -> dict:
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            event_id = self._insert_audit(
+                cursor, company_id, actor_id, entity_type, entity_id, action, before, after,
+                outcome=outcome, severity=severity, reason=reason, metadata=metadata,
+                actor_type=actor_type, source_system=source_system,
+            )
+        records = self.list_audit_events(entity_id=canonical_uuid(entity_type, entity_id), limit=10)
+        return next((item for item in records if item["id"] == event_id), records[0] if records else {})
+
     def _insert_audit(
         self,
         cursor: Any,
@@ -1808,28 +2010,63 @@ class PostgresCmdbRepository(StateRepository):
         action: str,
         before: dict | None,
         after: dict | None,
-    ) -> None:
+        *,
+        outcome: str = "success",
+        severity: str = "informational",
+        reason: str = "",
+        metadata: dict | None = None,
+        actor_type: str = "user",
+        source_system: str | None = None,
+    ) -> str:
         company_uuid = None
         if company_slug:
             cursor.execute("SELECT id FROM companies WHERE slug = %s", (company_slug,))
             row = cursor.fetchone()
             company_uuid = str(row[0]) if row else None
-        after_value = deepcopy(after) if after else None
-        if after_value is not None and actor_id:
-            after_value["actorApiId"] = actor_id
+        actor_uuid = None
+        actor_label = "System"
+        if actor_id:
+            try:
+                actor_uuid = str(uuid.UUID(actor_id))
+            except (ValueError, TypeError):
+                cursor.execute("SELECT id FROM users WHERE attributes->>'legacyId' = %s LIMIT 1", (actor_id,))
+                actor_row = cursor.fetchone()
+                actor_uuid = str(actor_row[0]) if actor_row else None
+            if actor_uuid:
+                cursor.execute("SELECT email::text FROM users WHERE id = %s::uuid", (actor_uuid,))
+                actor_row = cursor.fetchone()
+                actor_label = actor_row[0] if actor_row else actor_id
+        context = current_audit_context()
+        safe_before = sanitize_audit_value(deepcopy(before)) if before is not None else None
+        safe_after = sanitize_audit_value(deepcopy(after)) if after is not None else None
+        event_id = str(uuid.uuid4())
+        entity_uuid = canonical_uuid(entity_type, entity_id)
+        safe_metadata = sanitize_audit_value({
+            **(metadata or {}),
+            "clientAddress": context.client_address,
+            "userAgent": context.user_agent,
+        })
         cursor.execute(
             """
             INSERT INTO audit_events (
-                company_id, actor_user_id, entity_type, entity_id, action,
-                before_value, after_value
-            ) VALUES (%s::uuid, NULL, %s, %s::uuid, %s, %s::jsonb, %s::jsonb)
+                id, company_id, actor_user_id, actor_type, actor_label, source_system,
+                event_category, entity_type, entity_id, entity_name, action, outcome,
+                severity, request_id, correlation_id, before_value, after_value,
+                changes, reason, metadata
+            ) VALUES (
+                %s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s::uuid, %s,
+                %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb
+            )
             """,
             (
-                company_uuid,
-                entity_type,
-                entity_id,
-                action,
-                json.dumps(before) if before is not None else None,
-                json.dumps(after_value) if after_value is not None else None,
+                event_id, company_uuid, actor_uuid, actor_type if actor_uuid else "system", actor_label,
+                source_system or context.source_system, event_category(entity_type, action), entity_type,
+                entity_uuid, entity_name(before, after, entity_id), action, outcome, severity,
+                context.request_id or None, context.correlation_id or context.request_id or None,
+                json.dumps(safe_before) if safe_before is not None else None,
+                json.dumps(safe_after) if safe_after is not None else None,
+                json.dumps(field_changes(before, after)), reason[:1000] or None,
+                json.dumps(safe_metadata),
             ),
         )
+        return event_id

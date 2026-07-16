@@ -71,5 +71,22 @@ body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradie
 .dashboard-system-card { height: 100%; min-height: 178px; padding: 16px; background: linear-gradient(140deg, #17243a, #111b2e) !important; }
 .dashboard-attention-row { min-height: 78px; padding: 10px 0; }
 .dashboard-divider { height: 1px; background: #263956; }
+.governance-page { width: 100%; padding-bottom: 28px; }
+.governance-heading-icon { display: grid; place-items: center; flex: none; width: 52px; height: 52px; margin-top: 4px; border-radius: 13px; color: #07131d; background: linear-gradient(135deg, #50d5b9, #7997ff); box-shadow: 0 12px 26px #0005; }
+.governance-heading-icon .MuiSvgIcon-root { font-size: 28px; }
+.governance-filter { display: grid; grid-template-columns: minmax(220px, 1.4fr) repeat(4, minmax(145px, 1fr)) auto; gap: 10px; align-items: center; padding: 12px; margin-bottom: 15px; background: #101a2d !important; }
+.governance-loading { min-height: 320px; display: grid; place-content: center; justify-items: center; gap: 14px; }
+.governance-table { overflow: hidden; background: #0f192b !important; }
+.governance-table .MuiTable-root { min-width: 920px; }
+.governance-table .MuiTableCell-head { color: #aebbd0; font-size: .7rem; font-weight: 850; letter-spacing: .05em; text-transform: uppercase; background: #111c2f; }
+.governance-table .MuiTableCell-root { border-color: #263956; vertical-align: top; }
+.audit-value { max-width: 330px; max-height: 190px; margin: 0; overflow: auto; white-space: pre-wrap; color: #c9d5e8; font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.audit-metadata { max-height: 260px; margin: 0; padding: 14px; overflow: auto; border: 1px solid #2b3d5d; border-radius: 9px; color: #c9d5e8; background: #091321; font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.audit-timeline { padding: 18px; background: linear-gradient(145deg, #132139, #101a2c) !important; }
+.audit-timeline-row { padding: 11px 0; border-top: 1px solid #263956; }
+.report-catalog { position: sticky; top: 78px; padding: 17px; }
+.report-catalog .MuiButton-root { width: 100%; }
+.report-heading { padding: 18px; background: linear-gradient(135deg, #14253e, #111b2e) !important; }
 @media (max-width: 1250px) { .asset-filter-toolbar { grid-template-columns: repeat(3, minmax(180px, 1fr)); } }
-@media (max-width: 900px) { .relationship-canvas { height: 680px; } .relationship-toolbar .MuiTextField-root { flex-basis: 100%; } .asset-filter-toolbar { grid-template-columns: 1fr; } }
+@media (max-width: 1100px) { .governance-filter { grid-template-columns: repeat(3, minmax(170px, 1fr)); } }
+@media (max-width: 900px) { .relationship-canvas { height: 680px; } .relationship-toolbar .MuiTextField-root { flex-basis: 100%; } .asset-filter-toolbar,.governance-filter { grid-template-columns: 1fr; } .report-catalog { position: static; } }

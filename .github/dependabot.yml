@@ -8,6 +8,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      vite-toolchain:
+        patterns:
+          - "vite"
+          - "@vitejs/*"
   - package-ecosystem: github-actions
     directory: /
     schedule:
