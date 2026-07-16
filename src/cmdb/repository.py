@@ -119,6 +119,9 @@ class StateRepository:
         self.state = state
         self.save_state = save_state
         self.state.setdefault("auditEvents", [])
+        self.state.setdefault("dataQualityExceptions", [])
+        self.state.setdefault("reconciliationCandidates", [])
+        self.state.setdefault("fieldAuthority", [])
 
     def list_companies(self) -> list[dict]:
         return deepcopy(self.state["companies"])
@@ -223,6 +226,79 @@ class StateRepository:
             return False
         self.state["relationships"] = [item for item in self.state["relationships"] if item["id"] != relationship_id]
         self._audit(company_id, actor_id, "relationship", relationship_id, "retired", relationship, None)
+        self.save_state(self.state)
+        return True
+
+    def list_data_quality_exceptions(self, company_id: str | None = None) -> list[dict]:
+        return deepcopy([
+            item for item in self.state.get("dataQualityExceptions", [])
+            if company_id is None or item.get("companyId") == company_id
+        ])
+
+    def create_data_quality_exception(self, exception: dict, actor_id: str | None = None) -> dict:
+        stored = {**deepcopy(exception), "id": canonical_uuid("data_quality_exception", exception["id"]), "state": "active", "createdAt": utc_now()}
+        existing = next((item for item in self.state["dataQualityExceptions"] if item.get("companyId") == stored["companyId"] and item.get("ruleKey") == stored["ruleKey"] and item.get("entityId") == stored["entityId"] and item.get("state") == "active"), None)
+        if existing:
+            before = deepcopy(existing)
+            existing.update(stored)
+            stored = existing
+            action = "updated"
+        else:
+            self.state["dataQualityExceptions"].append(stored)
+            before = None
+            action = "created"
+        self._audit(stored["companyId"], actor_id, "data_quality_exception", stored["id"], action, before, stored, reason=stored.get("reason", ""))
+        self.save_state(self.state)
+        return deepcopy(stored)
+
+    def resolve_data_quality_exception(self, exception_id: str, actor_id: str | None = None) -> dict | None:
+        item = next((value for value in self.state.get("dataQualityExceptions", []) if value["id"] == exception_id), None)
+        if not item:
+            return None
+        before = deepcopy(item)
+        item.update(state="resolved", resolvedAt=utc_now(), resolvedBy=actor_id)
+        self._audit(item["companyId"], actor_id, "data_quality_exception", item["id"], "resolved", before, item)
+        self.save_state(self.state)
+        return deepcopy(item)
+
+    def list_reconciliation_candidates(self, company_id: str | None = None, state: str | None = None) -> list[dict]:
+        return deepcopy([
+            item for item in self.state.get("reconciliationCandidates", [])
+            if (company_id is None or item.get("companyId") == company_id) and (not state or item.get("state", "pending") == state)
+        ])
+
+    def resolve_reconciliation_candidate(self, candidate_id: str, decision: str, notes: str, target_ci_id: str | None, actor_id: str | None = None) -> dict | None:
+        item = next((value for value in self.state.get("reconciliationCandidates", []) if value["id"] == candidate_id), None)
+        if not item:
+            return None
+        before = deepcopy(item)
+        item.update(state="approved" if decision in {"use_existing", "create_new"} else "rejected", decision=decision, decisionNotes=notes, targetAssetId=target_ci_id, reviewedBy=actor_id, reviewedAt=utc_now())
+        self._audit(item.get("companyId"), actor_id, "reconciliation_candidate", item["id"], "decision_recorded", before, item, reason=notes)
+        self.save_state(self.state)
+        return deepcopy(item)
+
+    def list_field_authority(self, company_id: str | None = None) -> list[dict]:
+        return deepcopy([item for item in self.state.get("fieldAuthority", []) if company_id is None or item.get("companyId") == company_id])
+
+    def upsert_field_authority(self, rule: dict, actor_id: str | None = None) -> dict:
+        existing = next((item for item in self.state["fieldAuthority"] if all(item.get(key) == rule.get(key) for key in ("companyId", "ciType", "fieldName", "provider"))), None)
+        before = deepcopy(existing) if existing else None
+        if existing:
+            existing.update(deepcopy(rule)); stored = existing
+        else:
+            stored = deepcopy(rule); self.state["fieldAuthority"].append(stored)
+        rule_id = canonical_uuid("field_authority", f'{rule["companyId"]}:{rule["ciType"]}:{rule["fieldName"]}:{rule["provider"]}')
+        self._audit(rule["companyId"], actor_id, "field_authority", rule_id, "updated" if before else "created", before, stored)
+        self.save_state(self.state)
+        return deepcopy(stored)
+
+    def delete_field_authority(self, company_id: str, ci_type: str, field_name: str, provider: str, actor_id: str | None = None) -> bool:
+        existing = next((item for item in self.state["fieldAuthority"] if item.get("companyId") == company_id and item.get("ciType") == ci_type and item.get("fieldName") == field_name and item.get("provider") == provider), None)
+        if not existing:
+            return False
+        self.state["fieldAuthority"].remove(existing)
+        rule_id = canonical_uuid("field_authority", f"{company_id}:{ci_type}:{field_name}:{provider}")
+        self._audit(company_id, actor_id, "field_authority", rule_id, "deleted", existing, None)
         self.save_state(self.state)
         return True
 
@@ -1552,6 +1628,141 @@ class PostgresCmdbRepository(StateRepository):
             self._insert_audit(cursor, company_id, actor_id, "relationship", relationship_id, "retired", relationship, None)
         self._refresh_state_mirror()
         self.save_state(self.state)
+        return True
+
+    def list_data_quality_exceptions(self, company_id: str | None = None) -> list[dict]:
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT d.id, c.slug, d.rule_key, d.entity_type, d.entity_id, d.reason,
+                       d.state, d.expires_at, d.created_by, d.created_at, d.resolved_by, d.resolved_at
+                FROM data_quality_exceptions d JOIN companies c ON c.id = d.company_id
+                WHERE (%s::text IS NULL OR c.slug = %s) ORDER BY d.created_at DESC
+                """, (company_id, company_id),
+            )
+            return [{"id": str(r[0]), "companyId": r[1], "ruleKey": r[2], "entityType": r[3],
+                     "entityId": str(r[4]), "reason": r[5], "state": r[6],
+                     "expiresAt": self._timestamp(r[7]) or None, "createdBy": str(r[8]) if r[8] else None,
+                     "createdAt": self._timestamp(r[9]), "resolvedBy": str(r[10]) if r[10] else None,
+                     "resolvedAt": self._timestamp(r[11]) or None} for r in cursor.fetchall()]
+
+    def create_data_quality_exception(self, exception: dict, actor_id: str | None = None) -> dict:
+        exception_uuid = canonical_uuid("data_quality_exception", exception["id"])
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT id FROM companies WHERE slug = %s", (exception["companyId"],))
+            company_row = cursor.fetchone()
+            if not company_row:
+                raise ValueError("Customer not found")
+            cursor.execute(
+                """INSERT INTO data_quality_exceptions
+                       (id, company_id, rule_key, entity_type, entity_id, reason, state, expires_at, created_by)
+                   VALUES (%s::uuid, %s::uuid, %s, %s, %s::uuid, %s, 'active', %s::timestamptz, %s::uuid)
+                   ON CONFLICT (company_id, rule_key, entity_type, entity_id) WHERE state = 'active'
+                   DO UPDATE SET reason = EXCLUDED.reason, expires_at = EXCLUDED.expires_at,
+                                 created_by = EXCLUDED.created_by, created_at = now()
+                   RETURNING id""",
+                (exception_uuid, str(company_row[0]), exception["ruleKey"], exception.get("entityType", "configuration_item"),
+                 exception["entityId"], exception["reason"], exception.get("expiresAt") or None, actor_id),
+            )
+            stored_id = str(cursor.fetchone()[0])
+            stored = {**exception, "id": stored_id, "state": "active"}
+            self._insert_audit(cursor, exception["companyId"], actor_id, "data_quality_exception", stored_id, "created", None, stored, reason=exception["reason"])
+        return next(item for item in self.list_data_quality_exceptions(exception["companyId"]) if item["id"] == stored_id)
+
+    def resolve_data_quality_exception(self, exception_id: str, actor_id: str | None = None) -> dict | None:
+        before = next((item for item in self.list_data_quality_exceptions() if item["id"] == exception_id), None)
+        if not before:
+            return None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute("UPDATE data_quality_exceptions SET state = 'resolved', resolved_by = %s::uuid, resolved_at = now() WHERE id = %s::uuid AND state = 'active'", (actor_id, exception_id))
+            if not cursor.rowcount:
+                return None
+            after = {**before, "state": "resolved", "resolvedBy": actor_id, "resolvedAt": utc_now()}
+            self._insert_audit(cursor, before["companyId"], actor_id, "data_quality_exception", exception_id, "resolved", before, after)
+        return next((item for item in self.list_data_quality_exceptions(before["companyId"]) if item["id"] == exception_id), after)
+
+    def list_reconciliation_candidates(self, company_id: str | None = None, state: str | None = None) -> list[dict]:
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT rc.id, c.slug, ic.provider, e.external_object_type, e.external_id, e.external_name,
+                          rc.candidate_ci_id, ci.display_name, rc.reason, rc.confidence, rc.state,
+                          rc.external_record, rc.conflict_details, rc.decision, rc.decision_notes,
+                          rc.target_ci_id, target.display_name, rc.created_at, rc.reviewed_by, rc.reviewed_at
+                   FROM reconciliation_candidates rc
+                   JOIN sync_runs sr ON sr.id = rc.sync_run_id
+                   JOIN integration_connections ic ON ic.id = sr.integration_connection_id
+                   LEFT JOIN external_object_mappings e ON e.id = rc.mapping_id
+                   LEFT JOIN configuration_items ci ON ci.id = rc.candidate_ci_id
+                   LEFT JOIN configuration_items target ON target.id = rc.target_ci_id
+                   LEFT JOIN companies c ON c.id = COALESCE(rc.company_id, ci.company_id, target.company_id, ic.company_id)
+                   WHERE (%s::text IS NULL OR c.slug = %s) AND (%s::text IS NULL OR rc.state = %s)
+                   ORDER BY rc.created_at DESC, rc.confidence DESC""",
+                (company_id, company_id, state, state),
+            )
+            return [{"id": str(r[0]), "companyId": r[1], "provider": PROVIDER_FROM_DB.get(r[2], r[2]),
+                     "externalObjectType": r[3] or "configuration_item", "externalId": r[4] or "",
+                     "externalName": r[5] or (r[11] or {}).get("name", ""),
+                     "candidateAssetId": str(r[6]) if r[6] else None, "candidateAssetName": r[7] or "",
+                     "reason": r[8], "confidence": float(r[9]), "state": r[10],
+                     "externalRecord": r[11] or {}, "conflictDetails": r[12] or {}, "decision": r[13] or "",
+                     "decisionNotes": r[14] or "", "targetAssetId": str(r[15]) if r[15] else None,
+                     "targetAssetName": r[16] or "", "createdAt": self._timestamp(r[17]),
+                     "reviewedBy": str(r[18]) if r[18] else None, "reviewedAt": self._timestamp(r[19]) or None}
+                    for r in cursor.fetchall()]
+
+    def resolve_reconciliation_candidate(self, candidate_id: str, decision: str, notes: str, target_ci_id: str | None, actor_id: str | None = None) -> dict | None:
+        before = next((item for item in self.list_reconciliation_candidates() if item["id"] == candidate_id), None)
+        if not before:
+            return None
+        new_state = "approved" if decision in {"use_existing", "create_new"} else "rejected"
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """UPDATE reconciliation_candidates SET state = %s, decision = %s, decision_notes = %s,
+                          target_ci_id = %s::uuid, reviewed_by = %s::uuid, reviewed_at = now()
+                   WHERE id = %s::uuid AND state = 'pending'""",
+                (new_state, decision, notes, target_ci_id, actor_id, candidate_id),
+            )
+            if not cursor.rowcount:
+                return None
+            after = {**before, "state": new_state, "decision": decision, "decisionNotes": notes, "targetAssetId": target_ci_id}
+            self._insert_audit(cursor, before.get("companyId"), actor_id, "reconciliation_candidate", candidate_id, "decision_recorded", before, after, reason=notes)
+        return next((item for item in self.list_reconciliation_candidates(before.get("companyId")) if item["id"] == candidate_id), after)
+
+    def list_field_authority(self, company_id: str | None = None) -> list[dict]:
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT c.slug, f.ci_type, f.field_name, f.provider, f.priority
+                   FROM ci_field_authority f JOIN companies c ON c.id = f.company_id
+                   WHERE (%s::text IS NULL OR c.slug = %s)
+                   ORDER BY c.name, f.ci_type, f.field_name, f.priority, f.provider""", (company_id, company_id),
+            )
+            return [{"companyId": r[0], "ciType": r[1], "fieldName": r[2], "provider": PROVIDER_FROM_DB.get(r[3], r[3]), "priority": r[4]} for r in cursor.fetchall()]
+
+    def upsert_field_authority(self, rule: dict, actor_id: str | None = None) -> dict:
+        before = next((item for item in self.list_field_authority(rule["companyId"]) if all(item.get(key) == rule.get(key) for key in ("companyId", "ciType", "fieldName", "provider"))), None)
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT id FROM companies WHERE slug = %s", (rule["companyId"],)); company_row = cursor.fetchone()
+            if not company_row:
+                raise ValueError("Customer not found")
+            cursor.execute(
+                """INSERT INTO ci_field_authority (company_id, ci_type, field_name, provider, priority)
+                   VALUES (%s::uuid, %s, %s, %s, %s)
+                   ON CONFLICT (company_id, ci_type, field_name, provider) DO UPDATE SET priority = EXCLUDED.priority""",
+                (str(company_row[0]), rule["ciType"], rule["fieldName"], PROVIDER_TO_DB.get(rule["provider"], rule["provider"]), rule["priority"]),
+            )
+            rule_id = canonical_uuid("field_authority", f'{rule["companyId"]}:{rule["ciType"]}:{rule["fieldName"]}:{rule["provider"]}')
+            self._insert_audit(cursor, rule["companyId"], actor_id, "field_authority", rule_id, "updated" if before else "created", before, rule)
+        return rule
+
+    def delete_field_authority(self, company_id: str, ci_type: str, field_name: str, provider: str, actor_id: str | None = None) -> bool:
+        before = next((item for item in self.list_field_authority(company_id) if item["ciType"] == ci_type and item["fieldName"] == field_name and item["provider"] == provider), None)
+        if not before:
+            return False
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT id FROM companies WHERE slug = %s", (company_id,)); company_uuid = str(cursor.fetchone()[0])
+            cursor.execute("DELETE FROM ci_field_authority WHERE company_id = %s::uuid AND ci_type = %s AND field_name = %s AND provider = %s", (company_uuid, ci_type, field_name, PROVIDER_TO_DB.get(provider, provider)))
+            rule_id = canonical_uuid("field_authority", f"{company_id}:{ci_type}:{field_name}:{provider}")
+            self._insert_audit(cursor, company_id, actor_id, "field_authority", rule_id, "deleted", before, None)
         return True
 
     def list_integrations(self) -> list[dict]:

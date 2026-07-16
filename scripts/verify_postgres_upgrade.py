@@ -66,7 +66,7 @@ def main() -> None:
             )
 
         applied = apply_migrations(factory, ROOT)
-        assert applied == ["2026.07.15.1", "2026.07.15.2", "2026.07.15.3", "2026.07.16.1"], applied
+        assert applied == ["2026.07.15.1", "2026.07.15.2", "2026.07.15.3", "2026.07.16.1", "2026.07.16.2"], applied
         repository = PostgresCmdbRepository(legacy_state, lambda _state: None, factory)
         assert repository.migrate_legacy_company_branding() == 1
         assert repository.get_company_branding("acme")["name"] == "Acme Service Portal"

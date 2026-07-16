@@ -241,3 +241,21 @@ export type ReportPreview = {
   summary: { rowCount: number; customerCount: number };
   previewLimited: boolean;
 };
+
+export type DataQualityFinding = {
+  id: string; ruleKey: string; ruleLabel: string; category: string; severity: 'high' | 'medium' | 'low';
+  companyId: string; assetId: string; assetName: string; assetType: string; source: string;
+  evidence: string; recommendation: string;
+};
+export type DataQualityCustomer = { companyId: string; companyName: string; assetCount: number; findingCount: number; highCount: number; score: number };
+export type ReconciliationCandidate = {
+  id: string; companyId: string; provider: string; externalObjectType: string; externalId: string; externalName: string;
+  candidateAssetId?: string | null; candidateAssetName: string; reason: string; confidence: number; state: string;
+  conflictDetails: Record<string, unknown>;
+};
+export type FieldAuthorityRule = { companyId: string; ciType: string; fieldName: string; provider: string; priority: number };
+export type DataQualitySnapshot = {
+  summary: { score: number; assetCount: number; findingCount: number; highCount: number; exceptionCount: number; staleDays: number; pendingReconciliationCount: number; byCategory: Record<string, number> };
+  customers: DataQualityCustomer[]; findings: DataQualityFinding[]; candidates: ReconciliationCandidate[];
+  fieldAuthority: FieldAuthorityRule[];
+};

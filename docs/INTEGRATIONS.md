@@ -34,6 +34,8 @@ Prefer an existing external mapping. Otherwise use one unique strong identifier.
 
 Ambiguous matches become review candidates with evidence, confidence and conflicting fields. The operator must be able to select an existing CI, create a new one or ignore the observation.
 
+The Governance > Data quality workbench implements this human decision boundary and customer-specific field-authority policy. Decisions are retained for the future integration worker; recording a decision does not yet write to a provider.
+
 ### Preview and apply
 
 Show created, updated, unchanged, blocked and conflicted counts before writes. Applying the same provider page twice must be idempotent.

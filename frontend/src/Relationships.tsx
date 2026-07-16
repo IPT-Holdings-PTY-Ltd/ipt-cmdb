@@ -3,13 +3,13 @@ import AppsOutlined from '@mui/icons-material/AppsOutlined';
 import AutoAwesomeOutlined from '@mui/icons-material/AutoAwesomeOutlined';
 import CloseOutlined from '@mui/icons-material/CloseOutlined';
 import ComputerOutlined from '@mui/icons-material/ComputerOutlined';
-import DeleteOutline from '@mui/icons-material/DeleteOutline';
+import DeleteOutlined from '@mui/icons-material/DeleteOutlined';
 import FitScreenOutlined from '@mui/icons-material/FitScreenOutlined';
 import GridViewOutlined from '@mui/icons-material/GridViewOutlined';
 import KeyOutlined from '@mui/icons-material/KeyOutlined';
 import LockOpenOutlined from '@mui/icons-material/LockOpenOutlined';
 import LockOutlined from '@mui/icons-material/LockOutlined';
-import PersonOutline from '@mui/icons-material/PersonOutline';
+import PersonOutlined from '@mui/icons-material/PersonOutlined';
 import PostAddOutlined from '@mui/icons-material/PostAddOutlined';
 import RouterOutlined from '@mui/icons-material/RouterOutlined';
 import SearchOutlined from '@mui/icons-material/SearchOutlined';
@@ -143,7 +143,7 @@ function AssetIcon({ asset }: { asset: Asset }) {
   if (kind === 'compute') return <ComputerOutlined fontSize="small" />;
   if (kind === 'software') return <AppsOutlined fontSize="small" />;
   if (kind === 'licence') return <KeyOutlined fontSize="small" />;
-  if (kind === 'person') return <PersonOutline fontSize="small" />;
+  if (kind === 'person') return <PersonOutlined fontSize="small" />;
   return <AccountTreeOutlined fontSize="small" />;
 }
 
@@ -152,22 +152,44 @@ function CiNode({ data, selected }: NodeProps<Node<CiNodeData>>) {
   const mark = productMark(asset);
   const owner = asset.metadata?.businessOwner || asset.metadata?.technicalOwner || asset.metadata?.serviceOwner || 'No owner recorded';
   const classes = ['ci-react-node', `kind-${assetKind(asset)}`, `impact-${data.impactRole || 'neutral'}`, selected ? 'selected' : '', data.dimmed ? 'dimmed' : ''].filter(Boolean).join(' ');
-  return <Tooltip arrow placement="top" title={<Box sx={{ p: 0.5 }}><Typography fontWeight={800}>{asset.name}</Typography><Typography variant="caption" display="block">{asset.type} · {asset.metadata?.operationalStatus || 'unknown'}</Typography><Typography variant="caption" display="block">Owner: {owner}</Typography>{asset.metadata?.site && <Typography variant="caption" display="block">Site: {asset.metadata.site}</Typography>}</Box>}>
-    <Box className={classes}>
-      <Handle type="target" position={Position.Left} isConnectable={data.connectable} />
-      <Stack className="ci-node-heading" direction="row" spacing={1} alignItems="center">
-        <Box className="ci-node-icon"><AssetIcon asset={asset} /></Box>
-        <Box className="ci-node-label"><Typography variant="caption" color="text.secondary">{asset.type}</Typography><Typography fontWeight={800} noWrap>{asset.name}</Typography></Box>
-        {mark && <span className="ci-vendor-mark">{mark}</span>}
-      </Stack>
-      <Stack direction="row" spacing={0.5} sx={{ mt: 1 }}><Chip size="small" label={asset.metadata?.operationalStatus || 'unknown'} /><Chip size="small" label={asset.metadata?.criticality || 'medium'} /></Stack>
-      {Boolean(data.sharedBusinessAppCount) && <Chip className="ci-shared-app-chip" size="small" color="warning" variant="outlined" label={`Shared · ${data.sharedBusinessAppCount} other app${data.sharedBusinessAppCount === 1 ? '' : 's'}`} />}
-      {asset.type === 'Virtualization cluster' && <Typography variant="caption" color="text.secondary">HA {asset.metadata?.haEnabled === 'yes' ? 'enabled' : 'disabled'} · {asset.metadata?.capacityStatus || 'unknown'} capacity</Typography>}
-      {asset.type === 'Virtual machine' && <Typography variant="caption" color="text.secondary">{asset.metadata?.powerState || 'unknown'} · {asset.metadata?.protectionStatus || 'unknown'}</Typography>}
-      {(displayLayer(asset) === 'network' || asset.metadata?.networkZone || asset.metadata?.vlanId || asset.metadata?.subnet) && <Typography variant="caption" color="text.secondary">{asset.metadata?.networkZone || 'Unzoned'}{asset.metadata?.vlanId ? ` · VLAN ${asset.metadata.vlanId}` : ''}{asset.metadata?.ipAddress ? ` · ${asset.metadata.ipAddress}` : ''}</Typography>}
-      <Handle type="source" position={Position.Right} isConnectable={data.connectable} />
-    </Box>
-  </Tooltip>;
+  return (
+    <Tooltip arrow placement="top" title={<Box sx={{ p: 0.5 }}><Typography sx={{
+      fontWeight: 800
+    }}>{asset.name}</Typography><Typography variant="caption" sx={{
+      display: "block"
+    }}>{asset.type} · {asset.metadata?.operationalStatus || 'unknown'}</Typography><Typography variant="caption" sx={{
+      display: "block"
+    }}>Owner: {owner}</Typography>{asset.metadata?.site && <Typography variant="caption" sx={{
+      display: "block"
+    }}>Site: {asset.metadata.site}</Typography>}</Box>}>
+      <Box className={classes}>
+        <Handle type="target" position={Position.Left} isConnectable={data.connectable} />
+        <Stack className="ci-node-heading" direction="row" spacing={1} sx={{
+          alignItems: "center"
+        }}>
+          <Box className="ci-node-icon"><AssetIcon asset={asset} /></Box>
+          <Box className="ci-node-label"><Typography variant="caption" sx={{
+            color: "text.secondary"
+          }}>{asset.type}</Typography><Typography noWrap sx={{
+            fontWeight: 800
+          }}>{asset.name}</Typography></Box>
+          {mark && <span className="ci-vendor-mark">{mark}</span>}
+        </Stack>
+        <Stack direction="row" spacing={0.5} sx={{ mt: 1 }}><Chip size="small" label={asset.metadata?.operationalStatus || 'unknown'} /><Chip size="small" label={asset.metadata?.criticality || 'medium'} /></Stack>
+        {Boolean(data.sharedBusinessAppCount) && <Chip className="ci-shared-app-chip" size="small" color="warning" variant="outlined" label={`Shared · ${data.sharedBusinessAppCount} other app${data.sharedBusinessAppCount === 1 ? '' : 's'}`} />}
+        {asset.type === 'Virtualization cluster' && <Typography variant="caption" sx={{
+          color: "text.secondary"
+        }}>HA {asset.metadata?.haEnabled === 'yes' ? 'enabled' : 'disabled'} · {asset.metadata?.capacityStatus || 'unknown'} capacity</Typography>}
+        {asset.type === 'Virtual machine' && <Typography variant="caption" sx={{
+          color: "text.secondary"
+        }}>{asset.metadata?.powerState || 'unknown'} · {asset.metadata?.protectionStatus || 'unknown'}</Typography>}
+        {(displayLayer(asset) === 'network' || asset.metadata?.networkZone || asset.metadata?.vlanId || asset.metadata?.subnet) && <Typography variant="caption" sx={{
+          color: "text.secondary"
+        }}>{asset.metadata?.networkZone || 'Unzoned'}{asset.metadata?.vlanId ? ` · VLAN ${asset.metadata.vlanId}` : ''}{asset.metadata?.ipAddress ? ` · ${asset.metadata.ipAddress}` : ''}</Typography>}
+        <Handle type="source" position={Position.Right} isConnectable={data.connectable} />
+      </Box>
+    </Tooltip>
+  );
 }
 
 function impactEndpoints(relationship: Relationship) {
@@ -601,115 +623,180 @@ export function Relationships() {
       : `${pendingSource.name} ${relationshipTypes[pendingType].label} ${pendingTarget.name}`
     : '';
 
-  return <Box>
-    <Title title="Relationships" />
-    <Typography variant="overline" color="primary">Impact and dependency map</Typography>
-    <Typography variant="h3">CI topology</Typography>
-    <Typography color="text.secondary" sx={{ mb: 2 }}>Choose a perspective for the task at hand. Every view uses the same canonical CIs and relationships, so a change made in one layer is immediately reflected everywhere.</Typography>
-    {error && <Alert severity="error" onClose={() => setError('')} sx={{ mb: 2 }}>{error}</Alert>}
+  return (
+    <Box>
+      <Title title="Relationships" />
+      <Typography variant="overline" color="primary">Impact and dependency map</Typography>
+      <Typography variant="h3">CI topology</Typography>
+      <Typography
+        sx={{
+          color: "text.secondary",
+          mb: 2
+        }}>Choose a perspective for the task at hand. Every view uses the same canonical CIs and relationships, so a change made in one layer is immediately reflected everywhere.</Typography>
+      {error && <Alert severity="error" onClose={() => setError('')} sx={{ mb: 2 }}>{error}</Alert>}
 
-    <Paper className="relationship-toolbar" variant="outlined">
-      <TextField size="small" placeholder="Search CIs" value={search} onChange={event => setSearch(event.target.value)} InputProps={{ startAdornment: <InputAdornment position="start"><SearchOutlined fontSize="small" /></InputAdornment> }} />
-      <FormControl size="small" sx={{ minWidth: 190 }}><InputLabel>Perspective</InputLabel><Select label="Perspective" value={topologyView} onChange={event => changePerspective(event.target.value as TopologyView)}>{(Object.keys(perspectiveLabels) as TopologyView[]).map(view => <MenuItem key={view} value={view}>{perspectiveLabels[view]}</MenuItem>)}</Select></FormControl>
-      <Autocomplete
-        className="business-application-filter"
-        size="small"
-        options={businessSystems}
-        value={focusedBusinessSystem || null}
-        onChange={(_event, option) => changeBusinessApplication(option?.id || '')}
-        getOptionLabel={option => option.name}
-        isOptionEqualToValue={(option, value) => option.id === value.id}
-        noOptionsText="No business applications found"
-        renderInput={params => <TextField {...params} label="Business application" placeholder="All business applications" />}
-      />
-      <FormControl size="small" sx={{ minWidth: 145 }}><InputLabel>Auto-layout</InputLabel><Select label="Auto-layout" value={layoutDirection} onChange={event => setLayoutDirection(event.target.value as LayoutDirection)}><MenuItem value="RIGHT">Left to right</MenuItem><MenuItem value="DOWN">Top to bottom</MenuItem></Select></FormControl>
-      <Button variant="outlined" startIcon={layoutBusy ? <CircularProgress size={16} /> : <AutoAwesomeOutlined />} disabled={layoutBusy || !nodes.length} onClick={() => void applyAutoLayout()}>Auto-arrange</Button>
-      <Button variant="outlined" startIcon={<GridViewOutlined />} disabled={!nodes.length} onClick={applyGridLayout}>Grid</Button>
-      <Button variant="outlined" startIcon={<FitScreenOutlined />} disabled={!nodes.length} onClick={() => void flow?.fitView({ padding: 0.22, duration: 300 })}>Fit</Button>
-      <Button variant="outlined" startIcon={locked ? <LockOutlined /> : <LockOpenOutlined />} onClick={() => setLocked(value => !value)}>{locked ? 'Unlock' : 'Lock'}</Button>
-      <Button color="inherit" onClick={() => void resetLayout()}>Reset layout</Button>
-    </Paper>
-
-    {focusedBusinessSystem && <Paper className="business-application-scope" variant="outlined">
-      <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} justifyContent="space-between" alignItems={{ xs: 'flex-start', md: 'center' }}>
-        <Stack direction="row" spacing={1.25} alignItems="center">
-          <Box className="business-application-scope-icon"><AppsOutlined /></Box>
-          <Box><Typography variant="overline" color="primary">Business application scope</Typography><Typography variant="h6">{focusedBusinessSystem.name}</Typography><Typography variant="caption" color="text.secondary">{focusedBusinessSystem.metadata?.businessOwner || focusedBusinessSystem.metadata?.serviceOwner || 'No business owner recorded'} · {businessScopeIds.size} related CIs</Typography></Box>
-        </Stack>
-        <FormControlLabel
-          control={<Switch checked={showSharedImpact} disabled={!sharedBusinessSystemIds.size} onChange={event => changeSharedImpact(event.target.checked)} />}
-          label={sharedBusinessSystemIds.size ? `Show shared impact (${sharedBusinessSystemIds.size})` : 'No shared application impact'}
+      <Paper className="relationship-toolbar" variant="outlined">
+        <TextField size="small" placeholder="Search CIs" value={search} onChange={event => setSearch(event.target.value)} slotProps={{ input: { startAdornment: <InputAdornment position="start"><SearchOutlined fontSize="small" /></InputAdornment> } }} />
+        <FormControl size="small" sx={{ minWidth: 190 }}><InputLabel>Perspective</InputLabel><Select label="Perspective" value={topologyView} onChange={event => changePerspective(event.target.value as TopologyView)}>{(Object.keys(perspectiveLabels) as TopologyView[]).map(view => <MenuItem key={view} value={view}>{perspectiveLabels[view]}</MenuItem>)}</Select></FormControl>
+        <Autocomplete
+          className="business-application-filter"
+          size="small"
+          options={businessSystems}
+          value={focusedBusinessSystem || null}
+          onChange={(_event, option) => changeBusinessApplication(option?.id || '')}
+          getOptionLabel={option => option.name}
+          isOptionEqualToValue={(option, value) => option.id === value.id}
+          noOptionsText="No business applications found"
+          renderInput={params => <TextField {...params} label="Business application" placeholder="All business applications" />}
         />
+        <FormControl size="small" sx={{ minWidth: 145 }}><InputLabel>Auto-layout</InputLabel><Select label="Auto-layout" value={layoutDirection} onChange={event => setLayoutDirection(event.target.value as LayoutDirection)}><MenuItem value="RIGHT">Left to right</MenuItem><MenuItem value="DOWN">Top to bottom</MenuItem></Select></FormControl>
+        <Button variant="outlined" startIcon={layoutBusy ? <CircularProgress size={16} /> : <AutoAwesomeOutlined />} disabled={layoutBusy || !nodes.length} onClick={() => void applyAutoLayout()}>Auto-arrange</Button>
+        <Button variant="outlined" startIcon={<GridViewOutlined />} disabled={!nodes.length} onClick={applyGridLayout}>Grid</Button>
+        <Button variant="outlined" startIcon={<FitScreenOutlined />} disabled={!nodes.length} onClick={() => void flow?.fitView({ padding: 0.22, duration: 300 })}>Fit</Button>
+        <Button variant="outlined" startIcon={locked ? <LockOutlined /> : <LockOpenOutlined />} onClick={() => setLocked(value => !value)}>{locked ? 'Unlock' : 'Lock'}</Button>
+        <Button color="inherit" onClick={() => void resetLayout()}>Reset layout</Button>
+      </Paper>
+
+      {focusedBusinessSystem && <Paper className="business-application-scope" variant="outlined">
+        <Stack
+          direction={{ xs: 'column', md: 'row' }}
+          spacing={2}
+          sx={{
+            justifyContent: "space-between",
+            alignItems: { xs: 'flex-start', md: 'center' }
+          }}>
+          <Stack direction="row" spacing={1.25} sx={{
+            alignItems: "center"
+          }}>
+            <Box className="business-application-scope-icon"><AppsOutlined /></Box>
+            <Box><Typography variant="overline" color="primary">Business application scope</Typography><Typography variant="h6">{focusedBusinessSystem.name}</Typography><Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>{focusedBusinessSystem.metadata?.businessOwner || focusedBusinessSystem.metadata?.serviceOwner || 'No business owner recorded'} · {businessScopeIds.size} related CIs</Typography></Box>
+          </Stack>
+          <FormControlLabel
+            control={<Switch checked={showSharedImpact} disabled={!sharedBusinessSystemIds.size} onChange={event => changeSharedImpact(event.target.checked)} />}
+            label={sharedBusinessSystemIds.size ? `Show shared impact (${sharedBusinessSystemIds.size})` : 'No shared application impact'}
+          />
+        </Stack>
+        <Stack
+          direction="row"
+          spacing={0.75}
+          useFlexGap
+          sx={{
+            flexWrap: "wrap",
+            mt: 1.5
+          }}>
+          {displayLayerOrder.filter(layer => Boolean(scopeLayerCounts.get(layer))).map(layer => <Chip key={layer} size="small" variant="outlined" label={`${displayLayerLabels[layer]} · ${scopeLayerCounts.get(layer)}`} />)}
+        </Stack>
+      </Paper>}
+      {focusedBusinessSystem && focusedSupportIds.size <= 1 && <Alert severity="warning" sx={{ mb: 1.5 }}>{focusedBusinessSystem.name} has no traversable supporting relationships. Add its application and infrastructure dependencies to complete this map.</Alert>}
+      {focusedBusinessSystem && focusedSupportIds.size > 1 && perspectiveVisibleIds.size === 0 && <Alert severity="warning" sx={{ mb: 1.5 }}>No {perspectiveLabels[topologyView].toLowerCase()} CIs are related to {focusedBusinessSystem.name}. Check its relationships or choose another perspective.</Alert>}
+
+      {topologyView === 'BUSINESS' && <Alert severity="info" sx={{ mb: 1.5 }}>{focusedBusinessSystem ? `Showing the business-impact path for ${focusedBusinessSystem.name}${showSharedImpact ? ' and applications sharing its supporting CIs' : ''}.` : `Showing ${businessSystemIds.size} business system(s) and shared supporting CIs. Select a business system to expand its complete technical dependency path.`}</Alert>}
+      {topologyView === 'APPLICATION' && <Alert severity="info" sx={{ mb: 1.5 }}>Applications, databases and business systems are arranged from compute foundations to business consumers. Select an item to reveal its complete dependency path.</Alert>}
+      {topologyView === 'VIRTUALIZATION' && <Alert severity="info" sx={{ mb: 1.5 }}>Clusters are collapsed by default. Double-click a cluster, or use its inspector, to show hosts and virtual machines. HA capacity is evaluated during change impact analysis.</Alert>}
+      {topologyView === 'NETWORK' && <Alert severity="info" sx={{ mb: 1.5 }}>Network path view · {networkZones.length ? `${networkZones.length} zone(s): ${networkZones.join(', ')}` : 'add site, zone, VLAN and subnet metadata to improve grouping'}. Select a network CI to overlay its complete business-impact path.</Alert>}
+      {topologyView === 'STORAGE' && <Alert severity="info" sx={{ mb: 1.5 }}>Storage arrays, datastores, backup components and protected workloads are shown from provider to consumer.</Alert>}
+      {topologyView === 'STACK' && <Alert severity="info" sx={{ mb: 1.5 }}>Full-stack lanes run from physical and cloud foundations through network, storage, virtualization, compute and applications to business systems.</Alert>}
+
+      <Stack className="relationship-filter-row" direction="row" spacing={1} useFlexGap sx={{
+        flexWrap: "wrap"
+      }}>
+        <Typography
+          variant="caption"
+          sx={{
+            color: "text.secondary",
+            alignSelf: 'center',
+            mr: 0.5
+          }}>Relationship lines</Typography>
+        {allRelationshipTypes.map(type => <Chip key={type} size="small" clickable variant={visibleTypes.has(type) ? 'filled' : 'outlined'} label={relationshipTypes[type].impactLabel} onClick={() => toggleRelationshipType(type)} sx={{ borderColor: relationshipTypes[type].color, color: visibleTypes.has(type) ? '#07131d' : relationshipTypes[type].color, bgcolor: visibleTypes.has(type) ? relationshipTypes[type].color : 'transparent' }} />)}
       </Stack>
-      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 1.5 }}>
-        {displayLayerOrder.filter(layer => Boolean(scopeLayerCounts.get(layer))).map(layer => <Chip key={layer} size="small" variant="outlined" label={`${displayLayerLabels[layer]} · ${scopeLayerCounts.get(layer)}`} />)}
-      </Stack>
-    </Paper>}
-    {focusedBusinessSystem && focusedSupportIds.size <= 1 && <Alert severity="warning" sx={{ mb: 1.5 }}>{focusedBusinessSystem.name} has no traversable supporting relationships. Add its application and infrastructure dependencies to complete this map.</Alert>}
-    {focusedBusinessSystem && focusedSupportIds.size > 1 && perspectiveVisibleIds.size === 0 && <Alert severity="warning" sx={{ mb: 1.5 }}>No {perspectiveLabels[topologyView].toLowerCase()} CIs are related to {focusedBusinessSystem.name}. Check its relationships or choose another perspective.</Alert>}
 
-    {topologyView === 'BUSINESS' && <Alert severity="info" sx={{ mb: 1.5 }}>{focusedBusinessSystem ? `Showing the business-impact path for ${focusedBusinessSystem.name}${showSharedImpact ? ' and applications sharing its supporting CIs' : ''}.` : `Showing ${businessSystemIds.size} business system(s) and shared supporting CIs. Select a business system to expand its complete technical dependency path.`}</Alert>}
-    {topologyView === 'APPLICATION' && <Alert severity="info" sx={{ mb: 1.5 }}>Applications, databases and business systems are arranged from compute foundations to business consumers. Select an item to reveal its complete dependency path.</Alert>}
-    {topologyView === 'VIRTUALIZATION' && <Alert severity="info" sx={{ mb: 1.5 }}>Clusters are collapsed by default. Double-click a cluster, or use its inspector, to show hosts and virtual machines. HA capacity is evaluated during change impact analysis.</Alert>}
-    {topologyView === 'NETWORK' && <Alert severity="info" sx={{ mb: 1.5 }}>Network path view · {networkZones.length ? `${networkZones.length} zone(s): ${networkZones.join(', ')}` : 'add site, zone, VLAN and subnet metadata to improve grouping'}. Select a network CI to overlay its complete business-impact path.</Alert>}
-    {topologyView === 'STORAGE' && <Alert severity="info" sx={{ mb: 1.5 }}>Storage arrays, datastores, backup components and protected workloads are shown from provider to consumer.</Alert>}
-    {topologyView === 'STACK' && <Alert severity="info" sx={{ mb: 1.5 }}>Full-stack lanes run from physical and cloud foundations through network, storage, virtualization, compute and applications to business systems.</Alert>}
+      {loading ? <Box className="relationship-loading"><CircularProgress /><Typography>Arranging configuration items…</Typography></Box> : !assets.length ? <Alert severity="info">No configuration items are visible in this workspace.</Alert> : <Box className={`relationship-canvas view-${topologyView.toLowerCase()}`}>
+        <ReactFlow<Node<CiNodeData>, Edge>
+          className={`${connecting ? 'relationship-flow is-connecting' : 'relationship-flow'} perspective-${topologyView.toLowerCase()}`}
+          nodes={shownNodes}
+          edges={shownEdges}
+          nodeTypes={nodeTypes}
+          onInit={setFlow}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onNodeDragStop={saveDragPosition}
+          onNodeClick={(_event, node) => inspectNode(node)}
+          onNodeDoubleClick={(_event, node) => { if (node.data.asset.type === 'Virtualization cluster') toggleCluster(node.id); }}
+          onEdgeClick={(_event, edge) => { setSelectedRelationshipId(edge.id); setSelectedAssetId(''); }}
+          onPaneClick={() => { setSelectedAssetId(''); setSelectedRelationshipId(''); }}
+          onConnectStart={() => { if (canEdit) { setConnecting(true); setError(''); } }}
+          onConnect={connection => { if (canEdit) { setError(''); setPendingConnection(connection); } }}
+          onConnectEnd={finishConnection}
+          isValidConnection={connection => Boolean(canEdit && connection.source && connection.target && connection.source !== connection.target)}
+          connectionRadius={42}
+          connectOnClick
+          nodesDraggable={!locked}
+          nodesConnectable={canEdit}
+          edgesReconnectable={false}
+          deleteKeyCode={null}
+          snapToGrid
+          snapGrid={[16, 16]}
+          selectionOnDrag
+          fitView
+          minZoom={0.2}
+          maxZoom={1.8}
+          onlyRenderVisibleElements
+        >
+          <Background gap={22} color="#2d3c55" />
+          <MiniMap nodeColor={node => node.data?.impactRole === 'downstream' ? '#f0a45d' : node.data?.impactRole === 'upstream' ? '#7997ff' : '#4cc7b1'} maskColor="rgba(7, 13, 24, .72)" pannable zoomable />
+          <Controls />
+          {topologyView === 'STACK' && <Panel position="top-right"><Paper className="stack-layer-legend" elevation={8}><Typography variant="overline" color="primary">Full stack layers</Typography>{displayLayerOrder.map(layer => <Stack key={layer} direction="row" spacing={1} sx={{
+            justifyContent: "space-between"
+          }}><Typography variant="caption">{displayLayerLabels[layer]}</Typography><Chip size="small" label={focusedBusinessSystem ? (scopeLayerCounts.get(layer) || 0) : assets.filter(asset => displayLayer(asset) === layer).length} /></Stack>)}</Paper></Panel>}
+          {!canEdit && <Panel position="bottom-left"><Chip size="small" icon={<LockOutlined />} label="Read-only relationships" /></Panel>}
+          {canEdit && <Panel position="bottom-left"><Chip className="relationship-connect-help" size="small" label="Drag or click a connector dot, then choose another CI" /></Panel>}
+          {(selectedAsset || selectedRelationship) && <Panel position="top-right"><Paper className="relationship-inspector" elevation={8}>
+            <Stack
+              direction="row"
+              sx={{
+                justifyContent: "space-between",
+                alignItems: "flex-start"
+              }}><Box><Typography variant="overline" color="primary">{selectedAsset ? 'Impact inspection' : 'Relationship'}</Typography><Typography variant="h6">{selectedAsset?.name || relationshipTypes[relationshipType(selectedRelationship!.type)].label}</Typography></Box><IconButton size="small" aria-label="Close inspector" onClick={() => { setSelectedAssetId(''); setSelectedRelationshipId(''); }}><CloseOutlined /></IconButton></Stack>
+            {selectedAsset && <><Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>{selectedAsset.type} · {selectedAsset.metadata?.criticality || 'medium'} criticality · {selectedAsset.metadata?.operationalStatus || 'unknown'}</Typography><Typography
+              variant="caption"
+              sx={{
+                display: "block",
+                mt: 1
+              }}>Layer: {displayLayerLabels[displayLayer(selectedAsset)]}</Typography><Typography variant="caption" sx={{
+              display: "block"
+            }}>Owner: {selectedAsset.metadata?.businessOwner || selectedAsset.metadata?.technicalOwner || selectedAsset.metadata?.serviceOwner || 'No owner recorded'}</Typography>{(displayLayer(selectedAsset) === 'network' || selectedAsset.metadata?.networkZone) && <Typography variant="caption" sx={{
+              display: "block"
+            }}>Network: {selectedAsset.metadata?.site || 'No site'} · {selectedAsset.metadata?.networkZone || 'Unzoned'}{selectedAsset.metadata?.vlanId ? ` · VLAN ${selectedAsset.metadata.vlanId}` : ''}{selectedAsset.metadata?.subnet ? ` · ${selectedAsset.metadata.subnet}` : ''}</Typography>}{selectedAsset.type === 'Business system' && <Typography variant="caption" sx={{
+              display: "block"
+            }}>Signoff: {selectedAsset.metadata?.signoffRequired === 'no' ? 'Not required' : selectedAsset.metadata?.signoffDelegate || selectedAsset.metadata?.businessOwner || 'Not assigned'}</Typography>}{selectedAsset.type === 'Virtualization cluster' && <><Typography variant="caption" sx={{
+              display: "block"
+            }}>{clusterCounts.get(selectedAsset.id)?.hosts || 0} host(s) · {clusterCounts.get(selectedAsset.id)?.vms || 0} VM(s) · {selectedAsset.metadata?.capacityStatus || 'unknown'} failover capacity</Typography><Button fullWidth variant="outlined" sx={{ mt: 1 }} onClick={() => toggleCluster(selectedAsset.id)}>{expandedClusters.has(selectedAsset.id) ? 'Collapse cluster' : 'Expand cluster'}</Button></>}{canEdit && <Button fullWidth variant="contained" sx={{ mt: 2 }} startIcon={<PostAddOutlined />} onClick={() => navigate(`/changes?assetId=${encodeURIComponent(selectedAsset.id)}`)}>Create change package</Button>}<Divider sx={{ my: 2 }} /><Stack direction="row" spacing={1}><Chip size="small" color="info" label={`${upstream.size} upstream`} /><Chip size="small" color="warning" label={`${downstream.size} downstream`} /></Stack>{upstream.size > 0 && <Box sx={{ mt: 2 }}><Typography variant="subtitle2">Upstream dependencies</Typography><Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>{[...upstream].map(id => assetById.get(id)?.name || id).join(', ')}</Typography></Box>}{downstream.size > 0 && <Box sx={{ mt: 2 }}><Typography variant="subtitle2">Downstream impact</Typography><Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>{[...downstream].map(id => assetById.get(id)?.name || id).join(', ')}</Typography></Box>}<Divider sx={{ my: 2 }} /><Typography variant="subtitle2">Direct relationships</Typography><Stack spacing={1} sx={{ mt: 1 }}>{relationships.filter(item => item.fromId === selectedAsset.id || item.toId === selectedAsset.id).map(item => <Paper variant="outlined" key={item.id} sx={{ p: 1 }}><Typography variant="caption">{assetById.get(item.fromId)?.name || item.fromId} {relationshipTypes[relationshipType(item.type)].label} {assetById.get(item.toId)?.name || item.toId}</Typography><Chip size="small" sx={{ ml: 1 }} label={item.impactPolicy || 'required'} />{canEdit && <Button color="error" size="small" startIcon={<DeleteOutlined />} onClick={() => void disconnectRelationship(item)}>Disconnect</Button>}</Paper>)}</Stack></>}
+            {selectedRelationship && <><Typography
+              sx={{
+                color: "text.secondary",
+                mt: 1
+              }}>{assetById.get(selectedRelationship.fromId)?.name || selectedRelationship.fromId} {relationshipTypes[relationshipType(selectedRelationship.type)].label} {assetById.get(selectedRelationship.toId)?.name || selectedRelationship.toId}</Typography><Chip size="small" sx={{ mt: 1 }} label={`${selectedRelationship.impactPolicy || 'required'} impact`} /><Typography variant="body2" sx={{ mt: 2 }}>{relationshipTypes[relationshipType(selectedRelationship.type)].description}</Typography>{canEdit && <Button fullWidth color="error" variant="outlined" sx={{ mt: 2 }} startIcon={<DeleteOutlined />} onClick={() => void disconnectRelationship(selectedRelationship)}>Disconnect relationship</Button>}</>}
+          </Paper></Panel>}
+        </ReactFlow>
+      </Box>}
 
-    <Stack className="relationship-filter-row" direction="row" spacing={1} useFlexGap flexWrap="wrap">
-      <Typography variant="caption" color="text.secondary" sx={{ alignSelf: 'center', mr: 0.5 }}>Relationship lines</Typography>
-      {allRelationshipTypes.map(type => <Chip key={type} size="small" clickable variant={visibleTypes.has(type) ? 'filled' : 'outlined'} label={relationshipTypes[type].impactLabel} onClick={() => toggleRelationshipType(type)} sx={{ borderColor: relationshipTypes[type].color, color: visibleTypes.has(type) ? '#07131d' : relationshipTypes[type].color, bgcolor: visibleTypes.has(type) ? relationshipTypes[type].color : 'transparent' }} />)}
-    </Stack>
-
-    {loading ? <Box className="relationship-loading"><CircularProgress /><Typography>Arranging configuration items…</Typography></Box> : !assets.length ? <Alert severity="info">No configuration items are visible in this workspace.</Alert> : <Box className={`relationship-canvas view-${topologyView.toLowerCase()}`}>
-      <ReactFlow<Node<CiNodeData>, Edge>
-        className={`${connecting ? 'relationship-flow is-connecting' : 'relationship-flow'} perspective-${topologyView.toLowerCase()}`}
-        nodes={shownNodes}
-        edges={shownEdges}
-        nodeTypes={nodeTypes}
-        onInit={setFlow}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onNodeDragStop={saveDragPosition}
-        onNodeClick={(_event, node) => inspectNode(node)}
-        onNodeDoubleClick={(_event, node) => { if (node.data.asset.type === 'Virtualization cluster') toggleCluster(node.id); }}
-        onEdgeClick={(_event, edge) => { setSelectedRelationshipId(edge.id); setSelectedAssetId(''); }}
-        onPaneClick={() => { setSelectedAssetId(''); setSelectedRelationshipId(''); }}
-        onConnectStart={() => { if (canEdit) { setConnecting(true); setError(''); } }}
-        onConnect={connection => { if (canEdit) { setError(''); setPendingConnection(connection); } }}
-        onConnectEnd={finishConnection}
-        isValidConnection={connection => Boolean(canEdit && connection.source && connection.target && connection.source !== connection.target)}
-        connectionRadius={42}
-        connectOnClick
-        nodesDraggable={!locked}
-        nodesConnectable={canEdit}
-        edgesReconnectable={false}
-        deleteKeyCode={null}
-        snapToGrid
-        snapGrid={[16, 16]}
-        selectionOnDrag
-        fitView
-        minZoom={0.2}
-        maxZoom={1.8}
-        onlyRenderVisibleElements
-      >
-        <Background gap={22} color="#2d3c55" />
-        <MiniMap nodeColor={node => node.data?.impactRole === 'downstream' ? '#f0a45d' : node.data?.impactRole === 'upstream' ? '#7997ff' : '#4cc7b1'} maskColor="rgba(7, 13, 24, .72)" pannable zoomable />
-        <Controls />
-        {topologyView === 'STACK' && <Panel position="top-right"><Paper className="stack-layer-legend" elevation={8}><Typography variant="overline" color="primary">Full stack layers</Typography>{displayLayerOrder.map(layer => <Stack key={layer} direction="row" justifyContent="space-between" spacing={1}><Typography variant="caption">{displayLayerLabels[layer]}</Typography><Chip size="small" label={focusedBusinessSystem ? (scopeLayerCounts.get(layer) || 0) : assets.filter(asset => displayLayer(asset) === layer).length} /></Stack>)}</Paper></Panel>}
-        {!canEdit && <Panel position="bottom-left"><Chip size="small" icon={<LockOutlined />} label="Read-only relationships" /></Panel>}
-        {canEdit && <Panel position="bottom-left"><Chip className="relationship-connect-help" size="small" label="Drag or click a connector dot, then choose another CI" /></Panel>}
-        {(selectedAsset || selectedRelationship) && <Panel position="top-right"><Paper className="relationship-inspector" elevation={8}>
-          <Stack direction="row" justifyContent="space-between" alignItems="flex-start"><Box><Typography variant="overline" color="primary">{selectedAsset ? 'Impact inspection' : 'Relationship'}</Typography><Typography variant="h6">{selectedAsset?.name || relationshipTypes[relationshipType(selectedRelationship!.type)].label}</Typography></Box><IconButton size="small" aria-label="Close inspector" onClick={() => { setSelectedAssetId(''); setSelectedRelationshipId(''); }}><CloseOutlined /></IconButton></Stack>
-          {selectedAsset && <><Typography color="text.secondary" variant="body2">{selectedAsset.type} · {selectedAsset.metadata?.criticality || 'medium'} criticality · {selectedAsset.metadata?.operationalStatus || 'unknown'}</Typography><Typography variant="caption" display="block" sx={{ mt: 1 }}>Layer: {displayLayerLabels[displayLayer(selectedAsset)]}</Typography><Typography variant="caption" display="block">Owner: {selectedAsset.metadata?.businessOwner || selectedAsset.metadata?.technicalOwner || selectedAsset.metadata?.serviceOwner || 'No owner recorded'}</Typography>{(displayLayer(selectedAsset) === 'network' || selectedAsset.metadata?.networkZone) && <Typography variant="caption" display="block">Network: {selectedAsset.metadata?.site || 'No site'} · {selectedAsset.metadata?.networkZone || 'Unzoned'}{selectedAsset.metadata?.vlanId ? ` · VLAN ${selectedAsset.metadata.vlanId}` : ''}{selectedAsset.metadata?.subnet ? ` · ${selectedAsset.metadata.subnet}` : ''}</Typography>}{selectedAsset.type === 'Business system' && <Typography variant="caption" display="block">Signoff: {selectedAsset.metadata?.signoffRequired === 'no' ? 'Not required' : selectedAsset.metadata?.signoffDelegate || selectedAsset.metadata?.businessOwner || 'Not assigned'}</Typography>}{selectedAsset.type === 'Virtualization cluster' && <><Typography variant="caption" display="block">{clusterCounts.get(selectedAsset.id)?.hosts || 0} host(s) · {clusterCounts.get(selectedAsset.id)?.vms || 0} VM(s) · {selectedAsset.metadata?.capacityStatus || 'unknown'} failover capacity</Typography><Button fullWidth variant="outlined" sx={{ mt: 1 }} onClick={() => toggleCluster(selectedAsset.id)}>{expandedClusters.has(selectedAsset.id) ? 'Collapse cluster' : 'Expand cluster'}</Button></>}{canEdit && <Button fullWidth variant="contained" sx={{ mt: 2 }} startIcon={<PostAddOutlined />} onClick={() => navigate(`/changes?assetId=${encodeURIComponent(selectedAsset.id)}`)}>Create change package</Button>}<Divider sx={{ my: 2 }} /><Stack direction="row" spacing={1}><Chip size="small" color="info" label={`${upstream.size} upstream`} /><Chip size="small" color="warning" label={`${downstream.size} downstream`} /></Stack>{upstream.size > 0 && <Box sx={{ mt: 2 }}><Typography variant="subtitle2">Upstream dependencies</Typography><Typography variant="body2" color="text.secondary">{[...upstream].map(id => assetById.get(id)?.name || id).join(', ')}</Typography></Box>}{downstream.size > 0 && <Box sx={{ mt: 2 }}><Typography variant="subtitle2">Downstream impact</Typography><Typography variant="body2" color="text.secondary">{[...downstream].map(id => assetById.get(id)?.name || id).join(', ')}</Typography></Box>}<Divider sx={{ my: 2 }} /><Typography variant="subtitle2">Direct relationships</Typography><Stack spacing={1} sx={{ mt: 1 }}>{relationships.filter(item => item.fromId === selectedAsset.id || item.toId === selectedAsset.id).map(item => <Paper variant="outlined" key={item.id} sx={{ p: 1 }}><Typography variant="caption">{assetById.get(item.fromId)?.name || item.fromId} {relationshipTypes[relationshipType(item.type)].label} {assetById.get(item.toId)?.name || item.toId}</Typography><Chip size="small" sx={{ ml: 1 }} label={item.impactPolicy || 'required'} />{canEdit && <Button color="error" size="small" startIcon={<DeleteOutline />} onClick={() => void disconnectRelationship(item)}>Disconnect</Button>}</Paper>)}</Stack></>}
-          {selectedRelationship && <><Typography color="text.secondary" sx={{ mt: 1 }}>{assetById.get(selectedRelationship.fromId)?.name || selectedRelationship.fromId} {relationshipTypes[relationshipType(selectedRelationship.type)].label} {assetById.get(selectedRelationship.toId)?.name || selectedRelationship.toId}</Typography><Chip size="small" sx={{ mt: 1 }} label={`${selectedRelationship.impactPolicy || 'required'} impact`} /><Typography variant="body2" sx={{ mt: 2 }}>{relationshipTypes[relationshipType(selectedRelationship.type)].description}</Typography>{canEdit && <Button fullWidth color="error" variant="outlined" sx={{ mt: 2 }} startIcon={<DeleteOutline />} onClick={() => void disconnectRelationship(selectedRelationship)}>Disconnect relationship</Button>}</>}
-        </Paper></Panel>}
-      </ReactFlow>
-    </Box>}
-
-    <Dialog open={Boolean(pendingConnection)} onClose={() => setPendingConnection(null)} maxWidth="sm" fullWidth>
-      <DialogTitle>Create relationship</DialogTitle>
-      <DialogContent><Typography color="text.secondary" sx={{ mb: 2 }}>The connection is drawn in outage-impact direction: from the supporting CI to the affected CI.</Typography><Stack spacing={2}><FormControl fullWidth><InputLabel>Relationship type</InputLabel><Select label="Relationship type" value={pendingType} onChange={event => setPendingType(event.target.value as RelationshipType)}>{allRelationshipTypes.map(type => <MenuItem key={type} value={type}>{relationshipTypes[type].label}</MenuItem>)}</Select></FormControl><FormControl fullWidth><InputLabel>Failure impact</InputLabel><Select label="Failure impact" value={pendingImpactPolicy} onChange={event => setPendingImpactPolicy(event.target.value as ImpactPolicy)}><MenuItem value="required">Required — dependent system is unavailable</MenuItem><MenuItem value="degraded">Degraded — reduced function or performance</MenuItem><MenuItem value="redundant">Redundant — alternate component should carry service</MenuItem><MenuItem value="informational">Informational — do not propagate outage impact</MenuItem></Select></FormControl></Stack>{pendingSentence && <Alert severity="info" sx={{ mt: 2 }}>{pendingSentence}</Alert>}</DialogContent>
-      <DialogActions><Button onClick={() => setPendingConnection(null)}>Cancel</Button><Button variant="contained" disabled={savingRelationship} onClick={() => void createRelationship()}>{savingRelationship ? 'Saving…' : 'Create relationship'}</Button></DialogActions>
-    </Dialog>
-  </Box>;
+      <Dialog open={Boolean(pendingConnection)} onClose={() => setPendingConnection(null)} maxWidth="sm" fullWidth>
+        <DialogTitle>Create relationship</DialogTitle>
+        <DialogContent><Typography
+          sx={{
+            color: "text.secondary",
+            mb: 2
+          }}>The connection is drawn in outage-impact direction: from the supporting CI to the affected CI.</Typography><Stack spacing={2}><FormControl fullWidth><InputLabel>Relationship type</InputLabel><Select label="Relationship type" value={pendingType} onChange={event => setPendingType(event.target.value as RelationshipType)}>{allRelationshipTypes.map(type => <MenuItem key={type} value={type}>{relationshipTypes[type].label}</MenuItem>)}</Select></FormControl><FormControl fullWidth><InputLabel>Failure impact</InputLabel><Select label="Failure impact" value={pendingImpactPolicy} onChange={event => setPendingImpactPolicy(event.target.value as ImpactPolicy)}><MenuItem value="required">Required — dependent system is unavailable</MenuItem><MenuItem value="degraded">Degraded — reduced function or performance</MenuItem><MenuItem value="redundant">Redundant — alternate component should carry service</MenuItem><MenuItem value="informational">Informational — do not propagate outage impact</MenuItem></Select></FormControl></Stack>{pendingSentence && <Alert severity="info" sx={{ mt: 2 }}>{pendingSentence}</Alert>}</DialogContent>
+        <DialogActions><Button onClick={() => setPendingConnection(null)}>Cancel</Button><Button variant="contained" disabled={savingRelationship} onClick={() => void createRelationship()}>{savingRelationship ? 'Saving…' : 'Create relationship'}</Button></DialogActions>
+      </Dialog>
+    </Box>
+  );
 }

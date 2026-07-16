@@ -28,6 +28,7 @@ IPT CMDB combines a tenant-aware asset inventory, business-system modelling, int
 | Recovery | Portable checksum-protected export/import plus operational guidance for PostgreSQL PITR or `pg_dump` |
 | Branding | MSP identity, logo, colours and report footer; tenant-scoped customer branding storage |
 | Governance | Append-only attributable audit ledger, request correlation, tenant-aware Audit Center and CI activity timelines |
+| Data quality | MSP/customer quality scores, prioritized findings, audited exceptions, reconciliation review and per-customer field authority |
 | Reports | Controlled MSP/customer report catalogue with branded PDF, filterable XLSX and UTF-8 CSV exports |
 | Integrations | Root control plane and connectivity boundary; production ingestion/mapping is the next delivery increment |
 
@@ -120,6 +121,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime, tenancy, identity and re
 - [Architecture](ARCHITECTURE.md)
 - [Data model and relationship semantics](docs/DATA_MODEL.md)
 - [Governance, audit and reporting](docs/GOVERNANCE.md)
+- [Data quality and reconciliation](docs/DATA_QUALITY.md)
 - [Integration design and provider boundaries](docs/INTEGRATIONS.md)
 - [Azure/container deployment](docs/DEPLOYMENT.md)
 - [Operations, upgrades and recovery](docs/OPERATIONS.md)
@@ -132,8 +134,8 @@ Interactive API documentation is available at `/docs` while the API is running.
 
 ## Near-term roadmap
 
-1. Read-only ConnectWise company and configuration ingestion with a customer-mapping review screen.
-2. Reconciliation inbox for ambiguous matches, field authority and bulk ownership/layer corrections.
+1. Read-only ConnectWise company and configuration ingestion using the reconciliation and authority workbench.
+2. Bulk ownership, relationship-layer and lifecycle correction actions from data-quality findings.
 3. Scheduled worker execution, retry, locking and richer integration diagnostics.
 4. N-central device/customer ingestion and Passportal metadata association.
 5. Explicitly approved ConnectWise change-ticket publishing with PDF attachment and idempotency.

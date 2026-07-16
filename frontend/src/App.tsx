@@ -17,6 +17,7 @@ import { BrandingProvider, useMspBranding } from './branding';
 import { useMemo } from 'react';
 import { BusinessSystemsPage } from './BusinessSystems';
 import { AuditCenterPage, ReportsPage } from './Governance';
+import { DataQualityPage } from './DataQuality';
 
 function BrandedApplication() {
   const { brand } = useMspBranding();
@@ -43,6 +44,7 @@ function BrandedApplication() {
         <Route path="/changes" element={<ChangeControlPage />} />
         <Route path="/governance/audit" element={<AuditCenterPage />} />
         <Route path="/governance/reports" element={<ReportsPage />} />
+        <Route path="/governance/data-quality" element={<DataQualityPage />} />
         <Route path="/customer/users" element={<CustomerUsersPage />} />
         <Route path="/admin/customers" element={<CustomersPage />} />
         <Route path="/admin/customer-groups" element={<CustomerGroupsPage />} />
