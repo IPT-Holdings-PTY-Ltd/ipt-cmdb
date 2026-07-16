@@ -8,29 +8,56 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: npm
+
       - name: Install Python dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
       - name: Run Python tests
         run: python -m unittest discover -s test -v
+      - name: Verify blank PostgreSQL bootstrap
+        run: python scripts/verify_blank_postgres.py --admin-url postgresql://postgres:postgres@localhost:5432/postgres
+      - name: Verify forward-only PostgreSQL upgrade
+        run: python scripts/verify_postgres_upgrade.py --admin-url postgresql://postgres:postgres@localhost:5432/postgres
+
       - name: Install frontend dependencies
         run: npm ci
-      - name: Type-check frontend
-        run: npm run typecheck
       - name: Run Node tests
         run: npm test
+      - name: Type-check frontend
+        run: npm run typecheck
       - name: Build frontend
         run: npm run build
+
       - name: Build container
         run: docker build --tag ipt-cmdb:ci .

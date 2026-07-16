@@ -15,6 +15,7 @@ import { BrandingPage, CustomerGroupsPage, CustomersPage, DatabasePage, Integrat
 import { WorkspaceProvider } from './workspace';
 import { BrandingProvider, useMspBranding } from './branding';
 import { useMemo } from 'react';
+import { BusinessSystemsPage } from './BusinessSystems';
 
 function BrandedApplication() {
   const { brand } = useMspBranding();
@@ -36,6 +37,7 @@ function BrandedApplication() {
     <Admin dataProvider={dataProvider} authProvider={authProvider} dashboard={Dashboard} layout={WorkspaceLayout} loginPage={LoginPage} theme={theme} requireAuth>
       <Resource name="assets" list={AssetList} show={AssetShow} edit={AssetEdit} create={AssetCreate} icon={Inventory2Outlined} recordRepresentation="name" />
       <CustomRoutes>
+        <Route path="/business-systems" element={<BusinessSystemsPage />} />
         <Route path="/relationships" element={<Relationships />} />
         <Route path="/changes" element={<ChangeControlPage />} />
         <Route path="/customer/users" element={<CustomerUsersPage />} />

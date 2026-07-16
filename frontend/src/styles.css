@@ -6,18 +6,44 @@ body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradie
 .login-card > img,.login-card > [aria-label$="logo fallback"] { margin-bottom: 24px; }
 .attention-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-top: 1px solid #243552; }
 .form-section { width: 100%; margin: 24px 0 4px !important; padding-bottom: 8px; border-bottom: 1px solid #2b3d5d; }
+.asset-summary-card { height: 100%; padding: 13px 15px; border-top-width: 3px !important; }
+.asset-summary-card .MuiTypography-h5 { margin-top: 2px; font-weight: 850; }
+.asset-filter-toolbar { display: grid; grid-template-columns: minmax(210px, 1.25fr) repeat(5, minmax(150px, 1fr)) auto; gap: 9px; align-items: center; padding: 11px; margin-bottom: 14px; background: #101a2d !important; }
+.asset-group { overflow: hidden; background: #0f192b !important; }
+.asset-group-heading { min-height: 54px; padding: 10px 14px; border-bottom: 1px solid #2b3d5d; background: linear-gradient(90deg, #17243a, #111b2e); }
+.asset-group .MuiTable-root { min-width: 1120px; }
+.asset-group .MuiTableCell-head { color: #aebbd0; font-size: .72rem; font-weight: 850; letter-spacing: .045em; text-transform: uppercase; background: #111c2f; }
+.asset-inventory-row .MuiTableCell-root { padding-top: 9px; padding-bottom: 9px; border-color: #263956; vertical-align: middle; }
+.asset-name-button { min-width: 190px; padding: 0 !important; justify-content: flex-start !important; text-transform: none !important; }
+.asset-name-button .MuiTypography-root { line-height: 1.3; }
+.asset-detail { width: 100%; padding: 8px 4px 20px; }
+.asset-detail-card { height: 100%; min-height: 225px; padding: 17px; background: linear-gradient(145deg, #132139, #101a2c) !important; }
 .relationship-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px; margin-bottom: 10px; background: #101a2d !important; }
 .relationship-toolbar .MuiTextField-root { min-width: 220px; flex: 1; }
+.relationship-toolbar .business-application-filter { min-width: 270px; flex: 1.2; }
+.business-application-scope { padding: 13px 15px; margin-bottom: 12px; border-color: #4cc7b166 !important; background: linear-gradient(135deg, #10283a, #101a2d) !important; }
+.business-application-scope-icon { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 11px; color: #07131d; background: #f1d372; box-shadow: 0 8px 20px #0005; }
+.ci-shared-app-chip { margin-top: 7px; max-width: 100%; }
 .relationship-filter-row { margin: 0 0 12px; }
 .relationship-loading { min-height: 360px; display: grid; place-items: center; align-content: center; gap: 16px; color: #9eacc2; }
 .relationship-canvas { width: 100%; height: calc(100vh - 330px); min-height: 660px; overflow: hidden; border: 1px solid #2b3d5d; border-radius: 12px; background: #0a1323; }
+.relationship-canvas.view-stack { height: max(760px, calc(100vh - 300px)); min-height: 760px; background: repeating-linear-gradient(to bottom, #0d1829 0, #0d1829 89px, #0a1424 90px, #0a1424 179px, #253754 180px); }
+.relationship-canvas.view-network { background: linear-gradient(90deg, #101d30 0 16.6%, #0b1728 16.6% 33.2%, #101d30 33.2% 49.8%, #0b1728 49.8% 66.4%, #101d30 66.4% 83%, #0b1728 83%); }
+.stack-layer-legend { width: 205px; padding: 12px; background: #101a2ded !important; backdrop-filter: blur(10px); }
+.stack-layer-legend > .MuiStack-root { min-height: 31px; align-items: center; border-top: 1px solid #2b3d5d; }
 .ci-react-node { width: 230px; padding: 11px 13px; border: 1px solid #365175; border-left: 4px solid #4cc7b1; border-radius: 10px; background: #121f34; box-shadow: 0 10px 24px #0006; transition: opacity .16s ease, border-color .16s ease, box-shadow .16s ease; }
 .ci-node-heading { min-width: 0; }
 .ci-node-icon { width: 30px; height: 30px; flex: none; display: grid; place-items: center; border-radius: 8px; color: #c9d8f0; background: #263957; }
 .ci-node-label { min-width: 0; flex: 1; }
 .ci-vendor-mark { min-width: 27px; height: 24px; display: grid; place-items: center; padding: 0 5px; border-radius: 6px; background: #e7edf8; color: #172238; font-size: 9px; font-weight: 900; }
 .ci-react-node.kind-network { border-left-color: #50d5b9; background: #123238; }
+.ci-react-node.kind-business { border-left-color: #f1d372; background: linear-gradient(135deg, #3c3420, #1d2940); box-shadow: 0 12px 30px #0008, inset 0 0 22px #f1d3720e; }
 .ci-react-node.kind-server,.ci-react-node.kind-compute { border-left-color: #6798e8; background: #152842; }
+.ci-react-node.kind-virtual-cluster { border-left-color: #43c7d8; background: linear-gradient(135deg, #123a48, #172542); box-shadow: 0 12px 30px #0008, inset 0 0 22px #43c7d812; }
+.ci-react-node.kind-hypervisor { border-left-color: #56b4e9; background: #142d48; }
+.ci-react-node.kind-virtual-machine { border-left-color: #8cb4ff; background: #1a2944; }
+.ci-react-node.kind-virtual-storage { border-left-color: #f2c14e; background: #39321e; }
+.ci-react-node.kind-virtual-platform { border-left-color: #be8cff; background: #2a2143; }
 .ci-react-node.kind-software { border-left-color: #a68cf0; background: #282142; }
 .ci-react-node.kind-licence { border-left-color: #efc46b; background: #39301e; }
 .ci-react-node.kind-person { border-left-color: #71c5d4; background: #15343e; }
@@ -25,9 +51,25 @@ body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradie
 .ci-react-node.impact-upstream { border-color: #7997ff; box-shadow: 0 0 0 1px #7997ff75, 0 10px 24px #0006; }
 .ci-react-node.impact-downstream { border-color: #f0a45d; box-shadow: 0 0 0 1px #f0a45d75, 0 10px 24px #0006; }
 .ci-react-node.dimmed { opacity: .18; }
-.ci-react-node .react-flow__handle { width: 11px; height: 11px; border: 2px solid #0a1323; background: #86a7d8; }
-.ci-react-node:hover .react-flow__handle { background: #4cc7b1; transform: scale(1.15); }
+.ci-react-node .react-flow__handle { width: 15px; height: 15px; border: 3px solid #0a1323; background: #86a7d8; transition: background .14s ease, box-shadow .14s ease, transform .14s ease; }
+.ci-react-node:hover .react-flow__handle,.relationship-flow.is-connecting .ci-react-node .react-flow__handle { background: #4cc7b1; box-shadow: 0 0 0 5px #4cc7b126; transform: scale(1.12); }
+.relationship-flow.is-connecting .ci-react-node { opacity: 1; outline: 1px dashed #50d5b980; outline-offset: 4px; }
+.relationship-connect-help { color: #d9e4f6 !important; background: #13233be8 !important; border: 1px solid #365175; backdrop-filter: blur(8px); }
 .relationship-inspector { width: min(340px, calc(100vw - 90px)); max-height: calc(100vh - 390px); overflow: auto; padding: 18px; background: #111b2ef2 !important; backdrop-filter: blur(12px); }
 .react-flow__edge-text { fill: #c5d2e8; font-size: 10px; }
 .react-flow__edge-textbg { fill: #0b1424; }
-@media (max-width: 900px) { .relationship-canvas { height: 680px; } .relationship-toolbar .MuiTextField-root { flex-basis: 100%; } }
+.dashboard-page { width: 100%; padding-bottom: 28px; }
+.dashboard-metric { --metric-color: #7997ff; position: relative; height: 100%; min-height: 126px; padding: 15px 16px; overflow: hidden; border-top: 3px solid var(--metric-color) !important; background: linear-gradient(145deg, #142239, #101a2c) !important; }
+.dashboard-metric::after { content: ''; position: absolute; right: -26px; bottom: -45px; width: 105px; height: 105px; border-radius: 50%; background: color-mix(in srgb, var(--metric-color) 12%, transparent); }
+.dashboard-metric .MuiTypography-h3 { margin: 3px 0 7px; font-size: 1.85rem; }
+.dashboard-metric-icon { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 9px; color: var(--metric-color); background: color-mix(in srgb, var(--metric-color) 15%, transparent); }
+.dashboard-loading { min-height: 330px; display: grid; place-content: center; justify-items: center; gap: 15px; }
+.dashboard-customer-table { min-width: 860px; }
+.dashboard-customer-table .MuiTableCell-head { color: #aebbd0; font-size: .72rem; font-weight: 850; letter-spacing: .04em; text-transform: uppercase; }
+.dashboard-customer-table .MuiTableCell-root { border-color: #263956; }
+.dashboard-integration-row,.dashboard-change-row { padding: 13px 14px; background: #0f192b !important; }
+.dashboard-system-card { height: 100%; min-height: 178px; padding: 16px; background: linear-gradient(140deg, #17243a, #111b2e) !important; }
+.dashboard-attention-row { min-height: 78px; padding: 10px 0; }
+.dashboard-divider { height: 1px; background: #263956; }
+@media (max-width: 1250px) { .asset-filter-toolbar { grid-template-columns: repeat(3, minmax(180px, 1fr)); } }
+@media (max-width: 900px) { .relationship-canvas { height: 680px; } .relationship-toolbar .MuiTextField-root { flex-basis: 100%; } .asset-filter-toolbar { grid-template-columns: 1fr; } }

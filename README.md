@@ -1,88 +1,142 @@
-# CMDB Hub — MSP-ready foundation
+# IPT CMDB
 
-A Python browser-based CMDB designed for ConnectWise-centric MSPs. It has a working tenant-scoped inventory UI, login/session API, provider control plane, and safe sync proof-of-connection. It is intentionally an **inventory aggregator**, not a password vault: Passportal secrets are never copied into this CMDB.
+[![CI](https://github.com/IPT-Holdings-PTY-Ltd/ipt-cmdb/actions/workflows/ci.yml/badge.svg)](https://github.com/IPT-Holdings-PTY-Ltd/ipt-cmdb/actions/workflows/ci.yml)
+[![Container](https://img.shields.io/badge/container-ghcr.io-2496ed?logo=docker&logoColor=white)](https://github.com/IPT-Holdings-PTY-Ltd/ipt-cmdb/pkgs/container/ipt-cmdb)
+[![License](https://img.shields.io/badge/license-MIT-50d5b9.svg)](LICENSE)
 
-## Run locally
+An MSP-oriented configuration management platform for turning technical inventory into customer, service and change-impact intelligence.
+
+IPT CMDB combines a tenant-aware asset inventory, business-system modelling, interactive dependency maps, ITIL-aligned ownership and lifecycle data, and impact-aware change packages. It is designed to consolidate metadata from ConnectWise Manage, N-central and Passportal without becoming a password vault.
+
+> [!IMPORTANT]
+> This repository is a pre-release platform under active development. The local demo is suitable for development and controlled evaluation. Review the [security guidance](SECURITY.md) before any internet-facing deployment.
+
+## What works today
+
+| Area | Current capability |
+|---|---|
+| Multi-tenancy | MSP/root workspace, isolated customer workspaces and server-enforced company scope |
+| Access | Platform administrator, MSP operator and customer reader roles; customer groups and effective-access views |
+| Authentication | Local development sessions or Microsoft Entra ID through Azure Easy Auth-compatible headers |
+| Assets | ITIL-aligned lifecycle, owners, criticality, environment, site, renewal, EOL and integration identity metadata |
+| Business systems | Business-facing services with owners, RTO/RPO, sign-off context and supporting CI stacks |
+| Relationships | Drag-and-drop React Flow maps with full-stack, network, storage, virtualization and business-impact perspectives |
+| Impact analysis | Upstream/downstream traversal, shared dependencies, HA evidence and protected/degraded/outage decisions |
+| Change control | Guided change form, frozen impact snapshot, suggested risk and branded PDF generation |
+| Dashboards | MSP customer-risk queue and customer business-system/action dashboards |
+| PostgreSQL | Canonical repository, forward-only checksum migrations, blank-database bootstrap and upgrade verification |
+| Recovery | Portable checksum-protected export/import plus operational guidance for PostgreSQL PITR or `pg_dump` |
+| Branding | MSP identity, logo, colours and report footer; tenant-scoped customer branding storage |
+| Integrations | Root control plane and connectivity boundary; production ingestion/mapping is the next delivery increment |
+
+Passportal passwords, secure notes and credential values are explicitly out of scope. Only approved metadata associations should enter the CMDB.
+
+## Quick start with Docker
+
+Prerequisites: Docker Desktop or Docker Engine with Compose v2.
 
 ```powershell
+git clone https://github.com/IPT-Holdings-PTY-Ltd/ipt-cmdb.git
+cd ipt-cmdb
 docker compose up --build -d
 ```
 
-Open `http://localhost:3000`. The modular React Admin workspace is served by FastAPI. The seeded demo identities all use `ChangeMe!`:
+Open <http://localhost:3000>. The Compose stack starts the application and PostgreSQL, applies database migrations and seeds the demo workspace.
 
-For frontend-only development with API proxying:
+Check readiness:
 
 ```powershell
-npm install
-npm run dev
+docker compose ps
+Invoke-RestMethod http://localhost:3000/api/health
 ```
+
+The development identities all use the password `ChangeMe!`:
 
 | Login | Role | Scope |
 |---|---|---|
-| admin@example.com | Platform admin | every customer |
-| msp@example.com | MSP operator | Acme + Northwind |
-| client@acme.example | Client reader | Acme only |
+| `admin@example.com` | Platform administrator | All customers and root settings |
+| `msp@example.com` | MSP operator | Assigned managed customers |
+| `client@acme.example` | Customer reader | Acme Manufacturing only |
 
-## Core design
+These identities are demo data. Never expose them on a public deployment.
 
+## Developer workflow
+
+The production container serves a compiled React application from FastAPI. For hot-reload development, run PostgreSQL and FastAPI on port 3000, then Vite on port 5173:
+
+```powershell
+docker compose up -d postgres
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-dev.txt
+npm ci
+$env:DATABASE_URL='postgresql://cmdb:cmdb@localhost:5432/cmdb'
+$env:DATABASE_SEED_MODE='demo'
+python -m uvicorn backend.main:app --reload --port 3000
 ```
-ConnectWise Manage ─┐
-N-central ─────────┼─> Sync adapters ─> canonical CMDB / relationships ─> scoped API + portal
-Passportal ────────┘                          │
-                                             audit/sync-run history
-Azure Entra ID ─────────────────────────────> identity + company/role claims
+
+In a second terminal:
+
+```powershell
+npm run dev
 ```
 
-### CI metadata
+Open <http://localhost:5173>. Vite proxies `/api` to FastAPI.
 
-Each CI has a structured metadata profile alongside its flexible provider fields: lifecycle and operational state, business criticality, service owner, technical owner, custodian, site, environment, vendor/model, purchase date, hardware warranty end, subscription/licence renewal date and scheduled review. This separates accountability and lifecycle governance from source-specific details such as serial, IP address and API IDs.
+Before opening a pull request:
 
-The overview also provides a 90-day attention queue for overdue and upcoming subscription renewals and vendor end-of-life dates, including the relevant technical or service owner.
+```powershell
+python -m unittest discover -s test -v
+npm test
+npm run typecheck
+npm run build
+docker build --tag ipt-cmdb:local .
+```
 
-Platform administrators and MSP operators also receive an MSP overview that aggregates those attention items across only the customers they are permitted to manage. Branding is hidden from customer-only users, while database configuration remains platform-admin only.
+## Architecture at a glance
 
-### Change control
+```mermaid
+flowchart LR
+    SPA[React Admin SPA] -->|Authenticated HTTPS| API[FastAPI API]
+    API --> PG[(PostgreSQL)]
+    API --> PDF[Change PDF generator]
+    ENTRA[Microsoft Entra ID / Easy Auth] --> API
+    CW[ConnectWise Manage] --> WORKERS[Read-only sync workers]
+    NC[N-central] --> WORKERS
+    PP[Passportal metadata] --> WORKERS
+    WORKERS --> MAP[Mapping and reconciliation]
+    MAP --> PG
+```
 
-From a customer relationship map, select a CI and choose **Create change package**. The four-stage workflow combines technician-entered scope, schedule, business impact, implementation, validation, rollback and communication details with a CMDB-derived downstream impact snapshot. The saved record freezes CI names, criticality, environment, site and owners so the historical form does not change when the live CMDB changes.
+Canonical CI UUIDs remain stable when provider names change. Provider IDs are stored as mappings and observations; ambiguous matches must enter a review workflow rather than silently creating or overwriting records.
 
-The backend generates a branded A4 PDF with the MSP logo, document footer, confidentiality label, impact table, transparent risk factors, execution plan, integration status and approval block. The same MSP brand profile drives the login page, workspace header and application colours. Change records already carry a provider-neutral external reference and a `connectwise.not_published` state; no ConnectWise ticket is created yet. A future publisher can populate that envelope idempotently without changing the form or frontend contract.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime, tenancy, identity and reconciliation design.
 
-### Authorization model
+## Documentation
 
-Every asset carries `companyId`; every read filters against the caller's permitted company IDs. `platform_admin` sees all companies, `msp_operator` sees assigned customers and customer groups, and `client_reader` sees only their company. Sync requires MSP operator or platform admin. Production authentication uses Microsoft Entra ID through Azure Easy Auth and maps the Entra identity to these persisted roles and customer assignments. Local-development credentials are stored only as salted PBKDF2 hashes.
+- [Local development](docs/LOCAL_DEVELOPMENT.md)
+- [Architecture](ARCHITECTURE.md)
+- [Data model and relationship semantics](docs/DATA_MODEL.md)
+- [Integration design and provider boundaries](docs/INTEGRATIONS.md)
+- [Azure/container deployment](docs/DEPLOYMENT.md)
+- [Operations, upgrades and recovery](docs/OPERATIONS.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Support](SUPPORT.md)
+- [Changelog](CHANGELOG.md)
 
-### Provider approach
+Interactive API documentation is available at `/docs` while the API is running.
 
-- **ConnectWise Manage:** configured with REST base URL, company ID, public/private API keys and client ID. The current adapter calls `/company/companies` to validate credentials, but does **not** create/update CMDB companies without a review policy.
-- **N-central:** a connector boundary is ready for API token + base URL. Add device, customer, site, warranty and last-check-in normalizers next.
-- **Passportal:** only metadata such as owner, folder/customer reference and asset association should be synchronized. Never ingest passwords, secure notes, or credential values.
-- Future systems (Hudu, IT Glue, Intune, NinjaOne, Azure AD) implement the same adapter contract: collect → normalize → match → review/apply → audit.
+## Near-term roadmap
 
-## Azure hosting
+1. Read-only ConnectWise company and configuration ingestion with a customer-mapping review screen.
+2. Reconciliation inbox for ambiguous matches, field authority and bulk ownership/layer corrections.
+3. Scheduled worker execution, retry, locking and richer integration diagnostics.
+4. N-central device/customer ingestion and Passportal metadata association.
+5. Explicitly approved ConnectWise change-ticket publishing with PDF attachment and idempotency.
 
-The included `Dockerfile` and `azure.yaml` work with Azure Developer CLI (`azd up`) and Azure Container Apps. For production:
+External provider writes remain disabled until a reviewable, auditable workflow is implemented.
 
-1. Use Azure Database for PostgreSQL, Blob Storage for larger exports, and Key Vault for database and integration credentials. The app applies its versioned schema automatically after the server and database exist.
-2. Enable a managed identity for the container and grant it Key Vault Secrets User; inject secret references as the environment variables shown in `.env.example`.
-3. Put Entra ID authentication in front of the API and configure redirect URL `https://<your-cmdb-domain>/auth/callback`.
-4. Run sync jobs using Container Apps Jobs or Azure Functions/Service Bus—not the web request process—and save an immutable run/audit record.
-5. Configure a custom domain, HTTPS, Application Insights, backups, private endpoints, and least-privilege ConnectWise API member permissions.
+## License
 
-The app can initialise an existing blank PostgreSQL database with either the current workspace, a platform-only seed, or demo data. Infrastructure provisioning remains outside the web process: Docker Compose creates the local server/database, while Azure deployments should use Bicep/Terraform or an equivalent controlled deployment. Environment-managed database connections are read-only in the UI.
-
-The Database and recovery screen deliberately separates a checksum-protected **portable operational export/import** from a real database backup. Use Azure PostgreSQL point-in-time restore or scheduled `pg_dump`/`pg_restore` for disaster recovery; portable imports merge operational records and do not delete records absent from the file.
-
-## Next delivery increments
-
-1. Add separately permissioned customer theme overrides. MSP branding now uses its own canonical PostgreSQL profile with audited writes; customer-specific themes still use the synchronized application-state fallback.
-2. Add Entra OIDC, invite flow, MFA/conditional access and company-to-group mapping UI.
-3. Implement ConnectWise company/configuration/ticket matching and publish approved change packages as tickets using the existing external-reference envelope and an idempotency key.
-4. Implement N-central device/customer ingestion and Passportal metadata association.
-5. Add change approvals/revisions, CSV/API exports, webhooks and per-company audit logs.
-
-## Security boundaries
-
-- No credentials or secret content are stored in source, browser storage or CMDB records.
-- Keep raw provider payloads encrypted with short retention; redact before user-visible logs.
-- Make external writes disabled by default and require a selected-record review/apply step.
-- Use provider-specific API members/tokens with only read scopes until an explicitly approved write workflow exists.
+Licensed under the [MIT License](LICENSE).

@@ -1,49 +1,139 @@
-# CMDB Hub architecture
+# Architecture
 
-## Incremental web-platform migration
+IPT CMDB is a tenant-aware web platform with a React single-page application, a FastAPI service and PostgreSQL as the canonical operational store.
 
-The public container runs FastAPI and serves a compiled React/TypeScript application built with React Admin, Material UI and React Flow. The retired browser UI, its static bundle and the internal compatibility HTTP server have been removed. Every active browser endpoint is now handled directly by a typed FastAPI route.
+## Runtime components
 
-New API work belongs in typed FastAPI routes with Pydantic request/response models and PostgreSQL repositories. The remaining transition boundary is storage-only: `app.py` contains domain helpers and the temporary state repository, but no HTTP handler. Customers, users, access groups, configuration items, relationships, change packages, integration connections and sync history are read and written through `PostgresCmdbRepository` when PostgreSQL is available. Their canonical UUID records and write audit events live in normalized tables; the state document is refreshed as a portable fallback/backup mirror.
-
-Azure Container Apps Easy Auth is the production identity boundary. With `AUTH_MODE=easy_auth`, FastAPI reads the platform-injected Entra principal and maps the email claim to an assigned CMDB user. Tenant and record authorization remains enforced by the Python API. Local-development and break-glass credentials are stored separately as salted PBKDF2-SHA256 hashes; plaintext passwords are never persisted.
-
-The browser is a separate, static frontend. It calls an authenticated API and never receives a database connection string or integration credential. The API owns authorization, canonical CMDB writes and audit events. Integration workers run separately from the web process; they obtain provider credentials from Key Vault, write normalised observations, and enqueue review work where identity is uncertain.
-
-```text
-Static SPA (Azure Static Web Apps or Container Apps)
-          │ HTTPS / OIDC
-          ▼
-CMDB API (Container Apps) ──────► PostgreSQL (private endpoint)
-          │                              ▲
-          ├──► Service Bus / outbox ──────┤
-          ▼                              │
-Sync workers / Container Apps Jobs ──────┘
-          │
-          └──► ConnectWise, N-central, Passportal (read-only credentials in Key Vault)
+```mermaid
+flowchart TB
+    USER[MSP or customer user] --> EDGE[HTTPS and identity gateway]
+    EDGE --> SPA[React Admin SPA]
+    EDGE --> API[FastAPI]
+    SPA --> API
+    API --> PG[(PostgreSQL)]
+    API --> REPORTS[ReportLab PDF generation]
+    JOBS[Container Apps Jobs / workers] --> PROVIDERS[ConnectWise, N-central, Passportal]
+    JOBS --> PG
+    JOBS --> QUEUE[Reconciliation review queue]
 ```
 
-## Identity and rename rules
+The current Docker image contains the compiled SPA and API. This keeps local hosting simple while preserving a clean browser/API boundary. The browser never receives a database connection string or provider secret.
 
-`configuration_items.id` is the canonical UUID used by the UI, relationships, ownership and audit history. It never changes when a provider renames an item. `external_object_mappings` binds that canonical ID to an integration connection, object type and provider-specific ID. This makes the same device linkable to a ConnectWise configuration ID, an N-central device ID and a Passportal metadata object.
+## Frontend
 
-Workers reconcile in this order:
+The frontend uses:
 
-1. Existing `(connection, external object type, external ID)` mapping.
-2. A single verified strong identifier (serial, BIOS/device UUID, SID or hashed licence key).
-3. A pending review candidate; mutable names are useful evidence, never automatic identity.
-4. New canonical CI only when no safe match exists.
+- React and TypeScript;
+- React Admin for resource routing and authenticated application structure;
+- Material UI for components and theming;
+- React Flow and ELK for interactive topology and automatic layout.
 
-Integration connections are scope-aware: a connection with no `company_id` is an MSP/root tool (such as a ConnectWise or N-central tenant connection); a future connection with a `company_id` is customer-scoped. Credentials remain a Key Vault reference in either case. The portal currently exposes only MSP tools in the Root level workspace, leaving customer-scoped integration controls for a later, explicitly permissioned screen.
+The workspace selector is the tenant boundary in the user experience. Root users can select the MSP workspace or an authorised customer. Customer users are constrained to their assigned tenant. A workspace change triggers a new API-scoped load; cached data from the previous customer is not reused as authority.
 
-Each source observation is retained with a timestamp and payload hash. `ci_field_authority` decides which provider may update a given field. For example, N-central can be authoritative for device name/last seen, ConnectWise for customer/service ownership, and Passportal only for approved metadata links. A lower-priority provider rename is stored as an observation rather than silently replacing the canonical name.
+Major UI areas are:
 
-## Local development
+- MSP and customer operational dashboards;
+- relationship-aware asset inventory and detail views;
+- business-system catalogue;
+- layered dependency and impact maps;
+- change-control workflow and PDF output;
+- root customer, access, integration, branding and database administration.
 
-The browser demo can still run from JSON without Docker. When `DATABASE_URL` is set, startup takes an advisory migration lock, applies the idempotent schema before querying any table, records the schema version, then seeds an uninitialised database according to `DATABASE_SEED_MODE`. All tenant, identity, CMDB, change-control, integration operational records and the MSP brand profile then use canonical tables. Change scope, frozen impact paths, immutable revisions and external publishing state are stored separately from live CI records. Integration rows store only environment or Key Vault credential references—never secret values—and allow either MSP-wide or future customer-scoped connections. Small PNG/JPEG MSP logos are stored as constrained data URLs so portable exports stay self-contained; this contract can later be backed by Azure Blob Storage. The API keeps a synchronized mirror for portable export and fallback during the remaining customer-theme migration. The browser never has database access.
+## API and authorization
 
-The application initialises schemas and operational seed data; it does not create PostgreSQL servers or databases. Docker Compose owns local provisioning, while Azure infrastructure-as-code owns production provisioning. `DATABASE_URL` supplied by the environment is treated as managed configuration and cannot be overwritten in the browser unless the explicit local-only `ALLOW_UI_DATABASE_CONFIG` override is enabled.
+FastAPI owns all public routes, authentication resolution, tenant authorization, validation and audit-producing writes. Pydantic request models validate mutation inputs. Every operational entity is evaluated against the current user's allowed `companyId` set.
 
-Portable export format version 2 includes an integrity checksum and a restore preview. It intentionally excludes PostgreSQL roles/grants, canonical audit history, raw source observations and transaction history. Production recovery uses Azure PostgreSQL point-in-time restore or independently scheduled `pg_dump`/`pg_restore`.
+Roles currently exposed by the application are:
 
-The final application-state migration moves separately permissioned customer theme overrides into normalized tables. It must not expose PostgreSQL to the frontend or use provider `external_id` values as canonical keys.
+| Role | Intended scope |
+|---|---|
+| `platform_admin` | All customers and platform configuration |
+| `msp_operator` | Assigned customers and MSP operational tools |
+| `client_reader` | One customer workspace; read-only operational access |
+
+UI visibility is not a security control. API routes independently enforce platform role, customer access and management permission.
+
+## Authentication modes
+
+`AUTH_MODE` selects one of two supported boundaries:
+
+- `local` uses application sessions and salted PBKDF2-SHA256 password hashes for development.
+- `easy_auth` trusts identity headers injected by an authenticated Azure Container Apps/App Service gateway and maps the resulting email to a persisted CMDB user.
+
+Easy Auth header names, email-claim precedence, login URL and logout URL are runtime configurable. Password login is disabled in Easy Auth mode unless `ALLOW_LOCAL_BREAK_GLASS=true` is explicitly enabled.
+
+The API continues to enforce tenant and role authorization after external authentication. A valid Entra identity without a corresponding CMDB user assignment does not receive platform access.
+
+## PostgreSQL and migrations
+
+PostgreSQL is the production source of truth. The repository stores customers, users, access groups, CIs, identifiers, relationships, integration connections, mappings, observations, changes, branding, sync runs, reconciliation candidates and audit events in normalized tables.
+
+At startup the application:
+
+1. connects using `DATABASE_URL`;
+2. obtains a PostgreSQL advisory migration lock;
+3. verifies the recorded migration history is an exact prefix of the packaged history;
+4. checks immutable migration checksums;
+5. applies pending migrations in order;
+6. bootstraps operational data according to `DATABASE_SEED_MODE` when the database is blank.
+
+The application fails closed when a configured PostgreSQL database is unavailable or incompatible. It does not silently fall back to JSON customer data.
+
+Without `DATABASE_URL`, the default surface is a constrained first-start database setup experience. The lightweight local repository is available only with `ALLOW_LOCAL_DEVELOPMENT=true` and must not be enabled in production.
+
+## Canonical identity and reconciliation
+
+`configuration_items.id` is the stable canonical UUID referenced by relationships, ownership, change snapshots and audit events. It must not change when a provider renames an object.
+
+`external_object_mappings` binds a canonical entity to:
+
+- an integration connection;
+- a provider object type;
+- the provider's stable external ID;
+- the latest provider-visible name and metadata.
+
+Matching follows this order:
+
+1. existing connection/object/external-ID mapping;
+2. one verified strong identifier such as serial, device UUID or SID;
+3. a reconciliation candidate for human review;
+4. a new canonical CI only when no safe match exists.
+
+Names, IP addresses and mutable descriptions are evidence, not identity. `ci_field_authority` determines which source can update a canonical field. Lower-authority observations remain visible without silently overwriting the authoritative value.
+
+## Relationship and impact model
+
+Relationships are directed records with an `impactPolicy`:
+
+- `required` propagates outage impact;
+- `degraded` propagates degraded service;
+- `redundant` represents a protected path when evidence supports it;
+- `informational` is visible but excluded from impact traversal.
+
+The visual perspectives use one canonical graph. Full-stack lanes group foundation, network, storage, virtualization, compute, application/data and business-system CIs. Business-system filters traverse supporting dependencies so a customer-facing service can expose the underlying network, storage, compute and software stack.
+
+Virtualization impact uses recorded HA, cluster membership, host health, minimum-host capacity, mobility and protection evidence. It is an operational planning aid, not a replacement for live hypervisor admission-control data.
+
+## Change-control snapshots
+
+Change packages reference live scope CIs during preparation. When saved, the package freezes impacted CI names, paths, ownership, business systems, risk factors and technical plans. Later CI edits therefore do not rewrite historical evidence.
+
+The provider-neutral external-link envelope reserves future ConnectWise ticket state. Publishing must be explicit and idempotent; the current application does not create ConnectWise tickets.
+
+## Integration execution boundary
+
+The web API currently exposes integration configuration/status and safe connectivity checks. Production ingestion should run in a separate worker or Azure Container Apps Job so long-running provider calls, retries and rate limits do not consume web requests.
+
+Workers should follow:
+
+```text
+collect -> normalize -> identify/match -> preview/reconcile -> apply -> audit
+```
+
+Provider credentials belong in Azure Key Vault or equivalent secret injection. Integration rows store a credential reference or environment-backed state, never the secret value.
+
+## Recovery boundary
+
+Portable export/import is for moving supported operational records between installations. It is checksum protected and previewed before merge, but it is not a database backup.
+
+Production recovery relies on Azure Database for PostgreSQL point-in-time restore or independently scheduled and tested `pg_dump`/`pg_restore`. See [docs/OPERATIONS.md](docs/OPERATIONS.md).

@@ -1,0 +1,45 @@
+name: Feature request
+description: Propose a scoped improvement to the CMDB platform.
+title: "[Feature]: "
+labels: [enhancement, triage]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the MSP, technician or customer outcome rather than only the desired control.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Primary scope
+      options:
+        - MSP/root workspace
+        - Customer workspace
+        - Assets and lifecycle
+        - Relationships and impact
+        - Change control
+        - Integration and reconciliation
+        - Authentication and access
+        - Deployment and operations
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Tenant, security or external-write considerations
+      description: Explain any customer boundary, credential, provider API or approval implications.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Sensitive-data check
+      options:
+        - label: This request contains no credentials or customer-identifying data.
+          required: true

@@ -8,6 +8,8 @@ services:
       DATA_DIR: /app/data
       DATABASE_URL: postgresql://cmdb:cmdb@postgres:5432/cmdb
       DATABASE_SEED_MODE: demo
+      AUTH_MODE: ${AUTH_MODE:-local}
+      ALLOW_LOCAL_DEVELOPMENT: "false"
     depends_on:
       postgres:
         condition: service_healthy

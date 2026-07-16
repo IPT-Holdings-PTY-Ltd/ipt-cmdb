@@ -1,6 +1,6 @@
 import unittest
 from datetime import date
-from app import allowed, asset_metadata, attention_items, backup_document, build_seed_state, can_manage, customer_overview, normalise_metadata, preview_backup, relationship_exists, restore_backup, would_create_dependency_cycle
+from app import allowed, asset_metadata, attention_items, backup_document, build_seed_state, can_manage, customer_overview, dashboard_snapshot, normalise_metadata, preview_backup, relationship_exists, restore_backup, would_create_dependency_cycle
 
 class CompanyScopeTests(unittest.TestCase):
     def test_client_is_limited_to_its_assigned_company(self):
@@ -34,6 +34,16 @@ class CompanyScopeTests(unittest.TestCase):
         metadata = normalise_metadata({"endOfLifeDate": "2028-01-01"})
         self.assertEqual(metadata["endOfLifeDate"], "2028-01-01")
 
+    def test_metadata_supports_layered_network_views(self):
+        metadata = normalise_metadata({"displayLayer": "network", "networkZone": "Core", "vlanId": "110", "subnet": "10.10.110.0/24"})
+        self.assertEqual(metadata["displayLayer"], "network")
+        self.assertEqual(metadata["networkZone"], "Core")
+        self.assertEqual(metadata["vlanId"], "110")
+
+    def test_metadata_rejects_unknown_display_layer(self):
+        with self.assertRaisesRegex(ValueError, "display layer"):
+            normalise_metadata({"displayLayer": "mystery"})
+
     def test_attention_items_include_overdue_and_customer_context(self):
         assets = [{"id": "ci-1", "companyId": "acme", "name": "Renewal CI", "type": "Software", "metadata": {"renewalDate": "2026-07-01", "technicalOwner": "MSP Licensing"}}]
         items = attention_items(assets, [{"id": "acme", "name": "Acme Manufacturing"}], today=date(2026, 7, 10))
@@ -46,6 +56,19 @@ class CompanyScopeTests(unittest.TestCase):
         self.assertEqual(overview[0]["assetCount"], 1)
         self.assertEqual(overview[0]["criticalCount"], 1)
         self.assertEqual(overview[1]["assetCount"], 0)
+
+    def test_dashboard_snapshot_links_business_systems_to_supporting_cis(self):
+        companies = [{"id": "acme", "name": "Acme"}]
+        assets = [
+            {"id": "sage", "companyId": "acme", "name": "Sage 200", "type": "Business system", "status": "Active", "source": "manual", "metadata": {"businessOwner": "Finance", "displayLayer": "business"}},
+            {"id": "app", "companyId": "acme", "name": "APP01", "type": "Virtual machine", "status": "Active", "source": "manual", "metadata": {"technicalOwner": "MSP", "displayLayer": "compute"}},
+        ]
+        relationships = [{"id": "r1", "fromId": "sage", "toId": "app", "type": "depends_on", "impactPolicy": "required"}]
+        result = dashboard_snapshot(companies, assets, relationships, company_id="acme", today=date(2026, 7, 16))
+        self.assertEqual(result["scope"], "customer")
+        self.assertEqual(result["summary"]["businessSystems"], 1)
+        self.assertEqual(result["businessSystems"][0]["supportCount"], 1)
+        self.assertEqual(result["summary"]["unlinked"], 0)
 
     def test_backup_document_has_versioned_portable_shape(self):
         backup = backup_document()

@@ -1,9 +1,8 @@
 """FastAPI application for the CMDB Hub web platform.
 
-FastAPI owns the complete public API surface. Application state still uses the
-transitional repository in :mod:`app` while the canonical PostgreSQL
-repositories are introduced resource by resource; there is no secondary HTTP
-server or proxy bridge.
+FastAPI owns the complete public API surface. PostgreSQL is the sole
+operational source of truth whenever a database is configured; the local state
+repository exists only for setup, development and isolated unit tests.
 """
 from __future__ import annotations
 
@@ -18,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 import app as core
@@ -37,18 +36,46 @@ api = FastAPI(
 )
 
 
+@api.middleware("http")
+async def require_operational_database(request: Request, call_next):
+    """Expose only setup/auth endpoints until canonical PostgreSQL is active."""
+    if core.DATABASE_MODE != "database setup" or not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    allowed = {
+        "/api/health",
+        "/api/v2/health",
+        "/api/auth/config",
+        "/api/login",
+        "/api/logout",
+        "/api/me",
+        "/api/branding/public",
+        "/api/database/status",
+        "/api/database/test",
+        "/api/database/config",
+        "/api/companies",
+    }
+    if request.url.path in allowed:
+        return await call_next(request)
+    return JSONResponse(
+        {"detail": "Configure PostgreSQL before using operational CMDB features"},
+        status_code=503,
+    )
+
+
 def _build_repository() -> StateRepository:
-    fallback = StateRepository(core.DB, core.save_db)
+    local = StateRepository(core.DB, core.save_db)
     if core.DATABASE_MODE != "PostgreSQL" or not core.DATABASE_URL:
-        return fallback
-    try:
-        core.apply_postgres_schema(core.DATABASE_URL)
-        repository = PostgresCmdbRepository(core.DB, core.save_db, core.postgres_connection)
+        return local
+    core.apply_postgres_schema(core.DATABASE_URL)
+    repository = PostgresCmdbRepository(core.DB, core.save_db, core.postgres_connection)
+    if not repository.is_initialized():
         repository.bootstrap()
-        return repository
-    except Exception as error:
-        core.DATABASE_ERROR = f"Canonical repository unavailable: {str(error).splitlines()[0][:200]}"
-        return fallback
+        core.CANONICAL_DATABASE_INITIALIZED = True
+    else:
+        repository.migrate_legacy_company_branding()
+        core.DB.clear()
+        core.DB.update(repository.export_state())
+    return repository
 
 
 REPOSITORY = _build_repository()
@@ -57,7 +84,12 @@ REPOSITORY = _build_repository()
 def _easy_auth_email(request: Request) -> str | None:
     if os.getenv("AUTH_MODE", "local").lower() != "easy_auth":
         return None
-    encoded = request.headers.get("x-ms-client-principal")
+    principal_name_header = os.getenv("ENTRA_PRINCIPAL_NAME_HEADER", "x-ms-client-principal-name").lower()
+    principal_name = request.headers.get(principal_name_header)
+    if principal_name:
+        return principal_name.strip().lower()
+    principal_header = os.getenv("ENTRA_PRINCIPAL_HEADER", "x-ms-client-principal").lower()
+    encoded = request.headers.get(principal_header)
     if not encoded:
         return None
     try:
@@ -65,17 +97,36 @@ def _easy_auth_email(request: Request) -> str | None:
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     claims = {claim.get("typ", "").lower(): claim.get("val") for claim in principal.get("claims", [])}
-    return claims.get("preferred_username") or claims.get("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress")
+    claim_names = [
+        item.strip().lower()
+        for item in os.getenv(
+            "ENTRA_EMAIL_CLAIMS",
+            "preferred_username,http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress,emails",
+        ).split(",")
+        if item.strip()
+    ]
+    for name in claim_names:
+        value = claims.get(name)
+        if value:
+            return str(value).strip().lower()
+    return None
+
+
+def _local_login_enabled() -> bool:
+    return os.getenv("AUTH_MODE", "local").lower() == "local" or os.getenv("ALLOW_LOCAL_BREAK_GLASS", "false").lower() == "true"
 
 
 def current_user(request: Request) -> dict:
     users = REPOSITORY.list_users()
-    email = _easy_auth_email(request)
-    if email:
-        user = next((item for item in users if item["email"].lower() == email.lower()), None)
-        if not user:
-            raise HTTPException(403, "Your Entra identity has not been assigned CMDB access")
-        return user
+    if os.getenv("AUTH_MODE", "local").lower() == "easy_auth":
+        email = _easy_auth_email(request)
+        if email:
+            user = next((item for item in users if item["email"].lower() == email.lower()), None)
+            if not user:
+                raise HTTPException(403, "Your Entra identity has not been assigned CMDB access")
+            return user
+        if not _local_login_enabled():
+            raise HTTPException(401, "Microsoft sign-in is required")
 
     token = request.headers.get("authorization", "").removeprefix("Bearer ")
     session = core.SESSIONS.get(token)
@@ -98,6 +149,10 @@ def _company(company_id: str) -> dict:
     if not company:
         raise HTTPException(404, "Customer not found")
     return company
+
+
+def _known_company(company_id: str | None) -> bool:
+    return bool(company_id and any(company["id"] == company_id for company in REPOSITORY.list_companies()))
 
 
 def _company_for_user(company_id: str, user: dict, require_manage: bool = False) -> dict:
@@ -175,6 +230,7 @@ class RelationshipCreateRequest(BaseModel):
     fromId: str = Field(min_length=1)
     toId: str = Field(min_length=1)
     type: str = "related_to"
+    impactPolicy: str = "required"
 
 
 class BrandingRequest(BaseModel):
@@ -224,7 +280,7 @@ class ChangeCreateRequest(ChangeImpactRequest):
 @api.get("/api/health", tags=["platform"])
 def health() -> dict:
     return {
-        "status": "ok",
+        "status": "setup_required" if core.DATABASE_MODE == "database setup" else "ok",
         "api": "FastAPI",
         "databaseMode": core.DATABASE_MODE,
         "repositoryMode": REPOSITORY.mode,
@@ -236,6 +292,8 @@ def health() -> dict:
 
 @api.post("/api/login", tags=["authentication"])
 def login(payload: LoginRequest) -> dict:
+    if not _local_login_enabled():
+        raise HTTPException(403, "Local password login is disabled; use Microsoft sign-in")
     email = payload.email.strip().lower()
     user = REPOSITORY.authenticate(email, payload.password)
     if not user:
@@ -247,6 +305,19 @@ def login(payload: LoginRequest) -> dict:
         "token": token,
         "expiresAt": expires_at.isoformat().replace("+00:00", "Z"),
         "user": core.public_user(user),
+    }
+
+
+@api.get("/api/auth/config", tags=["authentication"])
+def auth_config() -> dict:
+    mode = os.getenv("AUTH_MODE", "local").lower()
+    external = mode == "easy_auth"
+    return {
+        "mode": mode,
+        "external": external,
+        "localLoginEnabled": _local_login_enabled(),
+        "externalLoginUrl": os.getenv("ENTRA_LOGIN_URL", "/.auth/login/aad?post_login_redirect_uri=/" ) if external else "",
+        "externalLogoutUrl": os.getenv("ENTRA_LOGOUT_URL", "/.auth/logout?post_logout_redirect_uri=/#/login") if external else "",
     }
 
 
@@ -295,7 +366,13 @@ def database_config(payload: DatabaseSettingsRequest, request: Request) -> dict:
         raise HTTPException(400, result.get("error", "Database configuration failed"))
     try:
         repository = PostgresCmdbRepository(core.DB, core.save_db, core.postgres_connection)
-        result["bootstrap"] = repository.bootstrap()
+        if not repository.is_initialized():
+            result["bootstrap"] = repository.bootstrap()
+            core.CANONICAL_DATABASE_INITIALIZED = True
+        else:
+            repository.migrate_legacy_company_branding()
+            core.DB.clear()
+            core.DB.update(repository.export_state())
         REPOSITORY = repository
     except Exception as error:
         core.DATABASE_ERROR = f"Database prepared but repository activation failed: {str(error).splitlines()[0][:180]}"
@@ -307,7 +384,7 @@ def database_config(payload: DatabaseSettingsRequest, request: Request) -> dict:
 def database_backup(request: Request) -> dict:
     user = current_user(request)
     _require_role(user, {"platform_admin"}, "Database backup requires platform admin role")
-    return core.backup_document()
+    return core.backup_document(REPOSITORY.export_state())
 
 
 @api.post("/api/database/restore/preview", tags=["platform"])
@@ -325,10 +402,22 @@ def database_restore(payload: BackupRestoreRequest, request: Request) -> dict:
     user = current_user(request)
     _require_role(user, {"platform_admin"}, "Backup restore requires platform admin role")
     try:
-        result = core.restore_backup(payload.model_dump())
-        if isinstance(REPOSITORY, PostgresCmdbRepository):
-            REPOSITORY.bootstrap()
-        return result
+        document = payload.model_dump()
+        preview = core.preview_backup(document)
+        state = document["state"]
+        state.setdefault("branding", {})
+        state.setdefault("mspBranding", core.DB.get("mspBranding", {}))
+        state.setdefault("accessGroups", [{"id": "all-managed-customers", "name": "All managed customers", "companyIds": ["*"], "system": True}])
+        state.setdefault("changes", [])
+        with core.LOCK:
+            imported = REPOSITORY.import_state(state, user["id"])
+        return {
+            "message": "Portable backup imported successfully.",
+            "companies": imported.get("companies", len(state["companies"])),
+            "assets": imported.get("assets", len(state["assets"])),
+            "restoredFrom": payload.createdAt or "an unknown date",
+            "warning": preview["warning"],
+        }
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
 
@@ -352,8 +441,6 @@ def create_company(payload: CompanyCreateRequest, request: Request) -> dict:
     company = {"id": slug, "name": name, "externalIds": {}}
     with core.LOCK:
         company = REPOSITORY.create_company(company, actor["id"])
-        core.DB["branding"][slug] = {"name": name, "accent": "#50d5b9", "logoText": name[0].upper()}
-        core.save_db(core.DB)
     return company
 
 
@@ -374,10 +461,27 @@ def root_overview(request: Request) -> list[dict]:
     return core.customer_overview(companies, assets)
 
 
+@api.get("/api/dashboard", tags=["dashboard"])
+def dashboard(request: Request, companyId: str | None = None) -> dict:
+    user = current_user(request)
+    if companyId:
+        _company_for_user(companyId, user)
+    else:
+        _require_role(user, {"platform_admin", "msp_operator"}, "MSP dashboard requires root or MSP role")
+    companies = [company for company in REPOSITORY.list_companies() if core.allowed(user, company["id"])]
+    assets = [asset for asset in REPOSITORY.list_assets() if core.allowed(user, asset["companyId"])]
+    asset_ids = {asset["id"] for asset in assets if not companyId or asset["companyId"] == companyId}
+    relationships = [item for item in REPOSITORY.list_relationships() if item["fromId"] in asset_ids and item["toId"] in asset_ids]
+    changes = [item for item in REPOSITORY.list_changes() if core.allowed(user, item["companyId"])]
+    integrations = REPOSITORY.list_integrations() if not companyId else []
+    sync_runs = REPOSITORY.list_sync_runs() if not companyId else []
+    return core.dashboard_snapshot(companies, assets, relationships, changes, integrations, sync_runs, company_id=companyId)
+
+
 def _validate_group(payload: AccessGroupRequest, current_id: str | None = None) -> tuple[str, list[str]]:
     name = payload.name.strip()[:80]
     company_ids = sorted(set(payload.companyIds))
-    if not name or not company_ids or not all(core.known_company(company_id) for company_id in company_ids):
+    if not name or not company_ids or not all(_known_company(company_id) for company_id in company_ids):
         raise HTTPException(400, "Provide a group name and at least one valid customer")
     if any(item["id"] != current_id and item["name"].lower() == name.lower() for item in REPOSITORY.list_access_groups()):
         raise HTTPException(409, "A group with that name already exists")
@@ -517,11 +621,11 @@ def create_user(payload: UserCreateRequest, request: Request) -> dict:
                 if company["id"] in group["companyIds"]
             )
         assigned_companies = sorted(company_ids)
-        if not assigned_companies or not all(core.known_company(company_id) for company_id in assigned_companies):
+        if not assigned_companies or not all(_known_company(company_id) for company_id in assigned_companies):
             raise HTTPException(400, "Choose at least one valid customer permission or access group")
         role = "msp_operator"
     elif payload.accountType == "customer":
-        if not payload.companyId or not core.known_company(payload.companyId) or not core.can_manage(actor, payload.companyId):
+        if not payload.companyId or not _known_company(payload.companyId) or not core.can_manage(actor, payload.companyId):
             raise HTTPException(403, "Choose a customer you manage")
         assigned_companies = [payload.companyId]
         role = "client_reader"
@@ -572,12 +676,13 @@ def get_branding(request: Request, scope: str | None = None, companyId: str | No
         _require_role(user, {"platform_admin", "msp_operator"}, "MSP branding requires root or MSP role")
         return REPOSITORY.get_msp_branding()
     if companyId:
-        company = _company_for_user(companyId, user)
-        return core.DB["branding"].get(
-            companyId,
-            {"name": company["name"], "accent": "#50d5b9", "logoText": company["name"][0].upper()},
-        )
-    return {key: value for key, value in core.DB["branding"].items() if core.allowed(user, key)}
+        _company_for_user(companyId, user)
+        return REPOSITORY.get_company_branding(companyId)
+    return {
+        key: value
+        for key, value in REPOSITORY.list_company_branding().items()
+        if core.allowed(user, key)
+    }
 
 
 @api.put("/api/branding", tags=["branding"])
@@ -606,13 +711,14 @@ def update_branding(payload: BrandingRequest, request: Request) -> dict:
     company = _company_for_user(payload.companyId, user, require_manage=True)
     brand = {
         "name": (payload.name or company["name"])[:80],
-        "accent": (payload.accent or "#50d5b9")[:16],
+        "accent": _validated_colour(payload.accent, "#50d5b9"),
+        "secondaryAccent": _validated_colour(payload.secondaryAccent, "#7997ff"),
         "logoText": (payload.logoText or company["name"][0]).upper()[:3],
+        "logoDataUrl": _validated_logo_data_url(payload.logoDataUrl),
+        "logoFileName": payload.logoFileName[:180] if payload.logoDataUrl else "",
     }
     with core.LOCK:
-        core.DB["branding"][payload.companyId] = brand
-        core.save_db(core.DB)
-    return brand
+        return REPOSITORY.update_company_branding(payload.companyId, brand, user["id"])
 
 
 def _asset_for_user(asset_id: str, user: dict, require_manage: bool = False) -> dict:
@@ -698,6 +804,22 @@ def demo_data(request: Request) -> dict:
         current = by_name.get((item["companyId"], item["name"]))
         if current:
             legacy_to_canonical[item["id"]] = current["id"]
+            # Re-running the explicit demo seed upgrades demo-owned records as
+            # the sample model evolves, without touching imported/manual CIs.
+            if current.get("source") == "demo":
+                desired_metadata = core.normalise_metadata(
+                    {**(current.get("metadata") or {}), **(item.get("metadata") or {})},
+                    item.get("status"),
+                )
+                changes = {}
+                if current.get("type") != item.get("type"):
+                    changes["type"] = item["type"]
+                if current.get("fields") != item.get("fields"):
+                    changes["fields"] = item.get("fields") or {}
+                if current.get("metadata") != desired_metadata:
+                    changes["metadata"] = desired_metadata
+                if changes:
+                    REPOSITORY.update_asset(current["id"], changes, user["id"])
             continue
         asset = {
             **item,
@@ -751,6 +873,8 @@ def create_relationship(payload: RelationshipCreateRequest, request: Request) ->
         raise HTTPException(400, "A configuration item cannot be related to itself")
     if payload.type not in core.RELATIONSHIP_TYPES:
         raise HTTPException(400, "Choose a valid relationship type")
+    if payload.impactPolicy not in core.IMPACT_POLICIES:
+        raise HTTPException(400, "Choose a valid impact policy")
     relationships = REPOSITORY.list_relationships()
     if core.relationship_exists(relationships, from_asset["id"], to_asset["id"], payload.type):
         raise HTTPException(409, "That relationship already exists")
@@ -758,7 +882,10 @@ def create_relationship(payload: RelationshipCreateRequest, request: Request) ->
         relationships, from_asset["id"], to_asset["id"]
     ):
         raise HTTPException(409, "That dependency would create a cycle")
-    relationship = {"id": str(uuid.uuid4()), "fromId": from_asset["id"], "toId": to_asset["id"], "type": payload.type}
+    relationship = {
+        "id": str(uuid.uuid4()), "fromId": from_asset["id"], "toId": to_asset["id"],
+        "type": payload.type, "impactPolicy": payload.impactPolicy,
+    }
     with core.LOCK:
         return REPOSITORY.create_relationship(relationship, from_asset["companyId"], user["id"])
 

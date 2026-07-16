@@ -1,9 +1,8 @@
 """Resource repositories for the canonical CMDB data model.
 
-The local implementation keeps the lightweight JSON development mode.  The
-PostgreSQL implementation uses canonical UUIDs for CIs and relationships and
-keeps the transitional application-state document synchronized only as a
-portable fallback/backup source while the remaining resources are migrated.
+The local implementation exists only for setup and lightweight development.
+The PostgreSQL implementation is the sole operational source of truth when a
+database is configured; portable exports are assembled from canonical tables.
 """
 from __future__ import annotations
 
@@ -44,6 +43,17 @@ DEFAULT_MSP_BRANDING = {
     "reportFooter": "",
     "confidentialityLabel": "Internal use only",
 }
+
+
+def default_company_branding(name: str) -> dict:
+    return {
+        "name": name,
+        "logoText": (name[:1] or "C").upper(),
+        "accent": "#50d5b9",
+        "secondaryAccent": "#7997ff",
+        "logoDataUrl": "",
+        "logoFileName": "",
+    }
 
 
 def branding_audit_value(brand: dict) -> dict:
@@ -93,7 +103,7 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 class StateRepository:
-    """Local JSON/application-state implementation used for development fallback."""
+    """Local setup/development repository and in-memory unit-test implementation."""
 
     mode = "state"
 
@@ -555,6 +565,40 @@ class StateRepository:
         self.save_state(self.state)
         return deepcopy(stored)
 
+    def get_company_branding(self, company_id: str) -> dict:
+        company = next((item for item in self.state["companies"] if item["id"] == company_id), None)
+        if not company:
+            raise ValueError("Customer not found")
+        return {
+            **default_company_branding(company["name"]),
+            **deepcopy(self.state.setdefault("branding", {}).get(company_id) or {}),
+        }
+
+    def list_company_branding(self) -> dict[str, dict]:
+        return {company["id"]: self.get_company_branding(company["id"]) for company in self.state["companies"]}
+
+    def update_company_branding(self, company_id: str, brand: dict, actor_id: str | None = None) -> dict:
+        before = self.get_company_branding(company_id)
+        stored = {**before, **deepcopy(brand)}
+        self.state.setdefault("branding", {})[company_id] = stored
+        self._audit(company_id, actor_id, "company_branding", company_id, "updated", branding_audit_value(before), branding_audit_value(stored))
+        self.save_state(self.state)
+        return deepcopy(stored)
+
+    def export_state(self) -> dict:
+        return deepcopy(self.state)
+
+    def import_state(self, state: dict, actor_id: str | None = None) -> dict[str, int]:
+        self.state.clear()
+        self.state.update(deepcopy(state))
+        self.state.setdefault("auditEvents", [])
+        self.save_state(self.state)
+        return {
+            "companies": len(self.state.get("companies", [])),
+            "assets": len(self.state.get("assets", [])),
+            "relationships": len(self.state.get("relationships", [])),
+        }
+
     def _audit(
         self,
         company_id: str | None,
@@ -602,6 +646,43 @@ class PostgresCmdbRepository(StateRepository):
         super().__init__(state, save_state)
         self.connection_factory = connection_factory
 
+    def is_initialized(self) -> bool:
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT EXISTS (SELECT 1 FROM users WHERE status <> 'disabled')")
+            return bool(cursor.fetchone()[0])
+
+    def migrate_legacy_company_branding(self) -> int:
+        """Import only the last non-canonical field, then retire the old document."""
+        imported = 0
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT slug, id, name FROM companies WHERE status <> 'inactive'")
+            companies = {slug: (str(company_id), name) for slug, company_id, name in cursor.fetchall()}
+            for company_slug, configured_brand in self.state.get("branding", {}).items():
+                company = companies.get(company_slug)
+                if not company:
+                    continue
+                company_uuid, company_name = company
+                brand = {**default_company_branding(company_name), **(configured_brand or {})}
+                cursor.execute(
+                    """
+                    INSERT INTO company_branding (
+                        company_id, display_name, logo_text, accent_color,
+                        secondary_color, logo_data_url, logo_file_name, updated_at
+                    ) VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT (company_id) DO NOTHING
+                    """,
+                    (
+                        company_uuid, brand["name"], brand["logoText"], brand["accent"],
+                        brand["secondaryAccent"], brand.get("logoDataUrl") or None,
+                        brand.get("logoFileName") or None,
+                    ),
+                )
+                imported += max(0, cursor.rowcount)
+            cursor.execute("SELECT to_regclass('public.legacy_application_state')")
+            if cursor.fetchone()[0]:
+                cursor.execute("DELETE FROM legacy_application_state WHERE state_key = 'cmdb_api'")
+        return imported
+
     def bootstrap(self) -> dict[str, int]:
         """Idempotently import transition-state CMDB records and refresh the mirror."""
         asset_ids: dict[str, str] = {}
@@ -627,6 +708,34 @@ class PostgresCmdbRepository(StateRepository):
 
             cursor.execute("SELECT slug, id FROM companies")
             company_ids = {slug: str(company_id) for slug, company_id in cursor.fetchall()}
+
+            for company_slug, configured_brand in self.state.get("branding", {}).items():
+                company_uuid = company_ids.get(company_slug)
+                company = next((item for item in self.state["companies"] if item["id"] == company_slug), None)
+                if not company_uuid or not company:
+                    continue
+                brand = {**default_company_branding(company["name"]), **(configured_brand or {})}
+                cursor.execute(
+                    """
+                    INSERT INTO company_branding (
+                        company_id, display_name, logo_text, accent_color,
+                        secondary_color, logo_data_url, logo_file_name, updated_at
+                    ) VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT (company_id) DO UPDATE SET
+                        display_name = EXCLUDED.display_name,
+                        logo_text = EXCLUDED.logo_text,
+                        accent_color = EXCLUDED.accent_color,
+                        secondary_color = EXCLUDED.secondary_color,
+                        logo_data_url = EXCLUDED.logo_data_url,
+                        logo_file_name = EXCLUDED.logo_file_name,
+                        updated_at = now()
+                    """,
+                    (
+                        company_uuid, brand["name"], brand["logoText"], brand["accent"],
+                        brand["secondaryAccent"], brand.get("logoDataUrl") or None,
+                        brand.get("logoFileName") or None,
+                    ),
+                )
 
             for group in self.state.get("accessGroups", []):
                 group_uuid = canonical_uuid("access_group", group["id"])
@@ -897,12 +1006,13 @@ class PostgresCmdbRepository(StateRepository):
                 cursor.execute(
                     """
                     INSERT INTO ci_relationships (
-                        id, company_id, from_ci_id, to_ci_id, relationship_type
-                    ) VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s)
+                        id, company_id, from_ci_id, to_ci_id, relationship_type, impact_policy
+                    ) VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, %s)
                     ON CONFLICT (id) DO UPDATE SET
                         from_ci_id = EXCLUDED.from_ci_id,
                         to_ci_id = EXCLUDED.to_ci_id,
                         relationship_type = EXCLUDED.relationship_type,
+                        impact_policy = EXCLUDED.impact_policy,
                         retired_at = NULL
                     """,
                     (
@@ -911,12 +1021,17 @@ class PostgresCmdbRepository(StateRepository):
                         from_id,
                         to_id,
                         relationship["type"],
+                        relationship.get("impactPolicy", "required"),
                     ),
                 )
 
             self._rewrite_change_ids(asset_ids)
             for change in self.state.get("changes", []):
                 self._write_change(cursor, change)
+
+            cursor.execute("SELECT to_regclass('public.legacy_application_state')")
+            if cursor.fetchone()[0]:
+                cursor.execute("DELETE FROM legacy_application_state WHERE state_key = 'cmdb_api'")
 
         self._refresh_state_mirror()
         self.save_state(self.state)
@@ -1258,15 +1373,18 @@ class PostgresCmdbRepository(StateRepository):
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, from_ci_id, to_ci_id, relationship_type
+                SELECT id, from_ci_id, to_ci_id, relationship_type, impact_policy
                 FROM ci_relationships
                 WHERE retired_at IS NULL
                 ORDER BY created_at, id
                 """
             )
             return [
-                {"id": str(item_id), "fromId": str(from_id), "toId": str(to_id), "type": relationship_type}
-                for item_id, from_id, to_id, relationship_type in cursor.fetchall()
+                {
+                    "id": str(item_id), "fromId": str(from_id), "toId": str(to_id),
+                    "type": relationship_type, "impactPolicy": impact_policy,
+                }
+                for item_id, from_id, to_id, relationship_type, impact_policy in cursor.fetchall()
             ]
 
     def create_relationship(self, relationship: dict, company_id: str, actor_id: str | None = None) -> dict:
@@ -1278,8 +1396,13 @@ class PostgresCmdbRepository(StateRepository):
                 raise ValueError("Customer not found")
             cursor.execute(
                 """
-                INSERT INTO ci_relationships (id, company_id, from_ci_id, to_ci_id, relationship_type)
-                VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s)
+                INSERT INTO ci_relationships (id, company_id, from_ci_id, to_ci_id, relationship_type, impact_policy)
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, %s)
+                ON CONFLICT (from_ci_id, to_ci_id, relationship_type) DO UPDATE SET
+                    company_id = EXCLUDED.company_id,
+                    impact_policy = EXCLUDED.impact_policy,
+                    retired_at = NULL
+                RETURNING id
                 """,
                 (
                     relationship_uuid,
@@ -1287,10 +1410,22 @@ class PostgresCmdbRepository(StateRepository):
                     relationship["fromId"],
                     relationship["toId"],
                     relationship["type"],
+                    relationship.get("impactPolicy", "required"),
                 ),
             )
-            stored = {**relationship, "id": relationship_uuid}
-            self._insert_audit(cursor, company_id, actor_id, "relationship", relationship_uuid, "created", None, stored)
+            stored_id = str(cursor.fetchone()[0])
+            reactivated = stored_id != relationship_uuid
+            stored = {**relationship, "id": stored_id, "impactPolicy": relationship.get("impactPolicy", "required")}
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "relationship",
+                stored_id,
+                "reactivated" if reactivated else "created",
+                {**stored, "retired": True} if reactivated else None,
+                stored,
+            )
         self._refresh_state_mirror()
         self.save_state(self.state)
         return stored
@@ -1427,6 +1562,104 @@ class PostgresCmdbRepository(StateRepository):
         self.save_state(self.state)
         return self.get_msp_branding()
 
+    def get_company_branding(self, company_id: str) -> dict:
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT c.name, cb.display_name, cb.logo_text, cb.accent_color,
+                       cb.secondary_color, cb.logo_data_url, cb.logo_file_name
+                FROM companies c
+                LEFT JOIN company_branding cb ON cb.company_id = c.id
+                WHERE c.slug = %s AND c.status <> 'inactive'
+                """,
+                (company_id,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            raise ValueError("Customer not found")
+        company_name, display_name, logo_text, accent, secondary, logo_data_url, logo_file_name = row
+        return {
+            **default_company_branding(company_name),
+            **(
+                {
+                    "name": display_name,
+                    "logoText": logo_text,
+                    "accent": accent,
+                    "secondaryAccent": secondary,
+                    "logoDataUrl": logo_data_url or "",
+                    "logoFileName": logo_file_name or "",
+                }
+                if display_name
+                else {}
+            ),
+        }
+
+    def list_company_branding(self) -> dict[str, dict]:
+        return {company["id"]: self.get_company_branding(company["id"]) for company in self.list_companies()}
+
+    def update_company_branding(self, company_id: str, brand: dict, actor_id: str | None = None) -> dict:
+        before = self.get_company_branding(company_id)
+        stored = {**before, **deepcopy(brand)}
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT id FROM companies WHERE slug = %s AND status <> 'inactive'", (company_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("Customer not found")
+            company_uuid = str(row[0])
+            cursor.execute(
+                """
+                INSERT INTO company_branding (
+                    company_id, display_name, logo_text, accent_color,
+                    secondary_color, logo_data_url, logo_file_name,
+                    updated_by, updated_at
+                ) VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s::uuid, now())
+                ON CONFLICT (company_id) DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    logo_text = EXCLUDED.logo_text,
+                    accent_color = EXCLUDED.accent_color,
+                    secondary_color = EXCLUDED.secondary_color,
+                    logo_data_url = EXCLUDED.logo_data_url,
+                    logo_file_name = EXCLUDED.logo_file_name,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = now()
+                """,
+                (
+                    company_uuid, stored["name"], stored["logoText"], stored["accent"],
+                    stored["secondaryAccent"], stored.get("logoDataUrl") or None,
+                    stored.get("logoFileName") or None, actor_id,
+                ),
+            )
+            self._insert_audit(
+                cursor, company_id, actor_id, "company_branding", company_uuid,
+                "updated", branding_audit_value(before), branding_audit_value(stored),
+            )
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return self.get_company_branding(company_id)
+
+    def export_state(self) -> dict:
+        """Assemble a portable document from canonical tables, never a JSON mirror."""
+        return {
+            "companies": self.list_companies(),
+            "users": self.list_users(include_credentials=True),
+            "accessGroups": self.list_access_groups(),
+            "assets": self.list_assets(),
+            "relationships": self.list_relationships(),
+            "changes": self.list_changes(),
+            "integrations": self.list_integrations(),
+            "syncRuns": self.list_sync_runs(),
+            "branding": self.list_company_branding(),
+            "mspBranding": self.get_msp_branding(),
+            "auditEvents": [],
+        }
+
+    def import_state(self, state: dict, actor_id: str | None = None) -> dict[str, int]:
+        """Explicitly merge a validated portable state into canonical tables."""
+        self.state.clear()
+        self.state.update(deepcopy(state))
+        self.state.setdefault("auditEvents", [])
+        return self.bootstrap()
+
     def list_sync_runs(self) -> list[dict]:
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -1552,6 +1785,7 @@ class PostgresCmdbRepository(StateRepository):
         self.state["changes"] = self.list_changes()
         self.state["integrations"] = self.list_integrations()
         self.state["syncRuns"] = self.list_sync_runs()
+        self.state["branding"] = self.list_company_branding()
         self.state["mspBranding"] = self.get_msp_branding()
 
     def _rewrite_change_ids(self, mapping: dict[str, str]) -> None:

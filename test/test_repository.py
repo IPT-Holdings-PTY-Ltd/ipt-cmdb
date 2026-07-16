@@ -111,6 +111,25 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.state["auditEvents"][0]["entityType"], "msp_branding")
         self.assertNotIn("data:image", self.state["auditEvents"][0]["after"]["logoDataUrl"])
 
+    def test_customer_branding_is_scoped_persisted_and_audited(self):
+        self.assertEqual(self.repository.get_company_branding("acme")["name"], "Acme")
+        stored = self.repository.update_company_branding(
+            "acme",
+            {
+                "name": "Acme Portal",
+                "logoText": "AC",
+                "accent": "#123456",
+                "secondaryAccent": "#654321",
+                "logoDataUrl": "",
+                "logoFileName": "",
+            },
+            "admin",
+        )
+        self.assertEqual(stored["name"], "Acme Portal")
+        self.assertEqual(self.repository.list_company_branding()["acme"]["accent"], "#123456")
+        self.assertEqual(self.state["auditEvents"][0]["entityType"], "company_branding")
+        self.assertEqual(self.state["auditEvents"][0]["companyId"], "acme")
+
     def test_asset_write_creates_an_audit_event(self):
         asset = {"id": "asset-1", "companyId": "acme", "name": "APP01", "type": "Server"}
         self.repository.create_asset(asset, "admin")

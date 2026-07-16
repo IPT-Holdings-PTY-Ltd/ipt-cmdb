@@ -10,27 +10,32 @@ ASSETS = [
     {"id": "db", "companyId": "acme", "name": "DB01", "type": "Server", "source": "ncentral", "metadata": {"criticality": "critical", "environment": "production", "technicalOwner": "Platform Team", "site": "HQ"}},
     {"id": "app", "companyId": "acme", "name": "APP01", "type": "Server", "source": "ncentral", "metadata": {"criticality": "high", "environment": "production", "serviceOwner": "Applications"}},
     {"id": "portal", "companyId": "acme", "name": "Customer Portal", "type": "Software", "source": "manual", "metadata": {"criticality": "high", "environment": "production"}},
+    {"id": "sage", "companyId": "acme", "name": "Sage 200", "type": "Business system", "source": "manual", "metadata": {"criticality": "critical", "environment": "production", "businessOwner": "Finance Director", "signoffDelegate": "Financial Controller", "signoffRequired": "yes", "department": "Finance", "userPopulation": "42 users", "rtoHours": "4", "rpoHours": "1"}},
     {"id": "other", "companyId": "northwind", "name": "OTHER", "type": "Server", "source": "ncentral", "metadata": {}},
 ]
 
 RELATIONSHIPS = [
     {"fromId": "app", "toId": "db", "type": "depends_on"},
     {"fromId": "portal", "toId": "app", "type": "installed_on"},
+    {"fromId": "sage", "toId": "app", "type": "depends_on", "impactPolicy": "required"},
 ]
 
 
 class ChangeControlTests(unittest.TestCase):
     def test_impact_snapshot_follows_supporting_to_affected_semantics(self):
         snapshot = build_impact_snapshot("acme", ["db"], ASSETS, RELATIONSHIPS)
-        self.assertEqual([item["assetId"] for item in snapshot], ["db", "app", "portal"])
+        self.assertEqual([item["assetId"] for item in snapshot], ["db", "app", "portal", "sage"])
         self.assertEqual(snapshot[1]["role"], "Direct impact")
         self.assertEqual(snapshot[2]["role"], "Downstream impact")
         self.assertEqual(snapshot[2]["relationshipPath"], ["depends_on", "installed_on"])
+        self.assertEqual(snapshot[3]["impactSeverity"], "outage")
 
     def test_impact_preview_flags_risk_and_missing_owners(self):
         preview = preview_change_impact("acme", ["db"], True, ASSETS, RELATIONSHIPS)
         self.assertEqual(preview["summary"]["scopeCount"], 1)
         self.assertEqual(preview["summary"]["missingOwnerCount"], 1)
+        self.assertEqual(preview["summary"]["businessSystemCount"], 1)
+        self.assertEqual(preview["summary"]["businessOwners"], ["Finance Director"])
         self.assertIn(preview["summary"]["suggestedRisk"]["level"], {"high", "critical"})
 
     def test_cross_customer_scope_is_rejected(self):
@@ -41,7 +46,39 @@ class ChangeControlTests(unittest.TestCase):
         change = self._change()
         self.assertEqual(change["integrationState"]["connectwise"]["status"], "not_published")
         self.assertEqual(change["revision"], 1)
-        self.assertEqual(len(change["impactSnapshot"]), 3)
+        self.assertEqual(len(change["impactSnapshot"]), 4)
+
+    def test_informational_relationship_does_not_propagate_impact(self):
+        relationships = [
+            {"fromId": "sage", "toId": "db", "type": "depends_on", "impactPolicy": "informational"},
+        ]
+        snapshot = build_impact_snapshot("acme", ["db"], ASSETS, relationships)
+        self.assertEqual([item["assetId"] for item in snapshot], ["db"])
+
+    def test_single_host_change_uses_cluster_ha_capacity(self):
+        assets, relationships = self._virtualization_fixture()
+        preview = preview_change_impact("acme", ["host-1"], False, assets, relationships)
+        by_id = {item["assetId"]: item for item in preview["items"]}
+        self.assertEqual(by_id["vm-1"]["impactSeverity"], "protected")
+        self.assertEqual(by_id["erp"]["impactSeverity"], "protected")
+        self.assertIn("1 eligible host", by_id["vm-1"]["virtualizationDecision"])
+        self.assertEqual(preview["summary"]["protectedVmCount"], 1)
+        self.assertIn("protected by verified HA capacity", " ".join(preview["summary"]["suggestedRisk"]["factors"]))
+
+    def test_multi_host_change_exhausts_cluster_failover(self):
+        assets, relationships = self._virtualization_fixture()
+        preview = preview_change_impact("acme", ["host-1", "host-2"], False, assets, relationships)
+        by_id = {item["assetId"]: item for item in preview["items"]}
+        self.assertEqual(by_id["vm-1"]["impactSeverity"], "outage")
+        self.assertEqual(by_id["erp"]["impactSeverity"], "outage")
+        self.assertEqual(preview["summary"]["outageVmCount"], 1)
+
+    def test_shared_datastore_failure_bypasses_compute_ha(self):
+        assets, relationships = self._virtualization_fixture()
+        preview = preview_change_impact("acme", ["ds-1"], False, assets, relationships)
+        by_id = {item["assetId"]: item for item in preview["items"]}
+        self.assertEqual(by_id["vm-1"]["impactSeverity"], "outage")
+        self.assertEqual(by_id["erp"]["impactSeverity"], "outage")
 
     def test_pdf_contains_change_and_impact_details(self):
         change = self._change()
@@ -52,6 +89,8 @@ class ChangeControlTests(unittest.TestCase):
         self.assertIn("Database maintenance", text)
         self.assertIn("DB01", text)
         self.assertIn("APP01", text)
+        self.assertIn("Sage 200", text)
+        self.assertIn("Financial Controller", text)
         self.assertIn("Rollback plan", text)
         self.assertIn("ConnectWise status", text)
 
@@ -102,6 +141,26 @@ class ChangeControlTests(unittest.TestCase):
             ASSETS,
             RELATIONSHIPS,
         )
+
+    @staticmethod
+    def _virtualization_fixture():
+        assets = [
+            {"id": "cluster", "companyId": "acme", "name": "PROD-CL01", "type": "Virtualization cluster", "source": "manual", "metadata": {"haEnabled": "yes", "minimumHosts": "1", "capacityStatus": "sufficient", "operationalStatus": "healthy"}},
+            {"id": "host-1", "companyId": "acme", "name": "ESX01", "type": "Hypervisor host", "source": "manual", "metadata": {"powerState": "running", "maintenanceMode": "no", "operationalStatus": "healthy"}},
+            {"id": "host-2", "companyId": "acme", "name": "ESX02", "type": "Hypervisor host", "source": "manual", "metadata": {"powerState": "running", "maintenanceMode": "no", "operationalStatus": "healthy"}},
+            {"id": "vm-1", "companyId": "acme", "name": "ERP01", "type": "Virtual machine", "source": "manual", "metadata": {"haEnabled": "yes", "mobility": "automatic", "protectionStatus": "protected", "virtualizationPlatform": "VMware vSphere", "clusterName": "PROD-CL01"}},
+            {"id": "ds-1", "companyId": "acme", "name": "DATASTORE01", "type": "Datastore", "source": "manual", "metadata": {}},
+            {"id": "erp", "companyId": "acme", "name": "ERP", "type": "Business system", "source": "manual", "metadata": {"businessOwner": "Finance"}},
+        ]
+        relationships = [
+            {"fromId": "host-1", "toId": "cluster", "type": "member_of", "impactPolicy": "informational"},
+            {"fromId": "host-2", "toId": "cluster", "type": "member_of", "impactPolicy": "informational"},
+            {"fromId": "vm-1", "toId": "cluster", "type": "member_of", "impactPolicy": "informational"},
+            {"fromId": "host-1", "toId": "vm-1", "type": "hosts", "impactPolicy": "required"},
+            {"fromId": "vm-1", "toId": "ds-1", "type": "stored_on", "impactPolicy": "required"},
+            {"fromId": "erp", "toId": "vm-1", "type": "depends_on", "impactPolicy": "required"},
+        ]
+        return assets, relationships
 
 
 if __name__ == "__main__":
