@@ -107,6 +107,9 @@ def build_report(
     company_names = {item["id"]: item["name"] for item in companies}
     scoped_assets = [item for item in assets if not company_id or item["companyId"] == company_id]
     scoped_changes = [item for item in changes if not company_id or item["companyId"] == company_id]
+    scoped_audit_events = [
+        item for item in audit_events if not company_id or item.get("companyId") == company_id
+    ]
     rows: list[dict] = []
 
     if report_id == "asset-register":
@@ -275,7 +278,7 @@ def build_report(
             ("source", "Source"),
             ("correlation", "Correlation ID"),
         )
-        for item in audit_events:
+        for item in scoped_audit_events:
             rows.append(
                 {
                     "time": item.get("createdAt", ""),

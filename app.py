@@ -2052,13 +2052,27 @@ def execute_sync(kind: str) -> dict:
         )
     elif kind == "connectwise":
         base = os.environ["CW_BASE_URL"].rstrip("/")
+        parsed_base = urlparse(base)
+        if (
+            parsed_base.scheme.casefold() != "https"
+            or not parsed_base.hostname
+            or parsed_base.username
+            or parsed_base.password
+        ):
+            run.update(
+                status="failed",
+                message="ConnectWise base URL must be an HTTPS URL without embedded credentials.",
+                finishedAt=now(),
+            )
+            return run
         raw = f"{os.environ['CW_COMPANY_ID']}+{os.environ['CW_PUBLIC_KEY']}:{os.environ['CW_PRIVATE_KEY']}"
         headers = {
             "Authorization": "Basic " + base64.b64encode(raw.encode()).decode(),
             "clientId": os.getenv("CW_CLIENT_ID", "msp-cmdb-hub"),
         }
         try:
-            with urlopen(
+            # The integration URL is restricted to HTTPS without embedded credentials above.
+            with urlopen(  # nosec B310
                 Request(f"{base}/company/companies?pageSize=100", headers=headers),
                 timeout=20,
             ) as response:

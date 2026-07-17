@@ -18,6 +18,8 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 
+from psycopg import sql
+
 from src.cmdb.audit import (
     current_audit_context,
     entity_name,
@@ -2444,8 +2446,8 @@ class PostgresCmdbRepository(StateRepository):
                 }
                 for user_id, email, status in cursor.fetchall()
             }
-            cursor.execute(
-                f"""
+            query = sql.SQL(
+                """
                 SELECT contact.id, c.slug, contact.linked_user_id, contact.display_name,
                        contact.first_name, contact.last_name, contact.primary_email::text,
                        contact.phone, contact.mobile, contact.job_title, contact.department,
@@ -2457,10 +2459,13 @@ class PostgresCmdbRepository(StateRepository):
                 FROM contacts contact
                 JOIN companies c ON c.id = contact.company_id
                 LEFT JOIN contact_responsibilities responsibility ON responsibility.contact_id = contact.id
-                {where}
+                {where_clause}
                 GROUP BY contact.id, c.slug
                 ORDER BY contact.normalized_name, contact.id
-                """,
+                """
+            ).format(where_clause=sql.SQL(where))
+            cursor.execute(
+                query,
                 tuple(parameters),
             )
             records = []
@@ -2668,8 +2673,8 @@ class PostgresCmdbRepository(StateRepository):
             clauses.append("responsibility.effective_until IS NULL")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connection_factory() as connection, connection.cursor() as cursor:
-            cursor.execute(
-                f"""
+            query = sql.SQL(
+                """
                 SELECT responsibility.id, company.slug, responsibility.ci_id,
                        ci.display_name, ci.ci_type, responsibility.contact_id,
                        contact.display_name, contact.primary_email::text,
@@ -2681,11 +2686,14 @@ class PostgresCmdbRepository(StateRepository):
                 JOIN companies company ON company.id = responsibility.company_id
                 JOIN configuration_items ci ON ci.id = responsibility.ci_id
                 JOIN contacts contact ON contact.id = responsibility.contact_id
-                {where}
+                {where_clause}
                 ORDER BY responsibility.effective_until NULLS FIRST,
                          responsibility.responsibility_role, responsibility.escalation_order,
                          contact.display_name
-                """,
+                """
+            ).format(where_clause=sql.SQL(where))
+            cursor.execute(
+                query,
                 tuple(parameters),
             )
             return [
@@ -3973,8 +3981,9 @@ class PostgresCmdbRepository(StateRepository):
             parameters.append(f"%{search[:200]}%")
         parameters.append(max(1, min(limit, 1000)))
         with self.connection_factory() as connection, connection.cursor() as cursor:
-            cursor.execute(
-                f"""
+            where_clause = sql.SQL(" AND ").join(sql.SQL(clause) for clause in clauses)
+            query = sql.SQL(
+                """
                 SELECT ae.id, c.slug, ae.actor_user_id, ae.actor_label, ae.actor_type,
                        ae.source_system, ae.event_category, ae.entity_type, ae.entity_id,
                        ae.entity_name, ae.action, ae.outcome, ae.severity, ae.request_id,
@@ -3982,10 +3991,13 @@ class PostgresCmdbRepository(StateRepository):
                        ae.reason, ae.metadata, ae.created_at
                 FROM audit_events ae
                 LEFT JOIN companies c ON c.id = ae.company_id
-                WHERE {" AND ".join(clauses)}
+                WHERE {where_clause}
                 ORDER BY ae.created_at DESC, ae.id DESC
                 LIMIT %s
-                """,
+                """
+            ).format(where_clause=where_clause)
+            cursor.execute(
+                query,
                 tuple(parameters),
             )
             return [

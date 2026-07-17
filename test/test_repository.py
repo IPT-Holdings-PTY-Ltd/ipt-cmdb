@@ -289,6 +289,162 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.state["relationships"], [])
         self.assertEqual(self.state["auditEvents"][0]["action"], "retired")
 
+    def test_user_company_and_asset_lifecycle_handles_missing_and_disabled_records(self):
+        self.assertIsNone(self.repository.authenticate("missing@example.com", "secret"))
+        self.assertIsNone(self.repository.authenticate("admin@example.com", "wrong"))
+        self.assertFalse(self.repository.set_user_status("missing", "disabled", "admin"))
+
+        self.repository.create_user(
+            {
+                "id": "reader",
+                "email": "reader@example.com",
+                "role": "client_reader",
+                "companyIds": ["acme"],
+            },
+            "VerySecret!42",
+            "admin",
+        )
+        self.assertTrue(
+            self.repository.set_user_status("reader", "disabled", "admin", reason="Access review")
+        )
+        self.assertNotIn("reader", {item["id"] for item in self.repository.list_users()})
+        self.assertIsNone(self.repository.authenticate("reader@example.com", "VerySecret!42"))
+
+        company = self.repository.create_company(
+            {"id": "northwind", "name": "Northwind Traders", "externalIds": {}}, "admin"
+        )
+        self.assertEqual(company["id"], "northwind")
+        asset = self.repository.create_asset(
+            {"id": "asset-1", "companyId": "acme", "name": "APP01", "type": "Server"},
+            "admin",
+        )
+        updated = self.repository.update_asset(asset["id"], {"status": "Retired"}, "admin")
+        self.assertEqual(updated["status"], "Retired")
+        self.assertIsNone(self.repository.update_asset("missing", {"status": "Retired"}, "admin"))
+        self.assertFalse(self.repository.delete_relationship("missing", "acme", "admin"))
+
+    def test_data_quality_exceptions_are_upserted_scoped_and_resolved(self):
+        exception = {
+            "id": "owner-gap:asset-1",
+            "companyId": "acme",
+            "ruleKey": "owner-gap",
+            "entityId": "asset-1",
+            "reason": "Temporary project ownership",
+        }
+        created = self.repository.create_data_quality_exception(exception, "admin")
+        exception["reason"] = "Ownership review scheduled"
+        updated = self.repository.create_data_quality_exception(exception, "admin")
+        self.assertEqual(created["id"], updated["id"])
+        self.assertEqual(len(self.repository.list_data_quality_exceptions("acme")), 1)
+        self.assertEqual(updated["reason"], "Ownership review scheduled")
+
+        resolved = self.repository.resolve_data_quality_exception(updated["id"], "admin")
+        self.assertEqual(resolved["state"], "resolved")
+        self.assertEqual(resolved["resolvedBy"], "admin")
+        self.assertIsNone(self.repository.resolve_data_quality_exception("missing", "admin"))
+        self.assertEqual(self.repository.list_data_quality_exceptions("northwind"), [])
+
+    def test_reconciliation_and_field_authority_decisions_are_governed(self):
+        self.state["reconciliationCandidates"] = [
+            {"id": "candidate-1", "companyId": "acme", "state": "pending"},
+            {"id": "candidate-2", "companyId": "northwind", "state": "pending"},
+        ]
+        self.assertEqual(
+            [item["id"] for item in self.repository.list_reconciliation_candidates("acme")],
+            ["candidate-1"],
+        )
+        decision = self.repository.resolve_reconciliation_candidate(
+            "candidate-1", "use_existing", "Serial number confirmed", "asset-1", "admin"
+        )
+        self.assertEqual(decision["state"], "approved")
+        self.assertEqual(decision["targetAssetId"], "asset-1")
+        self.assertIsNone(
+            self.repository.resolve_reconciliation_candidate(
+                "missing", "ignore", "Not relevant", None, "admin"
+            )
+        )
+
+        rule = {
+            "companyId": "acme",
+            "ciType": "Server",
+            "fieldName": "name",
+            "provider": "ncentral",
+            "priority": 100,
+        }
+        self.repository.upsert_field_authority(rule, "admin")
+        rule["priority"] = 10
+        updated = self.repository.upsert_field_authority(rule, "admin")
+        self.assertEqual(updated["priority"], 10)
+        self.assertEqual(len(self.repository.list_field_authority("acme")), 1)
+        self.assertTrue(
+            self.repository.delete_field_authority("acme", "Server", "name", "ncentral", "admin")
+        )
+        self.assertFalse(
+            self.repository.delete_field_authority("acme", "Server", "name", "ncentral", "admin")
+        )
+
+    def test_audit_search_filters_and_redaction_preserve_tenant_boundaries(self):
+        self.repository.record_audit_event(
+            "acme",
+            "admin",
+            "configuration_item",
+            "asset-1",
+            "updated",
+            before={"name": "APP01", "apiToken": "old-secret"},
+            after={"name": "APP02", "apiToken": "new-secret"},
+            reason="Rename approved",
+            metadata={"password": "hidden", "ticket": "CHG-1"},
+        )
+        self.repository.record_audit_event(
+            "northwind",
+            None,
+            "database",
+            "database-1",
+            "restored",
+            severity="warning",
+            actor_type="service",
+            source_system="recovery",
+        )
+        acme = self.repository.list_audit_events(
+            "acme",
+            actor_id="admin",
+            category="data",
+            action="updated",
+            entity_type="configuration_item",
+            entity_id="asset-1",
+            outcome="success",
+            search="APP02",
+            limit=1,
+        )
+        self.assertEqual(len(acme), 1)
+        self.assertEqual(acme[0]["before"]["apiToken"], "[redacted]")
+        self.assertEqual(acme[0]["metadata"]["password"], "[redacted]")
+        self.assertEqual(self.repository.list_audit_events("acme", search="not-found"), [])
+        self.assertEqual(len(self.repository.list_audit_events("northwind")), 1)
+
+    def test_state_export_import_is_deep_copied_and_reinitializes_optional_collections(self):
+        exported = self.repository.export_state()
+        exported["companies"][0]["name"] = "Changed outside repository"
+        self.assertEqual(self.state["companies"][0]["name"], "Acme")
+        with self.assertRaisesRegex(ValueError, "Customer not found"):
+            self.repository.get_company_branding("missing")
+
+        result = self.repository.import_state(
+            {
+                "companies": [{"id": "new", "name": "New Customer"}],
+                "users": [],
+                "accessGroups": [],
+                "assets": [{"id": "new-asset", "companyId": "new", "name": "CI"}],
+                "relationships": [],
+                "integrations": [],
+                "syncRuns": [],
+            },
+            "admin",
+        )
+        self.assertEqual(result, {"companies": 1, "assets": 1, "relationships": 0})
+        self.assertEqual(self.repository.list_contacts(), [])
+        self.assertIn("auditEvents", self.state)
+
 
 if __name__ == "__main__":
     unittest.main()

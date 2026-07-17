@@ -49,6 +49,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements-dev.txt
+python -m pre_commit install --hook-type pre-commit --hook-type pre-push
 $env:DATABASE_URL='postgresql://cmdb:cmdb@localhost:5432/cmdb'
 $env:DATABASE_SEED_MODE='demo'
 $env:AUTH_MODE='local'
@@ -67,7 +68,9 @@ Open <http://localhost:5173>. The Vite server proxies `/api` to port 3000.
 ## Test suite
 
 ```powershell
-python -m unittest discover -s test -v
+python -m pre_commit run --all-files
+python -m coverage run -m unittest discover -s test -v
+python -m coverage report
 npm test
 npm run typecheck
 npm run build
@@ -77,11 +80,20 @@ docker build --tag ipt-cmdb:local .
 Database bootstrap and upgrade checks need a reachable PostgreSQL administrator connection:
 
 ```powershell
+$env:TEST_POSTGRES_ADMIN_URL='postgresql://cmdb:cmdb@localhost:5432/postgres'
+python -m unittest discover -s test -p "test_postgres_repository.py" -v
 python scripts/verify_blank_postgres.py --admin-url postgresql://postgres:postgres@localhost:5432/postgres
 python scripts/verify_postgres_upgrade.py --admin-url postgresql://postgres:postgres@localhost:5432/postgres
 ```
 
-Each verifier creates an isolated temporary database and removes it after the check.
+The repository contract test and both verifiers create isolated temporary databases and remove
+them after each check. The ordinary local suite skips the PostgreSQL contract test when
+`TEST_POSTGRES_ADMIN_URL` is not set; GitHub Actions always enables it.
+
+The repository's `.python-version` keeps compatible version managers on Python 3.12,
+matching the production image and GitHub Actions. Security tools are intentionally
+isolated in `requirements-security.txt`; CI blocks medium/high confidence Bandit
+findings while dependency advisories are initially reported without blocking merges.
 
 ## Database modes
 

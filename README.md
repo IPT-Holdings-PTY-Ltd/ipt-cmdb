@@ -72,6 +72,7 @@ docker compose up -d postgres
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements-dev.txt
+python -m pre_commit install --hook-type pre-commit --hook-type pre-push
 npm ci
 $env:DATABASE_URL='postgresql://cmdb:cmdb@localhost:5432/cmdb'
 $env:DATABASE_SEED_MODE='demo'
@@ -89,12 +90,17 @@ Open <http://localhost:5173>. Vite proxies `/api` to FastAPI.
 Before opening a pull request:
 
 ```powershell
-python -m unittest discover -s test -v
+python -m pre_commit run --all-files
+python -m coverage run -m unittest discover -s test -v
+python -m coverage report
 npm test
 npm run typecheck
 npm run build
 docker build --tag ipt-cmdb:local .
 ```
+
+The pre-commit hook runs Ruff and mypy on each commit. The pre-push hook also runs
+the Python suite with branch coverage and enforces the checked-in coverage floor.
 
 ## Architecture at a glance
 
