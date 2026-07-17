@@ -99,6 +99,8 @@ function WorkspaceMenu() {
       <Menu.Item to="/admin/branding" primaryText="Branding" leftIcon={<PaletteOutlined />} />
       {platformAdmin && <Menu.Item to="/admin/database" primaryText="Database & recovery" leftIcon={<StorageOutlined />} />}
     </>}
+    {section('Account')}
+    <Menu.Item to="/profile/security" primaryText="My security" leftIcon={<SecurityOutlined />} />
   </Menu>;
 }
 

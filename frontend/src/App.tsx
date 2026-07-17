@@ -31,6 +31,7 @@ const RbacPage = lazy(() => import('./RootAdmin').then(module => ({ default: mod
 const IntegrationsPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.IntegrationsPage })));
 const BrandingPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.BrandingPage })));
 const DatabasePage = lazy(() => import('./RootAdmin').then(module => ({ default: module.DatabasePage })));
+const SecurityPage = lazy(() => import('./SecurityPage').then(module => ({ default: module.SecurityPage })));
 
 function RouteLoadingFallback() {
   return <Box sx={{ display: 'grid', minHeight: '45vh', placeItems: 'center' }}><CircularProgress aria-label="Loading workspace" /></Box>;
@@ -71,6 +72,7 @@ function BrandedApplication() {
           <Route path="/admin/integrations" element={<IntegrationsPage />} />
           <Route path="/admin/branding" element={<BrandingPage />} />
           <Route path="/admin/database" element={<DatabasePage />} />
+          <Route path="/profile/security" element={<SecurityPage />} />
         </CustomRoutes>
       </Admin>
     </Suspense></WorkspaceProvider>;

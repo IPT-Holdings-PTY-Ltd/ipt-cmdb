@@ -137,6 +137,10 @@ class StateRepository:
         self.state.setdefault("contacts", [])
         self.state.setdefault("contactResponsibilities", [])
         self.state.setdefault("apiTokens", [])
+        self.state.setdefault("mfaCredentials", [])
+        self.state.setdefault("mfaRecoveryCodes", [])
+        self.state.setdefault("loginChallenges", [])
+        self.state.setdefault("sessions", [])
 
     def list_companies(self) -> list[dict]:
         return deepcopy(self.state["companies"])
@@ -169,6 +173,7 @@ class StateRepository:
         record.setdefault("displayName", record["email"].split("@", 1)[0])
         record.setdefault("status", "active")
         record.setdefault("apiAccessEnabled", False)
+        record.setdefault("mfaRequired", False)
         record.setdefault("groupIds", [])
         record["directCompanyIds"] = direct_company_ids
         record["authSource"] = (
@@ -181,6 +186,15 @@ class StateRepository:
         record["apiTokenCount"] = len(active_tokens)
         record["lastApiUsedAt"] = (
             max((item.get("lastUsedAt") or "" for item in tokens), default="") or None
+        )
+        credential = next(
+            (item for item in self.state["mfaCredentials"] if item["userId"] == record["id"]),
+            None,
+        )
+        record["mfaEnabled"] = bool(credential and credential.get("status") == "enabled")
+        record["mfaRecoveryCodesRemaining"] = sum(
+            item["userId"] == record["id"] and not item.get("usedAt")
+            for item in self.state["mfaRecoveryCodes"]
         )
         return record
 
@@ -219,6 +233,7 @@ class StateRepository:
             "displayName": user["email"].split("@", 1)[0],
             "status": "active",
             "apiAccessEnabled": False,
+            "mfaRequired": False,
             "lastLoginAt": None,
             **deepcopy(user),
             "passwordHash": hash_password(password),
@@ -290,6 +305,313 @@ class StateRepository:
         if user:
             user["lastLoginAt"] = utc_now()
             self.save_state(self.state)
+
+    def get_mfa_credential(self, user_id: str) -> dict | None:
+        """Return encrypted MFA material for an internal authentication flow."""
+
+        credential = next(
+            (item for item in self.state["mfaCredentials"] if item["userId"] == user_id),
+            None,
+        )
+        return deepcopy(credential) if credential else None
+
+    def save_mfa_enrollment(
+        self,
+        user_id: str,
+        encrypted_secret: str,
+        nonce: str,
+        actor_id: str | None = None,
+    ) -> dict:
+        """Create or replace a pending TOTP enrollment."""
+
+        self.state["mfaCredentials"] = [
+            item for item in self.state["mfaCredentials"] if item["userId"] != user_id
+        ]
+        self.state["mfaRecoveryCodes"] = [
+            item for item in self.state["mfaRecoveryCodes"] if item["userId"] != user_id
+        ]
+        credential = {
+            "userId": user_id,
+            "method": "totp",
+            "status": "pending",
+            "encryptedSecret": encrypted_secret,
+            "secretNonce": nonce,
+            "keyVersion": 1,
+            "lastAcceptedCounter": None,
+            "enabledAt": None,
+            "updatedAt": utc_now(),
+        }
+        self.state["mfaCredentials"].append(credential)
+        self._audit(
+            None,
+            actor_id,
+            "authentication",
+            user_id,
+            "mfa_enrollment_started",
+            None,
+            {"method": "totp", "status": "pending"},
+        )
+        self.save_state(self.state)
+        return deepcopy(credential)
+
+    def enable_mfa(
+        self,
+        user_id: str,
+        counter: int,
+        recovery_hashes: list[str],
+        actor_id: str | None = None,
+    ) -> bool:
+        """Activate a verified TOTP credential and replace its recovery codes."""
+
+        credential = next(
+            (item for item in self.state["mfaCredentials"] if item["userId"] == user_id),
+            None,
+        )
+        if not credential:
+            return False
+        credential.update(
+            {
+                "status": "enabled",
+                "lastAcceptedCounter": counter,
+                "enabledAt": utc_now(),
+                "updatedAt": utc_now(),
+            }
+        )
+        self.state["mfaRecoveryCodes"] = [
+            item for item in self.state["mfaRecoveryCodes"] if item["userId"] != user_id
+        ] + [
+            {
+                "id": str(uuid.uuid4()),
+                "userId": user_id,
+                "codeHash": code_hash,
+                "usedAt": None,
+                "createdAt": utc_now(),
+            }
+            for code_hash in recovery_hashes
+        ]
+        self._audit(
+            None,
+            actor_id,
+            "authentication",
+            user_id,
+            "mfa_enabled",
+            None,
+            {"method": "totp", "recoveryCodeCount": len(recovery_hashes)},
+        )
+        self.save_state(self.state)
+        return True
+
+    def accept_mfa_counter(self, user_id: str, counter: int) -> bool:
+        """Atomically record a newer accepted TOTP time step."""
+
+        credential = next(
+            (item for item in self.state["mfaCredentials"] if item["userId"] == user_id),
+            None,
+        )
+        if (
+            not credential
+            or credential.get("status") != "enabled"
+            or (
+                credential.get("lastAcceptedCounter") is not None
+                and counter <= credential["lastAcceptedCounter"]
+            )
+        ):
+            return False
+        credential["lastAcceptedCounter"] = counter
+        credential["updatedAt"] = utc_now()
+        self.save_state(self.state)
+        return True
+
+    def consume_recovery_code(self, user_id: str, code: str) -> bool:
+        """Redeem one matching recovery code and make it unusable thereafter."""
+
+        for item in self.state["mfaRecoveryCodes"]:
+            if (
+                item["userId"] == user_id
+                and not item.get("usedAt")
+                and verify_password(code.upper(), item["codeHash"])
+            ):
+                item["usedAt"] = utc_now()
+                self.save_state(self.state)
+                return True
+        return False
+
+    def replace_recovery_codes(
+        self, user_id: str, recovery_hashes: list[str], actor_id: str | None = None
+    ) -> bool:
+        """Replace recovery codes after a freshly verified MFA challenge."""
+
+        credential = next(
+            (
+                item
+                for item in self.state["mfaCredentials"]
+                if item["userId"] == user_id and item.get("status") == "enabled"
+            ),
+            None,
+        )
+        if not credential:
+            return False
+        self.state["mfaRecoveryCodes"] = [
+            item for item in self.state["mfaRecoveryCodes"] if item["userId"] != user_id
+        ] + [
+            {
+                "id": str(uuid.uuid4()),
+                "userId": user_id,
+                "codeHash": code_hash,
+                "usedAt": None,
+                "createdAt": utc_now(),
+            }
+            for code_hash in recovery_hashes
+        ]
+        self._audit(
+            None,
+            actor_id,
+            "authentication",
+            user_id,
+            "mfa_recovery_codes_regenerated",
+            None,
+            {"recoveryCodeCount": len(recovery_hashes)},
+        )
+        self.save_state(self.state)
+        return True
+
+    def disable_mfa(
+        self,
+        user_id: str,
+        actor_id: str | None = None,
+        *,
+        reason: str = "",
+        action: str = "mfa_disabled",
+        metadata: dict | None = None,
+    ) -> bool:
+        """Remove TOTP and recovery material while preserving its audit trail."""
+
+        before_count = len(self.state["mfaCredentials"])
+        self.state["mfaCredentials"] = [
+            item for item in self.state["mfaCredentials"] if item["userId"] != user_id
+        ]
+        self.state["mfaRecoveryCodes"] = [
+            item for item in self.state["mfaRecoveryCodes"] if item["userId"] != user_id
+        ]
+        if len(self.state["mfaCredentials"]) == before_count:
+            return False
+        self._audit(
+            None,
+            actor_id,
+            "authentication",
+            user_id,
+            action,
+            {"status": "enabled"},
+            {"status": "disabled"},
+            reason=reason,
+            metadata=metadata,
+        )
+        self.save_state(self.state)
+        return True
+
+    def create_login_challenge(self, challenge: dict) -> None:
+        """Persist a password-verified, short-lived MFA login transaction."""
+
+        self.state["loginChallenges"].append(deepcopy(challenge))
+        self.save_state(self.state)
+
+    def get_login_challenge(self, token_hash: str) -> dict | None:
+        """Return a live, unconsumed login challenge."""
+
+        challenge = next(
+            (
+                item
+                for item in self.state["loginChallenges"]
+                if item["tokenHash"] == token_hash
+                and not item.get("consumedAt")
+                and item["expiresAt"] > utc_now()
+                and item.get("attempts", 0) < item.get("maxAttempts", 5)
+            ),
+            None,
+        )
+        return deepcopy(challenge) if challenge else None
+
+    def record_login_challenge_attempt(self, token_hash: str) -> int:
+        """Increment the failed-or-consumed verification attempt count."""
+
+        challenge = next(
+            (item for item in self.state["loginChallenges"] if item["tokenHash"] == token_hash),
+            None,
+        )
+        if not challenge:
+            return 0
+        challenge["attempts"] = challenge.get("attempts", 0) + 1
+        self.save_state(self.state)
+        return challenge["attempts"]
+
+    def consume_login_challenge(self, token_hash: str) -> None:
+        """Mark a successful login transaction as single-use."""
+
+        challenge = next(
+            (item for item in self.state["loginChallenges"] if item["tokenHash"] == token_hash),
+            None,
+        )
+        if challenge:
+            challenge["consumedAt"] = utc_now()
+            self.save_state(self.state)
+
+    def create_session(self, token_hash: str, user_id: str, expires_at: str) -> None:
+        """Persist a hashed browser session token."""
+
+        self.state["sessions"].append(
+            {
+                "tokenHash": token_hash,
+                "userId": user_id,
+                "expiresAt": expires_at,
+                "createdAt": utc_now(),
+                "lastSeenAt": utc_now(),
+                "revokedAt": None,
+            }
+        )
+        self.save_state(self.state)
+
+    def authenticate_session(self, token_hash: str) -> str | None:
+        """Resolve a live hashed browser session to its user identifier."""
+
+        session = next(
+            (
+                item
+                for item in self.state["sessions"]
+                if item["tokenHash"] == token_hash
+                and not item.get("revokedAt")
+                and item["expiresAt"] > utc_now()
+            ),
+            None,
+        )
+        if not session:
+            return None
+        session["lastSeenAt"] = utc_now()
+        self.save_state(self.state)
+        return session["userId"]
+
+    def revoke_session(self, token_hash: str) -> bool:
+        """Revoke one browser session by its stored hash."""
+
+        session = next(
+            (item for item in self.state["sessions"] if item["tokenHash"] == token_hash), None
+        )
+        if not session:
+            return False
+        session["revokedAt"] = session.get("revokedAt") or utc_now()
+        self.save_state(self.state)
+        return True
+
+    def revoke_user_sessions(self, user_id: str) -> int:
+        """Revoke every live browser session belonging to one user."""
+
+        count = 0
+        for session in self.state["sessions"]:
+            if session["userId"] == user_id and not session.get("revokedAt"):
+                session["revokedAt"] = utc_now()
+                count += 1
+        if count:
+            self.save_state(self.state)
+        return count
 
     @staticmethod
     def _public_api_token(token: dict) -> dict:
@@ -2535,6 +2857,10 @@ class PostgresCmdbRepository(StateRepository):
                 SELECT u.id, u.email::text, u.display_name, u.status,
                        u.api_access_enabled, u.last_login_at, u.archived_at,
                        u.identity_provider_subject, u.attributes, lac.password_hash,
+                       COALESCE(lac.mfa_required, false),
+                       COALESCE(mfa.status = 'enabled', false),
+                       (SELECT count(*) FROM user_mfa_recovery_codes recovery
+                        WHERE recovery.user_id = u.id AND recovery.used_at IS NULL),
                        EXISTS (SELECT 1 FROM user_platform_roles upr WHERE upr.user_id = u.id AND upr.role = 'platform_admin'),
                        ARRAY(
                            SELECT DISTINCT c.slug
@@ -2572,6 +2898,7 @@ class PostgresCmdbRepository(StateRepository):
                         WHERE token.user_id = u.id)
                 FROM users u
                 LEFT JOIN local_auth_credentials lac ON lac.user_id = u.id
+                LEFT JOIN user_mfa_credentials mfa ON mfa.user_id = u.id
                 WHERE %s OR u.status NOT IN ('disabled', 'archived')
                 ORDER BY u.email
                 """,
@@ -2589,6 +2916,9 @@ class PostgresCmdbRepository(StateRepository):
                 identity_provider_subject,
                 attributes,
                 password_hash,
+                mfa_required,
+                mfa_enabled,
+                recovery_codes_remaining,
                 is_admin,
                 company_ids,
                 group_ids,
@@ -2614,6 +2944,9 @@ class PostgresCmdbRepository(StateRepository):
                     "directCompanyIds": (["*"] if is_admin else list(direct_company_ids or [])),
                     "groupIds": list(group_ids or []),
                     "apiAccessEnabled": bool(api_access_enabled),
+                    "mfaRequired": bool(mfa_required),
+                    "mfaEnabled": bool(mfa_enabled),
+                    "mfaRecoveryCodesRemaining": int(recovery_codes_remaining or 0),
                     "apiTokenCount": int(api_token_count or 0),
                     "lastLoginAt": self._timestamp(last_login_at) or None,
                     "lastApiUsedAt": self._timestamp(last_api_used_at) or None,
@@ -2751,6 +3084,11 @@ class PostgresCmdbRepository(StateRepository):
             cursor.execute("DELETE FROM user_platform_roles WHERE user_id = %s::uuid", (user_id,))
             cursor.execute("DELETE FROM user_company_roles WHERE user_id = %s::uuid", (user_id,))
             cursor.execute("DELETE FROM user_access_groups WHERE user_id = %s::uuid", (user_id,))
+            if "mfaRequired" in changes:
+                cursor.execute(
+                    "UPDATE local_auth_credentials SET mfa_required = %s, updated_at = now() WHERE user_id = %s::uuid",
+                    (bool(changes["mfaRequired"]), user_id),
+                )
             if role == "platform_admin":
                 cursor.execute(
                     """
@@ -2836,6 +3174,320 @@ class PostgresCmdbRepository(StateRepository):
                 "UPDATE users SET last_login_at = now(), updated_at = now() WHERE id = %s::uuid",
                 (user_id,),
             )
+
+    def get_mfa_credential(self, user_id: str) -> dict | None:
+        """Return encrypted MFA material for an internal authentication flow."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT user_id, method, status, encrypted_secret, secret_nonce,
+                       key_version, last_accepted_counter, enabled_at, updated_at
+                FROM user_mfa_credentials WHERE user_id = %s::uuid
+                """,
+                (user_id,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "userId": str(row[0]),
+            "method": row[1],
+            "status": row[2],
+            "encryptedSecret": row[3],
+            "secretNonce": row[4],
+            "keyVersion": row[5],
+            "lastAcceptedCounter": row[6],
+            "enabledAt": self._timestamp(row[7]) or None,
+            "updatedAt": self._timestamp(row[8]),
+        }
+
+    def save_mfa_enrollment(
+        self,
+        user_id: str,
+        encrypted_secret: str,
+        nonce: str,
+        actor_id: str | None = None,
+    ) -> dict:
+        """Create or replace a pending TOTP enrollment."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO user_mfa_credentials (
+                    user_id, status, encrypted_secret, secret_nonce, key_version, updated_at
+                ) VALUES (%s::uuid, 'pending', %s, %s, 1, now())
+                ON CONFLICT (user_id) DO UPDATE
+                SET status = 'pending', encrypted_secret = EXCLUDED.encrypted_secret,
+                    secret_nonce = EXCLUDED.secret_nonce, key_version = 1,
+                    last_accepted_counter = NULL, enabled_at = NULL, updated_at = now()
+                """,
+                (user_id, encrypted_secret, nonce),
+            )
+            cursor.execute(
+                "DELETE FROM user_mfa_recovery_codes WHERE user_id = %s::uuid", (user_id,)
+            )
+            self._insert_audit(
+                cursor,
+                None,
+                actor_id,
+                "authentication",
+                user_id,
+                "mfa_enrollment_started",
+                None,
+                {"method": "totp", "status": "pending"},
+            )
+        credential = self.get_mfa_credential(user_id)
+        if not credential:
+            raise RuntimeError("MFA enrollment could not be persisted")
+        return credential
+
+    def enable_mfa(
+        self,
+        user_id: str,
+        counter: int,
+        recovery_hashes: list[str],
+        actor_id: str | None = None,
+    ) -> bool:
+        """Activate a verified TOTP credential and replace its recovery codes."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE user_mfa_credentials
+                SET status = 'enabled', last_accepted_counter = %s,
+                    enabled_at = now(), updated_at = now()
+                WHERE user_id = %s::uuid AND status = 'pending'
+                """,
+                (counter, user_id),
+            )
+            if cursor.rowcount != 1:
+                return False
+            cursor.execute(
+                "DELETE FROM user_mfa_recovery_codes WHERE user_id = %s::uuid", (user_id,)
+            )
+            cursor.executemany(
+                "INSERT INTO user_mfa_recovery_codes (user_id, code_hash) VALUES (%s::uuid, %s)",
+                [(user_id, code_hash) for code_hash in recovery_hashes],
+            )
+            self._insert_audit(
+                cursor,
+                None,
+                actor_id,
+                "authentication",
+                user_id,
+                "mfa_enabled",
+                None,
+                {"method": "totp", "recoveryCodeCount": len(recovery_hashes)},
+            )
+        return True
+
+    def accept_mfa_counter(self, user_id: str, counter: int) -> bool:
+        """Atomically record a newer accepted TOTP time step."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE user_mfa_credentials
+                SET last_accepted_counter = %s, updated_at = now()
+                WHERE user_id = %s::uuid AND status = 'enabled'
+                  AND (last_accepted_counter IS NULL OR last_accepted_counter < %s)
+                """,
+                (counter, user_id, counter),
+            )
+            return cursor.rowcount == 1
+
+    def consume_recovery_code(self, user_id: str, code: str) -> bool:
+        """Redeem one matching recovery code and make it unusable thereafter."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, code_hash FROM user_mfa_recovery_codes
+                WHERE user_id = %s::uuid AND used_at IS NULL FOR UPDATE
+                """,
+                (user_id,),
+            )
+            for code_id, code_hash in cursor.fetchall():
+                if verify_password(code.upper(), code_hash):
+                    cursor.execute(
+                        "UPDATE user_mfa_recovery_codes SET used_at = now() WHERE id = %s::uuid AND used_at IS NULL",
+                        (code_id,),
+                    )
+                    return cursor.rowcount == 1
+        return False
+
+    def replace_recovery_codes(
+        self, user_id: str, recovery_hashes: list[str], actor_id: str | None = None
+    ) -> bool:
+        """Replace recovery codes after a freshly verified MFA challenge."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT 1 FROM user_mfa_credentials WHERE user_id = %s::uuid AND status = 'enabled'",
+                (user_id,),
+            )
+            if not cursor.fetchone():
+                return False
+            cursor.execute(
+                "DELETE FROM user_mfa_recovery_codes WHERE user_id = %s::uuid", (user_id,)
+            )
+            cursor.executemany(
+                "INSERT INTO user_mfa_recovery_codes (user_id, code_hash) VALUES (%s::uuid, %s)",
+                [(user_id, code_hash) for code_hash in recovery_hashes],
+            )
+            self._insert_audit(
+                cursor,
+                None,
+                actor_id,
+                "authentication",
+                user_id,
+                "mfa_recovery_codes_regenerated",
+                None,
+                {"recoveryCodeCount": len(recovery_hashes)},
+            )
+        return True
+
+    def disable_mfa(
+        self,
+        user_id: str,
+        actor_id: str | None = None,
+        *,
+        reason: str = "",
+        action: str = "mfa_disabled",
+        metadata: dict | None = None,
+    ) -> bool:
+        """Remove TOTP and recovery material while preserving its audit trail."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute("DELETE FROM user_mfa_credentials WHERE user_id = %s::uuid", (user_id,))
+            if cursor.rowcount != 1:
+                return False
+            self._insert_audit(
+                cursor,
+                None,
+                actor_id,
+                "authentication",
+                user_id,
+                action,
+                {"status": "enabled"},
+                {"status": "disabled"},
+                reason=reason,
+                metadata=metadata,
+            )
+        return True
+
+    def create_login_challenge(self, challenge: dict) -> None:
+        """Persist a password-verified, short-lived MFA login transaction."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO auth_login_challenges (
+                    token_hash, user_id, purpose, attempts, max_attempts, expires_at
+                ) VALUES (%s, %s::uuid, %s, 0, %s, %s::timestamptz)
+                """,
+                (
+                    challenge["tokenHash"],
+                    challenge["userId"],
+                    challenge["purpose"],
+                    challenge.get("maxAttempts", 5),
+                    challenge["expiresAt"],
+                ),
+            )
+
+    def get_login_challenge(self, token_hash: str) -> dict | None:
+        """Return a live, unconsumed login challenge."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT token_hash, user_id, purpose, attempts, max_attempts, expires_at
+                FROM auth_login_challenges
+                WHERE token_hash = %s AND consumed_at IS NULL AND expires_at > now()
+                  AND attempts < max_attempts
+                """,
+                (token_hash,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "tokenHash": row[0],
+            "userId": str(row[1]),
+            "purpose": row[2],
+            "attempts": row[3],
+            "maxAttempts": row[4],
+            "expiresAt": self._timestamp(row[5]),
+        }
+
+    def record_login_challenge_attempt(self, token_hash: str) -> int:
+        """Increment the failed-or-consumed verification attempt count."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE auth_login_challenges SET attempts = attempts + 1 WHERE token_hash = %s RETURNING attempts",
+                (token_hash,),
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    def consume_login_challenge(self, token_hash: str) -> None:
+        """Mark a successful login transaction as single-use."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE auth_login_challenges SET consumed_at = now() WHERE token_hash = %s AND consumed_at IS NULL",
+                (token_hash,),
+            )
+
+    def create_session(self, token_hash: str, user_id: str, expires_at: str) -> None:
+        """Persist a hashed browser session token."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO user_sessions (token_hash, user_id, expires_at) VALUES (%s, %s::uuid, %s::timestamptz)",
+                (token_hash, user_id, expires_at),
+            )
+
+    def authenticate_session(self, token_hash: str) -> str | None:
+        """Resolve a live hashed browser session to its user identifier."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE user_sessions session
+                SET last_seen_at = now()
+                FROM users owner
+                WHERE session.token_hash = %s AND session.user_id = owner.id
+                  AND session.revoked_at IS NULL AND session.expires_at > now()
+                  AND owner.status = 'active'
+                RETURNING session.user_id
+                """,
+                (token_hash,),
+            )
+            row = cursor.fetchone()
+            return str(row[0]) if row else None
+
+    def revoke_session(self, token_hash: str) -> bool:
+        """Revoke one browser session by its stored hash."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE user_sessions SET revoked_at = COALESCE(revoked_at, now()) WHERE token_hash = %s",
+                (token_hash,),
+            )
+            return cursor.rowcount == 1
+
+    def revoke_user_sessions(self, user_id: str) -> int:
+        """Revoke every live browser session belonging to one user."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE user_sessions SET revoked_at = now() WHERE user_id = %s::uuid AND revoked_at IS NULL",
+                (user_id,),
+            )
+            return cursor.rowcount
 
     def list_api_tokens(self, user_id: str) -> list[dict]:
         with self.connection_factory() as connection, connection.cursor() as cursor:

@@ -8,7 +8,7 @@ import psycopg
 from psycopg import sql
 
 from src.cmdb.migrations import apply_migrations
-from src.cmdb.repository import PostgresCmdbRepository
+from src.cmdb.repository import PostgresCmdbRepository, hash_password
 
 ROOT = Path(__file__).resolve().parents[1]
 ADMIN_URL = os.getenv("TEST_POSTGRES_ADMIN_URL", "")
@@ -319,11 +319,43 @@ class PostgresRepositoryContractTests(unittest.TestCase):
                 "directCompanyIds": [],
                 "groupIds": ["all-customers"],
                 "apiAccessEnabled": True,
+                "mfaRequired": True,
             },
             actor_id,
             reason="Enable governed automation",
         )
         self.assertTrue(api_user["apiAccessEnabled"])
+        self.assertTrue(api_user["mfaRequired"])
+        repository.save_mfa_enrollment(operator["id"], "encrypted-seed", "nonce", actor_id)
+        self.assertEqual(repository.get_mfa_credential(operator["id"])["status"], "pending")
+        self.assertTrue(
+            repository.enable_mfa(
+                operator["id"], 100, [hash_password("AAAA-BBBB-CCCC-DDDD")], actor_id
+            )
+        )
+        self.assertTrue(repository.accept_mfa_counter(operator["id"], 101))
+        self.assertFalse(repository.accept_mfa_counter(operator["id"], 101))
+        self.assertTrue(repository.consume_recovery_code(operator["id"], "AAAA-BBBB-CCCC-DDDD"))
+        self.assertFalse(repository.consume_recovery_code(operator["id"], "AAAA-BBBB-CCCC-DDDD"))
+        challenge_hash = "b" * 64
+        repository.create_login_challenge(
+            {
+                "tokenHash": challenge_hash,
+                "userId": operator["id"],
+                "purpose": "verify",
+                "maxAttempts": 5,
+                "expiresAt": "2099-01-01T00:00:00Z",
+            }
+        )
+        self.assertEqual(repository.get_login_challenge(challenge_hash)["purpose"], "verify")
+        self.assertEqual(repository.record_login_challenge_attempt(challenge_hash), 1)
+        repository.consume_login_challenge(challenge_hash)
+        self.assertIsNone(repository.get_login_challenge(challenge_hash))
+        session_hash = "c" * 64
+        repository.create_session(session_hash, operator["id"], "2099-01-01T00:00:00Z")
+        self.assertEqual(repository.authenticate_session(session_hash), operator["id"])
+        self.assertTrue(repository.revoke_session(session_hash))
+        self.assertIsNone(repository.authenticate_session(session_hash))
         token_hash = "a" * 64
         api_token = repository.create_api_token(
             {

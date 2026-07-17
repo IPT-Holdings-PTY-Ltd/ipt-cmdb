@@ -33,6 +33,8 @@ The repository contains a production-style multi-stage `Dockerfile`, a Compose d
 | `DATABASE_SEED_MODE` | `empty` for a new platform; ignored after initialisation |
 | `AUTH_MODE` | `easy_auth` behind the Azure authentication boundary |
 | `ALLOW_LOCAL_BREAK_GLASS` | `false` unless an audited emergency design requires it |
+| `MFA_ENCRYPTION_KEY` | Stable URL-safe base64 encoding of 32 random bytes from Key Vault; required for local TOTP |
+| `LOCAL_MFA_POLICY` | `optional`, `admins` or `all`; applies only to local accounts |
 | `ALLOW_UI_DATABASE_CONFIG` | `false`; production database settings are infrastructure-owned |
 | `ALLOW_LOCAL_DEVELOPMENT` | Always `false` |
 | `ENTRA_LOGIN_URL` | Runtime login endpoint, normally `/.auth/login/aad?...` |
@@ -52,6 +54,8 @@ See `.env.example` for provider variables. Never commit populated values.
 5. Keep API authorization enabled; external authentication does not replace tenant checks.
 
 If an authenticated Entra user is not mapped to a CMDB account, access should be denied rather than auto-provisioned with broad scope.
+
+Entra identities should receive MFA through Conditional Access. Application TOTP is reserved for local and deliberately enabled break-glass identities. Every container replica must receive the same `MFA_ENCRYPTION_KEY`; changing it without re-encrypting stored seeds prevents enrolled users from completing TOTP.
 
 ## PostgreSQL
 

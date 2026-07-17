@@ -36,6 +36,18 @@ from src.cmdb.change_control import (
 )
 from src.cmdb.data_quality import RULES as DATA_QUALITY_RULES
 from src.cmdb.data_quality import evaluate_data_quality
+from src.cmdb.mfa import (
+    MfaConfigurationError,
+    decrypt_secret,
+    encrypt_secret,
+    encryption_key,
+    new_totp_secret,
+    opaque_token_hash,
+    provisioning_uri,
+    qr_data_uri,
+    recovery_codes,
+    verify_totp,
+)
 from src.cmdb.reports import (
     build_report,
     render_csv,
@@ -44,7 +56,12 @@ from src.cmdb.reports import (
     report_catalog,
     report_filename,
 )
-from src.cmdb.repository import PostgresCmdbRepository, StateRepository, canonical_uuid
+from src.cmdb.repository import (
+    PostgresCmdbRepository,
+    StateRepository,
+    canonical_uuid,
+    hash_password,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST", ROOT / "frontend" / "dist"))
@@ -273,11 +290,15 @@ def current_user(request: Request) -> dict:
         if not _local_login_enabled():
             raise HTTPException(401, "Microsoft sign-in is required")
 
-    session = core.SESSIONS.get(bearer)
-    if not session or session["expiresAt"] <= datetime.now(UTC):
+    user_id = REPOSITORY.authenticate_session(opaque_token_hash(bearer)) if bearer else None
+    if not user_id:
+        session = core.SESSIONS.get(bearer)
+        if session and session["expiresAt"] > datetime.now(UTC):
+            user_id = session["userId"]
+    if not user_id:
         core.SESSIONS.pop(bearer, None)
         raise HTTPException(401, "Sign in required")
-    user = next((item for item in users if item["id"] == session["userId"]), None)
+    user = next((item for item in users if item["id"] == user_id), None)
     if not user:
         raise HTTPException(401, "Sign in required")
     request.state.current_user = user
@@ -317,6 +338,41 @@ class LoginRequest(BaseModel):
 
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=1, max_length=512)
+
+
+class MfaLoginRequest(BaseModel):
+    """Validate the second step of a password-authenticated login."""
+
+    challengeToken: str = Field(min_length=32, max_length=512)
+    code: str = Field(min_length=6, max_length=64)
+
+
+class MfaChallengeRequest(BaseModel):
+    """Identify a password-verified login transaction."""
+
+    challengeToken: str = Field(min_length=32, max_length=512)
+
+
+class MfaCodeRequest(BaseModel):
+    """Validate a current authenticator or recovery code."""
+
+    code: str = Field(min_length=6, max_length=64)
+
+
+class MfaDisableRequest(MfaCodeRequest):
+    """Require both local factors before disabling MFA."""
+
+    password: str = Field(min_length=1, max_length=512)
+
+
+class MfaResetRequest(BaseModel):
+    """Capture authorization and governance evidence for an administrative MFA reset."""
+
+    reason: str = Field(min_length=4, max_length=500)
+    ticketReference: str = Field(default="", max_length=120)
+    confirmation: str = Field(min_length=3, max_length=320)
+    administratorPassword: str = Field(default="", max_length=512)
+    administratorCode: str = Field(default="", max_length=64)
 
 
 class DatabaseSettingsRequest(BaseModel):
@@ -385,6 +441,7 @@ class UserUpdateRequest(BaseModel):
     companyIds: list[str] = Field(default_factory=list)
     groupIds: list[str] = Field(default_factory=list)
     apiAccessEnabled: bool = False
+    mfaRequired: bool = False
     reason: str = Field(default="Administrative user update", max_length=500)
 
 
@@ -633,6 +690,126 @@ def health() -> dict:
     }
 
 
+def _user_by_id(user_id: str) -> dict | None:
+    return next((item for item in REPOSITORY.list_users() if item["id"] == user_id), None)
+
+
+def _mfa_policy_requires(user: dict) -> bool:
+    if user.get("authSource") != "local":
+        return False
+    policy = os.getenv("LOCAL_MFA_POLICY", "optional").strip().lower()
+    policy_requires = policy == "all" or (
+        policy == "admins" and user.get("role") == "platform_admin"
+    )
+    return bool(user.get("mfaRequired") or policy_requires)
+
+
+def _new_login_challenge(user: dict, purpose: str) -> dict:
+    raw_token = f"cmdb_mfa_{secrets.token_urlsafe(32)}"
+    expires_at = datetime.now(UTC) + timedelta(minutes=5)
+    REPOSITORY.create_login_challenge(
+        {
+            "tokenHash": opaque_token_hash(raw_token),
+            "userId": user["id"],
+            "purpose": purpose,
+            "attempts": 0,
+            "maxAttempts": 5,
+            "expiresAt": expires_at.isoformat().replace("+00:00", "Z"),
+        }
+    )
+    return {
+        "mfaRequired": True,
+        "mfaEnrollmentRequired": purpose == "enroll",
+        "challengeToken": raw_token,
+        "expiresAt": expires_at.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _issue_session(user: dict, *, mfa_method: str = "none") -> dict:
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(UTC) + timedelta(seconds=core.SESSION_TTL_SECONDS)
+    expires_text = expires_at.isoformat().replace("+00:00", "Z")
+    REPOSITORY.create_session(opaque_token_hash(token), user["id"], expires_text)
+    # Kept as a compatibility mirror for the lightweight local repository.
+    core.SESSIONS[token] = {"userId": user["id"], "expiresAt": expires_at}
+    REPOSITORY.record_user_login(user["id"])
+    REPOSITORY.record_audit_event(
+        None,
+        user["id"],
+        "authentication",
+        user["id"],
+        "login_succeeded",
+        after={"email": user["email"], "role": user["role"]},
+        metadata={"mode": "local", "mfaMethod": mfa_method},
+    )
+    return {
+        "token": token,
+        "expiresAt": expires_text,
+        "user": core.public_user(_user_by_id(user["id"]) or user),
+    }
+
+
+def _challenge(token: str, purpose: str | None = None) -> tuple[dict, dict]:
+    token_hash = opaque_token_hash(token)
+    challenge = REPOSITORY.get_login_challenge(token_hash)
+    if not challenge or (purpose and challenge["purpose"] != purpose):
+        raise HTTPException(401, "MFA challenge is invalid or expired")
+    user = _user_by_id(challenge["userId"])
+    if not user:
+        raise HTTPException(401, "MFA challenge is invalid or expired")
+    return challenge, user
+
+
+def _start_mfa_enrollment(user: dict, actor_id: str | None) -> dict:
+    secret = new_totp_secret()
+    encrypted, nonce = encrypt_secret(secret, user["id"])
+    REPOSITORY.save_mfa_enrollment(user["id"], encrypted, nonce, actor_id)
+    issuer = REPOSITORY.get_msp_branding().get("name") or "CMDB Hub"
+    uri = provisioning_uri(secret, user["email"], issuer)
+    return {
+        "status": "pending",
+        "manualKey": secret,
+        "provisioningUri": uri,
+        "qrCodeDataUri": qr_data_uri(uri),
+    }
+
+
+def _verify_enabled_mfa(user: dict, code: str) -> str | None:
+    credential = REPOSITORY.get_mfa_credential(user["id"])
+    if not credential or credential.get("status") != "enabled":
+        return None
+    compact = code.strip().upper().replace(" ", "")
+    recovery_value = "".join(character for character in compact if character.isalnum())
+    if len(recovery_value) > 6:
+        canonical_recovery = "-".join(
+            recovery_value[index : index + 4] for index in range(0, len(recovery_value), 4)
+        )
+        return (
+            "recovery_code"
+            if REPOSITORY.consume_recovery_code(user["id"], canonical_recovery)
+            else None
+        )
+    secret = decrypt_secret(credential["encryptedSecret"], credential["secretNonce"], user["id"])
+    counter = verify_totp(secret, compact, last_counter=credential.get("lastAcceptedCounter"))
+    if counter is None or not REPOSITORY.accept_mfa_counter(user["id"], counter):
+        return None
+    return "totp"
+
+
+def _mfa_failure(user: dict, token_hash: str, action: str) -> None:
+    attempts = REPOSITORY.record_login_challenge_attempt(token_hash)
+    REPOSITORY.record_audit_event(
+        None,
+        user["id"],
+        "authentication",
+        user["id"],
+        action,
+        outcome="failed",
+        severity="warning",
+        metadata={"attempt": attempts},
+    )
+
+
 @api.post("/api/login", tags=["authentication"])
 def login(payload: LoginRequest, request: Request) -> dict:
     if not _local_login_enabled():
@@ -652,35 +829,82 @@ def login(payload: LoginRequest, request: Request) -> dict:
             metadata={"email": email, "mode": "local"},
         )
         raise HTTPException(401, "Invalid credentials")
-    token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(UTC) + timedelta(seconds=core.SESSION_TTL_SECONDS)
-    core.SESSIONS[token] = {"userId": user["id"], "expiresAt": expires_at}
-    REPOSITORY.record_user_login(user["id"])
     request.state.current_user = user
-    REPOSITORY.record_audit_event(
-        None,
-        user["id"],
-        "authentication",
-        user["id"],
-        "login_succeeded",
-        after={"email": user["email"], "role": user["role"]},
-        metadata={"mode": "local"},
-    )
-    return {
-        "token": token,
-        "expiresAt": expires_at.isoformat().replace("+00:00", "Z"),
-        "user": core.public_user(user),
-    }
+    credential = REPOSITORY.get_mfa_credential(user["id"])
+    if credential and credential.get("status") == "enabled":
+        return _new_login_challenge(user, "verify")
+    if _mfa_policy_requires(user):
+        return _new_login_challenge(user, "enroll")
+    return _issue_session(user)
+
+
+@api.post("/api/login/mfa/enrollment", tags=["authentication"])
+def start_login_mfa_enrollment(payload: MfaChallengeRequest) -> dict:
+    _, user = _challenge(payload.challengeToken, "enroll")
+    try:
+        return _start_mfa_enrollment(user, user["id"])
+    except MfaConfigurationError as error:
+        raise HTTPException(503, str(error)) from error
+
+
+@api.post("/api/login/mfa", tags=["authentication"])
+def complete_mfa_login(payload: MfaLoginRequest, request: Request) -> dict:
+    challenge, user = _challenge(payload.challengeToken)
+    token_hash = opaque_token_hash(payload.challengeToken)
+    method: str | None
+    if challenge["purpose"] == "enroll":
+        credential = REPOSITORY.get_mfa_credential(user["id"])
+        if not credential or credential.get("status") != "pending":
+            raise HTTPException(409, "Start authenticator enrollment first")
+        try:
+            secret = decrypt_secret(
+                credential["encryptedSecret"], credential["secretNonce"], user["id"]
+            )
+        except MfaConfigurationError as error:
+            raise HTTPException(503, str(error)) from error
+        counter = verify_totp(secret, payload.code)
+        if counter is None:
+            _mfa_failure(user, token_hash, "mfa_enrollment_failed")
+            raise HTTPException(401, "Authenticator code was not accepted")
+        codes = recovery_codes()
+        if not REPOSITORY.enable_mfa(
+            user["id"], counter, [hash_password(code) for code in codes], user["id"]
+        ):
+            raise HTTPException(409, "Authenticator enrollment is no longer pending")
+        method = "totp"
+    else:
+        try:
+            method = _verify_enabled_mfa(user, payload.code)
+        except MfaConfigurationError as error:
+            raise HTTPException(503, str(error)) from error
+        if not method:
+            _mfa_failure(user, token_hash, "mfa_challenge_failed")
+            raise HTTPException(401, "Authenticator or recovery code was not accepted")
+        codes = []
+    REPOSITORY.record_login_challenge_attempt(token_hash)
+    REPOSITORY.consume_login_challenge(token_hash)
+    request.state.current_user = user
+    result = _issue_session(user, mfa_method=method)
+    if codes:
+        result["recoveryCodes"] = codes
+    return result
 
 
 @api.get("/api/auth/config", tags=["authentication"])
 def auth_config() -> dict:
     mode = os.getenv("AUTH_MODE", "local").lower()
     external = mode == "easy_auth"
+    try:
+        encryption_key()
+        mfa_available = True
+    except MfaConfigurationError:
+        mfa_available = False
     return {
         "mode": mode,
         "external": external,
         "localLoginEnabled": _local_login_enabled(),
+        "mfaAvailable": mfa_available,
+        "localMfaPolicy": os.getenv("LOCAL_MFA_POLICY", "optional").strip().lower(),
         "externalLoginUrl": os.getenv(
             "ENTRA_LOGIN_URL", "/.auth/login/aad?post_login_redirect_uri=/"
         )
@@ -698,13 +922,19 @@ def auth_config() -> dict:
 def logout(request: Request) -> Response:
     bearer = request.headers.get("authorization", "").removeprefix("Bearer ")
     session = core.SESSIONS.get(bearer)
+    persisted_user_id = (
+        REPOSITORY.authenticate_session(opaque_token_hash(bearer)) if bearer else None
+    )
     user = None
-    if session:
+    user_id = session["userId"] if session else persisted_user_id
+    if user_id:
         user = next(
-            (item for item in REPOSITORY.list_users() if item["id"] == session["userId"]),
+            (item for item in REPOSITORY.list_users() if item["id"] == user_id),
             None,
         )
     core.SESSIONS.pop(bearer, None)
+    if bearer:
+        REPOSITORY.revoke_session(opaque_token_hash(bearer))
     if user:
         request.state.current_user = user
         REPOSITORY.record_audit_event(
@@ -720,7 +950,92 @@ def logout(request: Request) -> Response:
 
 @api.get("/api/me", tags=["authentication"])
 def me(request: Request) -> dict:
-    return core.public_user(current_user(request))
+    user = current_user(request)
+    return {**core.public_user(user), "mfaRequired": _mfa_policy_requires(user)}
+
+
+@api.get("/api/me/mfa", tags=["authentication"])
+def my_mfa_status(request: Request) -> dict:
+    user = current_user(request)
+    return {
+        "available": bool(auth_config()["mfaAvailable"]),
+        "authSource": user.get("authSource"),
+        "required": _mfa_policy_requires(user),
+        "enabled": bool(user.get("mfaEnabled")),
+        "recoveryCodesRemaining": int(user.get("mfaRecoveryCodesRemaining", 0)),
+    }
+
+
+@api.post("/api/me/mfa/enrollment", tags=["authentication"])
+def start_my_mfa_enrollment(request: Request) -> dict:
+    user = current_user(request)
+    if user.get("authSource") != "local":
+        raise HTTPException(409, "MFA for this identity is managed by Microsoft Entra ID")
+    try:
+        return _start_mfa_enrollment(user, user["id"])
+    except MfaConfigurationError as error:
+        raise HTTPException(503, str(error)) from error
+
+
+@api.post("/api/me/mfa/confirm", tags=["authentication"])
+def confirm_my_mfa_enrollment(payload: MfaCodeRequest, request: Request) -> dict:
+    user = current_user(request)
+    credential = REPOSITORY.get_mfa_credential(user["id"])
+    if not credential or credential.get("status") != "pending":
+        raise HTTPException(409, "Start authenticator enrollment first")
+    try:
+        secret = decrypt_secret(
+            credential["encryptedSecret"], credential["secretNonce"], user["id"]
+        )
+    except MfaConfigurationError as error:
+        raise HTTPException(503, str(error)) from error
+    counter = verify_totp(secret, payload.code)
+    if counter is None:
+        raise HTTPException(401, "Authenticator code was not accepted")
+    codes = recovery_codes()
+    if not REPOSITORY.enable_mfa(
+        user["id"], counter, [hash_password(code) for code in codes], user["id"]
+    ):
+        raise HTTPException(409, "Authenticator enrollment is no longer pending")
+    return {"enabled": True, "recoveryCodes": codes}
+
+
+@api.post("/api/me/mfa/recovery-codes", tags=["authentication"])
+def regenerate_my_recovery_codes(payload: MfaCodeRequest, request: Request) -> dict:
+    user = current_user(request)
+    try:
+        method = _verify_enabled_mfa(user, payload.code)
+    except MfaConfigurationError as error:
+        raise HTTPException(503, str(error)) from error
+    if not method:
+        raise HTTPException(401, "Current authenticator or recovery code was not accepted")
+    codes = recovery_codes()
+    if not REPOSITORY.replace_recovery_codes(
+        user["id"], [hash_password(code) for code in codes], user["id"]
+    ):
+        raise HTTPException(409, "MFA is not enabled")
+    return {"recoveryCodes": codes}
+
+
+@api.post("/api/me/mfa/disable", status_code=204, tags=["authentication"])
+def disable_my_mfa(payload: MfaDisableRequest, request: Request) -> Response:
+    user = current_user(request)
+    if _mfa_policy_requires(user):
+        raise HTTPException(409, "MFA is required by your account or MSP policy")
+    if not REPOSITORY.authenticate(user["email"], payload.password):
+        raise HTTPException(401, "Password or authenticator code was not accepted")
+    try:
+        method = _verify_enabled_mfa(user, payload.code)
+    except MfaConfigurationError as error:
+        raise HTTPException(503, str(error)) from error
+    if not method:
+        raise HTTPException(401, "Password or authenticator code was not accepted")
+    if not REPOSITORY.disable_mfa(
+        user["id"], user["id"], reason="User disabled their authenticator"
+    ):
+        raise HTTPException(409, "MFA is not enabled")
+    _revoke_user_sessions(user["id"])
+    return Response(status_code=204)
 
 
 @api.get("/api/database/status", tags=["platform"])
@@ -1235,7 +1550,9 @@ def list_users(request: Request, companyId: str | None = None) -> list[dict]:
             for item in records
             if companyId in item["companyIds"] or item["role"] == "platform_admin"
         ]
-    return [core.visible_user(item) for item in records]
+    return [
+        {**core.visible_user(item), "mfaRequired": _mfa_policy_requires(item)} for item in records
+    ]
 
 
 @api.post("/api/users", status_code=201, tags=["access"])
@@ -1325,7 +1642,8 @@ def _revoke_user_sessions(user_id: str) -> int:
     tokens = [token for token, session in core.SESSIONS.items() if session.get("userId") == user_id]
     for token in tokens:
         core.SESSIONS.pop(token, None)
-    return len(tokens)
+    persisted = REPOSITORY.revoke_user_sessions(user_id)
+    return max(len(tokens), persisted)
 
 
 def _validate_user_scope(payload: UserUpdateRequest, actor: dict) -> dict:
@@ -1346,6 +1664,7 @@ def _validate_user_scope(payload: UserUpdateRequest, actor: dict) -> dict:
             "directCompanyIds": ["*"],
             "groupIds": [],
             "apiAccessEnabled": payload.apiAccessEnabled,
+            "mfaRequired": payload.mfaRequired,
         }
     if payload.role == "client_reader":
         company_id = payload.companyId or next(iter(payload.companyIds), None)
@@ -1363,6 +1682,7 @@ def _validate_user_scope(payload: UserUpdateRequest, actor: dict) -> dict:
             "directCompanyIds": [company_id],
             "groupIds": [],
             "apiAccessEnabled": payload.apiAccessEnabled,
+            "mfaRequired": payload.mfaRequired,
         }
 
     direct_ids = sorted(set(payload.companyIds))
@@ -1388,6 +1708,7 @@ def _validate_user_scope(payload: UserUpdateRequest, actor: dict) -> dict:
         "directCompanyIds": direct_ids,
         "groupIds": sorted(set(payload.groupIds)),
         "apiAccessEnabled": payload.apiAccessEnabled,
+        "mfaRequired": payload.mfaRequired,
     }
 
 
@@ -1409,7 +1730,7 @@ def update_user(user_id: str, payload: UserUpdateRequest, request: Request) -> d
         raise HTTPException(409, "The final active platform administrator cannot be demoted")
     changed_access = any(
         current.get(key) != values.get(key)
-        for key in ("email", "role", "directCompanyIds", "groupIds")
+        for key in ("email", "role", "directCompanyIds", "groupIds", "mfaRequired")
     )
     with core.LOCK:
         stored = REPOSITORY.update_user(user_id, values, actor["id"], reason=payload.reason.strip())
@@ -1480,6 +1801,53 @@ def reset_user_password(user_id: str, payload: UserPasswordRequest, request: Req
         raise HTTPException(404, "User not found")
     _revoke_user_sessions(user_id)
     return Response(status_code=204)
+
+
+@api.post("/api/users/{user_id}/mfa/reset", tags=["access"])
+def reset_user_mfa(user_id: str, payload: MfaResetRequest, request: Request) -> dict:
+    actor = current_user(request)
+    _require_role(actor, {"platform_admin"}, "MFA reset requires platform admin role")
+    target = _managed_user(user_id, actor)
+    if target.get("authSource") != "local":
+        raise HTTPException(409, "MFA for this identity is managed by Microsoft Entra ID")
+    if not target.get("mfaEnabled"):
+        raise HTTPException(409, "MFA is not enabled for this user")
+    if payload.confirmation.strip().casefold() != target["email"].casefold():
+        raise HTTPException(400, "Type the user's email address to confirm the MFA reset")
+
+    administrator_method = "entra_session"
+    if actor.get("authSource") == "local":
+        if not payload.administratorPassword or not REPOSITORY.authenticate(
+            actor["email"], payload.administratorPassword
+        ):
+            raise HTTPException(401, "Administrator verification was not accepted")
+        administrator_method = "password"
+        if actor.get("mfaEnabled"):
+            if not payload.administratorCode:
+                raise HTTPException(401, "Administrator verification was not accepted")
+            try:
+                factor_method = _verify_enabled_mfa(actor, payload.administratorCode)
+            except MfaConfigurationError as error:
+                raise HTTPException(503, str(error)) from error
+            if not factor_method:
+                raise HTTPException(401, "Administrator verification was not accepted")
+            administrator_method = f"password+{factor_method}"
+
+    if not REPOSITORY.disable_mfa(
+        user_id,
+        actor["id"],
+        reason=payload.reason.strip(),
+        action="mfa_reset_by_admin",
+        metadata={
+            "ticketReference": payload.ticketReference.strip(),
+            "administratorVerification": administrator_method,
+            "targetEmail": target["email"],
+        },
+    ):
+        raise HTTPException(409, "MFA is not enabled for this user")
+    revoked_sessions = _revoke_user_sessions(user_id)
+    stored = _managed_user(user_id, actor)
+    return {**core.visible_user(stored), "revokedSessions": revoked_sessions}
 
 
 @api.get("/api/users/{user_id}/tokens", tags=["access"])

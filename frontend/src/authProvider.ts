@@ -1,5 +1,5 @@
 import type { AuthProvider } from 'react-admin';
-import { apiFetch, getSession, setSession } from './session';
+import { apiFetch, getSession, setSession, type Session } from './session';
 import type { User } from './types';
 
 export type AuthConfiguration = {
@@ -8,7 +8,43 @@ export type AuthConfiguration = {
   localLoginEnabled: boolean;
   externalLoginUrl: string;
   externalLogoutUrl: string;
+  mfaAvailable: boolean;
+  localMfaPolicy: string;
 };
+
+export type MfaChallenge = {
+  mfaRequired: true;
+  mfaEnrollmentRequired: boolean;
+  challengeToken: string;
+  expiresAt: string;
+};
+
+export type MfaEnrollment = {
+  status: 'pending';
+  manualKey: string;
+  provisioningUri: string;
+  qrCodeDataUri: string;
+};
+
+export type MfaLoginResult = Session & { recoveryCodes?: string[] };
+
+export class MfaRequiredError extends Error {
+  constructor(public challenge: MfaChallenge) {
+    super(challenge.mfaEnrollmentRequired ? 'Authenticator setup required' : 'Authenticator code required');
+  }
+}
+
+export function startLoginMfaEnrollment(challengeToken: string) {
+  return apiFetch<MfaEnrollment>('/api/login/mfa/enrollment', {
+    method: 'POST', body: JSON.stringify({ challengeToken }),
+  });
+}
+
+export function completeLoginMfa(challengeToken: string, code: string) {
+  return apiFetch<MfaLoginResult>('/api/login/mfa', {
+    method: 'POST', body: JSON.stringify({ challengeToken, code }),
+  });
+}
 
 let authConfiguration: AuthConfiguration | null = null;
 
@@ -24,10 +60,11 @@ export const authProvider: AuthProvider = {
       window.location.assign(configuration.externalLoginUrl);
       return;
     }
-    const session = await apiFetch<{ token: string; expiresAt: string; user: User }>('/api/login', {
+    const session = await apiFetch<Session | MfaChallenge>('/api/login', {
       method: 'POST',
       body: JSON.stringify({ email: username, password }),
     });
+    if ('mfaRequired' in session) throw new MfaRequiredError(session);
     setSession(session);
   },
   async logout() {

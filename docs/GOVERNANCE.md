@@ -31,6 +31,10 @@ User records are retained as governance identities rather than hard-deleted. Adm
 
 Microsoft Entra-backed passwords remain owned by Entra ID and cannot be reset by the CMDB. Archived users remain visible in the identity directory and audit evidence, but cannot authenticate.
 
+Local-account MFA can be optional, required per identity, required for platform administrators or required for every local user. Users enroll and manage their own RFC 6238 authenticator under **My security**. Only platform administrators can reset an enrolled authenticator. The reset requires typed target confirmation, a reason, an optional ticket/change reference and administrator step-up verification; it removes the encrypted seed and recovery hashes, preserves the target's `MFA required` policy and revokes every active browser session. Enrollment, failed challenges, recovery-code rotation and administrative reset are audited without recording secret material.
+
+MSP user customer scope is group-first. Recurring scopes belong in governed customer groups; direct customer additions are exceptions. User management provides search-driven selection, filtered bulk changes and an effective-access breakdown that identifies group-derived and direct assignments. Direct additions that grow beyond a small exception set are highlighted for group review.
+
 ### Personal API tokens
 
 Personal API access is disabled per user by default. When enabled by an authorised administrator, tokens:

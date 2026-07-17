@@ -10,6 +10,9 @@ services:
       DATABASE_SEED_MODE: demo
       AUTH_MODE: ${AUTH_MODE:-local}
       ALLOW_LOCAL_DEVELOPMENT: "false"
+      # Local demo key only. Set MFA_ENCRYPTION_KEY from Key Vault/container secrets in production.
+      MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-Y21kYi1sb2NhbC1tZmEtZGV2ZWxvcG1lbnQta2V5ISE=}
+      LOCAL_MFA_POLICY: ${LOCAL_MFA_POLICY:-optional}
     depends_on:
       postgres:
         condition: service_healthy
