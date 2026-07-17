@@ -1,4 +1,5 @@
 """Prove an existing baseline database upgrades without replaying JSON state."""
+
 from __future__ import annotations
 
 import argparse
@@ -14,15 +15,25 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.cmdb.migrations import apply_migrations, latest_schema_version, migration_plan
-from src.cmdb.repository import PostgresCmdbRepository
+from src.cmdb.migrations import (  # noqa: E402 - repository root is added above
+    apply_migrations,
+    latest_schema_version,
+    migration_plan,
+)
+from src.cmdb.repository import (  # noqa: E402 - repository root is added above
+    PostgresCmdbRepository,
+)
 
 
 def database_url(base_url: str, name: str) -> str:
+    """Return the admin URL with its database path replaced by ``name``."""
+
     return urlunparse(urlparse(base_url)._replace(path=f"/{name}"))
 
 
 def main() -> None:
+    """Create a baseline database and verify its forward-only upgrade path."""
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--admin-url", default="postgresql://cmdb:cmdb@localhost:5432/postgres")
     parser.add_argument("--database", default="cmdb_upgrade_verify")
@@ -30,13 +41,23 @@ def main() -> None:
     if not args.database.startswith("cmdb_upgrade_verify"):
         raise SystemExit("Verification database must start with cmdb_upgrade_verify")
 
-    with psycopg.connect(args.admin_url, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s", (args.database,))
+    with (
+        psycopg.connect(args.admin_url, autocommit=True) as connection,
+        connection.cursor() as cursor,
+    ):
+        cursor.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+            (args.database,),
+        )
         cursor.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(args.database)))
         cursor.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(args.database)))
 
     target_url = database_url(args.admin_url, args.database)
-    factory = lambda: psycopg.connect(target_url, connect_timeout=8)
+
+    def factory():
+        """Open a connection to the temporary upgrade-verification database."""
+        return psycopg.connect(target_url, connect_timeout=8)
+
     legacy_state = {
         "companies": [{"id": "acme", "name": "Acme Manufacturing", "externalIds": {}}],
         "users": [],
@@ -46,12 +67,20 @@ def main() -> None:
         "integrations": [],
         "syncRuns": [],
         "accessGroups": [],
-        "branding": {"acme": {"name": "Acme Service Portal", "logoText": "AC", "accent": "#123456"}},
+        "branding": {
+            "acme": {
+                "name": "Acme Service Portal",
+                "logoText": "AC",
+                "accent": "#123456",
+            }
+        },
     }
     try:
         with factory() as connection, connection.cursor() as cursor:
             cursor.execute((ROOT / "db" / "schema.sql").read_text(encoding="utf-8"))
-            cursor.execute("INSERT INTO companies (slug, name) VALUES ('acme', 'Acme Manufacturing')")
+            cursor.execute(
+                "INSERT INTO companies (slug, name) VALUES ('acme', 'Acme Manufacturing')"
+            )
             cursor.execute(
                 "INSERT INTO users (email, display_name) VALUES ('admin@example.com', 'Admin') RETURNING id"
             )
@@ -110,7 +139,9 @@ def main() -> None:
         assert reactivated_relationship["id"] == first_relationship["id"]
         assert reactivated_relationship["impactPolicy"] == "required"
         with factory() as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) FROM legacy_application_state WHERE state_key = 'cmdb_api'")
+            cursor.execute(
+                "SELECT COUNT(*) FROM legacy_application_state WHERE state_key = 'cmdb_api'"
+            )
             assert cursor.fetchone()[0] == 0
             cursor.execute(
                 """
@@ -145,9 +176,17 @@ def main() -> None:
             "customer_branding=preserved legacy_state=retired relationship_reconnect=verified"
         )
     finally:
-        with psycopg.connect(args.admin_url, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s", (args.database,))
-            cursor.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(args.database)))
+        with (
+            psycopg.connect(args.admin_url, autocommit=True) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+                (args.database,),
+            )
+            cursor.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(args.database))
+            )
 
 
 if __name__ == "__main__":

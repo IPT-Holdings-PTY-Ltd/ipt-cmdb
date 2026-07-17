@@ -1,7 +1,7 @@
-import unittest
 import base64
 import json
 import os
+import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -9,7 +9,6 @@ from fastapi.testclient import TestClient
 import app as core
 import backend.main as backend_main
 from src.cmdb.repository import StateRepository
-
 
 api = backend_main.api
 
@@ -25,20 +24,64 @@ class FastApiMigrationTests(unittest.TestCase):
                 {"id": "northwind", "name": "Northwind Traders", "externalIds": {}},
             ],
             "users": [
-                {"id": "admin", "email": "admin@example.com", "password": "ChangeMe!", "role": "platform_admin", "companyIds": ["*"]},
-                {"id": "client", "email": "client@acme.example", "password": "ChangeMe!", "role": "client_reader", "companyIds": ["acme"]},
+                {
+                    "id": "admin",
+                    "email": "admin@example.com",
+                    "password": "ChangeMe!",
+                    "role": "platform_admin",
+                    "companyIds": ["*"],
+                },
+                {
+                    "id": "client",
+                    "email": "client@acme.example",
+                    "password": "ChangeMe!",
+                    "role": "client_reader",
+                    "companyIds": ["acme"],
+                },
             ],
             "assets": [
-                {"id": "asset-1", "companyId": "acme", "name": "ACME-DC01", "type": "Server", "status": "Active", "source": "manual", "fields": {}},
-                {"id": "asset-2", "companyId": "northwind", "name": "NW-DC01", "type": "Server", "status": "Active", "source": "manual", "fields": {}},
+                {
+                    "id": "asset-1",
+                    "companyId": "acme",
+                    "name": "ACME-DC01",
+                    "type": "Server",
+                    "status": "Active",
+                    "source": "manual",
+                    "fields": {},
+                },
+                {
+                    "id": "asset-2",
+                    "companyId": "northwind",
+                    "name": "NW-DC01",
+                    "type": "Server",
+                    "status": "Active",
+                    "source": "manual",
+                    "fields": {},
+                },
             ],
             "relationships": [],
             "changes": [],
             "branding": {},
             "mspBranding": {"name": "CMDB Hub", "accent": "#50d5b9", "logoText": "C"},
-            "accessGroups": [{"id": "all-managed-customers", "name": "All managed customers", "companyIds": ["*"], "system": True}],
+            "accessGroups": [
+                {
+                    "id": "all-managed-customers",
+                    "name": "All managed customers",
+                    "companyIds": ["*"],
+                    "system": True,
+                }
+            ],
             "integrations": [
-                {"id": "connectwise", "name": "ConnectWise Manage", "type": "connectwise", "enabled": False, "mode": "configured_by_environment", "lastSync": None, "status": "Not configured", "scope": "msp"}
+                {
+                    "id": "connectwise",
+                    "name": "ConnectWise Manage",
+                    "type": "connectwise",
+                    "enabled": False,
+                    "mode": "configured_by_environment",
+                    "lastSync": None,
+                    "status": "Not configured",
+                    "scope": "msp",
+                }
             ],
             "syncRuns": [],
         }
@@ -111,11 +154,19 @@ class FastApiMigrationTests(unittest.TestCase):
 
     def test_audit_center_is_tenant_scoped_and_contains_attribution(self):
         admin = self._login("admin@example.com")
-        headers = {"Authorization": f"Bearer {admin}", "X-Correlation-ID": "change-4451"}
+        headers = {
+            "Authorization": f"Bearer {admin}",
+            "X-Correlation-ID": "change-4451",
+        }
         created = self.client.post(
             "/api/assets",
             headers=headers,
-            json={"companyId": "acme", "name": "ACME-AUDIT-01", "type": "Server", "status": "Active"},
+            json={
+                "companyId": "acme",
+                "name": "ACME-AUDIT-01",
+                "type": "Server",
+                "status": "Active",
+            },
         )
         self.assertEqual(created.status_code, 201)
         events = self.client.get(
@@ -134,11 +185,22 @@ class FastApiMigrationTests(unittest.TestCase):
         visible = self.client.get("/api/audit-events?companyId=acme", headers=client_headers)
         self.assertEqual(visible.status_code, 200)
         self.assertTrue(all(item.get("companyId") == "acme" for item in visible.json()))
-        self.assertEqual(self.client.get("/api/audit-events?companyId=northwind", headers=client_headers).status_code, 403)
-        self.assertEqual(self.client.get("/api/audit-events", headers=client_headers).status_code, 403)
+        self.assertEqual(
+            self.client.get(
+                "/api/audit-events?companyId=northwind", headers=client_headers
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.get("/api/audit-events", headers=client_headers).status_code,
+            403,
+        )
 
     def test_authentication_events_never_capture_passwords(self):
-        failed = self.client.post("/api/login", json={"email": "admin@example.com", "password": "incorrect-secret"})
+        failed = self.client.post(
+            "/api/login",
+            json={"email": "admin@example.com", "password": "incorrect-secret"},
+        )
         self.assertEqual(failed.status_code, 401)
         event = core.DB["auditEvents"][0]
         self.assertEqual(event["action"], "login_failed")
@@ -152,18 +214,29 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(catalog.status_code, 200)
         self.assertIn("asset-register", {item["id"] for item in catalog.json()})
         self.assertNotIn("access-review", {item["id"] for item in catalog.json()})
-        preview = self.client.get("/api/reports/asset-register/preview?companyId=acme", headers=headers)
+        preview = self.client.get(
+            "/api/reports/asset-register/preview?companyId=acme", headers=headers
+        )
         self.assertEqual(preview.status_code, 200)
         self.assertEqual(preview.json()["summary"]["rowCount"], 1)
         self.assertEqual(preview.json()["rows"][0]["customer"], "Acme Manufacturing")
-        export = self.client.get("/api/reports/asset-register/download?companyId=acme&format=csv", headers=headers)
+        export = self.client.get(
+            "/api/reports/asset-register/download?companyId=acme&format=csv",
+            headers=headers,
+        )
         self.assertEqual(export.status_code, 200)
         self.assertIn("text/csv", export.headers["content-type"])
         self.assertIn("ACME-DC01", export.content.decode("utf-8-sig"))
-        xlsx = self.client.get("/api/reports/asset-register/download?companyId=acme&format=xlsx", headers=headers)
+        xlsx = self.client.get(
+            "/api/reports/asset-register/download?companyId=acme&format=xlsx",
+            headers=headers,
+        )
         self.assertEqual(xlsx.status_code, 200)
         self.assertTrue(xlsx.content.startswith(b"PK"))
-        pdf = self.client.get("/api/reports/asset-register/download?companyId=acme&format=pdf", headers=headers)
+        pdf = self.client.get(
+            "/api/reports/asset-register/download?companyId=acme&format=pdf",
+            headers=headers,
+        )
         self.assertEqual(pdf.status_code, 200)
         self.assertTrue(pdf.content.startswith(b"%PDF"))
 
@@ -173,29 +246,69 @@ class FastApiMigrationTests(unittest.TestCase):
         visible = self.client.get("/api/data-quality?companyId=acme", headers=client_headers)
         self.assertEqual(visible.status_code, 200)
         self.assertEqual({item["companyId"] for item in visible.json()["findings"]}, {"acme"})
-        self.assertEqual(self.client.get("/api/data-quality?companyId=northwind", headers=client_headers).status_code, 403)
-        self.assertEqual(self.client.get("/api/data-quality", headers=client_headers).status_code, 403)
-        denied = self.client.post("/api/data-quality/exceptions", headers=client_headers, json={"companyId": "acme", "ruleKey": "missing_owner", "entityId": "asset-1", "reason": "Approved temporary exception"})
+        self.assertEqual(
+            self.client.get(
+                "/api/data-quality?companyId=northwind", headers=client_headers
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.get("/api/data-quality", headers=client_headers).status_code,
+            403,
+        )
+        denied = self.client.post(
+            "/api/data-quality/exceptions",
+            headers=client_headers,
+            json={
+                "companyId": "acme",
+                "ruleKey": "missing_owner",
+                "entityId": "asset-1",
+                "reason": "Approved temporary exception",
+            },
+        )
         self.assertEqual(denied.status_code, 403)
 
         admin = self._login("admin@example.com")
         headers = {"Authorization": f"Bearer {admin}"}
-        created = self.client.post("/api/data-quality/exceptions", headers=headers, json={"companyId": "acme", "ruleKey": "missing_owner", "entityId": "asset-1", "reason": "Owner assignment is in progress"})
+        created = self.client.post(
+            "/api/data-quality/exceptions",
+            headers=headers,
+            json={
+                "companyId": "acme",
+                "ruleKey": "missing_owner",
+                "entityId": "asset-1",
+                "reason": "Owner assignment is in progress",
+            },
+        )
         self.assertEqual(created.status_code, 201)
         refreshed = self.client.get("/api/data-quality?companyId=acme", headers=headers)
-        self.assertNotIn("missing_owner", {item["ruleKey"] for item in refreshed.json()["findings"]})
+        self.assertNotIn(
+            "missing_owner", {item["ruleKey"] for item in refreshed.json()["findings"]}
+        )
         self.assertEqual(core.DB["auditEvents"][0]["entityType"], "data_quality_exception")
 
     def test_source_authority_is_customer_scoped_and_audited(self):
         token = self._login("admin@example.com")
         headers = {"Authorization": f"Bearer {token}"}
-        saved = self.client.put("/api/field-authority", headers=headers, json={"companyId": "acme", "ciType": "Server", "fieldName": "display_name", "provider": "ncentral", "priority": 10})
+        saved = self.client.put(
+            "/api/field-authority",
+            headers=headers,
+            json={
+                "companyId": "acme",
+                "ciType": "Server",
+                "fieldName": "display_name",
+                "provider": "ncentral",
+                "priority": 10,
+            },
+        )
         self.assertEqual(saved.status_code, 200)
         rules = self.client.get("/api/field-authority?companyId=acme", headers=headers)
         self.assertEqual(rules.json()[0]["priority"], 10)
         self.assertEqual(core.DB["auditEvents"][0]["entityType"], "field_authority")
 
-    def test_easy_auth_is_container_configured_and_does_not_fall_back_to_passwords(self):
+    def test_easy_auth_is_container_configured_and_does_not_fall_back_to_passwords(
+        self,
+    ):
         claims = {
             "claims": [
                 {"typ": "preferred_username", "val": "admin@example.com"},
@@ -210,7 +323,10 @@ class FastApiMigrationTests(unittest.TestCase):
             me = self.client.get("/api/me", headers={"x-ms-client-principal": principal})
             self.assertEqual(me.status_code, 200)
             self.assertEqual(me.json()["email"], "admin@example.com")
-            local = self.client.post("/api/login", json={"email": "admin@example.com", "password": "ChangeMe!"})
+            local = self.client.post(
+                "/api/login",
+                json={"email": "admin@example.com", "password": "ChangeMe!"},
+            )
             self.assertEqual(local.status_code, 403)
 
     def test_easy_auth_principal_name_header_is_configurable(self):
@@ -222,7 +338,9 @@ class FastApiMigrationTests(unittest.TestCase):
                 "ENTRA_PRINCIPAL_NAME_HEADER": "x-authenticated-email",
             },
         ):
-            response = self.client.get("/api/me", headers={"x-authenticated-email": "admin@example.com"})
+            response = self.client.get(
+                "/api/me", headers={"x-authenticated-email": "admin@example.com"}
+            )
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["role"], "platform_admin")
 
@@ -232,7 +350,9 @@ class FastApiMigrationTests(unittest.TestCase):
         backup = self.client.get("/api/database/backup", headers=headers)
         self.assertEqual(backup.status_code, 200)
         self.assertEqual(backup.json()["version"], 2)
-        preview = self.client.post("/api/database/restore/preview", headers=headers, json=backup.json())
+        preview = self.client.post(
+            "/api/database/restore/preview", headers=headers, json=backup.json()
+        )
         self.assertEqual(preview.status_code, 200)
         self.assertTrue(preview.json()["valid"])
         self.assertEqual(preview.json()["companies"], 2)
@@ -299,17 +419,23 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([item["id"] for item in response.json()], ["asset-1"])
 
-    def test_contacts_are_separate_from_logins_and_drive_structured_asset_ownership(self):
+    def test_contacts_are_separate_from_logins_and_drive_structured_asset_ownership(
+        self,
+    ):
         admin = self._login("admin@example.com")
         headers = {"Authorization": f"Bearer {admin}"}
         created = self.client.post(
             "/api/contacts",
             headers=headers,
             json={
-                "companyId": "acme", "displayName": "Jane Owner",
-                "firstName": "Jane", "lastName": "Owner",
-                "email": "jane.owner@acme.example", "jobTitle": "Finance Director",
-                "department": "Finance", "status": "active",
+                "companyId": "acme",
+                "displayName": "Jane Owner",
+                "firstName": "Jane",
+                "lastName": "Owner",
+                "email": "jane.owner@acme.example",
+                "jobTitle": "Finance Director",
+                "department": "Finance",
+                "status": "active",
             },
         )
         self.assertEqual(created.status_code, 201)
@@ -334,18 +460,28 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(portal.json()["portalUser"]["email"], "jane.owner@acme.example")
 
         replacement = self.client.post(
-            "/api/contacts", headers=headers,
-            json={"companyId": "acme", "displayName": "Alex Replacement", "email": "alex@acme.example"},
+            "/api/contacts",
+            headers=headers,
+            json={
+                "companyId": "acme",
+                "displayName": "Alex Replacement",
+                "email": "alex@acme.example",
+            },
         )
         self.assertEqual(replacement.status_code, 201)
         transferred = self.client.post(
-            f"/api/contacts/{contact_id}/reassign", headers=headers,
-            json={"replacementContactId": replacement.json()["id"], "reason": "Responsibility handover"},
+            f"/api/contacts/{contact_id}/reassign",
+            headers=headers,
+            json={
+                "replacementContactId": replacement.json()["id"],
+                "reason": "Responsibility handover",
+            },
         )
         self.assertEqual(transferred.status_code, 200)
         self.assertEqual(transferred.json()["transferred"], 1)
         offboarded = self.client.patch(
-            f"/api/contacts/{contact_id}", headers=headers,
+            f"/api/contacts/{contact_id}",
+            headers=headers,
             json={"status": "left_company", "reason": "Employee departed"},
         )
         self.assertEqual(offboarded.status_code, 200)
@@ -363,8 +499,20 @@ class FastApiMigrationTests(unittest.TestCase):
             {item["displayName"] for item in visible.json()},
             {"Jane Owner", "Alex Replacement"},
         )
-        self.assertEqual(self.client.get("/api/contacts?companyId=northwind", headers=client_headers).status_code, 403)
-        self.assertEqual(self.client.post("/api/contacts", headers=client_headers, json={"companyId": "acme", "displayName": "Blocked"}).status_code, 403)
+        self.assertEqual(
+            self.client.get(
+                "/api/contacts?companyId=northwind", headers=client_headers
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/contacts",
+                headers=client_headers,
+                json={"companyId": "acme", "displayName": "Blocked"},
+            ).status_code,
+            403,
+        )
 
         detail = self.client.get(f"/api/contacts/{contact_id}", headers=headers)
         self.assertEqual(detail.status_code, 200)
@@ -386,7 +534,12 @@ class FastApiMigrationTests(unittest.TestCase):
         created = self.client.post(
             "/api/assets",
             headers=headers,
-            json={"companyId": "acme", "name": "ACME-APP02", "type": "Server", "fields": {"ip": "10.0.0.22"}},
+            json={
+                "companyId": "acme",
+                "name": "ACME-APP02",
+                "type": "Server",
+                "fields": {"ip": "10.0.0.22"},
+            },
         )
         self.assertEqual(created.status_code, 201)
         updated = self.client.patch(
@@ -401,7 +554,15 @@ class FastApiMigrationTests(unittest.TestCase):
         token = self._login("admin@example.com")
         headers = {"Authorization": f"Bearer {token}"}
         core.DB["assets"].append(
-            {"id": "asset-3", "companyId": "acme", "name": "ACME-APP01", "type": "Server", "status": "Active", "source": "manual", "fields": {}}
+            {
+                "id": "asset-3",
+                "companyId": "acme",
+                "name": "ACME-APP01",
+                "type": "Server",
+                "status": "Active",
+                "source": "manual",
+                "fields": {},
+            }
         )
         created = self.client.post(
             "/api/relationships",
@@ -441,14 +602,16 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in listed.json()], [created.json()["id"]])
 
         updated = self.client.patch(
-            f"/api/changes/{created.json()['id']}", headers=headers,
+            f"/api/changes/{created.json()['id']}",
+            headers=headers,
             json={"expectedRevision": 1, "title": "Patch domain controller safely"},
         )
         self.assertEqual(updated.status_code, 200)
         self.assertEqual(updated.json()["revision"], 2)
         self.assertEqual(updated.json()["title"], "Patch domain controller safely")
         stale = self.client.patch(
-            f"/api/changes/{created.json()['id']}", headers=headers,
+            f"/api/changes/{created.json()['id']}",
+            headers=headers,
             json={"expectedRevision": 1, "title": "Overwrite a newer revision"},
         )
         self.assertEqual(stale.status_code, 409)
@@ -456,8 +619,13 @@ class FastApiMigrationTests(unittest.TestCase):
         current = updated.json()
         for status in ("impact_review", "awaiting_approval", "declined"):
             transitioned = self.client.post(
-                f"/api/changes/{current['id']}/transition", headers=headers,
-                json={"status": status, "expectedRevision": current["revision"], "reason": f"Lifecycle decision: {status}"},
+                f"/api/changes/{current['id']}/transition",
+                headers=headers,
+                json={
+                    "status": status,
+                    "expectedRevision": current["revision"],
+                    "reason": f"Lifecycle decision: {status}",
+                },
             )
             self.assertEqual(transitioned.status_code, 200)
             current = transitioned.json()

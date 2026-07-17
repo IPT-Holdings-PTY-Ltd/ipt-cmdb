@@ -4,6 +4,7 @@ The database name is constrained to the ``cmdb_bootstrap_verify`` prefix and is
 always removed after the check. Use only against a disposable development
 PostgreSQL server.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -21,11 +22,15 @@ if str(ROOT) not in sys.path:
 
 
 def database_url(base_url: str, name: str) -> str:
+    """Return the admin URL with its database path replaced by ``name``."""
+
     parsed = urlparse(base_url)
     return urlunparse(parsed._replace(path=f"/{name}"))
 
 
 def main() -> None:
+    """Create a temporary blank database and verify first-start bootstrap."""
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--admin-url", default="postgresql://cmdb:cmdb@localhost:5432/postgres")
     parser.add_argument("--database", default="cmdb_bootstrap_verify")
@@ -33,8 +38,14 @@ def main() -> None:
     if not args.database.startswith("cmdb_bootstrap_verify"):
         raise SystemExit("Verification database must start with cmdb_bootstrap_verify")
 
-    with psycopg.connect(args.admin_url, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s", (args.database,))
+    with (
+        psycopg.connect(args.admin_url, autocommit=True) as connection,
+        connection.cursor() as cursor,
+    ):
+        cursor.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+            (args.database,),
+        )
         cursor.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(args.database)))
         cursor.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(args.database)))
 
@@ -59,9 +70,17 @@ def main() -> None:
             f"repository={backend.REPOSITORY.mode} companies={len(companies)} users={len(users)}"
         )
     finally:
-        with psycopg.connect(args.admin_url, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s", (args.database,))
-            cursor.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(args.database)))
+        with (
+            psycopg.connect(args.admin_url, autocommit=True) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+                (args.database,),
+            )
+            cursor.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(args.database))
+            )
 
 
 if __name__ == "__main__":

@@ -1,20 +1,25 @@
 """Ordered, forward-only PostgreSQL migrations for CMDB Hub."""
+
 from __future__ import annotations
 
 import hashlib
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
-
+from typing import Any
 
 BASELINE_VERSION = "2026.07.13.1"
-MIGRATION_NAME = re.compile(r"^(?P<version>\d{4}\.\d{2}\.\d{2}\.\d+)__(?P<description>[a-z0-9_]+)\.sql$")
+MIGRATION_NAME = re.compile(
+    r"^(?P<version>\d{4}\.\d{2}\.\d{2}\.\d+)__(?P<description>[a-z0-9_]+)\.sql$"
+)
 
 
 @dataclass(frozen=True)
 class Migration:
+    """Describe one immutable, checksummed PostgreSQL schema migration."""
+
     version: str
     description: str
     path: Path
@@ -66,8 +71,12 @@ def apply_migrations(connection_factory: Callable[[], Any], root: Path) -> list[
             )
             """
         )
-        cursor.execute("ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum varchar(64)")
-        cursor.execute("ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS execution_ms integer")
+        cursor.execute(
+            "ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum varchar(64)"
+        )
+        cursor.execute(
+            "ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS execution_ms integer"
+        )
         cursor.execute("SELECT version, checksum FROM schema_migrations ORDER BY version")
         applied = {version: checksum for version, checksum in cursor.fetchall()}
         unknown = sorted(set(applied) - set(planned))
@@ -109,4 +118,6 @@ def apply_migrations(connection_factory: Callable[[], Any], root: Path) -> list[
 
 
 def latest_schema_version(root: Path) -> str:
+    """Return the newest schema version available in the migration plan."""
+
     return migration_plan(root)[-1].version
