@@ -92,11 +92,27 @@ class RepositoryTests(unittest.TestCase):
         group = {
             "id": "managed",
             "name": "Managed",
+            "description": "Managed customers",
             "companyIds": ["acme"],
+            "ownerUserId": "admin",
+            "membershipMode": "manual",
+            "membershipRules": {},
             "system": False,
         }
-        self.repository.create_access_group(group, "admin")
-        self.repository.update_access_group("managed", {"name": "Managed customers"}, "admin")
+        created = self.repository.create_access_group(group, "admin")
+        self.assertEqual(created["revision"], 1)
+        self.assertEqual(created["ownerLabel"], "admin@example.com")
+        updated = self.repository.update_access_group(
+            "managed",
+            {"name": "Managed customers", "expectedRevision": 1},
+            "admin",
+        )
+        self.assertEqual(updated["revision"], 2)
+        self.assertIsNone(
+            self.repository.update_access_group(
+                "managed", {"name": "Stale update", "expectedRevision": 1}, "admin"
+            )
+        )
         self.assertTrue(self.repository.delete_access_group("managed", "admin"))
         self.assertEqual(
             [item["action"] for item in self.state["auditEvents"][:3]],

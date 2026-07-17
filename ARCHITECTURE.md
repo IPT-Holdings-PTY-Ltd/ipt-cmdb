@@ -61,6 +61,7 @@ UI visibility is not a security control. API routes independently enforce platfo
 
 - `local` uses application sessions and salted PBKDF2-SHA256 password hashes for development.
 - `easy_auth` trusts identity headers injected by an authenticated Azure Container Apps/App Service gateway and maps the resulting email to a persisted CMDB user.
+- restricted personal API tokens authenticate automation against an explicit resource allow-list, read/write scopes and an optional customer subset. Only token hashes are persisted, and platform administration is never available through this channel.
 
 Easy Auth header names, email-claim precedence, login URL and logout URL are runtime configurable. Password login is disabled in Easy Auth mode unless `ALLOW_LOCAL_BREAK_GLASS=true` is explicitly enabled.
 

@@ -38,6 +38,13 @@ class FastApiMigrationTests(unittest.TestCase):
                     "role": "client_reader",
                     "companyIds": ["acme"],
                 },
+                {
+                    "id": "operator",
+                    "email": "operator@example.com",
+                    "password": "ChangeMe!",
+                    "role": "msp_operator",
+                    "companyIds": ["acme"],
+                },
             ],
             "assets": [
                 {
@@ -99,10 +106,215 @@ class FastApiMigrationTests(unittest.TestCase):
         core.DATABASE_MODE = self.original_database_mode
         core.SESSIONS.clear()
 
-    def _login(self, email: str) -> str:
-        response = self.client.post("/api/login", json={"email": email, "password": "ChangeMe!"})
+    def _login(self, email: str, password: str = "ChangeMe!") -> str:
+        response = self.client.post("/api/login", json={"email": email, "password": password})
         self.assertEqual(response.status_code, 200)
         return response.json()["token"]
+
+    def _headers(self, email: str, password: str = "ChangeMe!") -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._login(email, password)}"}
+
+    def test_authorization_matrix_enforces_customer_read_scope(self):
+        routes = [
+            "/api/dashboard?companyId={company}",
+            "/api/assets?companyId={company}",
+            "/api/contacts?companyId={company}",
+            "/api/relationships?companyId={company}",
+            "/api/changes?companyId={company}",
+            "/api/data-quality?companyId={company}",
+            "/api/reconciliation-candidates?companyId={company}",
+            "/api/field-authority?companyId={company}",
+            "/api/audit-events?companyId={company}",
+            "/api/reports/catalog?companyId={company}",
+        ]
+        roles = {
+            "platform_admin": ("admin@example.com", 200, 200),
+            "msp_operator": ("operator@example.com", 200, 403),
+            "client_reader": ("client@acme.example", 200, 403),
+        }
+
+        for role, (email, own_status, other_status) in roles.items():
+            headers = self._headers(email)
+            for route in routes:
+                with self.subTest(role=role, route=route, company="acme"):
+                    self.assertEqual(
+                        self.client.get(route.format(company="acme"), headers=headers).status_code,
+                        own_status,
+                    )
+                with self.subTest(role=role, route=route, company="northwind"):
+                    self.assertEqual(
+                        self.client.get(
+                            route.format(company="northwind"), headers=headers
+                        ).status_code,
+                        other_status,
+                    )
+
+        for email, expected_ids in {
+            "admin@example.com": {"asset-1", "asset-2"},
+            "operator@example.com": {"asset-1"},
+            "client@acme.example": {"asset-1"},
+        }.items():
+            with self.subTest(email=email, route="unfiltered asset inventory"):
+                response = self.client.get("/api/assets", headers=self._headers(email))
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual({item["id"] for item in response.json()}, expected_ids)
+
+    def test_authorization_matrix_enforces_customer_write_scope(self):
+        cases = [
+            ("admin@example.com", "acme", 201),
+            ("admin@example.com", "northwind", 201),
+            ("operator@example.com", "acme", 201),
+            ("operator@example.com", "northwind", 403),
+            ("client@acme.example", "acme", 403),
+            ("client@acme.example", "northwind", 403),
+        ]
+        for index, (email, company_id, expected_status) in enumerate(cases):
+            with self.subTest(email=email, company=company_id):
+                response = self.client.post(
+                    "/api/assets",
+                    headers=self._headers(email),
+                    json={
+                        "companyId": company_id,
+                        "name": f"AUTH-MATRIX-{index}",
+                        "type": "Server",
+                    },
+                )
+                self.assertEqual(response.status_code, expected_status)
+
+        for email in ("operator@example.com", "client@acme.example"):
+            with self.subTest(email=email, route="cross-customer asset detail"):
+                response = self.client.get("/api/assets/asset-2", headers=self._headers(email))
+                self.assertEqual(response.status_code, 403)
+
+    def test_authorization_matrix_separates_root_and_platform_admin_routes(self):
+        root_routes = [
+            "/api/dashboard",
+            "/api/root-overview",
+            "/api/root-attention",
+            "/api/contacts",
+            "/api/access-groups",
+            "/api/users",
+            "/api/integrations",
+            "/api/sync-runs",
+            "/api/audit-events",
+            "/api/reports/catalog",
+        ]
+        for role, email, expected_status in (
+            ("platform_admin", "admin@example.com", 200),
+            ("msp_operator", "operator@example.com", 200),
+            ("client_reader", "client@acme.example", 403),
+        ):
+            headers = self._headers(email)
+            for route in root_routes:
+                with self.subTest(role=role, route=route):
+                    self.assertEqual(
+                        self.client.get(route, headers=headers).status_code,
+                        expected_status,
+                    )
+
+        admin_only_routes = ["/api/database/status", "/api/rbac/roles"]
+        for role, email, expected_status in (
+            ("platform_admin", "admin@example.com", 200),
+            ("msp_operator", "operator@example.com", 403),
+            ("client_reader", "client@acme.example", 403),
+        ):
+            headers = self._headers(email)
+            for route in admin_only_routes:
+                with self.subTest(role=role, route=route):
+                    self.assertEqual(
+                        self.client.get(route, headers=headers).status_code,
+                        expected_status,
+                    )
+
+        operator_groups = self.client.get(
+            "/api/access-groups", headers=self._headers("operator@example.com")
+        )
+        self.assertEqual(operator_groups.status_code, 200)
+        self.assertEqual(operator_groups.json()[0]["companyIds"], ["acme"])
+
+    def test_protected_mutations_authenticate_before_resource_lookup(self):
+        create = self.client.post(
+            "/api/relationships",
+            json={"fromId": "missing-a", "toId": "missing-b", "type": "depends_on"},
+        )
+        delete = self.client.delete("/api/relationships/missing")
+        self.assertEqual(create.status_code, 401)
+        self.assertEqual(delete.status_code, 401)
+
+    def test_authorization_matrix_controls_customer_and_user_administration(self):
+        admin_headers = self._headers("admin@example.com")
+        root_user = self.client.post(
+            "/api/users",
+            headers=admin_headers,
+            json={
+                "email": "all-customers@example.com",
+                "password": "Temporary!42",
+                "accountType": "root",
+                "groupIds": ["all-managed-customers"],
+            },
+        )
+        self.assertEqual(root_user.status_code, 201)
+        self.assertEqual(root_user.json()["role"], "msp_operator")
+        self.assertEqual(root_user.json()["companyIds"], ["acme", "northwind"])
+
+        created_company = self.client.post(
+            "/api/companies",
+            headers=admin_headers,
+            json={"name": "Contoso Services", "slug": "contoso"},
+        )
+        self.assertEqual(created_company.status_code, 201)
+        dynamic_scope = self.client.get(
+            "/api/companies",
+            headers=self._headers("all-customers@example.com", "Temporary!42"),
+        )
+        self.assertEqual(
+            {item["id"] for item in dynamic_scope.json()}, {"acme", "contoso", "northwind"}
+        )
+
+        for email in ("operator@example.com", "client@acme.example"):
+            with self.subTest(email=email, action="create customer"):
+                denied = self.client.post(
+                    "/api/companies",
+                    headers=self._headers(email),
+                    json={"name": f"Blocked {email}", "slug": f"blocked-{email.split('@')[0]}"},
+                )
+                self.assertEqual(denied.status_code, 403)
+
+        operator_headers = self._headers("operator@example.com")
+        own_customer_user = self.client.post(
+            "/api/users",
+            headers=operator_headers,
+            json={
+                "email": "new-reader@acme.example",
+                "password": "Temporary!42",
+                "accountType": "customer",
+                "companyId": "acme",
+            },
+        )
+        self.assertEqual(own_customer_user.status_code, 201)
+        self.assertEqual(own_customer_user.json()["companyIds"], ["acme"])
+        denied_other_customer = self.client.post(
+            "/api/users",
+            headers=operator_headers,
+            json={
+                "email": "blocked-reader@northwind.example",
+                "password": "Temporary!42",
+                "accountType": "customer",
+                "companyId": "northwind",
+            },
+        )
+        self.assertEqual(denied_other_customer.status_code, 403)
+
+        expected_companies = {
+            "admin@example.com": {"acme", "contoso", "northwind"},
+            "operator@example.com": {"acme"},
+            "client@acme.example": {"acme"},
+        }
+        for email, expected_ids in expected_companies.items():
+            with self.subTest(email=email, action="list permitted customers"):
+                response = self.client.get("/api/companies", headers=self._headers(email))
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual({item["id"] for item in response.json()}, expected_ids)
 
     def test_complete_api_is_native_fastapi_without_proxy_route(self):
         paths = {route.path for route in api.routes}
@@ -648,6 +860,284 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(result.json()["status"], "blocked")
         history = self.client.get("/api/sync-runs", headers=headers)
         self.assertEqual(history.json()[0]["type"], "connectwise")
+
+    def test_user_profile_password_and_status_lifecycle_revokes_sessions(self):
+        admin_headers = self._headers("admin@example.com")
+        client_session = self._login("client@acme.example")
+        updated = self.client.patch(
+            "/api/users/client",
+            headers=admin_headers,
+            json={
+                "email": "owner@acme.example",
+                "displayName": "Acme Service Owner",
+                "role": "client_reader",
+                "companyId": "acme",
+                "companyIds": [],
+                "groupIds": [],
+                "apiAccessEnabled": False,
+                "reason": "Correct owner profile",
+            },
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["displayName"], "Acme Service Owner")
+        self.assertEqual(updated.json()["email"], "owner@acme.example")
+        self.assertEqual(
+            self.client.get(
+                "/api/assets?companyId=acme",
+                headers={"Authorization": f"Bearer {client_session}"},
+            ).status_code,
+            401,
+        )
+
+        owner_session = self._login("owner@acme.example")
+        changed = self.client.put(
+            "/api/users/client/password",
+            headers=admin_headers,
+            json={"password": "New-Local-Password-2026!"},
+        )
+        self.assertEqual(changed.status_code, 204)
+        self.assertEqual(
+            self.client.get(
+                "/api/assets?companyId=acme",
+                headers={"Authorization": f"Bearer {owner_session}"},
+            ).status_code,
+            401,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/login",
+                json={"email": "owner@acme.example", "password": "ChangeMe!"},
+            ).status_code,
+            401,
+        )
+        self._login("owner@acme.example", "New-Local-Password-2026!")
+
+        disabled = self.client.post(
+            "/api/users/client/status",
+            headers=admin_headers,
+            json={"status": "disabled", "reason": "User left the customer"},
+        )
+        self.assertEqual(disabled.status_code, 200)
+        self.assertEqual(disabled.json()["status"], "disabled")
+        self.assertEqual(
+            self.client.post(
+                "/api/login",
+                json={
+                    "email": "owner@acme.example",
+                    "password": "New-Local-Password-2026!",
+                },
+            ).status_code,
+            401,
+        )
+        enabled = self.client.post(
+            "/api/users/client/status",
+            headers=admin_headers,
+            json={"status": "active", "reason": "Access restored by administrator"},
+        )
+        self.assertEqual(enabled.status_code, 200)
+        self._login("owner@acme.example", "New-Local-Password-2026!")
+
+    def test_user_retirement_preserves_record_and_protects_final_admin(self):
+        admin_headers = self._headers("admin@example.com")
+        self.assertEqual(
+            self.client.post(
+                "/api/users/admin/status",
+                headers=admin_headers,
+                json={"status": "disabled", "reason": "Unsafe self-service action"},
+            ).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.delete("/api/users/admin", headers=admin_headers).status_code,
+            409,
+        )
+        archived = self.client.delete("/api/users/client", headers=admin_headers)
+        self.assertEqual(archived.status_code, 200)
+        directory = self.client.get("/api/users", headers=admin_headers)
+        client_user = next(item for item in directory.json() if item["id"] == "client")
+        self.assertEqual(client_user["status"], "archived")
+        self.assertEqual(
+            self.client.post(
+                "/api/login",
+                json={"email": "client@acme.example", "password": "ChangeMe!"},
+            ).status_code,
+            401,
+        )
+
+    def test_personal_api_token_is_one_time_scoped_and_revocable(self):
+        admin_headers = self._headers("admin@example.com")
+        enabled = self.client.patch(
+            "/api/users/client",
+            headers=admin_headers,
+            json={
+                "email": "client@acme.example",
+                "displayName": "Acme API Reader",
+                "role": "client_reader",
+                "companyId": "acme",
+                "companyIds": [],
+                "groupIds": [],
+                "apiAccessEnabled": True,
+                "reason": "Enable read-only CMDB automation",
+            },
+        )
+        self.assertEqual(enabled.status_code, 200)
+        created = self.client.post(
+            "/api/users/client/tokens",
+            headers=admin_headers,
+            json={
+                "name": "Asset inventory export",
+                "scopes": ["cmdb:read"],
+                "companyIds": ["acme"],
+                "expiresInDays": 30,
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        raw_token = created.json()["token"]
+        self.assertTrue(raw_token.startswith("cmdb_pat_"))
+        stored_token = core.DB["apiTokens"][0]
+        self.assertNotIn("token", stored_token)
+        self.assertNotEqual(stored_token["tokenHash"], raw_token)
+        token_headers = {"Authorization": f"Bearer {raw_token}"}
+        self.assertEqual(
+            self.client.get("/api/assets?companyId=acme", headers=token_headers).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.get("/api/assets?companyId=northwind", headers=token_headers).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/assets",
+                headers=token_headers,
+                json={"companyId": "acme", "name": "PAT-WRITE", "type": "Server"},
+            ).status_code,
+            403,
+        )
+        self.assertEqual(self.client.get("/api/users", headers=token_headers).status_code, 403)
+        listed = self.client.get("/api/users/client/tokens", headers=admin_headers)
+        self.assertEqual(listed.status_code, 200)
+        self.assertNotIn("token", listed.json()[0])
+        self.assertNotIn("tokenHash", listed.json()[0])
+        revoked = self.client.delete(
+            f"/api/users/client/tokens/{created.json()['id']}", headers=admin_headers
+        )
+        self.assertEqual(revoked.status_code, 200)
+        self.assertEqual(
+            self.client.get("/api/assets?companyId=acme", headers=token_headers).status_code,
+            401,
+        )
+
+    def test_msp_operator_can_manage_only_customer_users_in_scope(self):
+        operator_headers = self._headers("operator@example.com")
+        payload = {
+            "email": "client@acme.example",
+            "displayName": "Acme Customer User",
+            "role": "client_reader",
+            "companyId": "acme",
+            "companyIds": [],
+            "groupIds": [],
+            "apiAccessEnabled": False,
+            "reason": "Customer user profile maintenance",
+        }
+        allowed = self.client.patch("/api/users/client", headers=operator_headers, json=payload)
+        self.assertEqual(allowed.status_code, 200)
+        forbidden = self.client.patch(
+            "/api/users/admin",
+            headers=operator_headers,
+            json={**payload, "email": "admin@example.com"},
+        )
+        self.assertEqual(forbidden.status_code, 403)
+
+    def test_customer_groups_are_governed_versioned_and_delete_impact_is_explicit(self):
+        admin_headers = self._headers("admin@example.com")
+        created = self.client.post(
+            "/api/access-groups",
+            headers=admin_headers,
+            json={
+                "name": "Managed services",
+                "description": "Customers receiving the managed infrastructure service.",
+                "companyIds": ["acme", "northwind"],
+                "ownerUserId": "admin",
+                "membershipMode": "manual",
+                "membershipRules": {},
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        group = created.json()
+        self.assertEqual(group["revision"], 1)
+        self.assertEqual(group["ownerLabel"], "admin@example.com")
+        self.assertEqual(group["assignedUserCount"], 0)
+
+        assigned = self.client.patch(
+            "/api/users/operator",
+            headers=admin_headers,
+            json={
+                "email": "operator@example.com",
+                "displayName": "Managed Services Operator",
+                "role": "msp_operator",
+                "companyIds": ["acme"],
+                "groupIds": [group["id"]],
+                "apiAccessEnabled": False,
+                "reason": "Assign managed services customer group",
+            },
+        )
+        self.assertEqual(assigned.status_code, 200)
+        self.assertEqual(set(assigned.json()["companyIds"]), {"acme", "northwind"})
+
+        listed = self.client.get("/api/access-groups", headers=admin_headers)
+        listed_group = next(item for item in listed.json() if item["id"] == group["id"])
+        self.assertEqual(listed_group["assignedUserCount"], 1)
+
+        update_payload = {
+            "name": "Managed infrastructure",
+            "description": "Reviewed reusable customer scope.",
+            "companyIds": ["acme", "northwind"],
+            "ownerUserId": "admin",
+            "membershipMode": "manual",
+            "membershipRules": {},
+            "expectedRevision": 1,
+        }
+        updated = self.client.put(
+            "/api/access-groups/" + group["id"],
+            headers=admin_headers,
+            json=update_payload,
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["revision"], 2)
+        stale = self.client.put(
+            "/api/access-groups/" + group["id"],
+            headers=admin_headers,
+            json=update_payload,
+        )
+        self.assertEqual(stale.status_code, 409)
+
+        impact = self.client.get(
+            "/api/access-groups/" + group["id"] + "/impact",
+            headers=admin_headers,
+        )
+        self.assertEqual(impact.status_code, 200)
+        self.assertEqual(impact.json()["assignedUserCount"], 1)
+        self.assertEqual(impact.json()["usersLosingAccess"], 1)
+        self.assertEqual(impact.json()["users"][0]["lostCustomers"], ["Northwind Traders"])
+        self.assertEqual(
+            self.client.get(
+                "/api/access-groups/" + group["id"] + "/impact",
+                headers=self._headers("operator@example.com"),
+            ).status_code,
+            403,
+        )
+
+        deleted = self.client.delete("/api/access-groups/" + group["id"], headers=admin_headers)
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(deleted.json()["impact"]["lostCustomerAssignments"], 1)
+        operator = next(
+            item
+            for item in self.client.get("/api/users", headers=admin_headers).json()
+            if item["id"] == "operator"
+        )
+        self.assertEqual(operator["groupIds"], [])
+        self.assertEqual(operator["companyIds"], ["acme"])
 
 
 if __name__ == "__main__":

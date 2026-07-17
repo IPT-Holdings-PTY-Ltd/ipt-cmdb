@@ -136,14 +136,63 @@ class StateRepository:
         self.state.setdefault("fieldAuthority", [])
         self.state.setdefault("contacts", [])
         self.state.setdefault("contactResponsibilities", [])
+        self.state.setdefault("apiTokens", [])
 
     def list_companies(self) -> list[dict]:
         return deepcopy(self.state["companies"])
 
-    def list_users(self) -> list[dict]:
-        return deepcopy(
-            [item for item in self.state["users"] if item.get("status", "active") != "disabled"]
+    def _effective_user(self, user: dict) -> dict:
+        record = deepcopy(user)
+        direct_company_ids = list(record.get("directCompanyIds", record.get("companyIds", [])))
+        if record.get("role") == "platform_admin":
+            record["companyIds"] = ["*"]
+            direct_company_ids = ["*"]
+        else:
+            company_ids = set(direct_company_ids)
+            groups = {item["id"]: item for item in self.state.get("accessGroups", [])}
+            all_company_ids = {item["id"] for item in self.state.get("companies", [])}
+            for group_id in record.get("groupIds", []):
+                group = groups.get(group_id)
+                if not group:
+                    continue
+                group_company_ids = set(group.get("companyIds", []))
+                company_ids.update(
+                    all_company_ids if "*" in group_company_ids else group_company_ids
+                )
+            record["companyIds"] = sorted(company_ids & all_company_ids)
+        tokens = [item for item in self.state["apiTokens"] if item["userId"] == record["id"]]
+        active_tokens = [
+            item
+            for item in tokens
+            if not item.get("revokedAt") and item.get("expiresAt", "") > utc_now()
+        ]
+        record.setdefault("displayName", record["email"].split("@", 1)[0])
+        record.setdefault("status", "active")
+        record.setdefault("apiAccessEnabled", False)
+        record.setdefault("groupIds", [])
+        record["directCompanyIds"] = direct_company_ids
+        record["authSource"] = (
+            "entra"
+            if record.get("identityProviderSubject")
+            else "local"
+            if record.get("passwordHash") or record.get("password")
+            else "none"
         )
+        record["apiTokenCount"] = len(active_tokens)
+        record["lastApiUsedAt"] = (
+            max((item.get("lastUsedAt") or "" for item in tokens), default="") or None
+        )
+        return record
+
+    def list_users(
+        self, include_inactive: bool = False, include_credentials: bool = False
+    ) -> list[dict]:
+        del include_credentials
+        return [
+            self._effective_user(item)
+            for item in self.state["users"]
+            if include_inactive or item.get("status", "active") not in {"disabled", "archived"}
+        ]
 
     def authenticate(self, email: str, password: str) -> dict | None:
         user = next(
@@ -152,21 +201,28 @@ class StateRepository:
         )
         if not user:
             return None
-        if user.get("status", "active") == "disabled":
+        if user.get("status", "active") != "active":
             return None
         password_hash = user.get("passwordHash")
         if password_hash and verify_password(password, password_hash):
-            return deepcopy(user)
+            return self._effective_user(user)
         plaintext = user.get("password")
         if plaintext and hmac.compare_digest(plaintext, password):
             user["passwordHash"] = hash_password(password)
             user.pop("password", None)
             self.save_state(self.state)
-            return deepcopy(user)
+            return self._effective_user(user)
         return None
 
     def create_user(self, user: dict, password: str, actor_id: str | None = None) -> dict:
-        stored = {**deepcopy(user), "passwordHash": hash_password(password)}
+        stored = {
+            "displayName": user["email"].split("@", 1)[0],
+            "status": "active",
+            "apiAccessEnabled": False,
+            "lastLoginAt": None,
+            **deepcopy(user),
+            "passwordHash": hash_password(password),
+        }
         stored.pop("password", None)
         self.state["users"].append(stored)
         company_id = stored.get("companyIds", [None])[0] if stored.get("companyIds") else None
@@ -180,7 +236,139 @@ class StateRepository:
             {key: value for key, value in stored.items() if key != "passwordHash"},
         )
         self.save_state(self.state)
-        return deepcopy(stored)
+        return self._effective_user(stored)
+
+    def update_user(
+        self, user_id: str, changes: dict, actor_id: str | None = None, *, reason: str = ""
+    ) -> dict | None:
+        user = next((item for item in self.state["users"] if item["id"] == user_id), None)
+        if not user:
+            return None
+        before = {
+            key: value for key, value in user.items() if key not in {"password", "passwordHash"}
+        }
+        user.update(deepcopy(changes))
+        user["updatedAt"] = utc_now()
+        after = {
+            key: value for key, value in user.items() if key not in {"password", "passwordHash"}
+        }
+        company_id = next(iter(self._effective_user(user).get("companyIds", [])), None)
+        self._audit(
+            company_id,
+            actor_id,
+            "user",
+            user_id,
+            "updated",
+            before,
+            after,
+            reason=reason,
+        )
+        self.save_state(self.state)
+        return self._effective_user(user)
+
+    def set_user_password(self, user_id: str, password: str, actor_id: str | None = None) -> bool:
+        user = next((item for item in self.state["users"] if item["id"] == user_id), None)
+        if not user:
+            return False
+        user["passwordHash"] = hash_password(password)
+        user.pop("password", None)
+        user["updatedAt"] = utc_now()
+        self._audit(
+            next(iter(self._effective_user(user).get("companyIds", [])), None),
+            actor_id,
+            "user",
+            user_id,
+            "password_reset",
+            None,
+            {"passwordChanged": True},
+        )
+        self.save_state(self.state)
+        return True
+
+    def record_user_login(self, user_id: str) -> None:
+        user = next((item for item in self.state["users"] if item["id"] == user_id), None)
+        if user:
+            user["lastLoginAt"] = utc_now()
+            self.save_state(self.state)
+
+    @staticmethod
+    def _public_api_token(token: dict) -> dict:
+        return {key: deepcopy(value) for key, value in token.items() if key not in {"tokenHash"}}
+
+    def list_api_tokens(self, user_id: str) -> list[dict]:
+        return sorted(
+            [
+                self._public_api_token(item)
+                for item in self.state["apiTokens"]
+                if item["userId"] == user_id
+            ],
+            key=lambda item: item.get("createdAt", ""),
+            reverse=True,
+        )
+
+    def create_api_token(self, token: dict, actor_id: str | None = None) -> dict:
+        stored = {**deepcopy(token), "createdAt": utc_now(), "lastUsedAt": None, "revokedAt": None}
+        self.state["apiTokens"].append(stored)
+        public = self._public_api_token(stored)
+        self._audit(
+            next(iter(token.get("companyIds", [])), None),
+            actor_id,
+            "api_token",
+            token["id"],
+            "created",
+            None,
+            public,
+        )
+        self.save_state(self.state)
+        return public
+
+    def authenticate_api_token(self, token_hash: str) -> dict | None:
+        token = next(
+            (item for item in self.state["apiTokens"] if item["tokenHash"] == token_hash), None
+        )
+        if not token or token.get("revokedAt") or token.get("expiresAt", "") <= utc_now():
+            return None
+        user = next((item for item in self.state["users"] if item["id"] == token["userId"]), None)
+        if (
+            not user
+            or user.get("status", "active") != "active"
+            or not user.get("apiAccessEnabled", False)
+        ):
+            return None
+        token["lastUsedAt"] = utc_now()
+        self.save_state(self.state)
+        return {"user": self._effective_user(user), "token": self._public_api_token(token)}
+
+    def revoke_api_token(
+        self, token_id: str, actor_id: str | None = None, *, reason: str = ""
+    ) -> dict | None:
+        token = next((item for item in self.state["apiTokens"] if item["id"] == token_id), None)
+        if not token:
+            return None
+        before = self._public_api_token(token)
+        token["revokedAt"] = token.get("revokedAt") or utc_now()
+        token["revokedByUserId"] = actor_id
+        public = self._public_api_token(token)
+        self._audit(
+            next(iter(token.get("companyIds", [])), None),
+            actor_id,
+            "api_token",
+            token_id,
+            "revoked",
+            before,
+            public,
+            reason=reason,
+        )
+        self.save_state(self.state)
+        return public
+
+    def revoke_user_api_tokens(self, user_id: str, actor_id: str | None = None) -> int:
+        count = 0
+        for token in self.state["apiTokens"]:
+            if token["userId"] == user_id and not token.get("revokedAt"):
+                self.revoke_api_token(token["id"], actor_id, reason="User access disabled")
+                count += 1
+        return count
 
     def set_user_status(
         self,
@@ -197,6 +385,8 @@ class StateRepository:
             key: value for key, value in user.items() if key not in {"password", "passwordHash"}
         }
         user["status"] = status
+        user["archivedAt"] = utc_now() if status == "archived" else None
+        user["updatedAt"] = utc_now()
         after = {
             key: value for key, value in user.items() if key not in {"password", "passwordHash"}
         }
@@ -418,13 +608,46 @@ class StateRepository:
         return after
 
     def list_access_groups(self) -> list[dict]:
-        return deepcopy(self.state["accessGroups"])
+        users = {item["id"]: item for item in self.state.get("users", [])}
+        records = []
+        for item in self.state["accessGroups"]:
+            group = deepcopy(item)
+            owner = users.get(group.get("ownerUserId"))
+            group.setdefault("description", "")
+            group.setdefault("membershipMode", "dynamic" if group.get("system") else "manual")
+            group.setdefault(
+                "membershipRules",
+                {"rule": "all_managed_customers"} if group.get("system") else {},
+            )
+            group.setdefault("revision", 1)
+            group.setdefault("updatedAt", None)
+            group["ownerLabel"] = (
+                "System"
+                if group.get("system")
+                else (owner.get("displayName") or owner["email"] if owner else "Unassigned")
+            )
+            group["assignedUserCount"] = sum(
+                group["id"] in user.get("groupIds", [])
+                and user.get("status", "active") != "archived"
+                for user in users.values()
+            )
+            records.append(group)
+        return sorted(records, key=lambda item: (not item.get("system", False), item["name"]))
 
     def create_access_group(self, group: dict, actor_id: str | None = None) -> dict:
-        self.state["accessGroups"].append(deepcopy(group))
-        self._audit(None, actor_id, "access_group", group["id"], "created", None, group)
+        stored = {
+            "description": "",
+            "membershipMode": "manual",
+            "membershipRules": {},
+            "ownerUserId": actor_id,
+            "revision": 1,
+            "updatedAt": utc_now(),
+            **deepcopy(group),
+        }
+        self.state["accessGroups"].append(stored)
+        self._audit(None, actor_id, "access_group", stored["id"], "created", None, stored)
         self.save_state(self.state)
-        return deepcopy(group)
+        return next(item for item in self.list_access_groups() if item["id"] == stored["id"])
 
     def update_access_group(
         self, group_id: str, changes: dict, actor_id: str | None = None
@@ -436,10 +659,16 @@ class StateRepository:
         if not group:
             return None
         before = deepcopy(group)
-        group.update(deepcopy(changes))
+        values = deepcopy(changes)
+        expected_revision = values.pop("expectedRevision", group.get("revision", 1))
+        if expected_revision != group.get("revision", 1):
+            return None
+        group.update(values)
+        group["revision"] = group.get("revision", 1) + 1
+        group["updatedAt"] = utc_now()
         self._audit(None, actor_id, "access_group", group_id, "updated", before, group)
         self.save_state(self.state)
-        return deepcopy(group)
+        return next(item for item in self.list_access_groups() if item["id"] == group_id)
 
     def delete_access_group(self, group_id: str, actor_id: str | None = None) -> bool:
         group = next(
@@ -451,6 +680,8 @@ class StateRepository:
         self.state["accessGroups"] = [
             item for item in self.state["accessGroups"] if item["id"] != group_id
         ]
+        for user in self.state.get("users", []):
+            user["groupIds"] = [item for item in user.get("groupIds", []) if item != group_id]
         self._audit(None, actor_id, "access_group", group_id, "deleted", group, None)
         self.save_state(self.state)
         return True
@@ -1491,7 +1722,10 @@ class StateRepository:
         return deepcopy(stored)
 
     def export_state(self) -> dict:
-        return deepcopy(self.state)
+        state = deepcopy(self.state)
+        # API credentials are installation-bound secrets and are never portable.
+        state.pop("apiTokens", None)
+        return state
 
     def import_state(self, state: dict, actor_id: str | None = None) -> dict[str, int]:
         self.state.clear()
@@ -1499,6 +1733,7 @@ class StateRepository:
         self.state.setdefault("auditEvents", [])
         self.state.setdefault("contacts", [])
         self.state.setdefault("contactResponsibilities", [])
+        self.state["apiTokens"] = []
         self.save_state(self.state)
         return {
             "companies": len(self.state.get("companies", [])),
@@ -1701,15 +1936,34 @@ class PostgresCmdbRepository(StateRepository):
                 group_uuid = canonical_uuid("access_group", group["id"])
                 cursor.execute(
                     """
-                    INSERT INTO access_groups (id, slug, name, system, updated_at)
-                    VALUES (%s::uuid, %s, %s, %s, now())
+                    INSERT INTO access_groups (
+                        id, slug, name, system, description, membership_mode,
+                        membership_rules, revision, updated_at
+                    )
+                    VALUES (%s::uuid, %s, %s, %s, %s, %s, %s::jsonb, %s, now())
                     ON CONFLICT (slug) DO UPDATE SET
                         name = EXCLUDED.name,
                         system = EXCLUDED.system,
+                        description = EXCLUDED.description,
+                        membership_mode = EXCLUDED.membership_mode,
+                        membership_rules = EXCLUDED.membership_rules,
+                        revision = EXCLUDED.revision,
                         updated_at = now()
                     RETURNING id
                     """,
-                    (group_uuid, group["id"], group["name"], bool(group.get("system"))),
+                    (
+                        group_uuid,
+                        group["id"],
+                        group["name"],
+                        bool(group.get("system")),
+                        group.get("description", ""),
+                        group.get("membershipMode", "dynamic" if group.get("system") else "manual"),
+                        json.dumps(
+                            group.get("membershipRules")
+                            or ({"rule": "all_managed_customers"} if group.get("system") else {})
+                        ),
+                        max(1, int(group.get("revision", 1))),
+                    ),
                 )
                 group_uuid = str(cursor.fetchone()[0])
                 cursor.execute(
@@ -1736,10 +1990,12 @@ class PostgresCmdbRepository(StateRepository):
 
             cursor.execute("SELECT slug, id FROM access_groups")
             group_ids = {slug: str(group_id) for slug, group_id in cursor.fetchall()}
+            user_ids: dict[str, str] = {}
             for user in self.state.get("users", []):
                 user_uuid = canonical_uuid("user", user["id"])
                 attributes = {
                     "legacyId": user.get("id"),
+                    "role": user.get("role"),
                     "accountType": user.get(
                         "accountType",
                         "root"
@@ -1765,6 +2021,7 @@ class PostgresCmdbRepository(StateRepository):
                     ),
                 )
                 user_uuid = str(cursor.fetchone()[0])
+                user_ids[user["id"]] = user_uuid
                 password_hash = user.get("passwordHash")
                 if not password_hash and user.get("password"):
                     password_hash = hash_password(user["password"])
@@ -1798,7 +2055,7 @@ class PostgresCmdbRepository(StateRepository):
                     database_role = (
                         "msp_operator" if user.get("role") == "msp_operator" else "customer_reader"
                     )
-                    for company_slug in user.get("companyIds", []):
+                    for company_slug in user.get("directCompanyIds", user.get("companyIds", [])):
                         selected_role_companies: tuple[str, ...]
                         if company_slug == "*":
                             selected_role_companies = tuple(company_ids.values())
@@ -1823,6 +2080,14 @@ class PostgresCmdbRepository(StateRepository):
                             """,
                             (user_uuid, group_ids[group_slug]),
                         )
+
+            for group in self.state.get("accessGroups", []):
+                owner_uuid = user_ids.get(group.get("ownerUserId"))
+                if owner_uuid and group.get("id") in group_ids:
+                    cursor.execute(
+                        "UPDATE access_groups SET owner_user_id = %s::uuid WHERE id = %s::uuid",
+                        (owner_uuid, group_ids[group["id"]]),
+                    )
 
             contact_ids: dict[str, str] = {}
             for contact in self.state.get("contacts", []):
@@ -2261,11 +2526,15 @@ class PostgresCmdbRepository(StateRepository):
         self.save_state(self.state)
         return company
 
-    def list_users(self, include_credentials: bool = False) -> list[dict]:
+    def list_users(
+        self, include_inactive: bool = False, include_credentials: bool = False
+    ) -> list[dict]:
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT u.id, u.email::text, u.attributes, lac.password_hash,
+                SELECT u.id, u.email::text, u.display_name, u.status,
+                       u.api_access_enabled, u.last_login_at, u.archived_at,
+                       u.identity_provider_subject, u.attributes, lac.password_hash,
                        EXISTS (SELECT 1 FROM user_platform_roles upr WHERE upr.user_id = u.id AND upr.role = 'platform_admin'),
                        ARRAY(
                            SELECT DISTINCT c.slug
@@ -2288,33 +2557,74 @@ class PostgresCmdbRepository(StateRepository):
                            WHERE uag.user_id = u.id
                            ORDER BY ag.name
                        ),
-                       EXISTS (SELECT 1 FROM user_company_roles ucr WHERE ucr.user_id = u.id AND ucr.role = 'msp_operator')
+                       ARRAY(
+                           SELECT c.slug
+                           FROM user_company_roles ucr
+                           JOIN companies c ON c.id = ucr.company_id
+                           WHERE ucr.user_id = u.id AND c.status <> 'inactive'
+                           ORDER BY c.slug
+                       ),
+                       EXISTS (SELECT 1 FROM user_company_roles ucr WHERE ucr.user_id = u.id AND ucr.role = 'msp_operator'),
+                       (SELECT count(*) FROM user_api_tokens token
+                        WHERE token.user_id = u.id AND token.revoked_at IS NULL
+                          AND token.expires_at > now()),
+                       (SELECT max(token.last_used_at) FROM user_api_tokens token
+                        WHERE token.user_id = u.id)
                 FROM users u
                 LEFT JOIN local_auth_credentials lac ON lac.user_id = u.id
-                WHERE u.status <> 'disabled'
+                WHERE %s OR u.status NOT IN ('disabled', 'archived')
                 ORDER BY u.email
-                """
+                """,
+                (include_inactive,),
             )
             records = []
             for (
                 user_id,
                 email,
+                display_name,
+                status,
+                api_access_enabled,
+                last_login_at,
+                archived_at,
+                identity_provider_subject,
                 attributes,
                 password_hash,
                 is_admin,
                 company_ids,
                 group_ids,
+                direct_company_ids,
                 is_msp,
+                api_token_count,
+                last_api_used_at,
             ) in cursor.fetchall():
                 role = (
-                    "platform_admin" if is_admin else "msp_operator" if is_msp else "client_reader"
+                    "platform_admin"
+                    if is_admin
+                    else "msp_operator"
+                    if is_msp or (attributes or {}).get("role") == "msp_operator"
+                    else "client_reader"
                 )
                 record = {
                     "id": str(user_id),
                     "email": email,
+                    "displayName": display_name or email.split("@", 1)[0],
+                    "status": status,
                     "role": role,
                     "companyIds": ["*"] if is_admin else list(company_ids or []),
+                    "directCompanyIds": (["*"] if is_admin else list(direct_company_ids or [])),
                     "groupIds": list(group_ids or []),
+                    "apiAccessEnabled": bool(api_access_enabled),
+                    "apiTokenCount": int(api_token_count or 0),
+                    "lastLoginAt": self._timestamp(last_login_at) or None,
+                    "lastApiUsedAt": self._timestamp(last_api_used_at) or None,
+                    "archivedAt": self._timestamp(archived_at) or None,
+                    "authSource": (
+                        "entra"
+                        if identity_provider_subject
+                        else "local"
+                        if password_hash
+                        else "none"
+                    ),
                     "accountType": (attributes or {}).get(
                         "accountType", "root" if role != "client_reader" else "customer"
                     ),
@@ -2345,18 +2655,21 @@ class PostgresCmdbRepository(StateRepository):
         user_uuid = canonical_uuid("user", user["id"])
         attributes = {
             "legacyId": user.get("id"),
+            "role": user.get("role"),
             "accountType": user.get("accountType", "customer"),
         }
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO users (id, email, display_name, status, attributes)
-                VALUES (%s::uuid, %s, %s, 'active', %s::jsonb)
+                INSERT INTO users (
+                    id, email, display_name, status, api_access_enabled, attributes, updated_at
+                )
+                VALUES (%s::uuid, %s, %s, 'active', false, %s::jsonb, now())
                 """,
                 (
                     user_uuid,
                     user["email"],
-                    user["email"].split("@", 1)[0],
+                    user.get("displayName") or user["email"].split("@", 1)[0],
                     json.dumps(attributes),
                 ),
             )
@@ -2397,6 +2710,314 @@ class PostgresCmdbRepository(StateRepository):
         self.save_state(self.state)
         return next(item for item in self.list_users() if item["id"] == user_uuid)
 
+    def update_user(
+        self, user_id: str, changes: dict, actor_id: str | None = None, *, reason: str = ""
+    ) -> dict | None:
+        before = next(
+            (item for item in self.list_users(include_inactive=True) if item["id"] == user_id),
+            None,
+        )
+        if not before:
+            return None
+        role = changes.get("role", before["role"])
+        direct_company_ids = changes.get(
+            "directCompanyIds", before.get("directCompanyIds", before["companyIds"])
+        )
+        group_ids = changes.get("groupIds", before.get("groupIds", []))
+        account_type = changes.get("accountType", before.get("accountType", "customer"))
+        after = {
+            **before,
+            **deepcopy(changes),
+            "directCompanyIds": list(direct_company_ids),
+            "groupIds": list(group_ids),
+            "accountType": account_type,
+        }
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE users
+                SET email = %s, display_name = %s, api_access_enabled = %s,
+                    attributes = attributes || %s::jsonb, updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (
+                    after["email"],
+                    after.get("displayName") or after["email"].split("@", 1)[0],
+                    bool(after.get("apiAccessEnabled")),
+                    json.dumps({"role": role, "accountType": account_type}),
+                    user_id,
+                ),
+            )
+            cursor.execute("DELETE FROM user_platform_roles WHERE user_id = %s::uuid", (user_id,))
+            cursor.execute("DELETE FROM user_company_roles WHERE user_id = %s::uuid", (user_id,))
+            cursor.execute("DELETE FROM user_access_groups WHERE user_id = %s::uuid", (user_id,))
+            if role == "platform_admin":
+                cursor.execute(
+                    """
+                    INSERT INTO user_platform_roles (user_id, role)
+                    VALUES (%s::uuid, 'platform_admin')
+                    """,
+                    (user_id,),
+                )
+            else:
+                database_role = "msp_operator" if role == "msp_operator" else "customer_reader"
+                for company_slug in direct_company_ids:
+                    cursor.execute(
+                        """
+                        INSERT INTO user_company_roles (user_id, company_id, role)
+                        SELECT %s::uuid, id, %s FROM companies WHERE slug = %s
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (user_id, database_role, company_slug),
+                    )
+                for group_slug in group_ids:
+                    cursor.execute(
+                        """
+                        INSERT INTO user_access_groups (user_id, access_group_id)
+                        SELECT %s::uuid, id FROM access_groups WHERE slug = %s
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (user_id, group_slug),
+                    )
+            company_id = next((item for item in after.get("companyIds", []) if item != "*"), None)
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "user",
+                user_id,
+                "updated",
+                before,
+                after,
+                reason=reason,
+            )
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return next(
+            (item for item in self.list_users(include_inactive=True) if item["id"] == user_id),
+            None,
+        )
+
+    def set_user_password(self, user_id: str, password: str, actor_id: str | None = None) -> bool:
+        before = next(
+            (item for item in self.list_users(include_inactive=True) if item["id"] == user_id),
+            None,
+        )
+        if not before:
+            return False
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO local_auth_credentials (user_id, password_hash, updated_at)
+                VALUES (%s::uuid, %s, now())
+                ON CONFLICT (user_id) DO UPDATE
+                SET password_hash = EXCLUDED.password_hash, updated_at = now()
+                """,
+                (user_id, hash_password(password)),
+            )
+            cursor.execute("UPDATE users SET updated_at = now() WHERE id = %s::uuid", (user_id,))
+            self._insert_audit(
+                cursor,
+                next((item for item in before.get("companyIds", []) if item != "*"), None),
+                actor_id,
+                "user",
+                user_id,
+                "password_reset",
+                None,
+                {"passwordChanged": True},
+            )
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return True
+
+    def record_user_login(self, user_id: str) -> None:
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE users SET last_login_at = now(), updated_at = now() WHERE id = %s::uuid",
+                (user_id,),
+            )
+
+    def list_api_tokens(self, user_id: str) -> list[dict]:
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, user_id, name, token_prefix, scopes, company_ids,
+                       expires_at, last_used_at, revoked_at, created_at, created_by_user_id,
+                       revoked_by_user_id
+                FROM user_api_tokens
+                WHERE user_id = %s::uuid
+                ORDER BY created_at DESC
+                """,
+                (user_id,),
+            )
+            return [
+                {
+                    "id": str(token_id),
+                    "userId": str(owner_id),
+                    "name": name,
+                    "tokenPrefix": prefix,
+                    "scopes": list(scopes or []),
+                    "companyIds": list(company_ids or []),
+                    "expiresAt": self._timestamp(expires_at),
+                    "lastUsedAt": self._timestamp(last_used_at) or None,
+                    "revokedAt": self._timestamp(revoked_at) or None,
+                    "createdAt": self._timestamp(created_at),
+                    "createdByUserId": str(created_by) if created_by else None,
+                    "revokedByUserId": str(revoked_by) if revoked_by else None,
+                }
+                for (
+                    token_id,
+                    owner_id,
+                    name,
+                    prefix,
+                    scopes,
+                    company_ids,
+                    expires_at,
+                    last_used_at,
+                    revoked_at,
+                    created_at,
+                    created_by,
+                    revoked_by,
+                ) in cursor.fetchall()
+            ]
+
+    def create_api_token(self, token: dict, actor_id: str | None = None) -> dict:
+        token_id = canonical_uuid("api_token", token["id"])
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO user_api_tokens (
+                    id, user_id, name, token_prefix, token_hash, scopes, company_ids,
+                    expires_at, created_by_user_id
+                ) VALUES (
+                    %s::uuid, %s::uuid, %s, %s, %s, %s::text[], %s::text[],
+                    %s::timestamptz, %s::uuid
+                )
+                """,
+                (
+                    token_id,
+                    token["userId"],
+                    token["name"],
+                    token["tokenPrefix"],
+                    token["tokenHash"],
+                    token["scopes"],
+                    token.get("companyIds", []),
+                    token["expiresAt"],
+                    actor_id,
+                ),
+            )
+            public = {
+                **{key: value for key, value in token.items() if key != "tokenHash"},
+                "id": token_id,
+                "createdAt": utc_now(),
+                "lastUsedAt": None,
+                "revokedAt": None,
+            }
+            self._insert_audit(
+                cursor,
+                next(iter(token.get("companyIds", [])), None),
+                actor_id,
+                "api_token",
+                token_id,
+                "created",
+                None,
+                public,
+            )
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return public
+
+    def authenticate_api_token(self, token_hash: str) -> dict | None:
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT token.id, token.user_id, token.name, token.token_prefix,
+                       token.scopes, token.company_ids, token.expires_at,
+                       token.last_used_at, token.created_at
+                FROM user_api_tokens token
+                JOIN users owner ON owner.id = token.user_id
+                WHERE token.token_hash = %s
+                  AND token.revoked_at IS NULL
+                  AND token.expires_at > now()
+                  AND owner.status = 'active'
+                  AND owner.api_access_enabled = true
+                FOR UPDATE OF token
+                """,
+                (token_hash,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cursor.execute(
+                "UPDATE user_api_tokens SET last_used_at = now() WHERE id = %s::uuid",
+                (row[0],),
+            )
+        user = next((item for item in self.list_users() if item["id"] == str(row[1])), None)
+        if not user:
+            return None
+        return {
+            "user": user,
+            "token": {
+                "id": str(row[0]),
+                "userId": str(row[1]),
+                "name": row[2],
+                "tokenPrefix": row[3],
+                "scopes": list(row[4] or []),
+                "companyIds": list(row[5] or []),
+                "expiresAt": self._timestamp(row[6]),
+                "lastUsedAt": utc_now(),
+                "revokedAt": None,
+                "createdAt": self._timestamp(row[8]),
+            },
+        }
+
+    def revoke_api_token(
+        self, token_id: str, actor_id: str | None = None, *, reason: str = ""
+    ) -> dict | None:
+        current = next(
+            (item for item in self.list_api_tokens_for_all_users() if item["id"] == token_id),
+            None,
+        )
+        if not current:
+            return None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE user_api_tokens
+                SET revoked_at = COALESCE(revoked_at, now()), revoked_by_user_id = %s::uuid
+                WHERE id = %s::uuid
+                """,
+                (actor_id, token_id),
+            )
+            after = {**current, "revokedAt": current.get("revokedAt") or utc_now()}
+            self._insert_audit(
+                cursor,
+                next(iter(current.get("companyIds", [])), None),
+                actor_id,
+                "api_token",
+                token_id,
+                "revoked",
+                current,
+                after,
+                reason=reason,
+            )
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return after
+
+    def list_api_tokens_for_all_users(self) -> list[dict]:
+        return [
+            token
+            for user in self.list_users(include_inactive=True)
+            for token in self.list_api_tokens(user["id"])
+        ]
+
+    def revoke_user_api_tokens(self, user_id: str, actor_id: str | None = None) -> int:
+        tokens = [item for item in self.list_api_tokens(user_id) if not item.get("revokedAt")]
+        for token in tokens:
+            self.revoke_api_token(token["id"], actor_id, reason="User access disabled")
+        return len(tokens)
+
     def set_user_status(
         self,
         user_id: str,
@@ -2405,10 +3026,22 @@ class PostgresCmdbRepository(StateRepository):
         *,
         reason: str = "",
     ) -> bool:
-        active = next((item for item in self.list_users() if item["id"] == user_id), None)
+        active = next(
+            (item for item in self.list_users(include_inactive=True) if item["id"] == user_id),
+            None,
+        )
         before = active or {"id": user_id, "status": "disabled"}
         with self.connection_factory() as connection, connection.cursor() as cursor:
-            cursor.execute("UPDATE users SET status = %s WHERE id = %s::uuid", (status, user_id))
+            cursor.execute(
+                """
+                UPDATE users
+                SET status = %s,
+                    archived_at = CASE WHEN %s = 'archived' THEN now() ELSE NULL END,
+                    updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (status, status, user_id),
+            )
             if cursor.rowcount != 1:
                 return False
             after = {**before, "status": status}
@@ -2823,31 +3456,64 @@ class PostgresCmdbRepository(StateRepository):
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT ag.slug, ag.name, ag.system,
+                SELECT ag.slug, ag.name, ag.system, ag.description,
+                       ag.membership_mode, ag.membership_rules,
+                       ag.owner_user_id,
+                       COALESCE(owner.display_name, owner.email::text),
+                       ag.revision, ag.updated_at,
                        ARRAY(SELECT c.slug FROM access_group_companies agc
                              JOIN companies c ON c.id = agc.company_id
                              WHERE agc.access_group_id = ag.id AND c.status <> 'inactive'
-                             ORDER BY c.name)
+                             ORDER BY c.name),
+                       (SELECT count(*)
+                        FROM user_access_groups uag
+                        JOIN users assigned ON assigned.id = uag.user_id
+                        WHERE uag.access_group_id = ag.id
+                          AND assigned.status <> 'archived')
                 FROM access_groups ag
+                LEFT JOIN users owner ON owner.id = ag.owner_user_id
                 ORDER BY ag.system DESC, ag.name
                 """
             )
             return [
                 {
-                    "id": slug,
-                    "name": name,
-                    "companyIds": list(company_ids or []),
-                    "system": bool(system),
+                    "id": row[0],
+                    "name": row[1],
+                    "system": bool(row[2]),
+                    "description": row[3] or "",
+                    "membershipMode": row[4],
+                    "membershipRules": deepcopy(row[5] or {}),
+                    "ownerUserId": str(row[6]) if row[6] else None,
+                    "ownerLabel": "System" if row[2] else row[7] or "Unassigned",
+                    "revision": int(row[8]),
+                    "updatedAt": self._timestamp(row[9]),
+                    "companyIds": list(row[10] or []),
+                    "assignedUserCount": int(row[11]),
                 }
-                for slug, name, system, company_ids in cursor.fetchall()
+                for row in cursor.fetchall()
             ]
 
     def create_access_group(self, group: dict, actor_id: str | None = None) -> dict:
         group_uuid = canonical_uuid("access_group", group["id"])
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO access_groups (id, slug, name, system) VALUES (%s::uuid, %s, %s, %s)",
-                (group_uuid, group["id"], group["name"], bool(group.get("system"))),
+                """
+                INSERT INTO access_groups (
+                    id, slug, name, system, description, membership_mode,
+                    membership_rules, owner_user_id, revision, updated_at
+                )
+                VALUES (%s::uuid, %s, %s, %s, %s, %s, %s::jsonb, %s::uuid, 1, now())
+                """,
+                (
+                    group_uuid,
+                    group["id"],
+                    group["name"],
+                    bool(group.get("system")),
+                    group.get("description", ""),
+                    group.get("membershipMode", "manual"),
+                    json.dumps(group.get("membershipRules") or {}),
+                    group.get("ownerUserId") or actor_id,
+                ),
             )
             self._replace_group_companies(cursor, group_uuid, group["companyIds"])
             self._insert_audit(
@@ -2862,7 +3528,7 @@ class PostgresCmdbRepository(StateRepository):
             )
         self._refresh_state_mirror()
         self.save_state(self.state)
-        return group
+        return next(item for item in self.list_access_groups() if item["id"] == group["id"])
 
     def update_access_group(
         self, group_id: str, changes: dict, actor_id: str | None = None
@@ -2870,14 +3536,38 @@ class PostgresCmdbRepository(StateRepository):
         before = next((item for item in self.list_access_groups() if item["id"] == group_id), None)
         if not before:
             return None
-        after = {**before, **deepcopy(changes)}
+        values = deepcopy(changes)
+        expected_revision = values.pop("expectedRevision", before.get("revision", 1))
+        if expected_revision != before.get("revision", 1):
+            return None
+        after = {
+            **before,
+            **values,
+            "revision": before.get("revision", 1) + 1,
+        }
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT id FROM access_groups WHERE slug = %s", (group_id,))
             group_uuid = str(cursor.fetchone()[0])
             cursor.execute(
-                "UPDATE access_groups SET name = %s, updated_at = now() WHERE id = %s::uuid",
-                (after["name"], group_uuid),
+                """
+                UPDATE access_groups
+                SET name = %s, description = %s, membership_mode = %s,
+                    membership_rules = %s::jsonb, owner_user_id = %s::uuid,
+                    revision = revision + 1, updated_at = now()
+                WHERE id = %s::uuid AND revision = %s
+                """,
+                (
+                    after["name"],
+                    after.get("description", ""),
+                    after.get("membershipMode", "manual"),
+                    json.dumps(after.get("membershipRules") or {}),
+                    after.get("ownerUserId"),
+                    group_uuid,
+                    expected_revision,
+                ),
             )
+            if cursor.rowcount != 1:
+                return None
             self._replace_group_companies(cursor, group_uuid, after["companyIds"])
             self._insert_audit(
                 cursor,
@@ -2891,7 +3581,10 @@ class PostgresCmdbRepository(StateRepository):
             )
         self._refresh_state_mirror()
         self.save_state(self.state)
-        return after
+        return next(
+            (item for item in self.list_access_groups() if item["id"] == group_id),
+            None,
+        )
 
     def delete_access_group(self, group_id: str, actor_id: str | None = None) -> bool:
         before = next((item for item in self.list_access_groups() if item["id"] == group_id), None)
@@ -3927,6 +4620,7 @@ class PostgresCmdbRepository(StateRepository):
         self.state["syncRuns"] = self.list_sync_runs()
         self.state["branding"] = self.list_company_branding()
         self.state["mspBranding"] = self.get_msp_branding()
+        self.state.pop("apiTokens", None)
 
     def _rewrite_change_ids(self, mapping: dict[str, str]) -> None:
         if not mapping:

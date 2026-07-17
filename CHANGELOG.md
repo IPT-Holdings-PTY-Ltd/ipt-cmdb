@@ -12,7 +12,9 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Configuration-item activity timelines.
 - Asset, lifecycle, ownership, business-system, change, audit, access-review and integration-health report templates.
 - Branded PDF, filterable XLSX and UTF-8 CSV report downloads.
-- Blank-database and forward-upgrade coverage for schema `2026.07.16.1`.
+- Governed user lifecycle, session-revoking password changes and restricted personal API tokens.
+- Scalable customer-group directory with searchable membership assignment, accountable ownership, optimistic revisions and delete-impact review.
+- Blank-database and forward-upgrade coverage for schema `2026.07.17.4`.
 
 ### Planned
 
