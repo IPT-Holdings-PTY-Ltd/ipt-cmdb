@@ -68,6 +68,7 @@ class FastApiMigrationTests(unittest.TestCase):
             "/api/me",
             "/api/companies",
             "/api/users",
+            "/api/contacts",
             "/api/assets",
             "/api/assets/{asset_id}",
             "/api/relationships",
@@ -101,6 +102,7 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(schema["info"]["title"], "CMDB Hub API")
         self.assertEqual(schema["info"]["version"], "0.4.0")
         self.assertIn("/api/assets", schema["paths"])
+        self.assertIn("/api/contacts", schema["paths"])
         self.assertIn("/api/relationships", schema["paths"])
         self.assertIn("/api/changes/{change_id}/pdf", schema["paths"])
         self.assertIn("/api/audit-events", schema["paths"])
@@ -297,6 +299,79 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([item["id"] for item in response.json()], ["asset-1"])
 
+    def test_contacts_are_separate_from_logins_and_drive_structured_asset_ownership(self):
+        admin = self._login("admin@example.com")
+        headers = {"Authorization": f"Bearer {admin}"}
+        created = self.client.post(
+            "/api/contacts",
+            headers=headers,
+            json={
+                "companyId": "acme", "displayName": "Jane Owner",
+                "firstName": "Jane", "lastName": "Owner",
+                "email": "jane.owner@acme.example", "jobTitle": "Finance Director",
+                "department": "Finance", "status": "active",
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        contact_id = created.json()["id"]
+        self.assertIsNone(created.json()["portalUser"])
+
+        assigned = self.client.patch(
+            "/api/assets/asset-1",
+            headers=headers,
+            json={"responsibilities": [{"contactId": contact_id, "role": "technical_owner"}]},
+        )
+        self.assertEqual(assigned.status_code, 200)
+        self.assertEqual(assigned.json()["metadata"]["technicalOwner"], "Jane Owner")
+        self.assertEqual(assigned.json()["responsibilities"][0]["contactId"], contact_id)
+
+        portal = self.client.post(
+            f"/api/contacts/{contact_id}/portal-user",
+            headers=headers,
+            json={"password": "Temporary!42"},
+        )
+        self.assertEqual(portal.status_code, 201)
+        self.assertEqual(portal.json()["portalUser"]["email"], "jane.owner@acme.example")
+
+        replacement = self.client.post(
+            "/api/contacts", headers=headers,
+            json={"companyId": "acme", "displayName": "Alex Replacement", "email": "alex@acme.example"},
+        )
+        self.assertEqual(replacement.status_code, 201)
+        transferred = self.client.post(
+            f"/api/contacts/{contact_id}/reassign", headers=headers,
+            json={"replacementContactId": replacement.json()["id"], "reason": "Responsibility handover"},
+        )
+        self.assertEqual(transferred.status_code, 200)
+        self.assertEqual(transferred.json()["transferred"], 1)
+        offboarded = self.client.patch(
+            f"/api/contacts/{contact_id}", headers=headers,
+            json={"status": "left_company", "reason": "Employee departed"},
+        )
+        self.assertEqual(offboarded.status_code, 200)
+        self.assertEqual(offboarded.json()["portalUser"]["status"], "disabled")
+        self.assertNotIn(
+            "jane.owner@acme.example",
+            [user["email"] for user in backend_main.REPOSITORY.list_users()],
+        )
+
+        client = self._login("client@acme.example")
+        client_headers = {"Authorization": f"Bearer {client}"}
+        visible = self.client.get("/api/contacts?companyId=acme", headers=client_headers)
+        self.assertEqual(visible.status_code, 200)
+        self.assertEqual(
+            {item["displayName"] for item in visible.json()},
+            {"Jane Owner", "Alex Replacement"},
+        )
+        self.assertEqual(self.client.get("/api/contacts?companyId=northwind", headers=client_headers).status_code, 403)
+        self.assertEqual(self.client.post("/api/contacts", headers=client_headers, json={"companyId": "acme", "displayName": "Blocked"}).status_code, 403)
+
+        detail = self.client.get(f"/api/contacts/{contact_id}", headers=headers)
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["responsibilities"][0]["assetName"], "ACME-DC01")
+        self.assertIsNotNone(detail.json()["responsibilities"][0]["effectiveUntil"])
+        self.assertIn("contact", {item["entityType"] for item in core.DB["auditEvents"]})
+
     def test_customer_cannot_query_another_tenant(self):
         token = self._login("client@acme.example")
         response = self.client.get(
@@ -364,6 +439,31 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(created.json()["number"], "CHG-2026-0001")
         listed = self.client.get("/api/changes?companyId=acme", headers=headers)
         self.assertEqual([item["id"] for item in listed.json()], [created.json()["id"]])
+
+        updated = self.client.patch(
+            f"/api/changes/{created.json()['id']}", headers=headers,
+            json={"expectedRevision": 1, "title": "Patch domain controller safely"},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["revision"], 2)
+        self.assertEqual(updated.json()["title"], "Patch domain controller safely")
+        stale = self.client.patch(
+            f"/api/changes/{created.json()['id']}", headers=headers,
+            json={"expectedRevision": 1, "title": "Overwrite a newer revision"},
+        )
+        self.assertEqual(stale.status_code, 409)
+
+        current = updated.json()
+        for status in ("impact_review", "awaiting_approval", "declined"):
+            transitioned = self.client.post(
+                f"/api/changes/{current['id']}/transition", headers=headers,
+                json={"status": status, "expectedRevision": current["revision"], "reason": f"Lifecycle decision: {status}"},
+            )
+            self.assertEqual(transitioned.status_code, 200)
+            current = transitioned.json()
+        self.assertEqual(current["status"], "declined")
+        self.assertEqual(current["approvals"][-1]["decision"], "declined")
+        self.assertTrue(any(item["toStatus"] == "declined" for item in current["statusHistory"]))
 
     def test_integration_check_is_root_scoped_and_persisted_by_repository(self):
         client_token = self._login("client@acme.example")

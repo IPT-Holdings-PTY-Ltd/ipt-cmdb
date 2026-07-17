@@ -27,7 +27,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiFetch, getSession } from './session';
 import { businessApplicationMemberships, displayLayer, displayLayerColors, displayLayerLabels, displayLayerOrder, type DisplayLayer } from './topology';
-import type { Asset, Relationship } from './types';
+import type { Asset, Contact, Relationship } from './types';
 import { useWorkspace } from './workspace';
 import { AuditTimeline } from './Governance';
 
@@ -284,6 +284,26 @@ export function AssetList() {
   );
 }
 
+function ContactOwnershipInputs({ businessSystem = false }: { businessSystem?: boolean }) {
+  const workspace = useWorkspace();
+  const navigate = useNavigate();
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  useEffect(() => {
+    if (!workspace.isRoot) apiFetch<Contact[]>(`/api/contacts?companyId=${encodeURIComponent(workspace.companyId)}`).then(setContacts).catch(() => setContacts([]));
+  }, [workspace.companyId, workspace.isRoot]);
+  const choices = contacts.filter(item => ['active', 'on_leave'].includes(item.status)).map(item => ({
+    id: item.id, name: `${item.displayName}${item.department ? ` · ${item.department}` : ''}`,
+  }));
+  return <>
+    {businessSystem && <Grid size={{ xs: 12, md: 4 }}><SelectInput source="ownerSelections.business_owner" label="Business owner" choices={choices} emptyText="Unassigned" fullWidth /></Grid>}
+    <Grid size={{ xs: 12, md: 4 }}><SelectInput source="ownerSelections.service_owner" label="Service owner" choices={choices} emptyText="Unassigned" fullWidth /></Grid>
+    <Grid size={{ xs: 12, md: 4 }}><SelectInput source="ownerSelections.technical_owner" label="Technical owner" choices={choices} emptyText="Unassigned" fullWidth /></Grid>
+    {!businessSystem && <Grid size={{ xs: 12, md: 4 }}><SelectInput source="ownerSelections.custodian" label="Custodian" choices={choices} emptyText="Unassigned" fullWidth /></Grid>}
+    {businessSystem && <Grid size={{ xs: 12, md: 4 }}><SelectInput source="ownerSelections.signoff_delegate" label="Signoff delegate" choices={choices} emptyText="Owner signs off" fullWidth /></Grid>}
+    <Grid size={{ xs: 12 }}><Button size="small" startIcon={<AddOutlined />} onClick={() => navigate('/contacts')}>Create or update contacts</Button></Grid>
+  </>;
+}
+
 function AssetForm() {
   return (
     <SimpleForm defaultValues={{ status: 'Active', type: 'Device', metadata: { lifecycle: 'in_service', operationalStatus: 'healthy', criticality: 'medium', environment: 'production' } }}>
@@ -308,9 +328,7 @@ function AssetForm() {
       <Grid container spacing={2} sx={{
         width: "100%"
       }}>
-        <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.technicalOwner" label="Technical owner" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.serviceOwner" label="Service owner" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.custodian" fullWidth /></Grid>
+        <FormDataConsumer>{({ formData }) => <ContactOwnershipInputs businessSystem={formData?.type === 'Business system'} />}</FormDataConsumer>
         <Grid size={{ xs: 12, md: 6 }}><TextInput source="metadata.site" fullWidth /></Grid>
         <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.vendor" fullWidth /></Grid>
         <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.model" fullWidth /></Grid>

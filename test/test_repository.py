@@ -30,6 +30,7 @@ class RepositoryTests(unittest.TestCase):
     def test_postgres_change_methods_do_not_fall_through_to_state(self):
         self.assertIs(PostgresCmdbRepository.list_changes, StateRepository._postgres_list_changes)
         self.assertIs(PostgresCmdbRepository.create_change, StateRepository._postgres_create_change)
+        self.assertIs(PostgresCmdbRepository.update_change, StateRepository._postgres_update_change)
 
     def test_password_hash_verifies_without_storing_plaintext(self):
         encoded = hash_password("VerySecret!42")
@@ -74,6 +75,15 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.repository.get_change("change-1")["title"], "Patch database")
         self.assertEqual(self.repository.list_changes(), [change])
         self.assertEqual(self.state["auditEvents"][0]["entityType"], "change_request")
+
+    def test_change_revision_update_is_persisted_and_audited(self):
+        change = {"id": "change-1", "number": "CHG-2026-0001", "companyId": "acme", "title": "Patch database", "revision": 1, "impactSnapshot": []}
+        self.repository.create_change(change, "admin")
+        updated = {**change, "title": "Patch database safely", "revision": 2}
+        stored = self.repository.update_change("change-1", updated, "admin", action="updated", reason="Plan revised")
+        self.assertEqual(stored["revision"], 2)
+        self.assertEqual(self.repository.get_change("change-1")["title"], "Patch database safely")
+        self.assertEqual(self.state["auditEvents"][0]["reason"], "Plan revised")
 
     def test_sync_run_updates_connection_history_and_audit(self):
         run = {
@@ -136,6 +146,53 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.state["auditEvents"][0]["action"], "created")
         self.assertEqual(self.state["auditEvents"][0]["entityId"], "asset-1")
         self.assertEqual(len(self.saved), 1)
+
+    def test_contacts_and_responsibility_history_are_tenant_scoped_and_audited(self):
+        self.repository.create_asset(
+            {"id": "asset-1", "companyId": "acme", "name": "Sage 200", "type": "Business system", "metadata": {}},
+            "admin",
+        )
+        contact = self.repository.create_contact(
+            {
+                "id": "contact-1", "companyId": "acme", "displayName": "Jane Owner",
+                "email": "jane@acme.example", "status": "active", "source": "manual",
+                "syncStatus": "not_synced", "attributes": {},
+            },
+            "admin",
+        )
+        self.assertEqual(contact["responsibilityCount"], 0)
+        assigned = self.repository.replace_asset_responsibilities(
+            "asset-1",
+            [{"contactId": "contact-1", "role": "business_owner", "isPrimary": True, "escalationOrder": 1}],
+            "acme",
+            "admin",
+            reason="Owner confirmed",
+        )
+        self.assertEqual(assigned[0]["contactName"], "Jane Owner")
+        self.assertEqual(self.repository.get_asset("asset-1")["responsibilities"][0]["role"], "business_owner")
+        self.assertEqual(self.repository.get_contact("contact-1")["responsibilityCount"], 1)
+        self.repository.replace_asset_responsibilities("asset-1", [], "acme", "admin", reason="Owner departed")
+        history = self.repository.list_contact_responsibilities("acme", contact_id="contact-1", include_inactive=True)
+        self.assertIsNotNone(history[0]["effectiveUntil"])
+        self.assertEqual(self.state["auditEvents"][0]["reason"], "Owner departed")
+
+    def test_contact_profile_changes_capture_field_level_history(self):
+        self.repository.create_contact(
+            {
+                "id": "contact-1", "companyId": "acme", "displayName": "Jane Owner",
+                "email": "jane@acme.example", "status": "active", "source": "manual",
+                "syncStatus": "not_synced", "attributes": {},
+            },
+            "admin",
+        )
+        updated = self.repository.update_contact(
+            "contact-1", {"jobTitle": "Finance Director", "status": "on_leave"}, "admin", reason="Extended leave",
+        )
+        self.assertEqual(updated["jobTitle"], "Finance Director")
+        event = self.state["auditEvents"][0]
+        self.assertEqual(event["entityType"], "contact")
+        self.assertEqual(event["reason"], "Extended leave")
+        self.assertIn("jobTitle", {item["field"] for item in event["changes"]})
 
     def test_relationship_retirement_is_audited(self):
         relationship = {"id": "rel-1", "fromId": "a", "toId": "b", "type": "depends_on"}

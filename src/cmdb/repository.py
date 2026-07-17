@@ -51,6 +51,10 @@ DEFAULT_MSP_BRANDING = {
     "reportFooter": "",
     "confidentialityLabel": "Internal use only",
 }
+OWNER_RESPONSIBILITY_ROLES = {
+    "business_owner", "service_owner", "technical_owner", "custodian",
+    "change_approver", "signoff_delegate", "support_contact",
+}
 
 
 def default_company_branding(name: str) -> dict:
@@ -122,16 +126,20 @@ class StateRepository:
         self.state.setdefault("dataQualityExceptions", [])
         self.state.setdefault("reconciliationCandidates", [])
         self.state.setdefault("fieldAuthority", [])
+        self.state.setdefault("contacts", [])
+        self.state.setdefault("contactResponsibilities", [])
 
     def list_companies(self) -> list[dict]:
         return deepcopy(self.state["companies"])
 
     def list_users(self) -> list[dict]:
-        return deepcopy(self.state["users"])
+        return deepcopy([item for item in self.state["users"] if item.get("status", "active") != "disabled"])
 
     def authenticate(self, email: str, password: str) -> dict | None:
         user = next((item for item in self.state["users"] if item["email"].lower() == email.lower()), None)
         if not user:
+            return None
+        if user.get("status", "active") == "disabled":
             return None
         password_hash = user.get("passwordHash")
         if password_hash and verify_password(password, password_hash):
@@ -152,6 +160,141 @@ class StateRepository:
         self._audit(company_id, actor_id, "user", stored["id"], "created", None, {key: value for key, value in stored.items() if key != "passwordHash"})
         self.save_state(self.state)
         return deepcopy(stored)
+
+    def set_user_status(self, user_id: str, status: str, actor_id: str | None = None, *, reason: str = "") -> bool:
+        user = next((item for item in self.state["users"] if item["id"] == user_id), None)
+        if not user:
+            return False
+        before = {key: value for key, value in user.items() if key not in {"password", "passwordHash"}}
+        user["status"] = status
+        after = {key: value for key, value in user.items() if key not in {"password", "passwordHash"}}
+        company_id = user.get("companyIds", [None])[0] if user.get("companyIds") else None
+        self._audit(company_id, actor_id, "user", user_id, "status_changed", before, after, reason=reason)
+        self.save_state(self.state)
+        return True
+
+    def list_contacts(self, company_id: str | None = None) -> list[dict]:
+        responsibilities = self.state.get("contactResponsibilities", [])
+        users = {item["id"]: item for item in self.state.get("users", [])}
+        records = []
+        for item in self.state.get("contacts", []):
+            if company_id and item.get("companyId") != company_id:
+                continue
+            stored = deepcopy(item)
+            stored["responsibilityCount"] = sum(
+                assignment.get("contactId") == item["id"] and not assignment.get("effectiveUntil")
+                for assignment in responsibilities
+            )
+            linked_user = users.get(item.get("linkedUserId"))
+            stored["portalUser"] = (
+                {"id": linked_user["id"], "email": linked_user["email"], "role": linked_user["role"], "status": linked_user.get("status", "active")}
+                if linked_user else None
+            )
+            records.append(stored)
+        return sorted(records, key=lambda value: (value.get("displayName") or "").casefold())
+
+    def get_contact(self, contact_id: str) -> dict | None:
+        return next((item for item in self.list_contacts() if item["id"] == contact_id), None)
+
+    def create_contact(self, contact: dict, actor_id: str | None = None) -> dict:
+        stored = {
+            **deepcopy(contact),
+            "createdAt": contact.get("createdAt") or utc_now(),
+            "updatedAt": contact.get("updatedAt") or utc_now(),
+        }
+        self.state["contacts"].append(stored)
+        self._audit(stored["companyId"], actor_id, "contact", stored["id"], "created", None, stored)
+        self.save_state(self.state)
+        return self.get_contact(stored["id"])
+
+    def update_contact(self, contact_id: str, changes: dict, actor_id: str | None = None, *, reason: str = "") -> dict | None:
+        contact = next((item for item in self.state["contacts"] if item["id"] == contact_id), None)
+        if not contact:
+            return None
+        before = deepcopy(contact)
+        contact.update(deepcopy(changes))
+        contact["updatedAt"] = utc_now()
+        self._audit(contact["companyId"], actor_id, "contact", contact_id, "updated", before, contact, reason=reason)
+        self.save_state(self.state)
+        return self.get_contact(contact_id)
+
+    def list_contact_responsibilities(
+        self,
+        company_id: str | None = None,
+        *,
+        contact_id: str | None = None,
+        asset_id: str | None = None,
+        include_inactive: bool = False,
+    ) -> list[dict]:
+        contacts = {item["id"]: item for item in self.state.get("contacts", [])}
+        assets = {item["id"]: item for item in self.state.get("assets", [])}
+        records = []
+        for item in self.state.get("contactResponsibilities", []):
+            if company_id and item.get("companyId") != company_id:
+                continue
+            if contact_id and item.get("contactId") != contact_id:
+                continue
+            if asset_id and item.get("assetId") != asset_id:
+                continue
+            if not include_inactive and item.get("effectiveUntil"):
+                continue
+            contact = contacts.get(item.get("contactId"), {})
+            asset = assets.get(item.get("assetId"), {})
+            records.append({
+                **deepcopy(item),
+                "contactName": contact.get("displayName", "Unknown contact"),
+                "contactEmail": contact.get("email", ""),
+                "assetName": asset.get("name", "Unknown CI"),
+                "assetType": asset.get("type", ""),
+            })
+        return sorted(records, key=lambda value: (value.get("effectiveUntil") is not None, value.get("role", ""), value.get("contactName", "")))
+
+    def replace_asset_responsibilities(
+        self,
+        asset_id: str,
+        assignments: list[dict],
+        company_id: str,
+        actor_id: str | None = None,
+        *,
+        reason: str = "",
+    ) -> list[dict]:
+        before = self.list_contact_responsibilities(company_id, asset_id=asset_id)
+        normalized_before = sorted((item["role"], item["contactId"], bool(item.get("isPrimary", True)), int(item.get("escalationOrder", 1))) for item in before)
+        normalized_after = sorted((item["role"], item["contactId"], bool(item.get("isPrimary", True)), int(item.get("escalationOrder", 1))) for item in assignments)
+        if normalized_before == normalized_after:
+            return before
+        ended_at = utc_now()
+        for item in self.state["contactResponsibilities"]:
+            if item.get("assetId") == asset_id and not item.get("effectiveUntil"):
+                item["effectiveUntil"] = ended_at
+                item["endedBy"] = actor_id
+        for item in assignments:
+            self.state["contactResponsibilities"].append({
+                "id": str(uuid.uuid4()), "companyId": company_id, "assetId": asset_id,
+                "contactId": item["contactId"], "role": item["role"],
+                "isPrimary": bool(item.get("isPrimary", True)),
+                "effectiveFrom": ended_at, "effectiveUntil": None,
+                "escalationOrder": int(item.get("escalationOrder", 1)),
+                "notes": str(item.get("notes") or ""), "source": str(item.get("source") or "manual"),
+                "createdBy": actor_id, "endedBy": None,
+            })
+        after = self.list_contact_responsibilities(company_id, asset_id=asset_id)
+        self._audit(company_id, actor_id, "contact_responsibility", asset_id, "reassigned", {"assignments": before}, {"assignments": after}, reason=reason)
+        before_by_contact = {(item["contactId"], item["role"]): item for item in before}
+        after_by_contact = {(item["contactId"], item["role"]): item for item in after}
+        for key in sorted(set(before_by_contact) | set(after_by_contact)):
+            if key in before_by_contact and key in after_by_contact:
+                continue
+            contact_id, role = key
+            assigned = key in after_by_contact
+            self._audit(
+                company_id, actor_id, "contact", contact_id,
+                "responsibility_assigned" if assigned else "responsibility_ended",
+                before_by_contact.get(key), after_by_contact.get(key), reason=reason,
+                metadata={"assetId": asset_id, "responsibilityRole": role},
+            )
+        self.save_state(self.state)
+        return after
 
     def list_access_groups(self) -> list[dict]:
         return deepcopy(self.state["accessGroups"])
@@ -188,10 +331,14 @@ class StateRepository:
         return deepcopy(company)
 
     def list_assets(self) -> list[dict]:
-        return deepcopy(self.state["assets"])
+        assignments = self.list_contact_responsibilities()
+        by_asset: dict[str, list[dict]] = {}
+        for item in assignments:
+            by_asset.setdefault(item["assetId"], []).append(item)
+        return [{**deepcopy(item), "responsibilities": by_asset.get(item["id"], [])} for item in self.state["assets"]]
 
     def get_asset(self, asset_id: str) -> dict | None:
-        value = next((item for item in self.state["assets"] if item["id"] == asset_id), None)
+        value = next((item for item in self.list_assets() if item["id"] == asset_id), None)
         return deepcopy(value) if value else None
 
     def create_asset(self, asset: dict, actor_id: str | None = None) -> dict:
@@ -333,8 +480,26 @@ class StateRepository:
     def _postgres_create_change(self, change: dict, actor_id: str | None = None) -> dict:
         stored = {**deepcopy(change), "id": canonical_uuid("change_request", change["id"])}
         with self.connection_factory() as connection, connection.cursor() as cursor:
-            self._write_change(cursor, stored)
+            self._write_change(cursor, stored, actor_id)
             self._insert_audit(cursor, stored["companyId"], actor_id, "change_request", stored["id"], "created", None, stored)
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return self.get_change(stored["id"])
+
+    def _postgres_update_change(
+        self, change_id: str, change: dict, actor_id: str | None = None,
+        action: str = "updated", reason: str = "",
+    ) -> dict | None:
+        before = self.get_change(change_id)
+        if not before:
+            return None
+        stored = {**deepcopy(change), "id": canonical_uuid("change_request", change_id)}
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            self._write_change(cursor, stored, actor_id)
+            self._insert_audit(
+                cursor, stored["companyId"], actor_id, "change_request", stored["id"],
+                action, before, stored, reason=reason,
+            )
         self._refresh_state_mirror()
         self.save_state(self.state)
         return self.get_change(stored["id"])
@@ -348,7 +513,10 @@ class StateRepository:
                    cr.business_impact, cr.implementation_plan, cr.validation_plan,
                    cr.rollback_plan, cr.communication_status, cr.communication_plan,
                    cr.assigned_technician, cr.approver, cr.notes, cr.impact_summary,
-                   cr.risk_assessment, cr.revision, u.id, u.email::text,
+                   cr.risk_assessment, cr.revision, cr.actual_start, cr.actual_end,
+                   cr.actual_outage_minutes, cr.outcome, cr.failure_reason,
+                   cr.validation_result, cr.rollback_executed, cr.rollback_result,
+                   cr.closure_notes, cr.approvals, cr.status_history, u.id, u.email::text,
                    cr.created_at, cr.updated_at
             FROM change_requests cr
             JOIN companies c ON c.id = cr.company_id
@@ -361,7 +529,9 @@ class StateRepository:
             category, priority, risk_level, risk_source, outage_expected, planned_start,
             planned_end, reason, business_impact, implementation_plan, validation_plan,
             rollback_plan, communication_status, communication_plan, assigned_technician,
-            approver, notes, impact_summary, risk_assessment, revision, creator_id,
+            approver, notes, impact_summary, risk_assessment, revision, actual_start,
+            actual_end, actual_outage_minutes, outcome, failure_reason, validation_result,
+            rollback_executed, rollback_result, closure_notes, approvals, status_history, creator_id,
             creator_email, created_at, updated_at,
         ) = row
         change_id_text = str(change_id)
@@ -455,11 +625,22 @@ class StateRepository:
             "createdAt": self._timestamp(created_at),
             "updatedAt": self._timestamp(updated_at),
             "revision": revision,
+            "actualStart": self._timestamp(actual_start),
+            "actualEnd": self._timestamp(actual_end),
+            "actualOutageMinutes": int(actual_outage_minutes or 0),
+            "outcome": outcome or "pending",
+            "failureReason": failure_reason or "",
+            "validationResult": validation_result or "",
+            "rollbackExecuted": bool(rollback_executed),
+            "rollbackResult": rollback_result or "",
+            "closureNotes": closure_notes or "",
+            "approvals": approvals or [],
+            "statusHistory": status_history or [],
             "externalReferences": external_references,
             "integrationState": integration_state,
         }
 
-    def _write_change(self, cursor: Any, change: dict) -> None:
+    def _write_change(self, cursor: Any, change: dict, revision_actor_id: str | None = None) -> None:
         change_uuid = canonical_uuid("change_request", change["id"])
         cursor.execute("SELECT id FROM companies WHERE slug = %s", (change["companyId"],))
         company_row = cursor.fetchone()
@@ -472,6 +653,7 @@ class StateRepository:
             cursor.execute("SELECT id FROM users WHERE email = %s", (creator["email"],))
             creator_row = cursor.fetchone()
             creator_uuid = str(creator_row[0]) if creator_row else None
+        revision_actor_uuid = canonical_uuid("user", revision_actor_id) if revision_actor_id else creator_uuid
         cursor.execute(
             """
             INSERT INTO change_requests (
@@ -479,12 +661,17 @@ class StateRepository:
                 priority, risk_level, risk_source, outage_expected, planned_start,
                 planned_end, reason, business_impact, implementation_plan, validation_plan,
                 rollback_plan, communication_status, communication_plan, assigned_technician,
-                approver, notes, impact_summary, risk_assessment, revision, created_by,
+                approver, notes, impact_summary, risk_assessment, revision,
+                actual_start, actual_end, actual_outage_minutes, outcome, failure_reason,
+                validation_result, rollback_executed, rollback_result, closure_notes,
+                approvals, status_history, created_by,
                 created_at, updated_at
             ) VALUES (
                 %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 %s::timestamp, %s::timestamp, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s::uuid,
+                %s, %s, %s, %s::jsonb, %s::jsonb, %s,
+                %s::timestamptz, %s::timestamptz, %s, %s, %s,
+                %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::uuid,
                 COALESCE(%s::timestamptz, now()), COALESCE(%s::timestamptz, now())
             )
             ON CONFLICT (id) DO UPDATE SET
@@ -502,6 +689,12 @@ class StateRepository:
                 assigned_technician = EXCLUDED.assigned_technician, approver = EXCLUDED.approver,
                 notes = EXCLUDED.notes, impact_summary = EXCLUDED.impact_summary,
                 risk_assessment = EXCLUDED.risk_assessment, revision = EXCLUDED.revision,
+                actual_start = EXCLUDED.actual_start, actual_end = EXCLUDED.actual_end,
+                actual_outage_minutes = EXCLUDED.actual_outage_minutes, outcome = EXCLUDED.outcome,
+                failure_reason = EXCLUDED.failure_reason, validation_result = EXCLUDED.validation_result,
+                rollback_executed = EXCLUDED.rollback_executed, rollback_result = EXCLUDED.rollback_result,
+                closure_notes = EXCLUDED.closure_notes, approvals = EXCLUDED.approvals,
+                status_history = EXCLUDED.status_history,
                 created_by = EXCLUDED.created_by, updated_at = EXCLUDED.updated_at
             """,
             (
@@ -516,7 +709,12 @@ class StateRepository:
                 change.get("communicationPlan") or None, change.get("assignedTechnician") or None,
                 change.get("approver") or None, change.get("notes") or None,
                 json.dumps(change.get("impactSummary") or {}), json.dumps(change.get("riskAssessment") or {}),
-                int(change.get("revision") or 1), creator_uuid,
+                int(change.get("revision") or 1), change.get("actualStart") or None,
+                change.get("actualEnd") or None, int(change.get("actualOutageMinutes") or 0),
+                change.get("outcome", "pending"), change.get("failureReason") or None,
+                change.get("validationResult") or None, bool(change.get("rollbackExecuted")),
+                change.get("rollbackResult") or None, change.get("closureNotes") or None,
+                json.dumps(change.get("approvals") or []), json.dumps(change.get("statusHistory") or []), creator_uuid,
                 change.get("createdAt") or None, change.get("updatedAt") or None,
             ),
         )
@@ -563,7 +761,7 @@ class StateRepository:
             VALUES (%s::uuid, %s, %s::jsonb, %s::uuid)
             ON CONFLICT (change_id, revision) DO UPDATE SET document = EXCLUDED.document
             """,
-            (change_uuid, revision, json.dumps(change), creator_uuid),
+            (change_uuid, revision, json.dumps(change), revision_actor_uuid),
         )
         connectwise = (change.get("integrationState") or {}).get("connectwise") or {}
         sync_status = connectwise.get("status", "not_published")
@@ -610,6 +808,20 @@ class StateRepository:
         self._audit(change["companyId"], actor_id, "change_request", change["id"], "created", None, change)
         self.save_state(self.state)
         return deepcopy(change)
+
+    def update_change(
+        self, change_id: str, change: dict, actor_id: str | None = None,
+        action: str = "updated", reason: str = "",
+    ) -> dict | None:
+        current = next((item for item in self.state.get("changes", []) if item["id"] == change_id), None)
+        if not current:
+            return None
+        before = deepcopy(current)
+        current.clear()
+        current.update(deepcopy(change))
+        self._audit(current["companyId"], actor_id, "change_request", change_id, action, before, current, reason=reason)
+        self.save_state(self.state)
+        return deepcopy(current)
 
     def list_integrations(self) -> list[dict]:
         return deepcopy(self.state.get("integrations", []))
@@ -750,6 +962,8 @@ class StateRepository:
         self.state.clear()
         self.state.update(deepcopy(state))
         self.state.setdefault("auditEvents", [])
+        self.state.setdefault("contacts", [])
+        self.state.setdefault("contactResponsibilities", [])
         self.save_state(self.state)
         return {
             "companies": len(self.state.get("companies", [])),
@@ -822,6 +1036,7 @@ class PostgresCmdbRepository(StateRepository):
     get_change = StateRepository._postgres_get_change
     next_change_number = StateRepository._postgres_next_change_number
     create_change = StateRepository._postgres_create_change
+    update_change = StateRepository._postgres_update_change
 
     def __init__(
         self,
@@ -1022,6 +1237,78 @@ class PostgresCmdbRepository(StateRepository):
                             (user_uuid, group_ids[group_slug]),
                         )
 
+            contact_ids: dict[str, str] = {}
+            for contact in self.state.get("contacts", []):
+                company_uuid = company_ids.get(contact.get("companyId"))
+                if not company_uuid:
+                    continue
+                contact_uuid = canonical_uuid("contact", contact["id"])
+                contact_ids[contact["id"]] = contact_uuid
+                linked_user_id = contact.get("linkedUserId")
+                cursor.execute(
+                    """
+                    INSERT INTO contacts (
+                        id, company_id, linked_user_id, display_name, normalized_name,
+                        first_name, last_name, primary_email, phone, mobile, job_title,
+                        department, location, timezone, manager_contact_id, status,
+                        source, sync_status, last_seen_at, last_synced_at, attributes,
+                        created_at, updated_at
+                    ) VALUES (
+                        %s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s::uuid, %s, %s, %s, %s::timestamptz,
+                        %s::timestamptz, %s::jsonb, COALESCE(%s::timestamptz, now()),
+                        COALESCE(%s::timestamptz, now())
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        company_id = EXCLUDED.company_id,
+                        linked_user_id = EXCLUDED.linked_user_id,
+                        display_name = EXCLUDED.display_name,
+                        normalized_name = EXCLUDED.normalized_name,
+                        first_name = EXCLUDED.first_name,
+                        last_name = EXCLUDED.last_name,
+                        primary_email = EXCLUDED.primary_email,
+                        phone = EXCLUDED.phone,
+                        mobile = EXCLUDED.mobile,
+                        job_title = EXCLUDED.job_title,
+                        department = EXCLUDED.department,
+                        location = EXCLUDED.location,
+                        timezone = EXCLUDED.timezone,
+                        manager_contact_id = EXCLUDED.manager_contact_id,
+                        status = EXCLUDED.status,
+                        source = EXCLUDED.source,
+                        sync_status = EXCLUDED.sync_status,
+                        last_seen_at = EXCLUDED.last_seen_at,
+                        last_synced_at = EXCLUDED.last_synced_at,
+                        attributes = EXCLUDED.attributes,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        contact_uuid, company_uuid,
+                        canonical_uuid("user", linked_user_id) if linked_user_id else None,
+                        contact["displayName"], normalized_name(contact["displayName"]),
+                        contact.get("firstName") or None, contact.get("lastName") or None,
+                        contact.get("email") or None, contact.get("phone") or None,
+                        contact.get("mobile") or None, contact.get("jobTitle") or None,
+                        contact.get("department") or None, contact.get("location") or None,
+                        contact.get("timezone") or None,
+                        None,
+                        contact.get("status", "active"), contact.get("source", "manual"),
+                        contact.get("syncStatus", "not_synced"), contact.get("lastSeen") or None,
+                        contact.get("lastSynced") or None, json.dumps(contact.get("attributes") or {}),
+                        contact.get("createdAt") or None, contact.get("updatedAt") or None,
+                    ),
+                )
+
+            for contact in self.state.get("contacts", []):
+                if contact.get("managerContactId") and contact.get("id") in contact_ids:
+                    cursor.execute(
+                        "UPDATE contacts SET manager_contact_id = %s::uuid WHERE id = %s::uuid",
+                        (
+                            contact_ids.get(contact["managerContactId"], canonical_uuid("contact", contact["managerContactId"])),
+                            contact_ids[contact["id"]],
+                        ),
+                    )
+
             integration_ids: dict[str, str] = {}
             for integration in self.state.get("integrations", []):
                 kind = integration.get("type", integration.get("id", "future"))
@@ -1179,6 +1466,55 @@ class PostgresCmdbRepository(StateRepository):
                         lifecycle,
                         operational,
                         json.dumps(attributes),
+                    ),
+                )
+
+            for responsibility in self.state.get("contactResponsibilities", []):
+                company_uuid = company_ids.get(responsibility.get("companyId"))
+                asset_uuid = asset_ids.get(
+                    responsibility.get("assetId"),
+                    canonical_uuid("configuration_item", responsibility.get("assetId")),
+                )
+                contact_uuid = contact_ids.get(
+                    responsibility.get("contactId"),
+                    canonical_uuid("contact", responsibility.get("contactId")),
+                )
+                if not company_uuid:
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO contact_responsibilities (
+                        id, company_id, ci_id, contact_id, responsibility_role,
+                        is_primary, effective_from, effective_until, escalation_order,
+                        notes, source, created_by, ended_by, created_at
+                    ) VALUES (
+                        %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, %s,
+                        COALESCE(%s::timestamptz, now()), %s::timestamptz, %s,
+                        %s, %s, %s::uuid, %s::uuid, COALESCE(%s::timestamptz, now())
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        contact_id = EXCLUDED.contact_id,
+                        responsibility_role = EXCLUDED.responsibility_role,
+                        is_primary = EXCLUDED.is_primary,
+                        effective_from = EXCLUDED.effective_from,
+                        effective_until = EXCLUDED.effective_until,
+                        escalation_order = EXCLUDED.escalation_order,
+                        notes = EXCLUDED.notes,
+                        source = EXCLUDED.source,
+                        ended_by = EXCLUDED.ended_by
+                    """,
+                    (
+                        canonical_uuid("contact_responsibility", responsibility["id"]),
+                        company_uuid, asset_uuid, contact_uuid, responsibility["role"],
+                        bool(responsibility.get("isPrimary", True)),
+                        responsibility.get("effectiveFrom") or None,
+                        responsibility.get("effectiveUntil") or None,
+                        int(responsibility.get("escalationOrder", 1)),
+                        responsibility.get("notes") or None,
+                        responsibility.get("source", "manual"),
+                        canonical_uuid("user", responsibility["createdBy"]) if responsibility.get("createdBy") else None,
+                        canonical_uuid("user", responsibility["endedBy"]) if responsibility.get("endedBy") else None,
+                        responsibility.get("effectiveFrom") or None,
                     ),
                 )
 
@@ -1379,6 +1715,273 @@ class PostgresCmdbRepository(StateRepository):
         self.save_state(self.state)
         return next(item for item in self.list_users() if item["id"] == user_uuid)
 
+    def set_user_status(self, user_id: str, status: str, actor_id: str | None = None, *, reason: str = "") -> bool:
+        active = next((item for item in self.list_users() if item["id"] == user_id), None)
+        before = active or {"id": user_id, "status": "disabled"}
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute("UPDATE users SET status = %s WHERE id = %s::uuid", (status, user_id))
+            if cursor.rowcount != 1:
+                return False
+            after = {**before, "status": status}
+            company_id = before.get("companyIds", [None])[0] if before.get("companyIds") else None
+            self._insert_audit(cursor, company_id, actor_id, "user", user_id, "status_changed", before, after, reason=reason)
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return True
+
+    def list_contacts(self, company_id: str | None = None) -> list[dict]:
+        parameters: list[Any] = []
+        where = ""
+        if company_id:
+            where = "WHERE c.slug = %s"
+            parameters.append(company_id)
+        users = {item["id"]: item for item in self.list_users()}
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT id, email::text, status FROM users")
+            portal_accounts = {
+                str(user_id): {"id": str(user_id), "email": email, "role": users.get(str(user_id), {}).get("role", "client_reader"), "status": status}
+                for user_id, email, status in cursor.fetchall()
+            }
+            cursor.execute(
+                f"""
+                SELECT contact.id, c.slug, contact.linked_user_id, contact.display_name,
+                       contact.first_name, contact.last_name, contact.primary_email::text,
+                       contact.phone, contact.mobile, contact.job_title, contact.department,
+                       contact.location, contact.timezone, contact.manager_contact_id,
+                       contact.status, contact.source, contact.sync_status,
+                       contact.last_seen_at, contact.last_synced_at, contact.attributes,
+                       contact.created_at, contact.updated_at,
+                       COUNT(responsibility.id) FILTER (WHERE responsibility.effective_until IS NULL)
+                FROM contacts contact
+                JOIN companies c ON c.id = contact.company_id
+                LEFT JOIN contact_responsibilities responsibility ON responsibility.contact_id = contact.id
+                {where}
+                GROUP BY contact.id, c.slug
+                ORDER BY contact.normalized_name, contact.id
+                """,
+                tuple(parameters),
+            )
+            records = []
+            for row in cursor.fetchall():
+                linked_user_id = str(row[2]) if row[2] else None
+                linked_user = portal_accounts.get(linked_user_id)
+                records.append({
+                    "id": str(row[0]), "companyId": row[1], "linkedUserId": linked_user_id,
+                    "displayName": row[3], "firstName": row[4] or "", "lastName": row[5] or "",
+                    "email": row[6] or "", "phone": row[7] or "", "mobile": row[8] or "",
+                    "jobTitle": row[9] or "", "department": row[10] or "",
+                    "location": row[11] or "", "timezone": row[12] or "",
+                    "managerContactId": str(row[13]) if row[13] else None,
+                    "status": row[14], "source": row[15], "syncStatus": row[16],
+                    "lastSeen": self._timestamp(row[17]) or None,
+                    "lastSynced": self._timestamp(row[18]) or None,
+                    "attributes": row[19] or {}, "createdAt": self._timestamp(row[20]),
+                    "updatedAt": self._timestamp(row[21]), "responsibilityCount": int(row[22] or 0),
+                    "portalUser": (
+                        {"id": linked_user["id"], "email": linked_user["email"], "role": linked_user["role"], "status": linked_user["status"]}
+                        if linked_user else None
+                    ),
+                })
+            return records
+
+    def get_contact(self, contact_id: str) -> dict | None:
+        try:
+            parsed = str(uuid.UUID(contact_id))
+        except (ValueError, TypeError):
+            return None
+        return next((item for item in self.list_contacts() if item["id"] == parsed), None)
+
+    def create_contact(self, contact: dict, actor_id: str | None = None) -> dict:
+        contact_uuid = canonical_uuid("contact", contact["id"])
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT id FROM companies WHERE slug = %s AND status <> 'inactive'", (contact["companyId"],))
+            company_row = cursor.fetchone()
+            if not company_row:
+                raise ValueError("Customer not found")
+            cursor.execute(
+                """
+                INSERT INTO contacts (
+                    id, company_id, linked_user_id, display_name, normalized_name,
+                    first_name, last_name, primary_email, phone, mobile, job_title,
+                    department, location, timezone, manager_contact_id, status,
+                    source, sync_status, last_seen_at, last_synced_at, attributes,
+                    created_by, updated_by, created_at, updated_at
+                ) VALUES (
+                    %s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s::uuid, %s, %s, %s, %s::timestamptz,
+                    %s::timestamptz, %s::jsonb, %s::uuid, %s::uuid, now(), now()
+                )
+                """,
+                (
+                    contact_uuid, str(company_row[0]), contact.get("linkedUserId"), contact["displayName"],
+                    normalized_name(contact["displayName"]), contact.get("firstName") or None,
+                    contact.get("lastName") or None, contact.get("email") or None,
+                    contact.get("phone") or None, contact.get("mobile") or None,
+                    contact.get("jobTitle") or None, contact.get("department") or None,
+                    contact.get("location") or None, contact.get("timezone") or None,
+                    contact.get("managerContactId") or None, contact.get("status", "active"),
+                    contact.get("source", "manual"), contact.get("syncStatus", "not_synced"),
+                    contact.get("lastSeen") or None, contact.get("lastSynced") or None,
+                    json.dumps(contact.get("attributes") or {}), actor_id, actor_id,
+                ),
+            )
+            stored = {**deepcopy(contact), "id": contact_uuid}
+            self._insert_audit(cursor, contact["companyId"], actor_id, "contact", contact_uuid, "created", None, stored)
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return self.get_contact(contact_uuid)
+
+    def update_contact(self, contact_id: str, changes: dict, actor_id: str | None = None, *, reason: str = "") -> dict | None:
+        before = self.get_contact(contact_id)
+        if not before:
+            return None
+        after = {**before, **deepcopy(changes)}
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE contacts SET
+                    linked_user_id = %s::uuid, display_name = %s, normalized_name = %s,
+                    first_name = %s, last_name = %s, primary_email = %s,
+                    phone = %s, mobile = %s, job_title = %s, department = %s,
+                    location = %s, timezone = %s, manager_contact_id = %s::uuid,
+                    status = %s, source = %s, sync_status = %s,
+                    last_seen_at = %s::timestamptz, last_synced_at = %s::timestamptz,
+                    attributes = %s::jsonb, updated_by = %s::uuid, updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (
+                    after.get("linkedUserId") or None, after["displayName"], normalized_name(after["displayName"]),
+                    after.get("firstName") or None, after.get("lastName") or None,
+                    after.get("email") or None, after.get("phone") or None, after.get("mobile") or None,
+                    after.get("jobTitle") or None, after.get("department") or None,
+                    after.get("location") or None, after.get("timezone") or None,
+                    after.get("managerContactId") or None, after.get("status", "active"),
+                    after.get("source", "manual"), after.get("syncStatus", "not_synced"),
+                    after.get("lastSeen") or None, after.get("lastSynced") or None,
+                    json.dumps(after.get("attributes") or {}), actor_id, contact_id,
+                ),
+            )
+            self._insert_audit(cursor, before["companyId"], actor_id, "contact", contact_id, "updated", before, after, reason=reason)
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return self.get_contact(contact_id)
+
+    def list_contact_responsibilities(
+        self,
+        company_id: str | None = None,
+        *,
+        contact_id: str | None = None,
+        asset_id: str | None = None,
+        include_inactive: bool = False,
+    ) -> list[dict]:
+        clauses = []
+        parameters: list[Any] = []
+        if company_id:
+            clauses.append("company.slug = %s"); parameters.append(company_id)
+        if contact_id:
+            clauses.append("responsibility.contact_id = %s::uuid"); parameters.append(contact_id)
+        if asset_id:
+            clauses.append("responsibility.ci_id = %s::uuid"); parameters.append(asset_id)
+        if not include_inactive:
+            clauses.append("responsibility.effective_until IS NULL")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT responsibility.id, company.slug, responsibility.ci_id,
+                       ci.display_name, ci.ci_type, responsibility.contact_id,
+                       contact.display_name, contact.primary_email::text,
+                       responsibility.responsibility_role, responsibility.is_primary,
+                       responsibility.effective_from, responsibility.effective_until,
+                       responsibility.escalation_order, responsibility.notes,
+                       responsibility.source, responsibility.created_by, responsibility.ended_by
+                FROM contact_responsibilities responsibility
+                JOIN companies company ON company.id = responsibility.company_id
+                JOIN configuration_items ci ON ci.id = responsibility.ci_id
+                JOIN contacts contact ON contact.id = responsibility.contact_id
+                {where}
+                ORDER BY responsibility.effective_until NULLS FIRST,
+                         responsibility.responsibility_role, responsibility.escalation_order,
+                         contact.display_name
+                """,
+                tuple(parameters),
+            )
+            return [{
+                "id": str(row[0]), "companyId": row[1], "assetId": str(row[2]),
+                "assetName": row[3], "assetType": row[4], "contactId": str(row[5]),
+                "contactName": row[6], "contactEmail": row[7] or "", "role": row[8],
+                "isPrimary": bool(row[9]), "effectiveFrom": self._timestamp(row[10]),
+                "effectiveUntil": self._timestamp(row[11]) or None,
+                "escalationOrder": int(row[12]), "notes": row[13] or "",
+                "source": row[14], "createdBy": str(row[15]) if row[15] else None,
+                "endedBy": str(row[16]) if row[16] else None,
+            } for row in cursor.fetchall()]
+
+    def replace_asset_responsibilities(
+        self,
+        asset_id: str,
+        assignments: list[dict],
+        company_id: str,
+        actor_id: str | None = None,
+        *,
+        reason: str = "",
+    ) -> list[dict]:
+        before = self.list_contact_responsibilities(company_id, asset_id=asset_id)
+        normalized_before = sorted((item["role"], item["contactId"], bool(item["isPrimary"]), int(item["escalationOrder"])) for item in before)
+        normalized_after = sorted((item["role"], item["contactId"], bool(item.get("isPrimary", True)), int(item.get("escalationOrder", 1))) for item in assignments)
+        if normalized_before == normalized_after:
+            return before
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE contact_responsibilities
+                SET effective_until = now(), ended_by = %s::uuid
+                WHERE ci_id = %s::uuid AND effective_until IS NULL
+                """,
+                (actor_id, asset_id),
+            )
+            for item in assignments:
+                cursor.execute(
+                    """
+                    INSERT INTO contact_responsibilities (
+                        id, company_id, ci_id, contact_id, responsibility_role,
+                        is_primary, effective_from, escalation_order, notes,
+                        source, created_by, created_at
+                    ) SELECT gen_random_uuid(), company.id, %s::uuid, contact.id, %s,
+                             %s, now(), %s, %s, %s, %s::uuid, now()
+                      FROM companies company
+                      JOIN contacts contact ON contact.company_id = company.id AND contact.id = %s::uuid
+                      WHERE company.slug = %s
+                    """,
+                    (
+                        asset_id, item["role"], bool(item.get("isPrimary", True)),
+                        int(item.get("escalationOrder", 1)), item.get("notes") or None,
+                        item.get("source", "manual"), actor_id, item["contactId"], company_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Choose contacts belonging to this customer")
+            self._insert_audit(
+                cursor, company_id, actor_id, "contact_responsibility", asset_id,
+                "reassigned", {"assignments": before}, {"assignments": assignments}, reason=reason,
+            )
+            before_by_contact = {(item["contactId"], item["role"]): item for item in before}
+            after_by_contact = {(item["contactId"], item["role"]): item for item in assignments}
+            for key in sorted(set(before_by_contact) | set(after_by_contact)):
+                if key in before_by_contact and key in after_by_contact:
+                    continue
+                contact_id, role = key
+                assigned = key in after_by_contact
+                self._insert_audit(
+                    cursor, company_id, actor_id, "contact", contact_id,
+                    "responsibility_assigned" if assigned else "responsibility_ended",
+                    before_by_contact.get(key), after_by_contact.get(key), reason=reason,
+                    metadata={"assetId": asset_id, "responsibilityRole": role},
+                )
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return self.list_contact_responsibilities(company_id, asset_id=asset_id)
+
     def list_access_groups(self) -> list[dict]:
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -1464,7 +2067,12 @@ class PostgresCmdbRepository(StateRepository):
                 ORDER BY ci.display_name
                 """
             )
-            return [self._asset_from_row(row) for row in cursor.fetchall()]
+            assets = [self._asset_from_row(row) for row in cursor.fetchall()]
+        assignments = self.list_contact_responsibilities()
+        by_asset: dict[str, list[dict]] = {}
+        for item in assignments:
+            by_asset.setdefault(item["assetId"], []).append(item)
+        return [{**asset, "responsibilities": by_asset.get(asset["id"], [])} for asset in assets]
 
     def get_asset(self, asset_id: str) -> dict | None:
         try:
@@ -1484,7 +2092,11 @@ class PostgresCmdbRepository(StateRepository):
                 (parsed_id,),
             )
             row = cursor.fetchone()
-            return self._asset_from_row(row) if row else None
+        if not row:
+            return None
+        asset = self._asset_from_row(row)
+        asset["responsibilities"] = self.list_contact_responsibilities(asset["companyId"], asset_id=asset["id"])
+        return asset
 
     def create_asset(self, asset: dict, actor_id: str | None = None) -> dict:
         asset_uuid = canonical_uuid("configuration_item", asset["id"])
@@ -1963,6 +2575,8 @@ class PostgresCmdbRepository(StateRepository):
         return {
             "companies": self.list_companies(),
             "users": self.list_users(include_credentials=True),
+            "contacts": self.list_contacts(),
+            "contactResponsibilities": self.list_contact_responsibilities(include_inactive=True),
             "accessGroups": self.list_access_groups(),
             "assets": self.list_assets(),
             "relationships": self.list_relationships(),
@@ -2100,6 +2714,8 @@ class PostgresCmdbRepository(StateRepository):
     def _refresh_state_mirror(self) -> None:
         self.state["companies"] = self.list_companies()
         self.state["users"] = self.list_users(include_credentials=True)
+        self.state["contacts"] = self.list_contacts()
+        self.state["contactResponsibilities"] = self.list_contact_responsibilities(include_inactive=True)
         self.state["accessGroups"] = self.list_access_groups()
         self.state["assets"] = self.list_assets()
         self.state["relationships"] = self.list_relationships()

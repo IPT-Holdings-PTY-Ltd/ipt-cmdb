@@ -18,6 +18,7 @@ import { useMemo } from 'react';
 import { BusinessSystemsPage } from './BusinessSystems';
 import { AuditCenterPage, ReportsPage } from './Governance';
 import { DataQualityPage } from './DataQuality';
+import { ContactsPage } from './Contacts';
 
 function BrandedApplication() {
   const { brand } = useMspBranding();
@@ -42,6 +43,7 @@ function BrandedApplication() {
         <Route path="/business-systems" element={<BusinessSystemsPage />} />
         <Route path="/relationships" element={<Relationships />} />
         <Route path="/changes" element={<ChangeControlPage />} />
+        <Route path="/contacts" element={<ContactsPage />} />
         <Route path="/governance/audit" element={<AuditCenterPage />} />
         <Route path="/governance/reports" element={<ReportsPage />} />
         <Route path="/governance/data-quality" element={<DataQualityPage />} />

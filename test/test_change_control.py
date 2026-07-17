@@ -3,7 +3,14 @@ from io import BytesIO
 
 from pypdf import PdfReader
 
-from src.cmdb.change_control import build_impact_snapshot, create_change_record, preview_change_impact, render_change_pdf
+from src.cmdb.change_control import (
+    build_impact_snapshot,
+    create_change_record,
+    preview_change_impact,
+    render_change_pdf,
+    transition_change_record,
+    update_change_record,
+)
 
 
 ASSETS = [
@@ -47,6 +54,43 @@ class ChangeControlTests(unittest.TestCase):
         self.assertEqual(change["integrationState"]["connectwise"]["status"], "not_published")
         self.assertEqual(change["revision"], 1)
         self.assertEqual(len(change["impactSnapshot"]), 4)
+        self.assertEqual(change["statusHistory"][0]["toStatus"], "draft")
+
+    def test_edit_creates_revision_and_refreshes_impact(self):
+        change = self._change()
+        updated = update_change_record(
+            change,
+            {"expectedRevision": 1, "title": "Database maintenance revised", "scopeAssetIds": ["app"]},
+            {"id": "operator", "email": "operator@example.com"},
+            ASSETS,
+            RELATIONSHIPS,
+        )
+        self.assertEqual(updated["revision"], 2)
+        self.assertEqual(updated["title"], "Database maintenance revised")
+        self.assertEqual(updated["scopeAssetIds"], ["app"])
+        self.assertEqual(updated["lastUpdatedBy"]["email"], "operator@example.com")
+
+    def test_approval_and_failure_transitions_are_distinct_and_auditable(self):
+        actor = {"id": "operator", "email": "operator@example.com"}
+        change = self._change()
+        for status in ("impact_review", "awaiting_approval", "approved", "scheduled", "implementing"):
+            change = transition_change_record(change, status, {"reason": f"Move to {status}"}, actor)
+        self.assertEqual(change["approvals"][-1]["decision"], "approved")
+        change = transition_change_record(
+            change, "failed",
+            {"reason": "Database service did not recover", "actualOutageMinutes": 18, "validationResult": "Health check failed"},
+            actor,
+        )
+        self.assertEqual(change["outcome"], "failed")
+        self.assertEqual(change["actualOutageMinutes"], 18)
+        change = transition_change_record(change, "backed_out", {"reason": "Snapshot restored", "rollbackResult": "Service recovered"}, actor)
+        self.assertTrue(change["rollbackExecuted"])
+        self.assertEqual(change["outcome"], "backed_out")
+        self.assertEqual(change["statusHistory"][-1]["toStatus"], "backed_out")
+
+    def test_invalid_transition_is_rejected(self):
+        with self.assertRaises(ValueError):
+            transition_change_record(self._change(), "completed", {"reason": "Skipped controls"}, {"id": "admin", "email": "admin@example.com"})
 
     def test_informational_relationship_does_not_propagate_impact(self):
         relationships = [
