@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.cmdb.migrations import apply_migrations, latest_schema_version
+from src.cmdb.migrations import apply_migrations, latest_schema_version, migration_plan
 from src.cmdb.repository import PostgresCmdbRepository
 
 
@@ -66,7 +66,8 @@ def main() -> None:
             )
 
         applied = apply_migrations(factory, ROOT)
-        assert applied == ["2026.07.15.1", "2026.07.15.2", "2026.07.15.3", "2026.07.16.1", "2026.07.16.2"], applied
+        expected_incremental_versions = [item.version for item in migration_plan(ROOT)[1:]]
+        assert applied == expected_incremental_versions, applied
         repository = PostgresCmdbRepository(legacy_state, lambda _state: None, factory)
         assert repository.migrate_legacy_company_branding() == 1
         assert repository.get_company_branding("acme")["name"] == "Acme Service Portal"
