@@ -12,7 +12,8 @@ Describe the user-facing outcome and the reason for the change.
 
 ## Validation
 
-- [ ] `python -m unittest discover -s test -v`
+- [ ] `python -m pre_commit run --all-files`
+- [ ] `python -m coverage run -m unittest discover -s test -v` and `python -m coverage report`
 - [ ] `npm test`
 - [ ] `npm run typecheck`
 - [ ] `npm run build`

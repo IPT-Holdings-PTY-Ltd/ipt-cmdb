@@ -1,0 +1,30 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: Ruff lint
+        entry: python -m ruff check
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: Ruff formatting
+        entry: python -m ruff format --check
+        language: system
+        types: [python]
+      - id: mypy
+        name: Mypy
+        entry: python -m mypy app.py backend src scripts
+        language: system
+        pass_filenames: false
+      - id: python-coverage
+        name: Python tests with branch coverage
+        entry: python -m coverage run -m unittest discover -s test -p test_*.py
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+      - id: coverage-threshold
+        name: Coverage threshold
+        entry: python -m coverage report
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

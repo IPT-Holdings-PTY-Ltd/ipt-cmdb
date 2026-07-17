@@ -1,5 +1,7 @@
+import os
 import unittest
 from datetime import date
+from unittest.mock import patch
 
 from app import (
     allowed,
@@ -10,6 +12,7 @@ from app import (
     can_manage,
     customer_overview,
     dashboard_snapshot,
+    execute_sync,
     normalise_metadata,
     preview_backup,
     relationship_exists,
@@ -202,6 +205,18 @@ class CompanyScopeTests(unittest.TestCase):
         ]
         self.assertTrue(would_create_dependency_cycle(relationships, "database", "portal"))
         self.assertFalse(would_create_dependency_cycle(relationships, "reporting", "database"))
+
+    def test_connectwise_sync_rejects_non_https_base_url(self):
+        settings = {
+            "CW_BASE_URL": "file:///tmp/connectwise",
+            "CW_COMPANY_ID": "company",
+            "CW_PUBLIC_KEY": "public",
+            "CW_PRIVATE_KEY": "private",
+        }
+        with patch.dict(os.environ, settings, clear=False):
+            result = execute_sync("connectwise")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("HTTPS URL", result["message"])
 
 
 if __name__ == "__main__":

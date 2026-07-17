@@ -26,3 +26,18 @@ warn_redundant_casts = true
 warn_unreachable = true
 show_error_codes = true
 exclude = ["frontend/", "node_modules/", "test/"]
+
+[tool.coverage.run]
+branch = true
+source = ["app", "backend", "src"]
+
+[tool.coverage.report]
+fail_under = 58
+precision = 1
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]

@@ -2,6 +2,11 @@
 
 # Test-only PDF inspection dependency.
 pypdf>=6.14.2,<7
+httpx2>=2.7.0,<3
+
+# Local quality automation and coverage enforcement.
+coverage[toml]>=7.15.2,<8
+pre-commit>=4.6.0,<5
 
 # Static analysis and maintained third-party type information.
 ruff>=0.15.22,<0.16
