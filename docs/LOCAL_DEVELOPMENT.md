@@ -53,6 +53,8 @@ python -m pre_commit install --hook-type pre-commit --hook-type pre-push
 $env:DATABASE_URL='postgresql://cmdb:cmdb@localhost:5432/cmdb'
 $env:DATABASE_SEED_MODE='demo'
 $env:AUTH_MODE='local'
+$env:MFA_ENCRYPTION_KEY='<URL-safe base64 encoding of 32 random bytes>'
+$env:LOCAL_MFA_POLICY='optional'
 python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 3000
 ```
 

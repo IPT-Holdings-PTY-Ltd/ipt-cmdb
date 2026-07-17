@@ -34,6 +34,10 @@ Local authentication is for development. Production should use Microsoft Entra I
 
 Local password resets are administrative actions and revoke the user's active sessions. Entra-backed passwords must be changed through Entra ID. Disabled and archived CMDB users are denied both browser-session and personal-token authentication.
 
+Local accounts support RFC 6238 TOTP. TOTP seeds are encrypted with AES-256-GCM and bound to the user identifier; `MFA_ENCRYPTION_KEY` must be a stable 32-byte key supplied through Key Vault or the container secret store. Do not rotate or remove it without a controlled seed re-encryption plan. Seeds, provisioning URIs, authenticator codes and recovery codes must never appear in logs, audit payloads, portable exports or support tickets.
+
+Browser sessions and password-verified MFA challenges are stored in PostgreSQL using SHA-256 token hashes. Challenges expire after five minutes and five attempts. Accepted TOTP time steps are persisted to prevent replay. Recovery codes are high-entropy, one-use values stored only as salted PBKDF2 hashes. Administrative MFA reset is restricted to platform administrators, requires explicit target-email confirmation, and requires local administrators to repeat their password plus an enrolled MFA factor. The reset reason, optional ticket reference, verification method and session revocation are audited without retaining credentials or codes.
+
 ### Personal API tokens
 
 Personal tokens are intended for bounded CMDB automation, not interactive administration. Keep API access disabled unless required, grant the minimum read/write and customer scope, use short expiries and revoke unused tokens. Raw token values are returned once; only SHA-256 hashes are persisted. Personal tokens cannot access platform-administration APIs and are deliberately omitted from portable backup files.
@@ -41,6 +45,7 @@ Personal tokens are intended for bounded CMDB automation, not interactive admini
 ### Secrets
 
 - Keep `DATABASE_URL` and provider credentials in Key Vault or an equivalent secret store.
+- Keep `MFA_ENCRYPTION_KEY` in Key Vault and use the same value across every application replica.
 - Never expose secrets through frontend configuration, logs, API responses or portable exports.
 - Use dedicated, least-privilege provider identities.
 - Rotate any secret that is accidentally committed or shown in an issue; deleting it from the latest commit is not sufficient.
@@ -55,7 +60,7 @@ External writes are disabled by default. A future write path must be scoped, ide
 
 ### Backups and exports
 
-Portable exports contain operational and user-related data. Encrypt them, restrict access and define retention. They do not replace PostgreSQL backup and point-in-time recovery.
+Portable exports contain operational and user-related data. Encrypt them, restrict access and define retention. They deliberately exclude password hashes, MFA seeds, recovery codes, browser sessions, login challenges and personal-token hashes. They do not replace PostgreSQL backup and point-in-time recovery.
 
 ## Supported versions
 

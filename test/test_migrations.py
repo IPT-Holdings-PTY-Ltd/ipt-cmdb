@@ -62,9 +62,10 @@ class MigrationTests(unittest.TestCase):
                 "2026.07.17.2",
                 "2026.07.17.3",
                 "2026.07.17.4",
+                "2026.07.17.5",
             ],
         )
-        self.assertEqual(latest_schema_version(ROOT), "2026.07.17.4")
+        self.assertEqual(latest_schema_version(ROOT), "2026.07.17.5")
         self.assertTrue(all(len(item.checksum) == 64 for item in plan))
 
     def test_migrations_apply_once_and_reject_checksum_drift(self):
@@ -86,6 +87,7 @@ class MigrationTests(unittest.TestCase):
                 "2026.07.17.2",
                 "2026.07.17.3",
                 "2026.07.17.4",
+                "2026.07.17.5",
             ],
         )
         self.assertEqual(apply_migrations(factory, ROOT), [])

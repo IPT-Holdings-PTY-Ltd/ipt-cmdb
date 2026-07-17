@@ -4,6 +4,7 @@ import os
 import unittest
 from unittest.mock import patch
 
+import pyotp
 from fastapi.testclient import TestClient
 
 import app as core
@@ -418,6 +419,155 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(event["action"], "login_failed")
         self.assertEqual(event["outcome"], "failed")
         self.assertNotIn("incorrect-secret", json.dumps(event))
+
+    def test_local_totp_enrollment_recovery_replay_and_admin_reset(self):
+        mfa_key = base64.urlsafe_b64encode(bytes(range(32))).decode("ascii")
+        with patch.dict(
+            os.environ,
+            {"MFA_ENCRYPTION_KEY": mfa_key, "LOCAL_MFA_POLICY": "optional"},
+        ):
+            admin_token = self._login("admin@example.com")
+            headers = {"Authorization": f"Bearer {admin_token}"}
+            required = self.client.patch(
+                "/api/users/admin",
+                headers=headers,
+                json={
+                    "email": "admin@example.com",
+                    "displayName": "Admin",
+                    "role": "platform_admin",
+                    "companyIds": [],
+                    "groupIds": [],
+                    "apiAccessEnabled": False,
+                    "mfaRequired": True,
+                    "reason": "Require MFA for the platform administrator",
+                },
+            )
+            self.assertEqual(required.status_code, 200)
+            self.client.post("/api/logout", headers=headers)
+
+            first = self.client.post(
+                "/api/login",
+                json={"email": "admin@example.com", "password": "ChangeMe!"},
+            )
+            self.assertEqual(first.status_code, 200)
+            self.assertTrue(first.json()["mfaEnrollmentRequired"])
+            challenge_token = first.json()["challengeToken"]
+            enrollment = self.client.post(
+                "/api/login/mfa/enrollment", json={"challengeToken": challenge_token}
+            )
+            self.assertEqual(enrollment.status_code, 200)
+            self.assertTrue(enrollment.json()["qrCodeDataUri"].startswith("data:image/png"))
+            secret = enrollment.json()["manualKey"]
+            completed = self.client.post(
+                "/api/login/mfa",
+                json={
+                    "challengeToken": challenge_token,
+                    "code": pyotp.TOTP(secret).now(),
+                },
+            )
+            self.assertEqual(completed.status_code, 200)
+            self.assertEqual(len(completed.json()["recoveryCodes"]), 10)
+            recovery = completed.json()["recoveryCodes"]
+            session = completed.json()["token"]
+            self.client.post("/api/logout", headers={"Authorization": f"Bearer {session}"})
+
+            recovery_login = self.client.post(
+                "/api/login",
+                json={"email": "admin@example.com", "password": "ChangeMe!"},
+            ).json()
+            recovered = self.client.post(
+                "/api/login/mfa",
+                json={
+                    "challengeToken": recovery_login["challengeToken"],
+                    "code": recovery[0],
+                },
+            )
+            self.assertEqual(recovered.status_code, 200)
+            recovered_headers = {"Authorization": f"Bearer {recovered.json()['token']}"}
+            status = self.client.get("/api/me/mfa", headers=recovered_headers)
+            self.assertEqual(status.json()["recoveryCodesRemaining"], 9)
+            self.client.post("/api/logout", headers=recovered_headers)
+
+            replay_challenge = self.client.post(
+                "/api/login",
+                json={"email": "admin@example.com", "password": "ChangeMe!"},
+            ).json()
+            replay = self.client.post(
+                "/api/login/mfa",
+                json={
+                    "challengeToken": replay_challenge["challengeToken"],
+                    "code": recovery[0],
+                },
+            )
+            self.assertEqual(replay.status_code, 401)
+
+            reset_challenge = self.client.post(
+                "/api/login",
+                json={"email": "admin@example.com", "password": "ChangeMe!"},
+            ).json()
+            reset_session = self.client.post(
+                "/api/login/mfa",
+                json={
+                    "challengeToken": reset_challenge["challengeToken"],
+                    "code": recovery[1],
+                },
+            ).json()["token"]
+            reset_payload = {
+                "reason": "Lost authenticator during test",
+                "ticketReference": "CHG-1042",
+                "confirmation": "admin@example.com",
+                "administratorPassword": "ChangeMe!",
+                "administratorCode": recovery[2],
+            }
+            operator_reset = self.client.post(
+                "/api/users/admin/mfa/reset",
+                headers=self._headers("operator@example.com"),
+                json=reset_payload,
+            )
+            self.assertEqual(operator_reset.status_code, 403)
+            wrong_confirmation = self.client.post(
+                "/api/users/admin/mfa/reset",
+                headers={"Authorization": f"Bearer {reset_session}"},
+                json={**reset_payload, "confirmation": "wrong@example.com"},
+            )
+            self.assertEqual(wrong_confirmation.status_code, 400)
+            wrong_password = self.client.post(
+                "/api/users/admin/mfa/reset",
+                headers={"Authorization": f"Bearer {reset_session}"},
+                json={**reset_payload, "administratorPassword": "incorrect"},
+            )
+            self.assertEqual(wrong_password.status_code, 401)
+            reset = self.client.post(
+                "/api/users/admin/mfa/reset",
+                headers={"Authorization": f"Bearer {reset_session}"},
+                json=reset_payload,
+            )
+            self.assertEqual(reset.status_code, 200)
+            self.assertGreaterEqual(reset.json()["revokedSessions"], 1)
+            self.assertEqual(
+                self.client.get(
+                    "/api/me", headers={"Authorization": f"Bearer {reset_session}"}
+                ).status_code,
+                401,
+            )
+            next_login = self.client.post(
+                "/api/login",
+                json={"email": "admin@example.com", "password": "ChangeMe!"},
+            )
+            self.assertTrue(next_login.json()["mfaEnrollmentRequired"])
+            audit_text = json.dumps(core.DB["auditEvents"])
+            reset_event = next(
+                item for item in core.DB["auditEvents"] if item["action"] == "mfa_reset_by_admin"
+            )
+            self.assertEqual(reset_event["reason"], "Lost authenticator during test")
+            self.assertEqual(reset_event["metadata"]["ticketReference"], "CHG-1042")
+            self.assertEqual(
+                reset_event["metadata"]["administratorVerification"],
+                "password+recovery_code",
+            )
+            self.assertNotIn(secret, audit_text)
+            self.assertNotIn(recovery[0], audit_text)
+            self.assertNotIn(recovery[2], audit_text)
 
     def test_governance_reports_preview_and_download_in_customer_scope(self):
         client = self._login("client@acme.example")

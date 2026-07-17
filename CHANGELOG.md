@@ -14,7 +14,12 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Branded PDF, filterable XLSX and UTF-8 CSV report downloads.
 - Governed user lifecycle, session-revoking password changes and restricted personal API tokens.
 - Scalable customer-group directory with searchable membership assignment, accountable ownership, optimistic revisions and delete-impact review.
-- Blank-database and forward-upgrade coverage for schema `2026.07.17.4`.
+- RFC 6238 TOTP for local accounts with AES-GCM encrypted seeds, QR enrollment, replay protection, one-use recovery codes and governed reset.
+- Two-stage password/MFA login challenges and browser sessions persisted as hashes in PostgreSQL for container replicas.
+- Self-service **My security** controls plus per-user and environment-level MFA enforcement policy.
+- Platform-admin-only MFA reset with local administrator step-up verification, typed target confirmation, optional ticket evidence, discoverable disabled states, detailed audit metadata and immediate target-session revocation.
+- Replaced root user-management customer checkboxes with a scalable, search-driven scope selector, collapsed selections, filtered bulk management, group/direct/effective counts and assignment-source preview.
+- Blank-database and forward-upgrade coverage for schema `2026.07.17.5`.
 
 ### Planned
 

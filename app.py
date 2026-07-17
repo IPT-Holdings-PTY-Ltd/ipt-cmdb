@@ -719,6 +719,8 @@ def public_user(user: dict) -> dict:
         "companyIds": user["companyIds"],
         "authSource": user.get("authSource", "local"),
         "apiAccessEnabled": bool(user.get("apiAccessEnabled", False)),
+        "mfaRequired": bool(user.get("mfaRequired", False)),
+        "mfaEnabled": bool(user.get("mfaEnabled", False)),
     }
 
 
@@ -728,6 +730,7 @@ def visible_user(user: dict) -> dict:
         "directCompanyIds": user.get("directCompanyIds", user.get("companyIds", [])),
         "groupIds": user.get("groupIds", []),
         "apiTokenCount": int(user.get("apiTokenCount", 0)),
+        "mfaRecoveryCodesRemaining": int(user.get("mfaRecoveryCodesRemaining", 0)),
         "lastLoginAt": user.get("lastLoginAt"),
         "lastApiUsedAt": user.get("lastApiUsedAt"),
         "archivedAt": user.get("archivedAt"),

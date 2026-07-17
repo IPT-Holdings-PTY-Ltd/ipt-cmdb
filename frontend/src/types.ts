@@ -10,6 +10,9 @@ export type User = {
   accountType?: 'root' | 'customer';
   authSource?: 'local' | 'entra' | 'none';
   apiAccessEnabled?: boolean;
+  mfaRequired?: boolean;
+  mfaEnabled?: boolean;
+  mfaRecoveryCodesRemaining?: number;
   apiTokenCount?: number;
   lastLoginAt?: string | null;
   lastApiUsedAt?: string | null;

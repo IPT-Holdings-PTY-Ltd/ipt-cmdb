@@ -28,6 +28,7 @@ import { apiFetch, getSession } from './session';
 import type { AccessGroup, AccessGroupImpact, ApiToken, Company, Integration, RoleTemplate, SyncRun, User } from './types';
 import { useWorkspace } from './workspace';
 import { DEFAULT_MSP_BRAND, useMspBranding, type Brand } from './branding';
+import { CustomerScopeSelector } from './CustomerScopeSelector';
 
 type Notice = { severity: 'success' | 'error' | 'info' | 'warning'; message: string } | null;
 type DatabaseStatus = { configured: boolean; available: boolean; mode: string; source: string; managedByEnvironment?: boolean; error?: string | null; diagnosticError?: string | null; settings: DatabaseSettings; database?: string; databaseUser?: string; server?: string; schemaVersion?: string | null; expectedSchemaVersion?: string; migrationsPending?: boolean; initialized?: boolean; schemaState?: string; canCreateSchemaObjects?: boolean };
@@ -153,6 +154,13 @@ export function UsersPage() {
   const [editCompanyIds, setEditCompanyIds] = useState<string[]>([]);
   const [editGroupId, setEditGroupId] = useState('');
   const [editApiEnabled, setEditApiEnabled] = useState(false);
+  const [editMfaRequired, setEditMfaRequired] = useState(false);
+  const [mfaResetUser, setMfaResetUser] = useState<User | null>(null);
+  const [mfaResetReason, setMfaResetReason] = useState('Lost or replaced authenticator device');
+  const [mfaResetTicket, setMfaResetTicket] = useState('');
+  const [mfaResetConfirmation, setMfaResetConfirmation] = useState('');
+  const [mfaResetAdminPassword, setMfaResetAdminPassword] = useState('');
+  const [mfaResetAdminCode, setMfaResetAdminCode] = useState('');
   const [passwordUser, setPasswordUser] = useState<User | null>(null);
   const [newPassword, setNewPassword] = useState('');
   const [tokenUser, setTokenUser] = useState<User | null>(null);
@@ -186,6 +194,8 @@ export function UsersPage() {
   }
 
   const names = Object.fromEntries(workspace.companies.map(company => [company.id, company.name]));
+  const createAccessGroup = groups.find(group => group.id === groupId);
+  const editAccessGroup = groups.find(group => group.id === editGroupId);
   const dateLabel = (value?: string | null) => value ? new Date(value).toLocaleString() : 'Never';
   const visibleUsers = users.filter(user => {
     const matchesSearch = `${user.displayName} ${user.email} ${user.role}`.toLowerCase().includes(search.toLowerCase());
@@ -204,6 +214,7 @@ export function UsersPage() {
     setEditCompanyIds(user.directCompanyIds?.filter(id => id !== '*') || []);
     setEditGroupId(user.groupIds?.[0] || '');
     setEditApiEnabled(Boolean(user.apiAccessEnabled));
+    setEditMfaRequired(Boolean(user.mfaRequired));
   }
 
   async function saveUser(event: FormEvent) {
@@ -220,6 +231,7 @@ export function UsersPage() {
           companyIds: editRole === 'msp_operator' ? editCompanyIds : [],
           groupIds: editRole === 'msp_operator' && editGroupId ? [editGroupId] : [],
           apiAccessEnabled: editApiEnabled,
+          mfaRequired: editMfaRequired,
           reason: 'Updated from user management',
         }),
       });
@@ -272,6 +284,43 @@ export function UsersPage() {
     } catch (error) {
       setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Password reset failed.' });
     }
+  }
+
+  async function resetMfa(event: FormEvent) {
+    event.preventDefault();
+    if (!mfaResetUser) return;
+    try {
+      await apiFetch(`/api/users/${mfaResetUser.id}/mfa/reset`, {
+        method: 'POST', body: JSON.stringify({
+          reason: mfaResetReason,
+          ticketReference: mfaResetTicket,
+          confirmation: mfaResetConfirmation,
+          administratorPassword: mfaResetAdminPassword,
+          administratorCode: mfaResetAdminCode,
+        }),
+      });
+      setNotice({ severity: 'success', message: `Authenticator reset for ${mfaResetUser.email}. Active sessions were revoked and enrollment will be required at the next sign-in when policy requires it.` });
+      closeMfaReset();
+      await load();
+    } catch (error) { setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Authenticator reset failed.' }); }
+  }
+
+  function openMfaReset(user: User) {
+    setMfaResetUser(user);
+    setMfaResetReason('Lost or replaced authenticator device');
+    setMfaResetTicket('');
+    setMfaResetConfirmation('');
+    setMfaResetAdminPassword('');
+    setMfaResetAdminCode('');
+  }
+
+  function closeMfaReset() {
+    setMfaResetUser(null);
+    setMfaResetReason('Lost or replaced authenticator device');
+    setMfaResetTicket('');
+    setMfaResetConfirmation('');
+    setMfaResetAdminPassword('');
+    setMfaResetAdminCode('');
   }
 
   async function openTokens(user: User) {
@@ -331,9 +380,8 @@ export function UsersPage() {
           <TextField label="Email" type="email" value={email} onChange={event => setEmail(event.target.value)} required />
           <TextField label="Temporary password" type="password" value={password} onChange={event => setPassword(event.target.value)} slotProps={{ htmlInput: { minLength: 12 } }} helperText="At least 12 characters; local authentication only" required />
           {accountType === 'root' ? <>
-            <FormControl><InputLabel>MSP access group</InputLabel><Select label="MSP access group" value={groupId} onChange={event => setGroupId(event.target.value)}><MenuItem value="">No access group</MenuItem>{groups.map(group => <MenuItem key={group.id} value={group.id}>{group.name} ({group.companyIds.length} customers)</MenuItem>)}</Select></FormControl>
-            <Typography variant="subtitle2">Additional customer access</Typography>
-            <Paper variant="outlined" sx={{ p: 1.5, maxHeight: 190, overflow: 'auto' }}>{workspace.companies.map(company => <FormControlLabel key={company.id} control={<Checkbox checked={companyIds.includes(company.id)} onChange={(_, checked) => setCompanyIds(items => checked ? [...items, company.id] : items.filter(id => id !== company.id))} />} label={company.name} />)}</Paper>
+            <FormControl><InputLabel>MSP access group</InputLabel><Select label="MSP access group" value={groupId} onChange={event => { const nextGroupId = event.target.value; const inherited = new Set(groups.find(group => group.id === nextGroupId)?.companyIds || []); setGroupId(nextGroupId); setCompanyIds(items => items.filter(id => !inherited.has(id))); }}><MenuItem value="">No access group</MenuItem>{groups.map(group => <MenuItem key={group.id} value={group.id}>{group.name} ({group.companyIds.length} customers)</MenuItem>)}</Select></FormControl>
+            <CustomerScopeSelector companies={workspace.companies} directIds={companyIds} inheritedIds={createAccessGroup?.companyIds || []} inheritedLabel={createAccessGroup?.name || 'No access group'} onDirectIdsChange={setCompanyIds} />
           </> : <FormControl><InputLabel>Customer</InputLabel><Select label="Customer" value={companyId} onChange={event => setCompanyId(event.target.value)} required>{workspace.companies.map(company => <MenuItem key={company.id} value={company.id}>{company.name}</MenuItem>)}</Select></FormControl>}
           <Button variant="contained" type="submit" startIcon={<PersonAddAltOutlined />}>Create user</Button>
         </Stack></CardContent></Card></Grid>
@@ -342,13 +390,14 @@ export function UsersPage() {
             <Box><Typography variant="h5">Identity directory</Typography><Typography sx={{ color: 'text.secondary' }}>Disabled and archived accounts remain visible for governance.</Typography></Box>
             <Stack direction="row" spacing={1}><TextField size="small" label="Search users" value={search} onChange={event => setSearch(event.target.value)} /><FormControl size="small" sx={{ minWidth: 130 }}><InputLabel>Status</InputLabel><Select label="Status" value={statusFilter} onChange={event => setStatusFilter(event.target.value)}><MenuItem value="current">Current</MenuItem><MenuItem value="active">Active</MenuItem><MenuItem value="disabled">Disabled</MenuItem><MenuItem value="archived">Archived</MenuItem><MenuItem value="all">All</MenuItem></Select></FormControl></Stack>
           </Stack>
-          {loading ? <CircularProgress size={24} /> : <TableContainer><Table size="small"><TableHead><TableRow><TableCell>User</TableCell><TableCell>Status</TableCell><TableCell>Access</TableCell><TableCell>API</TableCell><TableCell>Activity</TableCell><TableCell align="right">Actions</TableCell></TableRow></TableHead><TableBody>{visibleUsers.map(user => <TableRow key={user.id} hover sx={{ opacity: user.status === 'archived' ? 0.62 : 1 }}>
+          {loading ? <CircularProgress size={24} /> : <TableContainer><Table size="small"><TableHead><TableRow><TableCell>User</TableCell><TableCell>Status</TableCell><TableCell>Access</TableCell><TableCell>MFA</TableCell><TableCell>API</TableCell><TableCell>Activity</TableCell><TableCell align="right">Actions</TableCell></TableRow></TableHead><TableBody>{visibleUsers.map(user => <TableRow key={user.id} hover sx={{ opacity: user.status === 'archived' ? 0.62 : 1 }}>
             <TableCell><Typography sx={{ fontWeight: 750 }}>{user.displayName || user.email}</Typography><Typography variant="caption" color="text.secondary">{user.email} · {user.authSource || 'local'}</Typography></TableCell>
             <TableCell><Chip size="small" label={user.status} color={user.status === 'active' ? 'success' : user.status === 'disabled' ? 'warning' : 'default'} /></TableCell>
             <TableCell><Typography variant="body2">{user.role.replaceAll('_', ' ')}</Typography><Typography variant="caption" color="text.secondary">{user.role === 'platform_admin' ? 'All customers' : user.companyIds.map(id => names[id] || id).join(', ') || 'No access'}</Typography></TableCell>
+            <TableCell><Chip size="small" variant="outlined" color={user.mfaEnabled ? 'success' : user.mfaRequired ? 'warning' : 'default'} label={user.mfaEnabled ? `Enabled · ${user.mfaRecoveryCodesRemaining || 0} recovery` : user.mfaRequired ? 'Setup required' : 'Optional'} /></TableCell>
             <TableCell><Chip size="small" variant="outlined" color={user.apiAccessEnabled ? 'primary' : 'default'} label={user.apiAccessEnabled ? `${user.apiTokenCount || 0} token${user.apiTokenCount === 1 ? '' : 's'}` : 'Disabled'} /></TableCell>
             <TableCell><Typography variant="caption">Login: {dateLabel(user.lastLoginAt)}</Typography><Typography variant="caption" sx={{ display: 'block' }}>API: {dateLabel(user.lastApiUsedAt)}</Typography></TableCell>
-            <TableCell align="right"><Stack direction="row" spacing={0.5} sx={{ justifyContent: 'flex-end', flexWrap: 'wrap' }}><Button size="small" startIcon={<EditOutlined />} onClick={() => openEdit(user)} disabled={user.status === 'archived'}>Edit</Button><Button size="small" startIcon={<KeyOutlined />} onClick={() => void openTokens(user)} disabled={user.status === 'archived'}>API</Button><Button size="small" onClick={() => setPasswordUser(user)} disabled={user.authSource === 'entra' || user.status === 'archived'}>Password</Button><Button size="small" color={user.status === 'active' ? 'warning' : 'success'} onClick={() => void changeStatus(user)} disabled={user.status === 'archived' || user.id === actor?.id}>{user.status === 'active' ? 'Disable' : 'Enable'}</Button><Button size="small" color="error" startIcon={<DeleteOutlined />} onClick={() => void archive(user)} disabled={user.status === 'archived' || user.id === actor?.id}>Archive</Button></Stack></TableCell>
+            <TableCell align="right"><Stack direction="row" spacing={0.5} sx={{ justifyContent: 'flex-end', flexWrap: 'wrap' }}><Button size="small" startIcon={<EditOutlined />} onClick={() => openEdit(user)} disabled={user.status === 'archived'}>Edit</Button><Button size="small" startIcon={<KeyOutlined />} onClick={() => void openTokens(user)} disabled={user.status === 'archived'}>API</Button><Button size="small" onClick={() => setPasswordUser(user)} disabled={user.authSource === 'entra' || user.status === 'archived'}>Password</Button><Box component="span" title={actor?.role !== 'platform_admin' ? 'Only platform administrators can reset MFA' : user.authSource === 'entra' ? 'MFA is managed by Microsoft Entra ID' : !user.mfaEnabled ? 'No authenticator is currently enrolled' : 'Remove the authenticator and recovery codes'}><Button size="small" color="warning" onClick={() => openMfaReset(user)} disabled={actor?.role !== 'platform_admin' || user.authSource === 'entra' || !user.mfaEnabled || user.status === 'archived'}>Reset MFA</Button></Box><Button size="small" color={user.status === 'active' ? 'warning' : 'success'} onClick={() => void changeStatus(user)} disabled={user.status === 'archived' || user.id === actor?.id}>{user.status === 'active' ? 'Disable' : 'Enable'}</Button><Button size="small" color="error" startIcon={<DeleteOutlined />} onClick={() => void archive(user)} disabled={user.status === 'archived' || user.id === actor?.id}>Archive</Button></Stack></TableCell>
           </TableRow>)}</TableBody></Table></TableContainer>}
         </CardContent></Card></Grid>
       </Grid>
@@ -362,8 +411,9 @@ export function UsersPage() {
               <MenuItem value="platform_admin">Platform administrator</MenuItem><MenuItem value="msp_operator">MSP operator</MenuItem><MenuItem value="client_reader">Customer user</MenuItem>
             </Select></FormControl>
             {editRole === 'client_reader' && <FormControl><InputLabel>Customer</InputLabel><Select label="Customer" value={editCompanyId} onChange={event => setEditCompanyId(event.target.value)} required>{workspace.companies.map(company => <MenuItem key={company.id} value={company.id}>{company.name}</MenuItem>)}</Select></FormControl>}
-            {editRole === 'msp_operator' && <><FormControl><InputLabel>MSP access group</InputLabel><Select label="MSP access group" value={editGroupId} onChange={event => setEditGroupId(event.target.value)}><MenuItem value="">No access group</MenuItem>{groups.map(group => <MenuItem key={group.id} value={group.id}>{group.name}</MenuItem>)}</Select></FormControl><Typography variant="subtitle2">Additional customer access</Typography><Paper variant="outlined" sx={{ p: 1.5, maxHeight: 180, overflow: 'auto' }}>{workspace.companies.map(company => <FormControlLabel key={company.id} control={<Checkbox checked={editCompanyIds.includes(company.id)} onChange={(_, checked) => setEditCompanyIds(items => checked ? [...items, company.id] : items.filter(id => id !== company.id))} />} label={company.name} />)}</Paper></>}
+            {editRole === 'msp_operator' && <><FormControl><InputLabel>MSP access group</InputLabel><Select label="MSP access group" value={editGroupId} onChange={event => { const nextGroupId = event.target.value; const inherited = new Set(groups.find(group => group.id === nextGroupId)?.companyIds || []); setEditGroupId(nextGroupId); setEditCompanyIds(items => items.filter(id => !inherited.has(id))); }}><MenuItem value="">No access group</MenuItem>{groups.map(group => <MenuItem key={group.id} value={group.id}>{group.name}</MenuItem>)}</Select></FormControl><CustomerScopeSelector companies={workspace.companies} directIds={editCompanyIds} inheritedIds={editAccessGroup?.companyIds || []} inheritedLabel={editAccessGroup?.name || 'No access group'} onDirectIdsChange={setEditCompanyIds} /></>}
             <FormControlLabel control={<Checkbox checked={editApiEnabled} onChange={(_, checked) => setEditApiEnabled(checked)} />} label="Allow personal API tokens" />
+            <FormControlLabel control={<Checkbox checked={editMfaRequired} onChange={(_, checked) => setEditMfaRequired(checked)} disabled={editing?.authSource === 'entra'} />} label="Require TOTP MFA at local sign-in" />
             <Alert severity="info">Role and customer scope changes take effect immediately. Turning API access off revokes every active token for this user.</Alert>
           </Stack></DialogContent>
           <DialogActions><Button onClick={() => setEditing(null)}>Cancel</Button><Button type="submit" variant="contained">Save changes</Button></DialogActions>
@@ -371,6 +421,9 @@ export function UsersPage() {
       </Dialog>
       <Dialog open={Boolean(passwordUser)} onClose={() => setPasswordUser(null)} fullWidth maxWidth="xs">
         <Stack component="form" onSubmit={resetPassword}><DialogTitle>Change local password</DialogTitle><DialogContent><Stack spacing={2} sx={{ pt: 1 }}><Typography color="text.secondary">Set a new password for {passwordUser?.email}.</Typography><TextField autoFocus label="New password" type="password" value={newPassword} onChange={event => setNewPassword(event.target.value)} slotProps={{ htmlInput: { minLength: 12 } }} helperText="At least 12 characters" required /><Alert severity="warning">All active browser sessions for this user will be revoked.</Alert></Stack></DialogContent><DialogActions><Button onClick={() => setPasswordUser(null)}>Cancel</Button><Button type="submit" variant="contained">Change password</Button></DialogActions></Stack>
+      </Dialog>
+      <Dialog open={Boolean(mfaResetUser)} onClose={closeMfaReset} fullWidth maxWidth="sm">
+        <Stack component="form" onSubmit={resetMfa}><DialogTitle>Reset authenticator</DialogTitle><DialogContent><Stack spacing={2} sx={{ pt: 1 }}><Alert severity="warning">This removes the enrolled authenticator and every recovery code for {mfaResetUser?.email}. All browser sessions will be revoked, while the account’s MFA-required policy remains unchanged.</Alert><TextField label="Reset reason" value={mfaResetReason} onChange={event => setMfaResetReason(event.target.value)} required slotProps={{ htmlInput: { minLength: 4, maxLength: 500 } }} /><TextField label="Ticket or change reference (optional)" value={mfaResetTicket} onChange={event => setMfaResetTicket(event.target.value)} slotProps={{ htmlInput: { maxLength: 120 } }} />{actor?.authSource === 'local' ? <><Divider>Administrator verification</Divider><TextField label="Your current password" type="password" value={mfaResetAdminPassword} onChange={event => setMfaResetAdminPassword(event.target.value)} required />{actor.mfaEnabled && <TextField label="Your authenticator or recovery code" value={mfaResetAdminCode} onChange={event => setMfaResetAdminCode(event.target.value)} required slotProps={{ htmlInput: { autoComplete: 'one-time-code', maxLength: 64 } }} />}</> : <Alert severity="info">Your Microsoft Entra session authorizes this administrative action. Conditional Access remains responsible for Entra step-up authentication.</Alert>}<Divider>Destructive action confirmation</Divider><TextField label={`Type ${mfaResetUser?.email || 'the user email'} to confirm`} value={mfaResetConfirmation} onChange={event => setMfaResetConfirmation(event.target.value)} required autoComplete="off" /></Stack></DialogContent><DialogActions><Button onClick={closeMfaReset}>Cancel</Button><Button type="submit" color="warning" variant="contained" disabled={mfaResetConfirmation.trim().toLowerCase() !== (mfaResetUser?.email || '').toLowerCase()}>Reset MFA and revoke sessions</Button></DialogActions></Stack>
       </Dialog>
       <Dialog open={Boolean(tokenUser)} onClose={() => setTokenUser(null)} fullWidth maxWidth="md">
         <DialogTitle>Personal API access · {tokenUser?.displayName || tokenUser?.email}</DialogTitle>
