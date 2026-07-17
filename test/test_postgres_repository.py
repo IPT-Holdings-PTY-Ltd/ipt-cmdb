@@ -1,5 +1,6 @@
 import os
 import unittest
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -254,6 +255,97 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         exported = repository.export_state()
         self.assertEqual(len(exported["companies"]), 1)
         self.assertEqual(exported["auditEvents"], [])
+
+        managed_group = repository.create_access_group(
+            {
+                "id": "managed-infrastructure",
+                "name": "Managed infrastructure",
+                "description": "Reusable managed-services customer scope.",
+                "companyIds": ["acme"],
+                "ownerUserId": actor_id,
+                "membershipMode": "manual",
+                "membershipRules": {},
+                "system": False,
+            },
+            actor_id,
+        )
+        self.assertEqual(managed_group["revision"], 1)
+        self.assertEqual(managed_group["ownerLabel"], "admin")
+        updated_group = repository.update_access_group(
+            managed_group["id"],
+            {
+                "description": "Reviewed managed-services customer scope.",
+                "expectedRevision": 1,
+            },
+            actor_id,
+        )
+        self.assertEqual(updated_group["revision"], 2)
+        self.assertIsNone(
+            repository.update_access_group(
+                managed_group["id"],
+                {"description": "Stale overwrite", "expectedRevision": 1},
+                actor_id,
+            )
+        )
+
+        operator = repository.create_user(
+            {
+                "id": "group-only-operator",
+                "email": "operator@example.com",
+                "role": "msp_operator",
+                "companyIds": [],
+                "groupIds": ["all-customers"],
+                "accountType": "root",
+            },
+            "Temporary!42",
+            actor_id,
+        )
+        self.assertEqual(operator["role"], "msp_operator")
+        self.assertEqual(operator["companyIds"], ["acme"])
+        repository.create_company(
+            {"id": "contoso", "name": "Contoso Services", "externalIds": {}}, actor_id
+        )
+        refreshed_operator = repository.authenticate("operator@example.com", "Temporary!42")
+        self.assertEqual(refreshed_operator["role"], "msp_operator")
+        self.assertEqual(refreshed_operator["companyIds"], ["acme", "contoso"])
+
+        api_user = repository.update_user(
+            operator["id"],
+            {
+                "email": "operator@example.com",
+                "displayName": "Automation Operator",
+                "role": "msp_operator",
+                "accountType": "root",
+                "directCompanyIds": [],
+                "groupIds": ["all-customers"],
+                "apiAccessEnabled": True,
+            },
+            actor_id,
+            reason="Enable governed automation",
+        )
+        self.assertTrue(api_user["apiAccessEnabled"])
+        token_hash = "a" * 64
+        api_token = repository.create_api_token(
+            {
+                "id": str(uuid.uuid4()),
+                "userId": operator["id"],
+                "name": "Repository contract",
+                "tokenPrefix": "cmdb_pat_contract",
+                "tokenHash": token_hash,
+                "scopes": ["cmdb:read"],
+                "companyIds": ["acme"],
+                "expiresAt": "2099-01-01T00:00:00Z",
+            },
+            actor_id,
+        )
+        self.assertNotIn("tokenHash", api_token)
+        authenticated_token = repository.authenticate_api_token(token_hash)
+        self.assertEqual(authenticated_token["user"]["id"], operator["id"])
+        self.assertEqual(authenticated_token["token"]["companyIds"], ["acme"])
+        revoked_token = repository.revoke_api_token(api_token["id"], actor_id)
+        self.assertIsNotNone(revoked_token["revokedAt"])
+        self.assertIsNone(repository.authenticate_api_token(token_hash))
+        self.assertTrue(repository.delete_access_group(managed_group["id"], actor_id))
         self.assertTrue(saved)
 
 

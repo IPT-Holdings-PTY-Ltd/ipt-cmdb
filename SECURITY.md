@@ -32,6 +32,12 @@ Local authentication is for development. Production should use Microsoft Entra I
 
 `ALLOW_LOCAL_BREAK_GLASS`, `ALLOW_UI_DATABASE_CONFIG` and `ALLOW_LOCAL_DEVELOPMENT` should remain `false` in production.
 
+Local password resets are administrative actions and revoke the user's active sessions. Entra-backed passwords must be changed through Entra ID. Disabled and archived CMDB users are denied both browser-session and personal-token authentication.
+
+### Personal API tokens
+
+Personal tokens are intended for bounded CMDB automation, not interactive administration. Keep API access disabled unless required, grant the minimum read/write and customer scope, use short expiries and revoke unused tokens. Raw token values are returned once; only SHA-256 hashes are persisted. Personal tokens cannot access platform-administration APIs and are deliberately omitted from portable backup files.
+
 ### Secrets
 
 - Keep `DATABASE_URL` and provider credentials in Key Vault or an equivalent secret store.

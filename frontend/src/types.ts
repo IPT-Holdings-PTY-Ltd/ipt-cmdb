@@ -1,9 +1,33 @@
 export type User = {
   id: string;
   email: string;
+  displayName: string;
+  status: 'active' | 'invited' | 'disabled' | 'archived';
   role: 'platform_admin' | 'msp_operator' | 'client_reader';
   companyIds: string[];
+  directCompanyIds?: string[];
+  groupIds?: string[];
   accountType?: 'root' | 'customer';
+  authSource?: 'local' | 'entra' | 'none';
+  apiAccessEnabled?: boolean;
+  apiTokenCount?: number;
+  lastLoginAt?: string | null;
+  lastApiUsedAt?: string | null;
+  archivedAt?: string | null;
+};
+
+export type ApiToken = {
+  id: string;
+  userId: string;
+  name: string;
+  tokenPrefix: string;
+  scopes: string[];
+  companyIds: string[];
+  expiresAt: string;
+  lastUsedAt?: string | null;
+  revokedAt?: string | null;
+  createdAt: string;
+  token?: string;
 };
 
 export type Contact = {
@@ -133,8 +157,33 @@ export type Relationship = {
 export type AccessGroup = {
   id: string;
   name: string;
+  description: string;
   companyIds: string[];
   system: boolean;
+  membershipMode: 'manual' | 'dynamic';
+  membershipRules: Record<string, unknown>;
+  ownerUserId?: string | null;
+  ownerLabel: string;
+  assignedUserCount: number;
+  revision: number;
+  updatedAt?: string | null;
+};
+
+export type AccessGroupImpact = {
+  groupId: string;
+  groupName: string;
+  assignedUserCount: number;
+  activeAssignedUserCount: number;
+  usersLosingAccess: number;
+  lostCustomerAssignments: number;
+  users: Array<{
+    id: string;
+    displayName: string;
+    email: string;
+    status: User['status'];
+    lostCompanyIds: string[];
+    lostCustomers: string[];
+  }>;
 };
 
 export type RoleTemplate = {

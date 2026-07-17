@@ -8,6 +8,7 @@ repository exists only for setup, development and isolated unit tests.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -209,7 +210,57 @@ def _local_login_enabled() -> bool:
     )
 
 
+API_TOKEN_ROUTE_PREFIXES = (
+    "/api/assets",
+    "/api/relationships",
+    "/api/contacts",
+    "/api/contact-responsibilities",
+    "/api/changes",
+    "/api/data-quality",
+    "/api/reports",
+    "/api/audit-events",
+    "/api/dashboard",
+    "/api/companies",
+)
+API_TOKEN_READ_ONLY_PREFIXES = ("/api/dashboard", "/api/companies", "/api/audit-events")
+
+
+def _api_token_user(bearer: str, request: Request) -> dict | None:
+    if not bearer.startswith("cmdb_pat_"):
+        return None
+    authenticated = REPOSITORY.authenticate_api_token(
+        hashlib.sha256(bearer.encode("utf-8")).hexdigest()
+    )
+    if not authenticated:
+        raise HTTPException(401, "API token is invalid, expired or revoked")
+    path = request.url.path
+    if not any(path.startswith(prefix) for prefix in API_TOKEN_ROUTE_PREFIXES):
+        raise HTTPException(403, "API tokens cannot access administrative endpoints")
+    if request.method not in {"GET", "HEAD"} and any(
+        path.startswith(prefix) for prefix in API_TOKEN_READ_ONLY_PREFIXES
+    ):
+        raise HTTPException(403, "This API resource is read-only for personal tokens")
+    token = authenticated["token"]
+    required_scope = "cmdb:read" if request.method in {"GET", "HEAD"} else "cmdb:write"
+    if required_scope not in token["scopes"]:
+        raise HTTPException(403, f"API token requires {required_scope} scope")
+    user = {
+        **authenticated["user"],
+        "authType": "api_token",
+        "apiTokenId": token["id"],
+        "apiTokenCompanyIds": token.get("companyIds", []),
+    }
+    request.state.api_token = token
+    request.state.current_user = user
+    return user
+
+
 def current_user(request: Request) -> dict:
+    bearer = request.headers.get("authorization", "").removeprefix("Bearer ")
+    api_user = _api_token_user(bearer, request)
+    if api_user:
+        return api_user
+
     users = REPOSITORY.list_users()
     if os.getenv("AUTH_MODE", "local").lower() == "easy_auth":
         email = _easy_auth_email(request)
@@ -222,10 +273,9 @@ def current_user(request: Request) -> dict:
         if not _local_login_enabled():
             raise HTTPException(401, "Microsoft sign-in is required")
 
-    token = request.headers.get("authorization", "").removeprefix("Bearer ")
-    session = core.SESSIONS.get(token)
+    session = core.SESSIONS.get(bearer)
     if not session or session["expiresAt"] <= datetime.now(UTC):
-        core.SESSIONS.pop(token, None)
+        core.SESSIONS.pop(bearer, None)
         raise HTTPException(401, "Sign in required")
     user = next((item for item in users if item["id"] == session["userId"]), None)
     if not user:
@@ -306,18 +356,58 @@ class AccessGroupRequest(BaseModel):
 
     id: str = ""
     name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default="", max_length=500)
     companyIds: list[str] = Field(min_length=1)
+    ownerUserId: str | None = None
+    membershipMode: str = Field(default="manual", pattern="^(manual|dynamic)$")
+    membershipRules: dict[str, Any] = Field(default_factory=dict)
+    expectedRevision: int | None = Field(default=None, ge=1)
 
 
 class UserCreateRequest(BaseModel):
     """Validate a root or customer portal account."""
 
     email: str = Field(min_length=3, max_length=320)
-    password: str = Field(min_length=8, max_length=512)
+    password: str = Field(min_length=12, max_length=512)
     accountType: str
     companyId: str | None = None
     companyIds: list[str] = Field(default_factory=list)
     groupIds: list[str] = Field(default_factory=list)
+
+
+class UserUpdateRequest(BaseModel):
+    """Validate profile, role, scope and API-access changes."""
+
+    email: str = Field(min_length=3, max_length=320)
+    displayName: str = Field(min_length=1, max_length=160)
+    role: str
+    companyId: str | None = None
+    companyIds: list[str] = Field(default_factory=list)
+    groupIds: list[str] = Field(default_factory=list)
+    apiAccessEnabled: bool = False
+    reason: str = Field(default="Administrative user update", max_length=500)
+
+
+class UserStatusRequest(BaseModel):
+    """Validate an account enable or disable action."""
+
+    status: str = Field(pattern="^(active|disabled)$")
+    reason: str = Field(min_length=4, max_length=500)
+
+
+class UserPasswordRequest(BaseModel):
+    """Validate an administrative local-password reset."""
+
+    password: str = Field(min_length=12, max_length=512)
+
+
+class ApiTokenCreateRequest(BaseModel):
+    """Validate a restricted, expiring personal API token."""
+
+    name: str = Field(min_length=2, max_length=100)
+    scopes: list[str] = Field(min_length=1, max_length=2)
+    companyIds: list[str] = Field(default_factory=list)
+    expiresInDays: int = Field(default=90, ge=1, le=365)
 
 
 class ContactCreateRequest(BaseModel):
@@ -565,6 +655,7 @@ def login(payload: LoginRequest, request: Request) -> dict:
     token = secrets.token_urlsafe(32)
     expires_at = datetime.now(UTC) + timedelta(seconds=core.SESSION_TTL_SECONDS)
     core.SESSIONS[token] = {"userId": user["id"], "expiresAt": expires_at}
+    REPOSITORY.record_user_login(user["id"])
     request.state.current_user = user
     REPOSITORY.record_audit_event(
         None,
@@ -849,9 +940,7 @@ def dashboard(request: Request, companyId: str | None = None) -> dict:
     )
 
 
-def _validate_group(
-    payload: AccessGroupRequest, current_id: str | None = None
-) -> tuple[str, list[str]]:
+def _validate_group(payload: AccessGroupRequest, current_id: str | None = None) -> dict:
     name = payload.name.strip()[:80]
     company_ids = sorted(set(payload.companyIds))
     if (
@@ -865,7 +954,110 @@ def _validate_group(
         for item in REPOSITORY.list_access_groups()
     ):
         raise HTTPException(409, "A group with that name already exists")
-    return name, company_ids
+    if payload.membershipMode != "manual" or payload.membershipRules:
+        raise HTTPException(
+            400,
+            "Rule-based dynamic groups are reserved for a future release; choose manual membership",
+        )
+    return {
+        "name": name,
+        "description": payload.description.strip()[:500],
+        "companyIds": company_ids,
+        "membershipMode": "manual",
+        "membershipRules": {},
+    }
+
+
+def _validated_group_owner(owner_user_id: str | None, fallback_user_id: str) -> str:
+    selected_id = owner_user_id or fallback_user_id
+    owner = next(
+        (
+            item
+            for item in REPOSITORY.list_users(include_inactive=True)
+            if item["id"] == selected_id
+        ),
+        None,
+    )
+    if (
+        not owner
+        or owner.get("status", "active") != "active"
+        or owner["role"] not in {"platform_admin", "msp_operator"}
+    ):
+        raise HTTPException(400, "Choose an active MSP or platform user as group owner")
+    return selected_id
+
+
+def _group_view(group: dict, actor: dict) -> dict | None:
+    group_company_ids = set(group["companyIds"])
+    company_ids = [
+        company["id"]
+        for company in REPOSITORY.list_companies()
+        if core.allowed(actor, company["id"])
+        and ("*" in group_company_ids or company["id"] in group_company_ids)
+    ]
+    if not company_ids:
+        return None
+    return {
+        **group,
+        "companyIds": company_ids,
+        "system": bool(group.get("system") or group["id"] == "all-managed-customers"),
+        "membershipMode": group.get(
+            "membershipMode", "dynamic" if group.get("system") else "manual"
+        ),
+        "membershipRules": group.get("membershipRules") or {},
+        "description": group.get("description", ""),
+        "ownerLabel": group.get("ownerLabel") or "Unassigned",
+        "assignedUserCount": int(group.get("assignedUserCount", 0)),
+        "revision": int(group.get("revision", 1)),
+    }
+
+
+def _access_group_impact(group: dict) -> dict:
+    companies = REPOSITORY.list_companies()
+    company_names = {item["id"]: item["name"] for item in companies}
+    all_company_ids = set(company_names)
+    groups = {item["id"]: item for item in REPOSITORY.list_access_groups()}
+
+    def resolved_company_ids(candidate: dict) -> set[str]:
+        configured = set(candidate.get("companyIds", []))
+        return all_company_ids if "*" in configured else configured & all_company_ids
+
+    target_company_ids = resolved_company_ids(group)
+    affected_users = []
+    for user in REPOSITORY.list_users(include_inactive=True):
+        if group["id"] not in user.get("groupIds", []):
+            continue
+        if user["role"] == "platform_admin":
+            retained_company_ids = set(all_company_ids)
+        else:
+            direct = set(user.get("directCompanyIds", []))
+            retained_company_ids = all_company_ids if "*" in direct else direct
+            for other_group_id in user.get("groupIds", []):
+                if other_group_id == group["id"]:
+                    continue
+                other_group = groups.get(other_group_id)
+                if other_group:
+                    retained_company_ids.update(resolved_company_ids(other_group))
+        lost_company_ids = sorted(target_company_ids - retained_company_ids)
+        affected_users.append(
+            {
+                "id": user["id"],
+                "displayName": user.get("displayName") or user["email"],
+                "email": user["email"],
+                "status": user.get("status", "active"),
+                "lostCompanyIds": lost_company_ids,
+                "lostCustomers": [company_names[item] for item in lost_company_ids],
+            }
+        )
+    return {
+        "groupId": group["id"],
+        "groupName": group["name"],
+        "assignedUserCount": len(affected_users),
+        "activeAssignedUserCount": sum(item["status"] == "active" for item in affected_users),
+        "usersLosingAccess": sum(bool(item["lostCompanyIds"]) for item in affected_users),
+        "lostCustomerAssignments": sum(len(item["lostCompanyIds"]) for item in affected_users),
+        "users": affected_users,
+    }
 
 
 @api.get("/api/access-groups", tags=["access"])
@@ -876,23 +1068,11 @@ def list_access_groups(request: Request) -> list[dict]:
         {"platform_admin", "msp_operator"},
         "MSP access groups require root or MSP role",
     )
-    visible = []
-    for group in REPOSITORY.list_access_groups():
-        company_ids = [
-            company["id"]
-            for company in REPOSITORY.list_companies()
-            if core.allowed(user, company["id"]) and company["id"] in group["companyIds"]
-        ]
-        if company_ids:
-            visible.append(
-                {
-                    "id": group["id"],
-                    "name": group["name"],
-                    "companyIds": company_ids,
-                    "system": bool(group.get("system") or group["id"] == "all-managed-customers"),
-                }
-            )
-    return visible
+    return [
+        visible
+        for group in REPOSITORY.list_access_groups()
+        if (visible := _group_view(group, user)) is not None
+    ]
 
 
 @api.post("/api/access-groups", status_code=201, tags=["access"])
@@ -903,16 +1083,25 @@ def create_access_group(payload: AccessGroupRequest, request: Request) -> dict:
         {"platform_admin"},
         "Customer group management requires platform admin role",
     )
-    name, company_ids = _validate_group(payload)
-    group_id = re.sub(r"[^a-z0-9]+", "-", (payload.id or name).lower()).strip("-")[:48]
+    values = _validate_group(payload)
+    group_id = re.sub(r"[^a-z0-9]+", "-", (payload.id or values["name"]).lower()).strip("-")[:48]
     if not group_id:
         raise HTTPException(400, "Provide a valid group name")
     if any(group["id"] == group_id for group in REPOSITORY.list_access_groups()):
         raise HTTPException(409, "A group with that ID already exists")
-    group = {"id": group_id, "name": name, "companyIds": company_ids, "system": False}
+    group = {
+        "id": group_id,
+        **values,
+        "ownerUserId": _validated_group_owner(payload.ownerUserId, actor["id"]),
+        "system": False,
+        "revision": 1,
+    }
     with core.LOCK:
         group = REPOSITORY.create_access_group(group, actor["id"])
-    return group
+    visible_group = _group_view(group, actor)
+    if visible_group is None:
+        raise HTTPException(500, "Created customer group is outside the administrator scope")
+    return visible_group
 
 
 @api.put("/api/access-groups/{group_id}", tags=["access"])
@@ -931,14 +1120,40 @@ def update_access_group(group_id: str, payload: AccessGroupRequest, request: Req
         raise HTTPException(404, "Customer group not found")
     if group.get("system") or group["id"] == "all-managed-customers":
         raise HTTPException(400, "The All managed customers group is dynamic and cannot be edited")
-    name, company_ids = _validate_group(payload, group_id)
+    if payload.expectedRevision is not None and payload.expectedRevision != group.get(
+        "revision", 1
+    ):
+        raise HTTPException(409, "This group changed since it was opened; refresh and try again")
+    values = {
+        **_validate_group(payload, group_id),
+        "ownerUserId": _validated_group_owner(payload.ownerUserId, actor["id"]),
+        "expectedRevision": group.get("revision", 1),
+    }
     with core.LOCK:
-        group = REPOSITORY.update_access_group(
-            group_id, {"name": name, "companyIds": company_ids}, actor["id"]
-        )
+        group = REPOSITORY.update_access_group(group_id, values, actor["id"])
     if group is None:
+        raise HTTPException(409, "This group changed since it was opened; refresh and try again")
+    visible_group = _group_view(group, actor)
+    if visible_group is None:
+        raise HTTPException(500, "Updated customer group is outside the administrator scope")
+    return visible_group
+
+
+@api.get("/api/access-groups/{group_id}/impact", tags=["access"])
+def access_group_delete_impact(group_id: str, request: Request) -> dict:
+    actor = current_user(request)
+    _require_role(
+        actor,
+        {"platform_admin"},
+        "Customer group impact review requires platform admin role",
+    )
+    group = next(
+        (item for item in REPOSITORY.list_access_groups() if item["id"] == group_id),
+        None,
+    )
+    if not group:
         raise HTTPException(404, "Customer group not found")
-    return group
+    return _access_group_impact(group)
 
 
 @api.delete("/api/access-groups/{group_id}", tags=["access"])
@@ -957,9 +1172,10 @@ def delete_access_group(group_id: str, request: Request) -> dict:
         raise HTTPException(404, "Customer group not found")
     if group.get("system") or group["id"] == "all-managed-customers":
         raise HTTPException(400, "The All managed customers group is dynamic and cannot be deleted")
+    impact = _access_group_impact(group)
     with core.LOCK:
         REPOSITORY.delete_access_group(group_id, actor["id"])
-    return {"deletedId": group_id}
+    return {"deletedId": group_id, "impact": impact}
 
 
 @api.get("/api/rbac/roles", tags=["access"])
@@ -973,7 +1189,10 @@ def rbac_roles(request: Request) -> list[dict]:
 def rbac_effective(userId: str, request: Request) -> dict:
     user = current_user(request)
     _require_role(user, {"platform_admin"}, "RBAC requires platform admin role")
-    target = next((item for item in REPOSITORY.list_users() if item["id"] == userId), None)
+    target = next(
+        (item for item in REPOSITORY.list_users(include_inactive=True) if item["id"] == userId),
+        None,
+    )
     if not target:
         raise HTTPException(404, "User not found")
     template = next((item for item in core.ROLE_TEMPLATES if item["id"] == target["role"]), None)
@@ -1006,7 +1225,7 @@ def list_users(request: Request, companyId: str | None = None) -> list[dict]:
         _company_for_user(companyId, user)
     records = [
         item
-        for item in REPOSITORY.list_users()
+        for item in REPOSITORY.list_users(include_inactive=True)
         if user["role"] == "platform_admin"
         or any(core.allowed(user, company_id) for company_id in item["companyIds"])
     ]
@@ -1029,20 +1248,22 @@ def create_user(payload: UserCreateRequest, request: Request) -> dict:
         raise HTTPException(409, "A user with this email already exists")
     if payload.accountType == "root":
         _require_role(actor, {"platform_admin"}, "Only platform admins can create root/MSP users")
-        company_ids = set(payload.companyIds)
+        direct_company_ids = set(payload.companyIds)
+        effective_company_ids = set(direct_company_ids)
         groups = {group["id"]: group for group in REPOSITORY.list_access_groups()}
         for group_id in payload.groupIds:
             group = groups.get(group_id)
             if not group:
                 raise HTTPException(400, "Choose valid MSP access groups")
-            company_ids.update(
+            group_company_ids = set(group["companyIds"])
+            effective_company_ids.update(
                 company["id"]
                 for company in REPOSITORY.list_companies()
-                if company["id"] in group["companyIds"]
+                if "*" in group_company_ids or company["id"] in group_company_ids
             )
-        assigned_companies = sorted(company_ids)
-        if not assigned_companies or not all(
-            _known_company(company_id) for company_id in assigned_companies
+        assigned_companies = sorted(direct_company_ids)
+        if not effective_company_ids or not all(
+            _known_company(company_id) for company_id in effective_company_ids
         ):
             raise HTTPException(
                 400, "Choose at least one valid customer permission or access group"
@@ -1064,12 +1285,257 @@ def create_user(payload: UserCreateRequest, request: Request) -> dict:
         "email": email,
         "role": role,
         "companyIds": assigned_companies,
+        "directCompanyIds": assigned_companies,
         "groupIds": sorted(set(payload.groupIds)) if payload.accountType == "root" else [],
         "accountType": payload.accountType,
     }
     with core.LOCK:
         new_user = REPOSITORY.create_user(new_user, payload.password, actor["id"])
     return core.visible_user(new_user)
+
+
+def _managed_user(user_id: str, actor: dict) -> dict:
+    target = next(
+        (item for item in REPOSITORY.list_users(include_inactive=True) if item["id"] == user_id),
+        None,
+    )
+    if not target:
+        raise HTTPException(404, "User not found")
+    if actor["role"] == "platform_admin":
+        return target
+    target_company_ids = [item for item in target["companyIds"] if item != "*"]
+    if (
+        actor["role"] != "msp_operator"
+        or target["role"] != "client_reader"
+        or not target_company_ids
+        or not all(core.can_manage(actor, item) for item in target_company_ids)
+    ):
+        raise HTTPException(403, "You cannot manage this user")
+    return target
+
+
+def _active_platform_admin_count() -> int:
+    return sum(
+        item["role"] == "platform_admin" and item.get("status", "active") == "active"
+        for item in REPOSITORY.list_users(include_inactive=True)
+    )
+
+
+def _revoke_user_sessions(user_id: str) -> int:
+    tokens = [token for token, session in core.SESSIONS.items() if session.get("userId") == user_id]
+    for token in tokens:
+        core.SESSIONS.pop(token, None)
+    return len(tokens)
+
+
+def _validate_user_scope(payload: UserUpdateRequest, actor: dict) -> dict:
+    if payload.role not in {"platform_admin", "msp_operator", "client_reader"}:
+        raise HTTPException(400, "Choose a supported role")
+    if actor["role"] != "platform_admin" and payload.role != "client_reader":
+        raise HTTPException(403, "Only platform admins can assign MSP or platform roles")
+    email = payload.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(400, "Enter a valid email address")
+    display_name = payload.displayName.strip()
+    if payload.role == "platform_admin":
+        return {
+            "email": email,
+            "displayName": display_name,
+            "role": payload.role,
+            "accountType": "root",
+            "directCompanyIds": ["*"],
+            "groupIds": [],
+            "apiAccessEnabled": payload.apiAccessEnabled,
+        }
+    if payload.role == "client_reader":
+        company_id = payload.companyId or next(iter(payload.companyIds), None)
+        if (
+            not company_id
+            or not _known_company(company_id)
+            or not core.can_manage(actor, company_id)
+        ):
+            raise HTTPException(403, "Choose a customer you manage")
+        return {
+            "email": email,
+            "displayName": display_name,
+            "role": payload.role,
+            "accountType": "customer",
+            "directCompanyIds": [company_id],
+            "groupIds": [],
+            "apiAccessEnabled": payload.apiAccessEnabled,
+        }
+
+    direct_ids = sorted(set(payload.companyIds))
+    groups = {item["id"]: item for item in REPOSITORY.list_access_groups()}
+    effective_ids = set(direct_ids)
+    for group_id in payload.groupIds:
+        group = groups.get(group_id)
+        if not group:
+            raise HTTPException(400, "Choose valid MSP access groups")
+        group_company_ids = set(group["companyIds"])
+        effective_ids.update(
+            company["id"]
+            for company in REPOSITORY.list_companies()
+            if "*" in group_company_ids or company["id"] in group_company_ids
+        )
+    if not effective_ids or not all(_known_company(item) for item in effective_ids):
+        raise HTTPException(400, "Choose at least one valid customer permission or access group")
+    return {
+        "email": email,
+        "displayName": display_name,
+        "role": payload.role,
+        "accountType": "root",
+        "directCompanyIds": direct_ids,
+        "groupIds": sorted(set(payload.groupIds)),
+        "apiAccessEnabled": payload.apiAccessEnabled,
+    }
+
+
+@api.patch("/api/users/{user_id}", tags=["access"])
+def update_user(user_id: str, payload: UserUpdateRequest, request: Request) -> dict:
+    actor = current_user(request)
+    current = _managed_user(user_id, actor)
+    values = _validate_user_scope(payload, actor)
+    if any(
+        item["id"] != user_id and item["email"].lower() == values["email"]
+        for item in REPOSITORY.list_users(include_inactive=True)
+    ):
+        raise HTTPException(409, "A user with this email already exists")
+    if (
+        current["role"] == "platform_admin"
+        and values["role"] != "platform_admin"
+        and _active_platform_admin_count() <= 1
+    ):
+        raise HTTPException(409, "The final active platform administrator cannot be demoted")
+    changed_access = any(
+        current.get(key) != values.get(key)
+        for key in ("email", "role", "directCompanyIds", "groupIds")
+    )
+    with core.LOCK:
+        stored = REPOSITORY.update_user(user_id, values, actor["id"], reason=payload.reason.strip())
+        if not values["apiAccessEnabled"]:
+            REPOSITORY.revoke_user_api_tokens(user_id, actor["id"])
+    if not stored:
+        raise HTTPException(404, "User not found")
+    revoked_sessions = _revoke_user_sessions(user_id) if changed_access else 0
+    return {**core.visible_user(stored), "revokedSessions": revoked_sessions}
+
+
+@api.post("/api/users/{user_id}/status", tags=["access"])
+def update_user_status(user_id: str, payload: UserStatusRequest, request: Request) -> dict:
+    actor = current_user(request)
+    target = _managed_user(user_id, actor)
+    if user_id == actor["id"] and payload.status == "disabled":
+        raise HTTPException(409, "You cannot disable your own account")
+    if (
+        target["role"] == "platform_admin"
+        and payload.status == "disabled"
+        and _active_platform_admin_count() <= 1
+    ):
+        raise HTTPException(409, "The final active platform administrator cannot be disabled")
+    with core.LOCK:
+        updated = REPOSITORY.set_user_status(
+            user_id, payload.status, actor["id"], reason=payload.reason.strip()
+        )
+        if payload.status == "disabled":
+            REPOSITORY.revoke_user_api_tokens(user_id, actor["id"])
+    if not updated:
+        raise HTTPException(404, "User not found")
+    revoked_sessions = _revoke_user_sessions(user_id) if payload.status == "disabled" else 0
+    stored = _managed_user(user_id, actor)
+    return {**core.visible_user(stored), "revokedSessions": revoked_sessions}
+
+
+@api.delete("/api/users/{user_id}", tags=["access"])
+def archive_user(user_id: str, request: Request) -> dict:
+    actor = current_user(request)
+    target = _managed_user(user_id, actor)
+    if user_id == actor["id"]:
+        raise HTTPException(409, "You cannot archive your own account")
+    if target["role"] == "platform_admin" and _active_platform_admin_count() <= 1:
+        raise HTTPException(409, "The final active platform administrator cannot be archived")
+    with core.LOCK:
+        archived = REPOSITORY.set_user_status(
+            user_id, "archived", actor["id"], reason="Account archived by administrator"
+        )
+        revoked_tokens = REPOSITORY.revoke_user_api_tokens(user_id, actor["id"])
+    if not archived:
+        raise HTTPException(404, "User not found")
+    return {
+        "archivedId": user_id,
+        "revokedSessions": _revoke_user_sessions(user_id),
+        "revokedApiTokens": revoked_tokens,
+    }
+
+
+@api.put("/api/users/{user_id}/password", status_code=204, tags=["access"])
+def reset_user_password(user_id: str, payload: UserPasswordRequest, request: Request) -> Response:
+    actor = current_user(request)
+    target = _managed_user(user_id, actor)
+    if target.get("authSource") == "entra":
+        raise HTTPException(409, "Reset this user's password in Microsoft Entra ID")
+    with core.LOCK:
+        changed = REPOSITORY.set_user_password(user_id, payload.password, actor["id"])
+    if not changed:
+        raise HTTPException(404, "User not found")
+    _revoke_user_sessions(user_id)
+    return Response(status_code=204)
+
+
+@api.get("/api/users/{user_id}/tokens", tags=["access"])
+def list_user_api_tokens(user_id: str, request: Request) -> list[dict]:
+    actor = current_user(request)
+    _managed_user(user_id, actor)
+    return REPOSITORY.list_api_tokens(user_id)
+
+
+@api.post("/api/users/{user_id}/tokens", status_code=201, tags=["access"])
+def create_user_api_token(user_id: str, payload: ApiTokenCreateRequest, request: Request) -> dict:
+    actor = current_user(request)
+    target = _managed_user(user_id, actor)
+    if target.get("status") != "active":
+        raise HTTPException(409, "Enable the user before creating an API token")
+    if not target.get("apiAccessEnabled"):
+        raise HTTPException(409, "Enable API access for this user first")
+    scopes = sorted(set(payload.scopes))
+    if not scopes or not set(scopes).issubset({"cmdb:read", "cmdb:write"}):
+        raise HTTPException(400, "Choose only supported CMDB API scopes")
+    company_ids = sorted(set(payload.companyIds))
+    if company_ids and (
+        not all(_known_company(item) for item in company_ids)
+        or not all(core.allowed(target, item) for item in company_ids)
+    ):
+        raise HTTPException(403, "Token customer scope cannot exceed the user's access")
+    raw_token = f"cmdb_pat_{secrets.token_urlsafe(32)}"
+    expires_at = datetime.now(UTC) + timedelta(days=payload.expiresInDays)
+    stored = REPOSITORY.create_api_token(
+        {
+            "id": str(uuid.uuid4()),
+            "userId": user_id,
+            "name": payload.name.strip(),
+            "tokenPrefix": raw_token[:20],
+            "tokenHash": hashlib.sha256(raw_token.encode("utf-8")).hexdigest(),
+            "scopes": scopes,
+            "companyIds": company_ids,
+            "expiresAt": expires_at.isoformat().replace("+00:00", "Z"),
+        },
+        actor["id"],
+    )
+    return {**stored, "token": raw_token}
+
+
+@api.delete("/api/users/{user_id}/tokens/{token_id}", tags=["access"])
+def revoke_user_api_token(user_id: str, token_id: str, request: Request) -> dict:
+    actor = current_user(request)
+    _managed_user(user_id, actor)
+    if not any(item["id"] == token_id for item in REPOSITORY.list_api_tokens(user_id)):
+        raise HTTPException(404, "API token not found")
+    revoked = REPOSITORY.revoke_api_token(
+        token_id, actor["id"], reason="Revoked from user management"
+    )
+    if not revoked:
+        raise HTTPException(404, "API token not found")
+    return revoked
 
 
 CONTACT_STATUSES = {"active", "on_leave", "left_company", "inactive"}
@@ -1678,11 +2144,11 @@ def list_relationships(request: Request, companyId: str | None = None) -> list[d
 
 @api.post("/api/relationships", status_code=201, tags=["relationships"])
 def create_relationship(payload: RelationshipCreateRequest, request: Request) -> dict:
+    user = current_user(request)
     from_asset = REPOSITORY.get_asset(payload.fromId)
     to_asset = REPOSITORY.get_asset(payload.toId)
     if not from_asset or not to_asset or from_asset["companyId"] != to_asset["companyId"]:
         raise HTTPException(400, "Choose two assets in the same company")
-    user = current_user(request)
     _company_for_user(from_asset["companyId"], user, require_manage=True)
     if from_asset["id"] == to_asset["id"]:
         raise HTTPException(400, "A configuration item cannot be related to itself")
@@ -1710,6 +2176,7 @@ def create_relationship(payload: RelationshipCreateRequest, request: Request) ->
 
 @api.delete("/api/relationships/{relationship_id}", tags=["relationships"])
 def delete_relationship(relationship_id: str, request: Request) -> dict:
+    user = current_user(request)
     relationship = next(
         (item for item in REPOSITORY.list_relationships() if item["id"] == relationship_id),
         None,
@@ -1719,7 +2186,6 @@ def delete_relationship(relationship_id: str, request: Request) -> dict:
     source = REPOSITORY.get_asset(relationship["fromId"])
     if not source:
         raise HTTPException(404, "Relationship source asset not found")
-    user = current_user(request)
     _company_for_user(source["companyId"], user, require_manage=True)
     with core.LOCK:
         deleted = REPOSITORY.delete_relationship(relationship_id, source["companyId"], user["id"])

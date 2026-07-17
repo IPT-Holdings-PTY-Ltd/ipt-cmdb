@@ -13,6 +13,9 @@ import RestoreOutlined from '@mui/icons-material/RestoreOutlined';
 import SecurityOutlined from '@mui/icons-material/SecurityOutlined';
 import StorageOutlined from '@mui/icons-material/StorageOutlined';
 import InsertPhotoOutlined from '@mui/icons-material/InsertPhotoOutlined';
+import BlockOutlined from '@mui/icons-material/BlockOutlined';
+import ContentCopyOutlined from '@mui/icons-material/ContentCopyOutlined';
+import KeyOutlined from '@mui/icons-material/KeyOutlined';
 import {
   Alert, Box, Button, Card, CardContent, Checkbox, Chip, CircularProgress, Dialog, DialogActions, DialogContent,
   DialogTitle, Divider, FormControl, FormControlLabel, Grid, InputLabel, List, ListItem, ListItemIcon, ListItemText,
@@ -22,7 +25,7 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Title, useNotify } from 'react-admin';
 import { Navigate } from 'react-router-dom';
 import { apiFetch, getSession } from './session';
-import type { AccessGroup, Company, Integration, RoleTemplate, SyncRun, User } from './types';
+import type { AccessGroup, AccessGroupImpact, ApiToken, Company, Integration, RoleTemplate, SyncRun, User } from './types';
 import { useWorkspace } from './workspace';
 import { DEFAULT_MSP_BRAND, useMspBranding, type Brand } from './branding';
 
@@ -140,6 +143,25 @@ export function UsersPage() {
   const [companyIds, setCompanyIds] = useState<string[]>([]);
   const [companyId, setCompanyId] = useState('');
   const [groupId, setGroupId] = useState('');
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState('current');
+  const [editing, setEditing] = useState<User | null>(null);
+  const [editEmail, setEditEmail] = useState('');
+  const [editName, setEditName] = useState('');
+  const [editRole, setEditRole] = useState<User['role']>('client_reader');
+  const [editCompanyId, setEditCompanyId] = useState('');
+  const [editCompanyIds, setEditCompanyIds] = useState<string[]>([]);
+  const [editGroupId, setEditGroupId] = useState('');
+  const [editApiEnabled, setEditApiEnabled] = useState(false);
+  const [passwordUser, setPasswordUser] = useState<User | null>(null);
+  const [newPassword, setNewPassword] = useState('');
+  const [tokenUser, setTokenUser] = useState<User | null>(null);
+  const [tokens, setTokens] = useState<ApiToken[]>([]);
+  const [tokenName, setTokenName] = useState('');
+  const [tokenDays, setTokenDays] = useState(90);
+  const [tokenScopes, setTokenScopes] = useState<string[]>(['cmdb:read']);
+  const [tokenCompanyIds, setTokenCompanyIds] = useState<string[]>([]);
+  const [revealedToken, setRevealedToken] = useState('');
 
   const load = async () => {
     setLoading(true);
@@ -164,17 +186,150 @@ export function UsersPage() {
   }
 
   const names = Object.fromEntries(workspace.companies.map(company => [company.id, company.name]));
+  const dateLabel = (value?: string | null) => value ? new Date(value).toLocaleString() : 'Never';
+  const visibleUsers = users.filter(user => {
+    const matchesSearch = `${user.displayName} ${user.email} ${user.role}`.toLowerCase().includes(search.toLowerCase());
+    const matchesStatus = statusFilter === 'all' || (statusFilter === 'current'
+      ? user.status !== 'archived'
+      : user.status === statusFilter);
+    return matchesSearch && matchesStatus;
+  });
+
+  function openEdit(user: User) {
+    setEditing(user);
+    setEditEmail(user.email);
+    setEditName(user.displayName || user.email.split('@')[0]);
+    setEditRole(user.role);
+    setEditCompanyId(user.directCompanyIds?.[0] || user.companyIds[0] || '');
+    setEditCompanyIds(user.directCompanyIds?.filter(id => id !== '*') || []);
+    setEditGroupId(user.groupIds?.[0] || '');
+    setEditApiEnabled(Boolean(user.apiAccessEnabled));
+  }
+
+  async function saveUser(event: FormEvent) {
+    event.preventDefault();
+    if (!editing) return;
+    try {
+      await apiFetch<User>(`/api/users/${editing.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          email: editEmail,
+          displayName: editName,
+          role: editRole,
+          companyId: editRole === 'client_reader' ? editCompanyId : undefined,
+          companyIds: editRole === 'msp_operator' ? editCompanyIds : [],
+          groupIds: editRole === 'msp_operator' && editGroupId ? [editGroupId] : [],
+          apiAccessEnabled: editApiEnabled,
+          reason: 'Updated from user management',
+        }),
+      });
+      setEditing(null);
+      setNotice({ severity: 'success', message: 'User profile and access updated.' });
+      await load();
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'User update failed.' });
+    }
+  }
+
+  async function changeStatus(user: User) {
+    const status = user.status === 'active' ? 'disabled' : 'active';
+    const verb = status === 'disabled' ? 'Disable' : 'Enable';
+    if (!window.confirm(`${verb} ${user.email}?${status === 'disabled' ? ' Active sessions and API tokens will be revoked.' : ''}`)) return;
+    try {
+      await apiFetch<User>(`/api/users/${user.id}/status`, {
+        method: 'POST',
+        body: JSON.stringify({ status, reason: `${verb}d from user management` }),
+      });
+      setNotice({ severity: 'success', message: `${user.email} ${status === 'active' ? 'enabled' : 'disabled'}.` });
+      await load();
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Status update failed.' });
+    }
+  }
+
+  async function archive(user: User) {
+    if (!window.confirm(`Archive ${user.email}? Their historical audit and ownership references will be retained.`)) return;
+    try {
+      await apiFetch(`/api/users/${user.id}`, { method: 'DELETE' });
+      setNotice({ severity: 'success', message: `${user.email} archived.` });
+      await load();
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'User could not be archived.' });
+    }
+  }
+
+  async function resetPassword(event: FormEvent) {
+    event.preventDefault();
+    if (!passwordUser) return;
+    try {
+      await apiFetch(`/api/users/${passwordUser.id}/password`, {
+        method: 'PUT',
+        body: JSON.stringify({ password: newPassword }),
+      });
+      setPasswordUser(null);
+      setNewPassword('');
+      setNotice({ severity: 'success', message: 'Local password changed and active sessions revoked.' });
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Password reset failed.' });
+    }
+  }
+
+  async function openTokens(user: User) {
+    setTokenUser(user);
+    setRevealedToken('');
+    setTokenName('');
+    setTokenCompanyIds([]);
+    try {
+      setTokens(await apiFetch<ApiToken[]>(`/api/users/${user.id}/tokens`));
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'API tokens could not be loaded.' });
+    }
+  }
+
+  async function createToken(event: FormEvent) {
+    event.preventDefault();
+    if (!tokenUser) return;
+    try {
+      const created = await apiFetch<ApiToken>(`/api/users/${tokenUser.id}/tokens`, {
+        method: 'POST',
+        body: JSON.stringify({
+          name: tokenName,
+          scopes: tokenScopes,
+          companyIds: tokenCompanyIds,
+          expiresInDays: tokenDays,
+        }),
+      });
+      setRevealedToken(created.token || '');
+      setTokenName('');
+      setTokens(await apiFetch<ApiToken[]>(`/api/users/${tokenUser.id}/tokens`));
+      await load();
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'API token could not be created.' });
+    }
+  }
+
+  async function revokeToken(token: ApiToken) {
+    if (!tokenUser || !window.confirm(`Revoke ${token.name}? This cannot be undone.`)) return;
+    try {
+      await apiFetch(`/api/users/${tokenUser.id}/tokens/${token.id}`, { method: 'DELETE' });
+      setTokens(await apiFetch<ApiToken[]>(`/api/users/${tokenUser.id}/tokens`));
+      await load();
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'API token could not be revoked.' });
+    }
+  }
+
   return (
-    <RootGuard><Title title="Users" /><PageHeading eyebrow="Access" title="User management" copy="Root users receive explicit customer scope from a reusable access group plus optional direct customer access. Customer users remain bound to one tenant." />
+    <RootGuard><Title title="Users" /><PageHeading eyebrow="Identity lifecycle" title="User management" copy="Create, edit, secure and retire human or automation identities. Server-side role, tenant and token policy remains authoritative." action={<Chip label={`${users.filter(user => user.status === 'active').length} active`} color="success" variant="outlined" />} />
       {notice && <Alert severity={notice.severity} sx={{ mb: 2 }}>{notice.message}</Alert>}
       <Grid container spacing={3}>
-        <Grid size={{ xs: 12, xl: 5 }}><Card><CardContent><Stack component="form" spacing={2} onSubmit={createUser}>
+        <Grid size={{ xs: 12, xl: 4 }}><Card><CardContent><Stack component="form" spacing={2} onSubmit={createUser}>
           <Typography variant="h5">Add user</Typography>
           {actor?.role === 'platform_admin' && <FormControl><InputLabel>Account type</InputLabel><Select label="Account type" value={accountType} onChange={event => setAccountType(event.target.value as 'root' | 'customer')}>
             <MenuItem value="root">MSP user</MenuItem><MenuItem value="customer">Customer user</MenuItem>
           </Select></FormControl>}
           <TextField label="Email" type="email" value={email} onChange={event => setEmail(event.target.value)} required />
-          <TextField label="Temporary password" type="password" value={password} onChange={event => setPassword(event.target.value)} slotProps={{ htmlInput: { minLength: 8 } }} helperText="At least 8 characters; local authentication only" required />
+          <TextField label="Temporary password" type="password" value={password} onChange={event => setPassword(event.target.value)} slotProps={{ htmlInput: { minLength: 12 } }} helperText="At least 12 characters; local authentication only" required />
           {accountType === 'root' ? <>
             <FormControl><InputLabel>MSP access group</InputLabel><Select label="MSP access group" value={groupId} onChange={event => setGroupId(event.target.value)}><MenuItem value="">No access group</MenuItem>{groups.map(group => <MenuItem key={group.id} value={group.id}>{group.name} ({group.companyIds.length} customers)</MenuItem>)}</Select></FormControl>
             <Typography variant="subtitle2">Additional customer access</Typography>
@@ -182,59 +337,213 @@ export function UsersPage() {
           </> : <FormControl><InputLabel>Customer</InputLabel><Select label="Customer" value={companyId} onChange={event => setCompanyId(event.target.value)} required>{workspace.companies.map(company => <MenuItem key={company.id} value={company.id}>{company.name}</MenuItem>)}</Select></FormControl>}
           <Button variant="contained" type="submit" startIcon={<PersonAddAltOutlined />}>Create user</Button>
         </Stack></CardContent></Card></Grid>
-        <Grid size={{ xs: 12, xl: 7 }}><Card><CardContent><Typography variant="h5">Users in your scope</Typography><Typography
-          sx={{
-            color: "text.secondary",
-            mb: 2
-          }}>Server-side permissions determine which records are visible here.</Typography>
-          {loading ? <CircularProgress size={24} /> : <TableContainer><Table size="small"><TableHead><TableRow><TableCell>User</TableCell><TableCell>Role</TableCell><TableCell>Customer scope</TableCell></TableRow></TableHead><TableBody>{users.map(user => <TableRow key={user.id}><TableCell>{user.email}</TableCell><TableCell><Chip size="small" label={user.role.replaceAll('_', ' ')} /></TableCell><TableCell>{user.role === 'platform_admin' ? 'All customers' : user.companyIds.map(id => names[id] || id).join(', ') || 'No access'}</TableCell></TableRow>)}</TableBody></Table></TableContainer>}
+        <Grid size={{ xs: 12, xl: 8 }}><Card><CardContent>
+          <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} sx={{ justifyContent: 'space-between', mb: 2 }}>
+            <Box><Typography variant="h5">Identity directory</Typography><Typography sx={{ color: 'text.secondary' }}>Disabled and archived accounts remain visible for governance.</Typography></Box>
+            <Stack direction="row" spacing={1}><TextField size="small" label="Search users" value={search} onChange={event => setSearch(event.target.value)} /><FormControl size="small" sx={{ minWidth: 130 }}><InputLabel>Status</InputLabel><Select label="Status" value={statusFilter} onChange={event => setStatusFilter(event.target.value)}><MenuItem value="current">Current</MenuItem><MenuItem value="active">Active</MenuItem><MenuItem value="disabled">Disabled</MenuItem><MenuItem value="archived">Archived</MenuItem><MenuItem value="all">All</MenuItem></Select></FormControl></Stack>
+          </Stack>
+          {loading ? <CircularProgress size={24} /> : <TableContainer><Table size="small"><TableHead><TableRow><TableCell>User</TableCell><TableCell>Status</TableCell><TableCell>Access</TableCell><TableCell>API</TableCell><TableCell>Activity</TableCell><TableCell align="right">Actions</TableCell></TableRow></TableHead><TableBody>{visibleUsers.map(user => <TableRow key={user.id} hover sx={{ opacity: user.status === 'archived' ? 0.62 : 1 }}>
+            <TableCell><Typography sx={{ fontWeight: 750 }}>{user.displayName || user.email}</Typography><Typography variant="caption" color="text.secondary">{user.email} · {user.authSource || 'local'}</Typography></TableCell>
+            <TableCell><Chip size="small" label={user.status} color={user.status === 'active' ? 'success' : user.status === 'disabled' ? 'warning' : 'default'} /></TableCell>
+            <TableCell><Typography variant="body2">{user.role.replaceAll('_', ' ')}</Typography><Typography variant="caption" color="text.secondary">{user.role === 'platform_admin' ? 'All customers' : user.companyIds.map(id => names[id] || id).join(', ') || 'No access'}</Typography></TableCell>
+            <TableCell><Chip size="small" variant="outlined" color={user.apiAccessEnabled ? 'primary' : 'default'} label={user.apiAccessEnabled ? `${user.apiTokenCount || 0} token${user.apiTokenCount === 1 ? '' : 's'}` : 'Disabled'} /></TableCell>
+            <TableCell><Typography variant="caption">Login: {dateLabel(user.lastLoginAt)}</Typography><Typography variant="caption" sx={{ display: 'block' }}>API: {dateLabel(user.lastApiUsedAt)}</Typography></TableCell>
+            <TableCell align="right"><Stack direction="row" spacing={0.5} sx={{ justifyContent: 'flex-end', flexWrap: 'wrap' }}><Button size="small" startIcon={<EditOutlined />} onClick={() => openEdit(user)} disabled={user.status === 'archived'}>Edit</Button><Button size="small" startIcon={<KeyOutlined />} onClick={() => void openTokens(user)} disabled={user.status === 'archived'}>API</Button><Button size="small" onClick={() => setPasswordUser(user)} disabled={user.authSource === 'entra' || user.status === 'archived'}>Password</Button><Button size="small" color={user.status === 'active' ? 'warning' : 'success'} onClick={() => void changeStatus(user)} disabled={user.status === 'archived' || user.id === actor?.id}>{user.status === 'active' ? 'Disable' : 'Enable'}</Button><Button size="small" color="error" startIcon={<DeleteOutlined />} onClick={() => void archive(user)} disabled={user.status === 'archived' || user.id === actor?.id}>Archive</Button></Stack></TableCell>
+          </TableRow>)}</TableBody></Table></TableContainer>}
         </CardContent></Card></Grid>
       </Grid>
+      <Dialog open={Boolean(editing)} onClose={() => setEditing(null)} fullWidth maxWidth="sm">
+        <Stack component="form" onSubmit={saveUser}>
+          <DialogTitle>Edit user and access</DialogTitle>
+          <DialogContent><Stack spacing={2} sx={{ pt: 1 }}>
+            <TextField label="Display name" value={editName} onChange={event => setEditName(event.target.value)} required />
+            <TextField label="Email" type="email" value={editEmail} onChange={event => setEditEmail(event.target.value)} required />
+            <FormControl><InputLabel>Role</InputLabel><Select label="Role" value={editRole} onChange={event => setEditRole(event.target.value as User['role'])} disabled={actor?.role !== 'platform_admin'}>
+              <MenuItem value="platform_admin">Platform administrator</MenuItem><MenuItem value="msp_operator">MSP operator</MenuItem><MenuItem value="client_reader">Customer user</MenuItem>
+            </Select></FormControl>
+            {editRole === 'client_reader' && <FormControl><InputLabel>Customer</InputLabel><Select label="Customer" value={editCompanyId} onChange={event => setEditCompanyId(event.target.value)} required>{workspace.companies.map(company => <MenuItem key={company.id} value={company.id}>{company.name}</MenuItem>)}</Select></FormControl>}
+            {editRole === 'msp_operator' && <><FormControl><InputLabel>MSP access group</InputLabel><Select label="MSP access group" value={editGroupId} onChange={event => setEditGroupId(event.target.value)}><MenuItem value="">No access group</MenuItem>{groups.map(group => <MenuItem key={group.id} value={group.id}>{group.name}</MenuItem>)}</Select></FormControl><Typography variant="subtitle2">Additional customer access</Typography><Paper variant="outlined" sx={{ p: 1.5, maxHeight: 180, overflow: 'auto' }}>{workspace.companies.map(company => <FormControlLabel key={company.id} control={<Checkbox checked={editCompanyIds.includes(company.id)} onChange={(_, checked) => setEditCompanyIds(items => checked ? [...items, company.id] : items.filter(id => id !== company.id))} />} label={company.name} />)}</Paper></>}
+            <FormControlLabel control={<Checkbox checked={editApiEnabled} onChange={(_, checked) => setEditApiEnabled(checked)} />} label="Allow personal API tokens" />
+            <Alert severity="info">Role and customer scope changes take effect immediately. Turning API access off revokes every active token for this user.</Alert>
+          </Stack></DialogContent>
+          <DialogActions><Button onClick={() => setEditing(null)}>Cancel</Button><Button type="submit" variant="contained">Save changes</Button></DialogActions>
+        </Stack>
+      </Dialog>
+      <Dialog open={Boolean(passwordUser)} onClose={() => setPasswordUser(null)} fullWidth maxWidth="xs">
+        <Stack component="form" onSubmit={resetPassword}><DialogTitle>Change local password</DialogTitle><DialogContent><Stack spacing={2} sx={{ pt: 1 }}><Typography color="text.secondary">Set a new password for {passwordUser?.email}.</Typography><TextField autoFocus label="New password" type="password" value={newPassword} onChange={event => setNewPassword(event.target.value)} slotProps={{ htmlInput: { minLength: 12 } }} helperText="At least 12 characters" required /><Alert severity="warning">All active browser sessions for this user will be revoked.</Alert></Stack></DialogContent><DialogActions><Button onClick={() => setPasswordUser(null)}>Cancel</Button><Button type="submit" variant="contained">Change password</Button></DialogActions></Stack>
+      </Dialog>
+      <Dialog open={Boolean(tokenUser)} onClose={() => setTokenUser(null)} fullWidth maxWidth="md">
+        <DialogTitle>Personal API access · {tokenUser?.displayName || tokenUser?.email}</DialogTitle>
+        <DialogContent><Stack spacing={2} sx={{ pt: 1 }}>
+          {!tokenUser?.apiAccessEnabled && <Alert severity="warning" icon={<BlockOutlined />}>API access is disabled for this user. Enable it in Edit user before creating a token.</Alert>}
+          {revealedToken && <Alert severity="success"><Typography sx={{ fontWeight: 750 }}>Copy this token now. It will not be shown again.</Typography><Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mt: 1 }}><TextField fullWidth value={revealedToken} slotProps={{ htmlInput: { readOnly: true } }} /><Button startIcon={<ContentCopyOutlined />} onClick={() => void navigator.clipboard.writeText(revealedToken)}>Copy</Button></Stack></Alert>}
+          <Paper component="form" variant="outlined" onSubmit={createToken} sx={{ p: 2 }}><Stack spacing={2}><Typography variant="h6">Create token</Typography><Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}><TextField fullWidth label="Token name" value={tokenName} onChange={event => setTokenName(event.target.value)} placeholder="Automation or integration name" required /><TextField label="Expires in days" type="number" value={tokenDays} onChange={event => setTokenDays(Number(event.target.value))} slotProps={{ htmlInput: { min: 1, max: 365 } }} sx={{ width: { sm: 180 } }} required /></Stack><Stack direction="row" spacing={2}><FormControlLabel control={<Checkbox checked={tokenScopes.includes('cmdb:read')} onChange={(_, checked) => setTokenScopes(scopes => checked ? [...new Set([...scopes, 'cmdb:read'])] : scopes.filter(scope => scope !== 'cmdb:read'))} />} label="Read CMDB" /><FormControlLabel control={<Checkbox checked={tokenScopes.includes('cmdb:write')} onChange={(_, checked) => setTokenScopes(scopes => checked ? [...new Set([...scopes, 'cmdb:write'])] : scopes.filter(scope => scope !== 'cmdb:write'))} />} label="Write CMDB" /></Stack><Box><Typography variant="subtitle2">Restrict to customers (optional)</Typography><Typography variant="caption" color="text.secondary">No selection uses the user’s full effective customer scope.</Typography><Paper variant="outlined" sx={{ p: 1, mt: 1, maxHeight: 150, overflow: 'auto' }}>{workspace.companies.filter(company => tokenUser?.companyIds.includes('*') || tokenUser?.companyIds.includes(company.id)).map(company => <FormControlLabel key={company.id} control={<Checkbox checked={tokenCompanyIds.includes(company.id)} onChange={(_, checked) => setTokenCompanyIds(items => checked ? [...items, company.id] : items.filter(id => id !== company.id))} />} label={company.name} />)}</Paper></Box><Button type="submit" variant="contained" startIcon={<KeyOutlined />} disabled={!tokenUser?.apiAccessEnabled || tokenScopes.length === 0}>Create token</Button></Stack></Paper>
+          <Box><Typography variant="h6" sx={{ mb: 1 }}>Issued tokens</Typography>{tokens.length === 0 ? <Typography color="text.secondary">No tokens have been issued.</Typography> : <TableContainer component={Paper} variant="outlined"><Table size="small"><TableHead><TableRow><TableCell>Name</TableCell><TableCell>Prefix</TableCell><TableCell>Scopes</TableCell><TableCell>Expires</TableCell><TableCell>Last used</TableCell><TableCell>Status</TableCell><TableCell align="right">Action</TableCell></TableRow></TableHead><TableBody>{tokens.map(token => <TableRow key={token.id}><TableCell>{token.name}</TableCell><TableCell><code>{token.tokenPrefix}</code></TableCell><TableCell>{token.scopes.join(', ')}</TableCell><TableCell>{dateLabel(token.expiresAt)}</TableCell><TableCell>{dateLabel(token.lastUsedAt)}</TableCell><TableCell><Chip size="small" label={token.revokedAt ? 'Revoked' : 'Active'} color={token.revokedAt ? 'default' : 'success'} /></TableCell><TableCell align="right"><Button size="small" color="error" onClick={() => void revokeToken(token)} disabled={Boolean(token.revokedAt)}>Revoke</Button></TableCell></TableRow>)}</TableBody></Table></TableContainer>}</Box>
+        </Stack></DialogContent><DialogActions><Button onClick={() => setTokenUser(null)}>Close</Button></DialogActions>
+      </Dialog>
     </RootGuard>
   );
 }
 
 export function CustomerGroupsPage() {
   const workspace = useWorkspace();
+  const actor = getSession()?.user;
   const [groups, setGroups] = useState<AccessGroup[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [query, setQuery] = useState('');
+  const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<AccessGroup | null>(null);
   const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [ownerUserId, setOwnerUserId] = useState('');
   const [companyIds, setCompanyIds] = useState<string[]>([]);
+  const [availableSearch, setAvailableSearch] = useState('');
+  const [selectedSearch, setSelectedSearch] = useState('');
+  const [deleteImpact, setDeleteImpact] = useState<AccessGroupImpact | null>(null);
+  const [deleteConfirmation, setDeleteConfirmation] = useState('');
   const [notice, setNotice] = useState<Notice>(null);
-  const load = () => apiFetch<AccessGroup[]>('/api/access-groups').then(setGroups).catch(error => setNotice({ severity: 'error', message: error.message }));
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const [groupData, userData] = await Promise.all([
+        apiFetch<AccessGroup[]>('/api/access-groups'),
+        apiFetch<User[]>('/api/users'),
+      ]);
+      setGroups(groupData);
+      setUsers(userData);
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Customer groups could not be loaded.' });
+    } finally {
+      setLoading(false);
+    }
+  };
   useEffect(() => { void load(); }, []);
 
-  function reset() { setEditing(null); setName(''); setCompanyIds([]); }
-  function edit(group: AccessGroup) { setEditing(group); setName(group.name); setCompanyIds(group.companyIds); }
+  const ownerOptions = users.filter(user => user.status === 'active' && ['platform_admin', 'msp_operator'].includes(user.role));
+  const companyName = (id: string) => workspace.companies.find(company => company.id === id)?.name || id;
+  const normalizedAvailableSearch = availableSearch.trim().toLowerCase();
+  const normalizedSelectedSearch = selectedSearch.trim().toLowerCase();
+  const availableCompanies = workspace.companies.filter(company => !companyIds.includes(company.id) && company.name.toLowerCase().includes(normalizedAvailableSearch));
+  const selectedCompanies = workspace.companies.filter(company => companyIds.includes(company.id) && company.name.toLowerCase().includes(normalizedSelectedSearch));
+  const visibleGroups = groups.filter(group => {
+    const haystack = [group.name, group.description, group.ownerLabel, ...group.companyIds.map(companyName)].join(' ').toLowerCase();
+    return haystack.includes(query.trim().toLowerCase());
+  });
+
+  function closeEditor() {
+    setEditorOpen(false);
+    setEditing(null);
+    setName('');
+    setDescription('');
+    setOwnerUserId('');
+    setCompanyIds([]);
+    setAvailableSearch('');
+    setSelectedSearch('');
+  }
+
+  function createGroup() {
+    setEditing(null);
+    setName('');
+    setDescription('');
+    setOwnerUserId(actor?.id || '');
+    setCompanyIds([]);
+    setAvailableSearch('');
+    setSelectedSearch('');
+    setEditorOpen(true);
+  }
+
+  function edit(group: AccessGroup) {
+    setEditing(group);
+    setName(group.name);
+    setDescription(group.description || '');
+    setOwnerUserId(group.ownerUserId || actor?.id || '');
+    setCompanyIds(group.companyIds);
+    setAvailableSearch('');
+    setSelectedSearch('');
+    setEditorOpen(true);
+  }
+
   async function save(event: FormEvent) {
-    event.preventDefault();
+    event.preventDefault(); setNotice(null);
     try {
-      await apiFetch(editing ? `/api/access-groups/${editing.id}` : '/api/access-groups', { method: editing ? 'PUT' : 'POST', body: JSON.stringify({ name, companyIds }) });
-      setNotice({ severity: 'success', message: editing ? 'Customer group updated.' : 'Customer group created.' }); reset(); await load();
+      await apiFetch(editing ? '/api/access-groups/' + editing.id : '/api/access-groups', {
+        method: editing ? 'PUT' : 'POST',
+        body: JSON.stringify({
+          name,
+          description,
+          companyIds,
+          ownerUserId,
+          membershipMode: 'manual',
+          membershipRules: {},
+          expectedRevision: editing?.revision,
+        }),
+      });
+      setNotice({ severity: 'success', message: editing ? 'Customer group updated.' : 'Customer group created.' });
+      closeEditor();
+      await load();
     } catch (error) { setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Group could not be saved.' }); }
   }
-  async function remove(group: AccessGroup) {
-    if (!window.confirm(`Delete ${group.name}? Existing users keep their direct customer permissions.`)) return;
-    try { await apiFetch(`/api/access-groups/${group.id}`, { method: 'DELETE' }); setNotice({ severity: 'success', message: 'Customer group deleted.' }); await load(); }
-    catch (error) { setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Group could not be deleted.' }); }
+
+  async function reviewDelete(group: AccessGroup) {
+    setNotice(null);
+    try {
+      setDeleteImpact(await apiFetch<AccessGroupImpact>('/api/access-groups/' + group.id + '/impact'));
+      setDeleteConfirmation('');
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Deletion impact could not be calculated.' });
+    }
   }
-  const companyName = (id: string) => workspace.companies.find(company => company.id === id)?.name || id;
+
+  async function remove() {
+    if (!deleteImpact || deleteConfirmation !== deleteImpact.groupName) return;
+    try {
+      await apiFetch('/api/access-groups/' + deleteImpact.groupId, { method: 'DELETE' });
+      setNotice({ severity: 'success', message: 'Customer group deleted after impact review.' });
+      setDeleteImpact(null);
+      setDeleteConfirmation('');
+      await load();
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Group could not be deleted.' });
+    }
+  }
+
+  const membershipSummary = (group: AccessGroup) => {
+    if (group.system) return 'Every managed customer';
+    const names = group.companyIds.slice(0, 3).map(companyName);
+    const remainder = group.companyIds.length - names.length;
+    return names.join(', ') + (remainder > 0 ? ' +' + remainder + ' more' : '');
+  };
+
   return (
-    <RootGuard adminOnly><Title title="Customer groups" /><PageHeading eyebrow="Organisation" title="Customer groups" copy="Bundle customer scopes into reusable access groups for MSP users. The dynamic All managed customers group follows the tenant list automatically." />
+    <RootGuard adminOnly><Title title="Customer groups" /><PageHeading eyebrow="Organisation" title="Customer groups" copy="Build governed, reusable customer scopes without losing sight of their owners, users or downstream access impact." action={<Button variant="contained" startIcon={<GroupsOutlined />} onClick={createGroup}>Create group</Button>} />
       {notice && <Alert severity={notice.severity} sx={{ mb: 2 }}>{notice.message}</Alert>}
-      <Grid container spacing={3}>
-        <Grid size={{ xs: 12, lg: 5 }}><Card><CardContent><Stack component="form" spacing={2} onSubmit={save}><Typography variant="h5">{editing ? `Edit ${editing.name}` : 'Create customer group'}</Typography><TextField label="Group name" value={name} onChange={event => setName(event.target.value)} required />
-          <Typography variant="subtitle2">Customers</Typography><Paper variant="outlined" sx={{ p: 1.5 }}>{workspace.companies.map(company => <FormControlLabel key={company.id} control={<Checkbox checked={companyIds.includes(company.id)} onChange={(_, checked) => setCompanyIds(items => checked ? [...items, company.id] : items.filter(id => id !== company.id))} />} label={company.name} />)}</Paper>
-          <Stack direction="row" spacing={1}><Button type="submit" variant="contained" startIcon={editing ? <EditOutlined /> : <GroupsOutlined />}>{editing ? 'Save group' : 'Create group'}</Button>{editing && <Button onClick={reset}>Cancel</Button>}</Stack>
-        </Stack></CardContent></Card></Grid>
-        <Grid size={{ xs: 12, lg: 7 }}><Stack spacing={2}>{groups.map(group => <Card key={group.id}><CardContent><Stack direction="row" spacing={2} sx={{
-          justifyContent: "space-between"
-        }}><Box><Stack direction="row" spacing={1} sx={{
-          alignItems: "center"
-        }}><Typography variant="h6">{group.name}</Typography>{group.system && <Chip size="small" label="Dynamic" color="primary" variant="outlined" />}</Stack><Typography sx={{
-          color: "text.secondary"
-        }}>{group.companyIds.includes('*') ? 'Every managed customer' : group.companyIds.map(companyName).join(', ')}</Typography></Box>{!group.system && <Stack direction="row"><Button size="small" startIcon={<EditOutlined />} onClick={() => edit(group)}>Edit</Button><Button size="small" color="error" startIcon={<DeleteOutlined />} onClick={() => remove(group)}>Delete</Button></Stack>}</Stack></CardContent></Card>)}</Stack></Grid>
-      </Grid>
+      <Card><CardContent>
+        <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} sx={{ justifyContent: 'space-between', alignItems: { md: 'center' }, mb: 2 }}><Box><Typography variant="h5">Group directory</Typography><Typography color="text.secondary">Search and review membership, ownership and usage before making a change.</Typography></Box><TextField size="small" label="Search groups or customers" value={query} onChange={event => setQuery(event.target.value)} sx={{ minWidth: { md: 300 } }} /></Stack>
+        {loading ? <CircularProgress size={24} /> : <TableContainer><Table><TableHead><TableRow><TableCell>Group</TableCell><TableCell>Type</TableCell><TableCell>Customer scope</TableCell><TableCell>Assigned users</TableCell><TableCell>Owner</TableCell><TableCell>Updated</TableCell><TableCell align="right">Actions</TableCell></TableRow></TableHead><TableBody>{visibleGroups.map(group => <TableRow key={group.id} hover>
+          <TableCell><Typography sx={{ fontWeight: 750 }}>{group.name}</Typography><Typography variant="caption" color="text.secondary">{group.description || 'No description provided'}</Typography></TableCell>
+          <TableCell><Chip size="small" label={group.membershipMode === 'dynamic' ? 'Dynamic' : 'Manual'} color={group.membershipMode === 'dynamic' ? 'primary' : 'default'} variant="outlined" /></TableCell>
+          <TableCell><Typography variant="body2">{membershipSummary(group)}</Typography><Typography variant="caption" color="text.secondary">{group.companyIds.length} customers</Typography></TableCell>
+          <TableCell><Chip size="small" label={group.assignedUserCount + ' users'} color={group.assignedUserCount ? 'success' : 'default'} variant="outlined" /></TableCell>
+          <TableCell>{group.ownerLabel}</TableCell><TableCell>{group.updatedAt ? new Date(group.updatedAt).toLocaleDateString() : 'Seeded'}</TableCell>
+          <TableCell align="right">{group.system ? <Typography variant="caption" color="text.secondary">System managed</Typography> : <Stack direction="row" spacing={0.5} sx={{ justifyContent: 'flex-end' }}><Button size="small" startIcon={<EditOutlined />} onClick={() => edit(group)}>Edit</Button><Button size="small" color="error" startIcon={<DeleteOutlined />} onClick={() => void reviewDelete(group)}>Delete</Button></Stack>}</TableCell>
+        </TableRow>)}</TableBody></Table></TableContainer>}
+      </CardContent></Card>
+
+      <Dialog open={editorOpen} onClose={closeEditor} fullWidth maxWidth="lg"><Stack component="form" onSubmit={save}><DialogTitle>{editing ? 'Edit customer group' : 'Create customer group'}</DialogTitle><DialogContent><Stack spacing={2} sx={{ pt: 1 }}>
+        <Grid container spacing={2}><Grid size={{ xs: 12, md: 6 }}><TextField fullWidth label="Group name" value={name} onChange={event => setName(event.target.value)} required /></Grid><Grid size={{ xs: 12, md: 6 }}><FormControl fullWidth><InputLabel>Accountable owner</InputLabel><Select label="Accountable owner" value={ownerUserId} onChange={event => setOwnerUserId(event.target.value)} required>{ownerOptions.map(user => <MenuItem key={user.id} value={user.id}>{user.displayName || user.email} — {user.role.replaceAll('_', ' ')}</MenuItem>)}</Select></FormControl></Grid></Grid>
+        <TextField label="Purpose and usage" value={description} onChange={event => setDescription(event.target.value)} multiline minRows={2} helperText="Explain why this scope exists and which MSP team should use it." />
+        <Alert severity="info"><Typography sx={{ fontWeight: 750 }}>Manual membership</Typography>Rule-based dynamic groups are prepared in the data model. They will be enabled later with reviewed customer tags and rules.</Alert>
+        <Grid container spacing={2}>
+          <Grid size={{ xs: 12, md: 6 }}><Paper variant="outlined" sx={{ p: 2, height: '100%' }}><Stack spacing={1.5}><Stack direction="row" spacing={1} sx={{ justifyContent: 'space-between', alignItems: 'center' }}><Box><Typography variant="h6">Available customers</Typography><Typography variant="caption" color="text.secondary">{availableCompanies.length} matching</Typography></Box><Button size="small" onClick={() => setCompanyIds(items => [...new Set([...items, ...availableCompanies.map(company => company.id)])])} disabled={!availableCompanies.length}>Add all filtered</Button></Stack><TextField size="small" label="Search available customers" value={availableSearch} onChange={event => setAvailableSearch(event.target.value)} /><Divider /><Stack divider={<Divider flexItem />} sx={{ maxHeight: 300, overflow: 'auto' }}>{availableCompanies.map(company => <Stack key={company.id} direction="row" spacing={1} sx={{ justifyContent: 'space-between', alignItems: 'center', py: 1 }}><Box><Typography>{company.name}</Typography><Typography variant="caption" color="text.secondary">{company.id}</Typography></Box><Button size="small" onClick={() => setCompanyIds(items => [...items, company.id])}>Add</Button></Stack>)}{!availableCompanies.length && <Typography color="text.secondary" sx={{ py: 2 }}>No available customers match this search.</Typography>}</Stack></Stack></Paper></Grid>
+          <Grid size={{ xs: 12, md: 6 }}><Paper variant="outlined" sx={{ p: 2, height: '100%' }}><Stack spacing={1.5}><Stack direction="row" spacing={1} sx={{ justifyContent: 'space-between', alignItems: 'center' }}><Box><Typography variant="h6">Customers in group</Typography><Typography variant="caption" color="text.secondary">{companyIds.length} selected</Typography></Box><Button size="small" color="warning" onClick={() => setCompanyIds(items => items.filter(id => !selectedCompanies.some(company => company.id === id)))} disabled={!selectedCompanies.length}>Remove filtered</Button></Stack><TextField size="small" label="Search selected customers" value={selectedSearch} onChange={event => setSelectedSearch(event.target.value)} /><Divider /><Stack divider={<Divider flexItem />} sx={{ maxHeight: 300, overflow: 'auto' }}>{selectedCompanies.map(company => <Stack key={company.id} direction="row" spacing={1} sx={{ justifyContent: 'space-between', alignItems: 'center', py: 1 }}><Box><Typography>{company.name}</Typography><Typography variant="caption" color="text.secondary">{company.id}</Typography></Box><Button size="small" color="warning" onClick={() => setCompanyIds(items => items.filter(id => id !== company.id))}>Remove</Button></Stack>)}{!selectedCompanies.length && <Typography color="text.secondary" sx={{ py: 2 }}>Add customers from the available list.</Typography>}</Stack></Stack></Paper></Grid>
+        </Grid>
+      </Stack></DialogContent><DialogActions><Button onClick={closeEditor}>Cancel</Button><Button type="submit" variant="contained" disabled={!name.trim() || !ownerUserId || companyIds.length === 0}>{editing ? 'Save group' : 'Create group'}</Button></DialogActions></Stack></Dialog>
+
+      <Dialog open={Boolean(deleteImpact)} onClose={() => setDeleteImpact(null)} fullWidth maxWidth="sm"><DialogTitle>Delete customer group?</DialogTitle><DialogContent><Stack spacing={2} sx={{ pt: 1 }}>
+        {deleteImpact && <><Alert severity={deleteImpact.usersLosingAccess ? 'warning' : 'info'}><Typography sx={{ fontWeight: 750 }}>{deleteImpact.usersLosingAccess ? deleteImpact.usersLosingAccess + ' users will lose customer access' : 'No users will lose effective customer access'}</Typography>{deleteImpact.lostCustomerAssignments} customer assignments will be removed across {deleteImpact.assignedUserCount} assigned users.</Alert>{deleteImpact.users.length > 0 && <Paper variant="outlined" sx={{ maxHeight: 240, overflow: 'auto' }}><List dense>{deleteImpact.users.map(user => <ListItem key={user.id} divider><ListItemText primary={user.displayName + ' · ' + user.email} secondary={user.lostCustomers.length ? 'Loses: ' + user.lostCustomers.join(', ') : 'Retains access through direct permissions or another group'} /></ListItem>)}</List></Paper>}<TextField label={'Type “' + deleteImpact.groupName + '” to confirm'} value={deleteConfirmation} onChange={event => setDeleteConfirmation(event.target.value)} fullWidth /></>}
+      </Stack></DialogContent><DialogActions><Button onClick={() => setDeleteImpact(null)}>Cancel</Button><Button color="error" variant="contained" onClick={() => void remove()} disabled={!deleteImpact || deleteConfirmation !== deleteImpact.groupName}>Delete group</Button></DialogActions></Dialog>
     </RootGuard>
   );
 }
@@ -248,16 +557,17 @@ export function RbacPage() {
   useEffect(() => { Promise.all([apiFetch<RoleTemplate[]>('/api/rbac/roles'), apiFetch<User[]>('/api/users')]).then(([roleData, userData]) => { setRoles(roleData); setUsers(userData); setSelected(userData[0]?.id || ''); }).catch(setError); }, []);
   useEffect(() => { if (selected) apiFetch<EffectiveAccess>(`/api/rbac/effective?userId=${encodeURIComponent(selected)}`).then(setEffective).catch(setError); }, [selected]);
   return (
-    <RootGuard adminOnly><Title title="Access control" /><PageHeading eyebrow="Access" title="Role-based access control" copy="Review the fixed role templates and preview the effective customer scope for any user. Custom roles are a future extension point; server permissions remain authoritative." />
+    <RootGuard adminOnly><Title title="Access control" /><PageHeading eyebrow="Access governance" title="Role-based access control" copy="Review role capabilities, effective customer boundaries and the personal API policy. All permissions are enforced by the server." />
       {error ? <ErrorNotice error={error} /> : null}
       <Grid container spacing={2} sx={{ mb: 3 }}>{roles.map(role => <Grid key={role.id} size={{ xs: 12, lg: 4 }}><Card sx={{ height: '100%' }}><CardContent><SecurityOutlined color="primary" /><Typography variant="h6" sx={{ mt: 1 }}>{role.name}</Typography><Chip size="small" label={role.scope} sx={{ my: 1 }} /><List dense>{role.permissions.map(permission => <ListItem key={permission} disableGutters><ListItemIcon sx={{ minWidth: 30 }}><CheckCircleOutlined color="success" fontSize="small" /></ListItemIcon><ListItemText primary={permission} /></ListItem>)}</List></CardContent></Card></Grid>)}</Grid>
-      <Card><CardContent><Typography variant="h5">Effective access preview</Typography><Typography
+      <Grid container spacing={2}><Grid size={{ xs: 12, lg: 8 }}><Card sx={{ height: '100%' }}><CardContent><Typography variant="h5">Effective access preview</Typography><Typography
         sx={{
           color: "text.secondary",
           mb: 2
         }}>Select a user to see the final role and tenant boundary resolved by the API.</Typography><FormControl fullWidth sx={{ maxWidth: 520, mb: 2 }}><InputLabel>User</InputLabel><Select label="User" value={selected} onChange={event => setSelected(event.target.value)}>{users.map(user => <MenuItem key={user.id} value={user.id}>{user.email} — {user.role.replaceAll('_', ' ')}</MenuItem>)}</Select></FormControl>{effective && <Alert severity="info"><Typography sx={{
         fontWeight: 750
-      }}>{effective.user.email} · {effective.role.name}</Typography><Typography variant="body2">Customer scope: {effective.scope}</Typography></Alert>}</CardContent></Card>
+      }}>{effective.user.email} · {effective.role.name}</Typography><Typography variant="body2">Account: {effective.user.status} · Authentication: {effective.user.authSource || 'local'}</Typography><Typography variant="body2">Customer scope: {effective.scope}</Typography><Typography variant="body2">Personal API access: {effective.user.apiAccessEnabled ? `Enabled (${effective.user.apiTokenCount || 0} issued)` : 'Disabled'}</Typography></Alert>}</CardContent></Card></Grid>
+      <Grid size={{ xs: 12, lg: 4 }}><Card sx={{ height: '100%' }}><CardContent><KeyOutlined color="primary" /><Typography variant="h5" sx={{ mt: 1 }}>Personal API policy</Typography><List dense><ListItem disableGutters><ListItemText primary="Explicit per-user enablement" secondary="Disabled by default and revoked automatically when an account is disabled." /></ListItem><ListItem disableGutters><ListItemText primary="Least-privilege scopes" secondary="Separate read and write scopes with optional customer restrictions." /></ListItem><ListItem disableGutters><ListItemText primary="Short-lived secrets" secondary="Maximum 365-day lifetime; raw tokens are displayed once and only hashes are stored." /></ListItem><ListItem disableGutters><ListItemText primary="No administration by token" secondary="Personal tokens cannot call users, RBAC, branding, database or integration administration APIs." /></ListItem></List></CardContent></Card></Grid></Grid>
     </RootGuard>
   );
 }

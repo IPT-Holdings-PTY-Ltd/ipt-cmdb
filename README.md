@@ -16,8 +16,8 @@ IPT CMDB combines a tenant-aware asset inventory, business-system modelling, int
 | Area | Current capability |
 |---|---|
 | Multi-tenancy | MSP/root workspace, isolated customer workspaces and server-enforced company scope |
-| Access | Platform administrator, MSP operator and customer reader roles; customer groups and effective-access views |
-| Authentication | Local development sessions or Microsoft Entra ID through Azure Easy Auth-compatible headers |
+| Access | Governed user lifecycle, platform/MSP/customer roles, customer groups, effective-access views and restricted personal API tokens |
+| Authentication | Local development sessions or Microsoft Entra ID through Azure Easy Auth-compatible headers; session revocation on sensitive identity changes |
 | Assets | ITIL-aligned lifecycle, owners, criticality, environment, site, renewal, EOL and integration identity metadata |
 | Business systems | Business-facing services with owners, RTO/RPO, sign-off context and supporting CI stacks |
 | Relationships | Drag-and-drop React Flow maps with full-stack, network, storage, virtualization and business-impact perspectives |

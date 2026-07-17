@@ -32,7 +32,7 @@ branch = true
 source = ["app", "backend", "src"]
 
 [tool.coverage.report]
-fail_under = 58
+fail_under = 60
 precision = 1
 show_missing = true
 skip_covered = true

@@ -516,6 +516,7 @@ def backup_document(state: dict | None = None) -> dict:
         "excluded": [
             "PostgreSQL roles and grants",
             "canonical audit history",
+            "API token secrets and token hashes",
             "raw integration observations",
             "point-in-time transaction history",
         ],
@@ -696,8 +697,10 @@ ROLE_TEMPLATES = [
 
 
 def allowed(user: dict | None, company_id: str) -> bool:
+    token_company_ids = user.get("apiTokenCompanyIds", []) if user else []
     return bool(
         user
+        and (not token_company_ids or company_id in token_company_ids)
         and (
             user["role"] == "platform_admin"
             or "*" in user["companyIds"]
@@ -707,12 +710,27 @@ def allowed(user: dict | None, company_id: str) -> bool:
 
 
 def public_user(user: dict) -> dict:
-    return {k: user[k] for k in ("id", "email", "role", "companyIds")}
+    return {
+        "id": user["id"],
+        "email": user["email"],
+        "displayName": user.get("displayName") or user["email"].split("@", 1)[0],
+        "status": user.get("status", "active"),
+        "role": user["role"],
+        "companyIds": user["companyIds"],
+        "authSource": user.get("authSource", "local"),
+        "apiAccessEnabled": bool(user.get("apiAccessEnabled", False)),
+    }
 
 
 def visible_user(user: dict) -> dict:
     return {
         **public_user(user),
+        "directCompanyIds": user.get("directCompanyIds", user.get("companyIds", [])),
+        "groupIds": user.get("groupIds", []),
+        "apiTokenCount": int(user.get("apiTokenCount", 0)),
+        "lastLoginAt": user.get("lastLoginAt"),
+        "lastApiUsedAt": user.get("lastApiUsedAt"),
+        "archivedAt": user.get("archivedAt"),
         "accountType": user.get(
             "accountType",
             "root" if user["role"] in {"platform_admin", "msp_operator"} else "customer",
