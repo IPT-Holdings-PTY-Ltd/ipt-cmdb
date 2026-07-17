@@ -119,6 +119,8 @@ def build_seed_state(mode: str, source: dict | None = None) -> dict:
     state.setdefault("accessGroups", [{"id": "all-managed-customers", "name": "All managed customers", "companyIds": ["*"], "system": True}])
     state.setdefault("changes", [])
     state.setdefault("syncRuns", [])
+    state.setdefault("contacts", [])
+    state.setdefault("contactResponsibilities", [])
     return state
 
 def database_diagnostics(database_url: str | None = None) -> dict:
@@ -271,7 +273,7 @@ def backup_document(state: dict | None = None) -> dict:
         "createdAt": now(),
         "databaseMode": DATABASE_MODE,
         "backupType": "portable_operational_state",
-        "included": ["customers", "users and local credential hashes", "configuration items", "relationships", "changes", "integrations", "MSP branding"],
+        "included": ["customers", "contacts and responsibility history", "users and local credential hashes", "configuration items", "relationships", "changes", "integrations", "MSP branding"],
         "excluded": ["PostgreSQL roles and grants", "canonical audit history", "raw integration observations", "point-in-time transaction history"],
         "state": state,
         "checksum": f"sha256:{checksum}",
@@ -299,6 +301,7 @@ def preview_backup(document: dict) -> dict:
         "assets": len(state["assets"]),
         "relationships": len(state["relationships"]),
         "changes": len(state.get("changes", [])),
+        "contacts": len(state.get("contacts", [])),
         "warning": "Portable import adds or updates operational records. It does not delete canonical records absent from the file and is not a PostgreSQL point-in-time restore.",
     }
 
@@ -309,6 +312,8 @@ def restore_backup(document: dict) -> dict:
     state.setdefault("mspBranding", {"name": "CMDB Hub", "accent": "#50d5b9", "secondaryAccent": "#7997ff", "logoText": "C", "logoDataUrl": "", "logoFileName": "", "supportEmail": "", "supportUrl": "", "supportPhone": "", "welcomeMessage": "", "reportFooter": "", "confidentialityLabel": "Internal use only"})
     state.setdefault("accessGroups", [{"id": "all-managed-customers", "name": "All managed customers", "companyIds": ["*"], "system": True}])
     state.setdefault("changes", [])
+    state.setdefault("contacts", [])
+    state.setdefault("contactResponsibilities", [])
     with LOCK:
         DB.clear(); DB.update(state); save_db(DB)
     return {"message": "Portable backup imported successfully.", "companies": len(DB["companies"]), "assets": len(DB["assets"]), "restoredFrom": document.get("createdAt", "an unknown date"), "warning": preview["warning"]}
@@ -316,6 +321,8 @@ DB = load_db()
 DB.setdefault("mspBranding", {"name": "CMDB Hub", "accent": "#50d5b9", "secondaryAccent": "#7997ff", "logoText": "C", "logoDataUrl": "", "logoFileName": "", "supportEmail": "", "supportUrl": "", "supportPhone": "", "welcomeMessage": "", "reportFooter": "", "confidentialityLabel": "Internal use only"})
 DB.setdefault("accessGroups", [{"id": "all-managed-customers", "name": "All managed customers", "companyIds": ["*"], "system": True}])
 DB.setdefault("changes", [])
+DB.setdefault("contacts", [])
+DB.setdefault("contactResponsibilities", [])
 ROLE_TEMPLATES = [
     {"id": "platform_admin", "name": "Platform admin", "scope": "Root", "system": True, "permissions": ["Manage customers, groups and users", "Manage MSP integrations and branding", "Manage RBAC and database configuration", "Full customer CMDB access"]},
     {"id": "msp_operator", "name": "MSP operator", "scope": "Assigned customer groups", "system": True, "permissions": ["View and manage assigned customer CIs", "Manage customer users", "Run approved integration syncs", "No RBAC or database configuration"]},

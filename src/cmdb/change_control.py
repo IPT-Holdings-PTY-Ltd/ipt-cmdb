@@ -7,11 +7,13 @@ publisher does not need to change the frontend contract.
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from datetime import datetime, timezone
 from html import escape
 from io import BytesIO
 import base64
 import re
+import uuid
 
 
 CHANGE_TYPES = {"standard", "normal", "emergency"}
@@ -19,6 +21,33 @@ CHANGE_CATEGORIES = {"infrastructure", "network", "software", "database", "secur
 CHANGE_PRIORITIES = {"low", "medium", "high", "critical"}
 RISK_LEVELS = {"low", "medium", "high", "critical"}
 COMMUNICATION_STATES = {"required", "not_required", "completed"}
+CHANGE_STATUSES = {
+    "draft", "impact_review", "awaiting_approval", "approved", "declined",
+    "scheduled", "implementing", "completed", "failed", "backed_out",
+    "post_implementation_review", "cancelled", "closed",
+}
+CHANGE_TRANSITIONS = {
+    "draft": {"impact_review", "cancelled"},
+    "impact_review": {"draft", "awaiting_approval", "cancelled"},
+    "awaiting_approval": {"impact_review", "approved", "declined", "cancelled"},
+    "approved": {"impact_review", "scheduled", "cancelled"},
+    "declined": {"draft", "cancelled"},
+    "scheduled": {"approved", "implementing", "cancelled"},
+    "implementing": {"completed", "failed"},
+    "completed": {"post_implementation_review"},
+    "failed": {"backed_out", "post_implementation_review"},
+    "backed_out": {"post_implementation_review"},
+    "post_implementation_review": {"closed"},
+    "cancelled": set(),
+    "closed": set(),
+}
+FULL_EDIT_STATUSES = {"draft", "impact_review"}
+SCHEDULE_EDIT_STATUSES = {"approved", "scheduled"}
+SCHEDULE_EDIT_FIELDS = {
+    "plannedStart", "plannedEnd", "assignedTechnician", "communicationStatus",
+    "communicationPlan", "notes",
+}
+REASON_REQUIRED_TRANSITIONS = {"declined", "cancelled", "failed", "backed_out", "closed"}
 NON_PROPAGATING_RELATIONSHIPS = {"related_to", "member_of", "backs_up"}
 REVERSED_IMPACT_RELATIONSHIPS = {
     "depends_on", "installed_on", "stored_on", "provided_by", "managed_by", "protected_by",
@@ -369,11 +398,127 @@ def create_change_record(payload: dict, number: str, change_id: str, company: di
         "createdAt": timestamp,
         "updatedAt": timestamp,
         "revision": 1,
+        "actualStart": "",
+        "actualEnd": "",
+        "actualOutageMinutes": 0,
+        "outcome": "pending",
+        "failureReason": "",
+        "validationResult": "",
+        "rollbackExecuted": False,
+        "rollbackResult": "",
+        "closureNotes": "",
+        "approvals": [],
+        "statusHistory": [{
+            "id": str(uuid.uuid4()), "fromStatus": None, "toStatus": "draft",
+            "reason": "Change created", "actorId": actor.get("id"),
+            "actorEmail": actor.get("email", ""), "createdAt": timestamp,
+        }],
         "externalReferences": [],
         "integrationState": {
             "connectwise": {"status": "not_published", "ticketId": None, "ticketUrl": None, "lastAttemptAt": None, "error": None}
         },
     }
+
+
+def update_change_record(
+    change: dict, payload: dict, actor: dict, assets: list[dict], relationships: list[dict],
+) -> dict:
+    """Create a new immutable revision while preserving the change identity."""
+    current_status = str(change.get("status") or "draft")
+    provided_fields = {key for key, value in payload.items() if value is not None and key != "expectedRevision"}
+    if current_status in SCHEDULE_EDIT_STATUSES:
+        unsupported = provided_fields - SCHEDULE_EDIT_FIELDS
+        if unsupported:
+            raise ValueError("Approved changes only allow schedule, assignment, communication and notes updates")
+        updated = dict(change)
+        for field in SCHEDULE_EDIT_FIELDS:
+            if field in payload and payload[field] is not None:
+                updated[field] = str(payload[field]).strip()[:8000]
+        if updated.get("plannedStart") and updated.get("plannedEnd") and updated["plannedEnd"] <= updated["plannedStart"]:
+            raise ValueError("Planned end must be after planned start")
+    elif current_status in FULL_EDIT_STATUSES:
+        merged = {**change, **{key: value for key, value in payload.items() if value is not None}}
+        values = normalise_change_payload(merged)
+        preview = preview_change_impact(
+            change["companyId"], values["scopeAssetIds"], values["outageExpected"], assets, relationships,
+        )
+        updated = dict(change)
+        for field in (
+            "title", "changeType", "category", "priority", "outageExpected", "plannedStart", "plannedEnd",
+            "reason", "businessImpact", "implementationPlan", "validationPlan", "rollbackPlan",
+            "communicationStatus", "communicationPlan", "assignedTechnician", "approver", "notes",
+            "scopeAssetIds",
+        ):
+            updated[field] = values[field]
+        suggested_risk = preview["summary"]["suggestedRisk"]
+        updated["riskLevel"] = values["riskLevel"] or suggested_risk["level"]
+        updated["riskSource"] = "technician" if values["riskLevel"] else "cmdb_suggestion"
+        updated["riskAssessment"] = suggested_risk
+        updated["impactSnapshot"] = preview["items"]
+        updated["impactSummary"] = preview["summary"]
+    else:
+        raise ValueError(f"A change in {current_status.replace('_', ' ')} status cannot be edited")
+    updated["revision"] = int(change.get("revision") or 1) + 1
+    updated["updatedAt"] = utc_now()
+    updated["lastUpdatedBy"] = {"id": actor.get("id"), "email": actor.get("email", "")}
+    return updated
+
+
+def transition_change_record(change: dict, target_status: str, payload: dict, actor: dict) -> dict:
+    """Apply an explicit, auditable lifecycle transition."""
+    current_status = str(change.get("status") or "draft")
+    target = str(target_status or "").lower()
+    if target not in CHANGE_STATUSES or target not in CHANGE_TRANSITIONS.get(current_status, set()):
+        raise ValueError(
+            f"Change cannot move from {current_status.replace('_', ' ')} to {target.replace('_', ' ')}"
+        )
+    reason = str(payload.get("reason") or "").strip()
+    if target in REASON_REQUIRED_TRANSITIONS and len(reason) < 4:
+        raise ValueError(f"Enter a reason for marking this change {target.replace('_', ' ')}")
+    timestamp = utc_now()
+    updated = deepcopy(change)
+    updated["status"] = target
+    updated["updatedAt"] = timestamp
+    updated["revision"] = int(change.get("revision") or 1) + 1
+    updated["lastUpdatedBy"] = {"id": actor.get("id"), "email": actor.get("email", "")}
+    history = list(updated.get("statusHistory") or [])
+    history.append({
+        "id": str(uuid.uuid4()), "fromStatus": current_status, "toStatus": target,
+        "reason": reason, "actorId": actor.get("id"), "actorEmail": actor.get("email", ""),
+        "createdAt": timestamp,
+    })
+    updated["statusHistory"] = history
+    if target in {"approved", "declined"}:
+        approvals = list(updated.get("approvals") or [])
+        approvals.append({
+            "id": str(uuid.uuid4()), "decision": target, "comments": reason,
+            "actorId": actor.get("id"), "actorEmail": actor.get("email", ""), "createdAt": timestamp,
+        })
+        updated["approvals"] = approvals
+    if target == "implementing":
+        updated["actualStart"] = str(payload.get("actualStart") or timestamp)
+    if target in {"completed", "failed"}:
+        updated["actualEnd"] = str(payload.get("actualEnd") or timestamp)
+        try:
+            updated["actualOutageMinutes"] = max(0, int(payload.get("actualOutageMinutes") or 0))
+        except (TypeError, ValueError) as error:
+            raise ValueError("Actual outage must be a whole number of minutes") from error
+    if target == "completed":
+        updated["outcome"] = "successful"
+        updated["validationResult"] = str(payload.get("validationResult") or reason).strip()[:8000]
+    elif target == "failed":
+        updated["outcome"] = "failed"
+        updated["failureReason"] = reason[:8000]
+        updated["validationResult"] = str(payload.get("validationResult") or "").strip()[:8000]
+    elif target == "backed_out":
+        updated["outcome"] = "backed_out"
+        updated["rollbackExecuted"] = True
+        updated["rollbackResult"] = str(payload.get("rollbackResult") or reason).strip()[:8000]
+    elif target == "cancelled":
+        updated["outcome"] = "cancelled"
+    elif target == "closed":
+        updated["closureNotes"] = str(payload.get("closureNotes") or reason).strip()[:8000]
+    return updated
 
 
 def _safe(value: object) -> str:
@@ -468,6 +613,8 @@ def render_change_pdf(change: dict, company: dict, branding: dict) -> bytes:
         ["Planned start", change.get("plannedStart") or "Not scheduled", "Planned end", change.get("plannedEnd") or "Not scheduled"],
         ["Assigned technician", change.get("assignedTechnician") or "Not assigned", "Approver", change.get("approver") or "Not assigned"],
         ["Customer communication", _label(change.get("communicationStatus")), "Revision", str(change.get("revision", 1))],
+        ["Actual start", change.get("actualStart") or "Not started", "Actual end", change.get("actualEnd") or "Not completed"],
+        ["Outcome", _label(change.get("outcome") or "pending"), "Actual outage", f"{int(change.get('actualOutageMinutes') or 0)} minute(s)"],
     ]
     summary_table = Table([[Paragraph(f"<b>{_safe(a)}</b>", styles["Cell"]), Paragraph(_safe(b), styles["Cell"]), Paragraph(f"<b>{_safe(c)}</b>", styles["Cell"]), Paragraph(_safe(d), styles["Cell"])] for a, b, c, d in summary_data], colWidths=[32 * mm, 57 * mm, 32 * mm, 57 * mm])
     summary_table.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.4, line), ("BACKGROUND", (0, 0), (0, -1), pale), ("BACKGROUND", (2, 0), (2, -1), pale), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 3 * mm), ("RIGHTPADDING", (0, 0), (-1, -1), 3 * mm), ("TOPPADDING", (0, 0), (-1, -1), 2.2 * mm), ("BOTTOMPADDING", (0, 0), (-1, -1), 2.2 * mm)]))
@@ -568,6 +715,19 @@ def render_change_pdf(change: dict, company: dict, branding: dict) -> bytes:
     for heading, text in plan_sections:
         story.append(KeepTogether([Paragraph(heading, styles["Section"]), Paragraph(_safe(text).replace("\n", "<br/>"), styles["Plan"])]))
 
+    if change.get("outcome") not in {None, "", "pending"} or change.get("validationResult") or change.get("failureReason"):
+        story.append(Paragraph("Implementation outcome", styles["Section"]))
+        outcome_rows = [
+            ["Outcome", _label(change.get("outcome") or "pending")],
+            ["Validation result", change.get("validationResult") or "Not recorded"],
+            ["Failure reason", change.get("failureReason") or "Not applicable"],
+            ["Rollback", change.get("rollbackResult") or ("Executed" if change.get("rollbackExecuted") else "Not executed")],
+            ["Closure notes", change.get("closureNotes") or "Not yet closed"],
+        ]
+        outcome_table = Table([[Paragraph(f"<b>{_safe(label)}</b>", styles["Cell"]), Paragraph(_safe(value), styles["Cell"])] for label, value in outcome_rows], colWidths=[48 * mm, 130 * mm])
+        outcome_table.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.4, line), ("BACKGROUND", (0, 0), (0, -1), pale), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 3 * mm), ("RIGHTPADDING", (0, 0), (-1, -1), 3 * mm), ("TOPPADDING", (0, 0), (-1, -1), 2.3 * mm), ("BOTTOMPADDING", (0, 0), (-1, -1), 2.3 * mm)]))
+        story.append(outcome_table)
+
     story.append(Paragraph("Record and integration details", styles["Section"]))
     cw_state = change.get("integrationState", {}).get("connectwise", {})
     record_data = [
@@ -582,7 +742,18 @@ def render_change_pdf(change: dict, company: dict, branding: dict) -> bytes:
     story.append(record_table)
 
     story.extend([Spacer(1, 8 * mm), Paragraph("Approval", styles["Section"])])
-    approval_rows = [["Approver", "Signature", "Decision", "Date"], [change.get("approver") or "Change approver", "", "Approved / Rejected", ""]]
+    approval_rows = [["Approver", "Comments / signature", "Decision", "Date"]]
+    recorded_approvals = change.get("approvals") or []
+    if recorded_approvals:
+        for decision in recorded_approvals:
+            approval_rows.append([
+                decision.get("actorEmail") or "Recorded approver",
+                decision.get("comments") or "",
+                _label(decision.get("decision")),
+                decision.get("createdAt") or "",
+            ])
+    else:
+        approval_rows.append([change.get("approver") or "Change approver", "", "Approved / Declined", ""])
     recorded_approvers = {str(change.get("approver") or "").strip().lower()}
     for item in business_systems:
         if item.get("signoffRequired") == "no":

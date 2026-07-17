@@ -11,6 +11,7 @@ import BusinessCenterOutlined from '@mui/icons-material/BusinessCenterOutlined';
 import AssessmentOutlined from '@mui/icons-material/AssessmentOutlined';
 import HistoryOutlined from '@mui/icons-material/HistoryOutlined';
 import FactCheckOutlined from '@mui/icons-material/FactCheckOutlined';
+import ContactsOutlined from '@mui/icons-material/ContactsOutlined';
 import { Box, FormControl, MenuItem, Select, Stack, Typography } from '@mui/material';
 import { AppBar, Layout, Menu, useRefresh, type LayoutProps } from 'react-admin';
 import { useWorkspace } from './workspace';
@@ -73,6 +74,7 @@ function WorkspaceMenu() {
       <Menu.ResourceItem name="assets" />
       <Menu.Item to="/relationships" primaryText="Relationships" leftIcon={<AccountTreeOutlined />} />
       <Menu.Item to="/changes" primaryText="Change control" leftIcon={<AssignmentOutlined />} />
+      <Menu.Item to="/contacts" primaryText="Contacts" leftIcon={<ContactsOutlined />} />
       {section('Governance')}
       <Menu.Item to="/governance/audit" primaryText="Audit activity" leftIcon={<HistoryOutlined />} />
       <Menu.Item to="/governance/data-quality" primaryText="Data quality" leftIcon={<FactCheckOutlined />} />
@@ -81,6 +83,7 @@ function WorkspaceMenu() {
     </>}
     {workspace.isRoot && rootRole && <>
       {section('Organisation')}
+      <Menu.Item to="/contacts" primaryText="Contact directory" leftIcon={<ContactsOutlined />} />
       {platformAdmin && <Menu.Item to="/admin/customers" primaryText="Customers" leftIcon={<AddBusinessOutlined />} />}
       {platformAdmin && <Menu.Item to="/admin/customer-groups" primaryText="Customer groups" leftIcon={<GroupsOutlined />} />}
       {section('Access')}

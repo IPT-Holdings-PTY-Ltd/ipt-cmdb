@@ -6,6 +6,51 @@ export type User = {
   accountType?: 'root' | 'customer';
 };
 
+export type Contact = {
+  id: string;
+  companyId: string;
+  linkedUserId?: string | null;
+  displayName: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+  phone: string;
+  mobile: string;
+  jobTitle: string;
+  department: string;
+  location: string;
+  timezone: string;
+  managerContactId?: string | null;
+  status: 'active' | 'on_leave' | 'left_company' | 'inactive';
+  source: string;
+  syncStatus: 'not_synced' | 'current' | 'stale' | 'conflict' | 'error';
+  lastSeen?: string | null;
+  lastSynced?: string | null;
+  attributes: Record<string, unknown>;
+  responsibilityCount: number;
+  portalUser?: { id: string; email: string; role: User['role']; status: 'active' | 'invited' | 'disabled' } | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ContactResponsibility = {
+  id: string;
+  companyId: string;
+  assetId: string;
+  assetName: string;
+  assetType: string;
+  contactId: string;
+  contactName: string;
+  contactEmail: string;
+  role: 'business_owner' | 'service_owner' | 'technical_owner' | 'custodian' | 'change_approver' | 'signoff_delegate' | 'support_contact';
+  isPrimary: boolean;
+  effectiveFrom: string;
+  effectiveUntil?: string | null;
+  escalationOrder: number;
+  notes: string;
+  source: string;
+};
+
 export type Company = {
   id: string;
   name: string;
@@ -74,6 +119,7 @@ export type Asset = {
   lastSeen?: string;
   fields: Record<string, unknown>;
   metadata: AssetMetadata;
+  responsibilities: ContactResponsibility[];
 };
 
 export type Relationship = {
@@ -191,11 +237,36 @@ export type ChangePackage = {
   category: string;
   priority: string;
   riskLevel: string;
+  riskSource: string;
+  riskAssessment: { score: number; level: string; factors: string[] };
   outageExpected: boolean;
   plannedStart: string;
   plannedEnd: string;
+  reason: string;
+  businessImpact: string;
+  implementationPlan: string;
+  validationPlan: string;
+  rollbackPlan: string;
+  communicationStatus: string;
+  communicationPlan: string;
   assignedTechnician: string;
   approver: string;
+  notes: string;
+  scopeAssetIds: string[];
+  revision: number;
+  updatedAt: string;
+  actualStart: string;
+  actualEnd: string;
+  actualOutageMinutes: number;
+  outcome: 'pending' | 'successful' | 'failed' | 'backed_out' | 'cancelled';
+  failureReason: string;
+  validationResult: string;
+  rollbackExecuted: boolean;
+  rollbackResult: string;
+  closureNotes: string;
+  approvals: Array<{ id: string; decision: 'approved' | 'declined'; comments: string; actorId?: string | null; actorEmail: string; createdAt: string }>;
+  statusHistory: Array<{ id: string; fromStatus?: string | null; toStatus: string; reason: string; actorId?: string | null; actorEmail: string; createdAt: string }>;
+  createdBy: { id?: string | null; email: string };
   createdAt: string;
   impactSnapshot: ChangeImpactItem[];
   impactSummary: ChangeImpactPreview['summary'];

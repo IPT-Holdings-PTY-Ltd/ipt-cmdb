@@ -3,14 +3,14 @@ import AddOutlined from '@mui/icons-material/AddOutlined';
 import BusinessCenterOutlined from '@mui/icons-material/BusinessCenterOutlined';
 import EditOutlined from '@mui/icons-material/EditOutlined';
 import {
-  Alert, Box, Button, Card, CardActions, CardContent, Chip, CircularProgress, Dialog, DialogActions,
+  Alert, Autocomplete, Box, Button, Card, CardActions, CardContent, Chip, CircularProgress, Dialog, DialogActions,
   DialogContent, DialogTitle, FormControl, Grid, InputLabel, MenuItem, Select, Stack, TextField, Typography,
 } from '@mui/material';
 import { useEffect, useMemo, useState } from 'react';
 import { Title } from 'react-admin';
 import { useNavigate } from 'react-router-dom';
 import { apiFetch, getSession } from './session';
-import type { Asset, AssetMetadata, Relationship } from './types';
+import type { Asset, AssetMetadata, Contact, Relationship } from './types';
 import { useWorkspace } from './workspace';
 
 type BusinessSystemDraft = {
@@ -18,10 +18,11 @@ type BusinessSystemDraft = {
   name: string;
   status: string;
   metadata: Partial<AssetMetadata>;
+  ownerSelections: Record<string, string>;
 };
 
 const blankDraft = (): BusinessSystemDraft => ({
-  name: '', status: 'Active', metadata: {
+  name: '', status: 'Active', ownerSelections: {}, metadata: {
     lifecycle: 'in_service', operationalStatus: 'healthy', criticality: 'high', environment: 'production',
     dataClassification: 'internal', customerFacing: 'no', signoffRequired: 'yes',
   },
@@ -43,6 +44,7 @@ export function BusinessSystemsPage() {
   const canEdit = ['platform_admin', 'msp_operator'].includes(getSession()?.user.role || '');
   const [assets, setAssets] = useState<Asset[]>([]);
   const [relationships, setRelationships] = useState<Relationship[]>([]);
+  const [contacts, setContacts] = useState<Contact[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -52,10 +54,11 @@ export function BusinessSystemsPage() {
     setLoading(true); setError('');
     try {
       const suffix = `?companyId=${encodeURIComponent(workspace.companyId)}`;
-      const [assetData, relationshipData] = await Promise.all([
+      const [assetData, relationshipData, contactData] = await Promise.all([
         apiFetch<Asset[]>(`/api/assets${suffix}`), apiFetch<Relationship[]>(`/api/relationships${suffix}`),
+        apiFetch<Contact[]>(`/api/contacts${suffix}`),
       ]);
-      setAssets(assetData); setRelationships(relationshipData);
+      setAssets(assetData); setRelationships(relationshipData); setContacts(contactData);
     } catch (value) { setError(value instanceof Error ? value.message : 'Business systems could not be loaded.'); }
     finally { setLoading(false); }
   };
@@ -63,13 +66,18 @@ export function BusinessSystemsPage() {
   useEffect(() => { if (!workspace.isRoot) void load(); }, [workspace.companyId, workspace.isRoot]);
   const systems = useMemo(() => assets.filter(asset => asset.type === 'Business system').sort((a, b) => a.name.localeCompare(b.name)), [assets]);
 
-  const editSystem = (asset: Asset) => setDraft({ id: asset.id, name: asset.name, status: asset.status, metadata: { ...asset.metadata } });
+  const editSystem = (asset: Asset) => setDraft({
+    id: asset.id, name: asset.name, status: asset.status, metadata: { ...asset.metadata },
+    ownerSelections: Object.fromEntries((asset.responsibilities || []).filter(item => !item.effectiveUntil && item.isPrimary).map(item => [item.role, item.contactId])),
+  });
   const setMetadata = (field: keyof AssetMetadata, value: string) => setDraft(current => current ? ({ ...current, metadata: { ...current.metadata, [field]: value } }) : current);
   const save = async () => {
     if (!draft?.name.trim()) { setError('Enter a business system name.'); return; }
+    if (!draft.ownerSelections.business_owner) { setError('Choose a business owner from the contact directory.'); return; }
     setSaving(true); setError('');
     try {
-      const body = JSON.stringify({ name: draft.name.trim(), type: 'Business system', status: draft.status, metadata: draft.metadata, ...(draft.id ? {} : { companyId: workspace.companyId, fields: {} }) });
+      const responsibilities = Object.entries(draft.ownerSelections).filter(([, contactId]) => Boolean(contactId)).map(([role, contactId]) => ({ role, contactId, isPrimary: true, escalationOrder: 1 }));
+      const body = JSON.stringify({ name: draft.name.trim(), type: 'Business system', status: draft.status, metadata: draft.metadata, responsibilities, ...(draft.id ? {} : { companyId: workspace.companyId, fields: {} }) });
       await apiFetch(draft.id ? `/api/assets/${draft.id}` : '/api/assets', { method: draft.id ? 'PATCH' : 'POST', body });
       setDraft(null); await load();
     } catch (value) { setError(value instanceof Error ? value.message : 'The business system could not be saved.'); }
@@ -77,6 +85,14 @@ export function BusinessSystemsPage() {
   };
 
   if (workspace.isRoot) return <Alert severity="info">Choose a customer workspace to manage its business systems.</Alert>;
+  const contactOptions = contacts.filter(item => ['active', 'on_leave'].includes(item.status));
+  const ownerField = (role: string, label: string, required = false) => <Autocomplete
+    options={contactOptions}
+    value={contactOptions.find(item => item.id === draft?.ownerSelections[role]) || null}
+    getOptionLabel={item => `${item.displayName}${item.department ? ` · ${item.department}` : ''}`}
+    onChange={(_, contact) => setDraft(current => current ? ({ ...current, ownerSelections: { ...current.ownerSelections, [role]: contact?.id || '' } }) : current)}
+    renderInput={params => <TextField {...params} required={required} label={label} helperText={required && !contactOptions.length ? 'Create a contact before assigning an owner.' : ''} />}
+  />;
   return (
     <Box>
       <Title title="Business systems" />
@@ -149,11 +165,12 @@ export function BusinessSystemsPage() {
             <Grid size={{ xs: 12, md: 6 }}><TextField fullWidth label="Department" value={draft.metadata.department || ''} onChange={event => setMetadata('department', event.target.value)} /></Grid>
           </Grid></Box>
           <Box><Typography variant="subtitle2" sx={{ mb: 1.5 }}>Ownership and approval</Typography><Grid container spacing={2}>
-            <Grid size={{ xs: 12, md: 4 }}><TextField fullWidth required label="Business owner" value={draft.metadata.businessOwner || ''} onChange={event => setMetadata('businessOwner', event.target.value)} /></Grid>
-            <Grid size={{ xs: 12, md: 4 }}><TextField fullWidth label="Service owner" value={draft.metadata.serviceOwner || ''} onChange={event => setMetadata('serviceOwner', event.target.value)} /></Grid>
-            <Grid size={{ xs: 12, md: 4 }}><TextField fullWidth label="Technical owner" value={draft.metadata.technicalOwner || ''} onChange={event => setMetadata('technicalOwner', event.target.value)} /></Grid>
-            <Grid size={{ xs: 12, md: 8 }}><TextField fullWidth label="Signoff delegate" value={draft.metadata.signoffDelegate || ''} onChange={event => setMetadata('signoffDelegate', event.target.value)} helperText="Optional person who can approve changes for the business owner." /></Grid>
+            <Grid size={{ xs: 12, md: 4 }}>{ownerField('business_owner', 'Business owner', true)}</Grid>
+            <Grid size={{ xs: 12, md: 4 }}>{ownerField('service_owner', 'Service owner')}</Grid>
+            <Grid size={{ xs: 12, md: 4 }}>{ownerField('technical_owner', 'Technical owner')}</Grid>
+            <Grid size={{ xs: 12, md: 8 }}>{ownerField('signoff_delegate', 'Signoff delegate')}</Grid>
             <Grid size={{ xs: 12, md: 4 }}><FormControl fullWidth><InputLabel>Business signoff</InputLabel><Select label="Business signoff" value={draft.metadata.signoffRequired || 'yes'} onChange={event => setMetadata('signoffRequired', event.target.value)}><MenuItem value="yes">Required</MenuItem><MenuItem value="no">Not required</MenuItem></Select></FormControl></Grid>
+            <Grid size={{ xs: 12 }}><Button size="small" startIcon={<AddOutlined />} onClick={() => { setDraft(null); navigate('/contacts'); }}>Create or update contacts</Button></Grid>
           </Grid></Box>
           <Box><Typography variant="subtitle2" sx={{ mb: 1.5 }}>Impact and recovery</Typography><Grid container spacing={2}>
             <Grid size={{ xs: 12, md: 3 }}><FormControl fullWidth><InputLabel>Criticality</InputLabel><Select label="Criticality" value={draft.metadata.criticality || 'high'} onChange={event => setMetadata('criticality', event.target.value)}>{selectOptions.criticality.map(value => <MenuItem key={value} value={value}>{value}</MenuItem>)}</Select></FormControl></Grid>

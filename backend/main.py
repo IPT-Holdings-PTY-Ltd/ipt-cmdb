@@ -23,7 +23,14 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 import app as core
-from src.cmdb.change_control import change_pdf_filename, create_change_record, preview_change_impact, render_change_pdf
+from src.cmdb.change_control import (
+    change_pdf_filename,
+    create_change_record,
+    preview_change_impact,
+    render_change_pdf,
+    transition_change_record,
+    update_change_record,
+)
 from src.cmdb.audit import AuditContext, reset_audit_context, set_audit_context
 from src.cmdb.data_quality import RULES as DATA_QUALITY_RULES, evaluate_data_quality
 from src.cmdb.repository import PostgresCmdbRepository, StateRepository, canonical_uuid
@@ -258,6 +265,57 @@ class UserCreateRequest(BaseModel):
     groupIds: list[str] = Field(default_factory=list)
 
 
+class ContactCreateRequest(BaseModel):
+    companyId: str = Field(min_length=1)
+    displayName: str = Field(min_length=1, max_length=180)
+    firstName: str = Field(default="", max_length=100)
+    lastName: str = Field(default="", max_length=100)
+    email: str = Field(default="", max_length=320)
+    phone: str = Field(default="", max_length=80)
+    mobile: str = Field(default="", max_length=80)
+    jobTitle: str = Field(default="", max_length=160)
+    department: str = Field(default="", max_length=160)
+    location: str = Field(default="", max_length=160)
+    timezone: str = Field(default="", max_length=100)
+    managerContactId: str | None = None
+    status: str = "active"
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class ContactPatchRequest(BaseModel):
+    displayName: str | None = Field(default=None, min_length=1, max_length=180)
+    firstName: str | None = Field(default=None, max_length=100)
+    lastName: str | None = Field(default=None, max_length=100)
+    email: str | None = Field(default=None, max_length=320)
+    phone: str | None = Field(default=None, max_length=80)
+    mobile: str | None = Field(default=None, max_length=80)
+    jobTitle: str | None = Field(default=None, max_length=160)
+    department: str | None = Field(default=None, max_length=160)
+    location: str | None = Field(default=None, max_length=160)
+    timezone: str | None = Field(default=None, max_length=100)
+    managerContactId: str | None = None
+    status: str | None = None
+    attributes: dict[str, Any] | None = None
+    reason: str = Field(default="", max_length=1000)
+
+
+class PortalUserCreateRequest(BaseModel):
+    password: str = Field(min_length=8, max_length=512)
+
+
+class ContactReassignRequest(BaseModel):
+    replacementContactId: str = Field(min_length=1)
+    reason: str = Field(min_length=4, max_length=1000)
+
+
+class ResponsibilityInput(BaseModel):
+    contactId: str = Field(min_length=1)
+    role: str = Field(min_length=1, max_length=80)
+    isPrimary: bool = True
+    escalationOrder: int = Field(default=1, ge=1, le=100)
+    notes: str = Field(default="", max_length=1000)
+
+
 class AssetCreateRequest(BaseModel):
     companyId: str = Field(min_length=1)
     name: str = Field(min_length=1, max_length=240)
@@ -265,6 +323,7 @@ class AssetCreateRequest(BaseModel):
     status: str = Field(default="Active", max_length=80)
     fields: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] | None = None
+    responsibilities: list[ResponsibilityInput] = Field(default_factory=list)
 
 
 class AssetPatchRequest(BaseModel):
@@ -273,6 +332,7 @@ class AssetPatchRequest(BaseModel):
     status: str | None = Field(default=None, max_length=80)
     fields: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
+    responsibilities: list[ResponsibilityInput] | None = None
 
 
 class RelationshipCreateRequest(BaseModel):
@@ -345,6 +405,41 @@ class ChangeCreateRequest(ChangeImpactRequest):
     assignedTechnician: str = ""
     approver: str = ""
     notes: str = ""
+
+
+class ChangeUpdateRequest(BaseModel):
+    expectedRevision: int = Field(ge=1)
+    scopeAssetIds: list[str] | None = None
+    title: str | None = Field(default=None, min_length=1, max_length=240)
+    changeType: str | None = None
+    category: str | None = None
+    priority: str | None = None
+    riskLevel: str | None = None
+    outageExpected: bool | None = None
+    plannedStart: str | None = None
+    plannedEnd: str | None = None
+    reason: str | None = Field(default=None, max_length=8000)
+    businessImpact: str | None = Field(default=None, max_length=8000)
+    implementationPlan: str | None = Field(default=None, max_length=8000)
+    validationPlan: str | None = Field(default=None, max_length=8000)
+    rollbackPlan: str | None = Field(default=None, max_length=8000)
+    communicationStatus: str | None = None
+    communicationPlan: str | None = Field(default=None, max_length=8000)
+    assignedTechnician: str | None = Field(default=None, max_length=240)
+    approver: str | None = Field(default=None, max_length=240)
+    notes: str | None = Field(default=None, max_length=8000)
+
+
+class ChangeTransitionRequest(BaseModel):
+    status: str = Field(min_length=1, max_length=80)
+    expectedRevision: int = Field(ge=1)
+    reason: str = Field(default="", max_length=8000)
+    actualStart: str = ""
+    actualEnd: str = ""
+    actualOutageMinutes: int = Field(default=0, ge=0)
+    validationResult: str = Field(default="", max_length=8000)
+    rollbackResult: str = Field(default="", max_length=8000)
+    closureNotes: str = Field(default="", max_length=8000)
 
 
 @api.get("/api/v2/health", tags=["platform"])
@@ -735,6 +830,248 @@ def create_user(payload: UserCreateRequest, request: Request) -> dict:
     return core.visible_user(new_user)
 
 
+CONTACT_STATUSES = {"active", "on_leave", "left_company", "inactive"}
+RESPONSIBILITY_ROLES = {
+    "business_owner", "service_owner", "technical_owner", "custodian",
+    "change_approver", "signoff_delegate", "support_contact",
+}
+RESPONSIBILITY_METADATA_FIELDS = {
+    "business_owner": "businessOwner",
+    "service_owner": "serviceOwner",
+    "technical_owner": "technicalOwner",
+    "custodian": "custodian",
+    "signoff_delegate": "signoffDelegate",
+}
+
+
+def _contact_for_user(contact_id: str, user: dict, require_manage: bool = False) -> dict:
+    contact = REPOSITORY.get_contact(contact_id)
+    if not contact:
+        raise HTTPException(404, "Contact not found")
+    _company_for_user(contact["companyId"], user, require_manage=require_manage)
+    return contact
+
+
+def _contact_values(payload: ContactCreateRequest | ContactPatchRequest, current: dict | None = None) -> dict:
+    values = {**(current or {}), **payload.model_dump(exclude_unset=True)}
+    values.pop("reason", None)
+    values["displayName"] = str(values.get("displayName") or "").strip()
+    if not values["displayName"]:
+        raise HTTPException(400, "Enter a contact name")
+    values["email"] = str(values.get("email") or "").strip().lower()
+    if values["email"] and "@" not in values["email"]:
+        raise HTTPException(400, "Enter a valid contact email address")
+    values["status"] = values.get("status") or "active"
+    if values["status"] not in CONTACT_STATUSES:
+        raise HTTPException(400, "Choose a valid contact status")
+    for field in ("firstName", "lastName", "phone", "mobile", "jobTitle", "department", "location", "timezone"):
+        values[field] = str(values.get(field) or "").strip()
+    return values
+
+
+def _validate_contact_assignments(company_id: str, assignments: list[ResponsibilityInput]) -> list[dict]:
+    contacts = {item["id"]: item for item in REPOSITORY.list_contacts(company_id)}
+    normalized = []
+    seen: set[tuple[str, str]] = set()
+    primaries: set[str] = set()
+    for assignment in assignments:
+        item = assignment.model_dump()
+        if item["role"] not in RESPONSIBILITY_ROLES:
+            raise HTTPException(400, "Choose a valid responsibility role")
+        contact = contacts.get(item["contactId"])
+        if not contact:
+            raise HTTPException(400, "Choose contacts belonging to this customer")
+        if contact["status"] in {"left_company", "inactive"}:
+            raise HTTPException(400, f"{contact['displayName']} is not an active contact")
+        key = (item["role"], item["contactId"])
+        if key in seen:
+            raise HTTPException(400, "A contact can only hold each responsibility once")
+        if item["isPrimary"] and item["role"] in primaries:
+            raise HTTPException(400, "Choose only one primary contact for each responsibility")
+        seen.add(key)
+        if item["isPrimary"]:
+            primaries.add(item["role"])
+        normalized.append(item)
+    return normalized
+
+
+def _responsibility_metadata(metadata: dict | None, company_id: str, assignments: list[dict]) -> dict:
+    result = dict(metadata or {})
+    for field in RESPONSIBILITY_METADATA_FIELDS.values():
+        result[field] = ""
+    contacts = {item["id"]: item for item in REPOSITORY.list_contacts(company_id)}
+    ordered = sorted(assignments, key=lambda item: (not item.get("isPrimary", True), int(item.get("escalationOrder", 1))))
+    for assignment in ordered:
+        field = RESPONSIBILITY_METADATA_FIELDS.get(assignment["role"])
+        contact = contacts.get(assignment["contactId"])
+        if field and contact and not result.get(field):
+            result[field] = contact["displayName"]
+    return result
+
+
+@api.get("/api/contacts", tags=["contacts"])
+def list_contacts(request: Request, companyId: str | None = None) -> list[dict]:
+    user = current_user(request)
+    if companyId:
+        _company_for_user(companyId, user)
+    else:
+        _require_role(user, {"platform_admin", "msp_operator"}, "MSP contact directory requires a root role")
+    return [
+        item for item in REPOSITORY.list_contacts(companyId)
+        if core.allowed(user, item["companyId"])
+    ]
+
+
+@api.get("/api/contacts/{contact_id}", tags=["contacts"])
+def get_contact(contact_id: str, request: Request) -> dict:
+    contact = _contact_for_user(contact_id, current_user(request))
+    return {
+        **contact,
+        "responsibilities": REPOSITORY.list_contact_responsibilities(
+            contact["companyId"], contact_id=contact_id, include_inactive=True,
+        ),
+    }
+
+
+@api.post("/api/contacts", status_code=201, tags=["contacts"])
+def create_contact(payload: ContactCreateRequest, request: Request) -> dict:
+    actor = current_user(request)
+    _company_for_user(payload.companyId, actor, require_manage=True)
+    values = _contact_values(payload)
+    if values["email"] and any(item["email"].lower() == values["email"] for item in REPOSITORY.list_contacts(payload.companyId)):
+        raise HTTPException(409, "A contact with this email already exists for the customer")
+    if values.get("managerContactId"):
+        manager = _contact_for_user(values["managerContactId"], actor)
+        if manager["companyId"] != payload.companyId:
+            raise HTTPException(400, "Choose a manager from the same customer")
+    contact = {
+        "id": str(uuid.uuid4()), "companyId": payload.companyId, "linkedUserId": None,
+        **values, "source": "manual", "syncStatus": "not_synced",
+        "lastSeen": core.now(), "lastSynced": None,
+    }
+    with core.LOCK:
+        return REPOSITORY.create_contact(contact, actor["id"])
+
+
+@api.patch("/api/contacts/{contact_id}", tags=["contacts"])
+def update_contact(contact_id: str, payload: ContactPatchRequest, request: Request) -> dict:
+    actor = current_user(request)
+    current = _contact_for_user(contact_id, actor, require_manage=True)
+    values = _contact_values(payload, current)
+    if values["email"] and any(
+        item["id"] != contact_id and item["email"].lower() == values["email"]
+        for item in REPOSITORY.list_contacts(current["companyId"])
+    ):
+        raise HTTPException(409, "A contact with this email already exists for the customer")
+    if values.get("managerContactId"):
+        manager = _contact_for_user(values["managerContactId"], actor)
+        if manager["companyId"] != current["companyId"] or manager["id"] == contact_id:
+            raise HTTPException(400, "Choose another contact from the same customer as manager")
+    if values["status"] in {"left_company", "inactive"} and len(payload.reason.strip()) < 4:
+        raise HTTPException(400, "Enter a reason when offboarding or deactivating a contact")
+    if values["status"] in {"left_company", "inactive"} and current.get("responsibilityCount", 0) > 0:
+        raise HTTPException(409, "Reassign this contact's active responsibilities before offboarding")
+    values.pop("responsibilityCount", None); values.pop("portalUser", None)
+    with core.LOCK:
+        if values["status"] in {"left_company", "inactive"} and current.get("linkedUserId"):
+            REPOSITORY.set_user_status(
+                current["linkedUserId"], "disabled", actor["id"], reason=payload.reason.strip()
+            )
+        stored = REPOSITORY.update_contact(contact_id, values, actor["id"], reason=payload.reason.strip())
+    if not stored:
+        raise HTTPException(404, "Contact not found")
+    return stored
+
+
+@api.post("/api/contacts/{contact_id}/reassign", tags=["contacts"])
+def reassign_contact(contact_id: str, payload: ContactReassignRequest, request: Request) -> dict:
+    actor = current_user(request)
+    current = _contact_for_user(contact_id, actor, require_manage=True)
+    replacement = _contact_for_user(payload.replacementContactId, actor, require_manage=True)
+    if replacement["companyId"] != current["companyId"] or replacement["id"] == current["id"]:
+        raise HTTPException(400, "Choose another active contact from the same customer")
+    if replacement["status"] not in {"active", "on_leave"}:
+        raise HTTPException(400, "Choose an active replacement contact")
+    affected = REPOSITORY.list_contact_responsibilities(current["companyId"], contact_id=contact_id)
+    asset_ids = sorted({item["assetId"] for item in affected})
+    transferred = 0
+    with core.LOCK:
+        for asset_id in asset_ids:
+            assignments = REPOSITORY.list_contact_responsibilities(current["companyId"], asset_id=asset_id)
+            existing_replacement_roles = {
+                item["role"] for item in assignments if item["contactId"] == replacement["id"]
+            }
+            revised = []
+            for item in assignments:
+                assignment = {
+                    "contactId": item["contactId"], "role": item["role"],
+                    "isPrimary": item["isPrimary"], "escalationOrder": item["escalationOrder"],
+                    "notes": item.get("notes", ""), "source": "manual",
+                }
+                if item["contactId"] == current["id"]:
+                    transferred += 1
+                    if item["role"] in existing_replacement_roles:
+                        continue
+                    assignment["contactId"] = replacement["id"]
+                revised.append(assignment)
+            REPOSITORY.replace_asset_responsibilities(
+                asset_id, revised, current["companyId"], actor["id"], reason=payload.reason.strip(),
+            )
+    return {
+        "contact": REPOSITORY.get_contact(contact_id),
+        "replacement": REPOSITORY.get_contact(replacement["id"]),
+        "transferred": transferred,
+        "assets": len(asset_ids),
+    }
+
+
+@api.post("/api/contacts/{contact_id}/portal-user", status_code=201, tags=["contacts"])
+def create_contact_portal_user(contact_id: str, payload: PortalUserCreateRequest, request: Request) -> dict:
+    actor = current_user(request)
+    contact = _contact_for_user(contact_id, actor, require_manage=True)
+    if contact.get("linkedUserId"):
+        raise HTTPException(409, "This contact already has portal access")
+    if contact["status"] not in {"active", "on_leave"}:
+        raise HTTPException(409, "Portal access cannot be created for an inactive contact")
+    if not contact.get("email"):
+        raise HTTPException(400, "Add an email address before creating portal access")
+    existing = next((item for item in REPOSITORY.list_users() if item["email"].lower() == contact["email"].lower()), None)
+    if existing:
+        if not core.allowed(existing, contact["companyId"]):
+            raise HTTPException(409, "An existing account with this email does not have access to this customer")
+        user = existing
+    else:
+        user = {
+            "id": str(uuid.uuid4()), "email": contact["email"], "role": "client_reader",
+            "companyIds": [contact["companyId"]], "groupIds": [], "accountType": "customer",
+        }
+        with core.LOCK:
+            user = REPOSITORY.create_user(user, payload.password, actor["id"])
+    with core.LOCK:
+        stored = REPOSITORY.update_contact(contact_id, {"linkedUserId": user["id"]}, actor["id"], reason="Portal access linked")
+    return stored
+
+
+@api.get("/api/contact-responsibilities", tags=["contacts"])
+def list_contact_responsibilities(
+    request: Request,
+    companyId: str | None = None,
+    contactId: str | None = None,
+    assetId: str | None = None,
+    includeInactive: bool = False,
+) -> list[dict]:
+    user = current_user(request)
+    if companyId:
+        _company_for_user(companyId, user)
+    else:
+        _require_role(user, {"platform_admin", "msp_operator"}, "MSP responsibility view requires a root role")
+    return [
+        item for item in REPOSITORY.list_contact_responsibilities(
+            companyId, contact_id=contactId, asset_id=assetId, include_inactive=includeInactive,
+        ) if core.allowed(user, item["companyId"])
+    ]
+
+
 def _validated_colour(value: str, fallback: str) -> str:
     return value.lower() if re.fullmatch(r"#[0-9a-fA-F]{6}", value or "") else fallback
 
@@ -842,8 +1179,12 @@ def get_asset(asset_id: str, request: Request) -> dict:
 def create_asset(payload: AssetCreateRequest, request: Request) -> dict:
     user = current_user(request)
     _company_for_user(payload.companyId, user, require_manage=True)
+    assignments = _validate_contact_assignments(payload.companyId, payload.responsibilities)
     try:
-        metadata = core.normalise_metadata(payload.metadata, payload.status)
+        metadata = core.normalise_metadata(
+            _responsibility_metadata(payload.metadata, payload.companyId, assignments),
+            payload.status,
+        )
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
     asset = {
@@ -859,7 +1200,12 @@ def create_asset(payload: AssetCreateRequest, request: Request) -> dict:
         "metadata": metadata,
     }
     with core.LOCK:
-        return REPOSITORY.create_asset(asset, user["id"])
+        stored = REPOSITORY.create_asset(asset, user["id"])
+        if assignments:
+            REPOSITORY.replace_asset_responsibilities(
+                stored["id"], assignments, payload.companyId, user["id"], reason="Initial ownership assigned",
+            )
+    return core.asset_view(REPOSITORY.get_asset(stored["id"]) or stored)
 
 
 @api.patch("/api/assets/{asset_id}", tags=["assets"])
@@ -867,19 +1213,31 @@ def update_asset(asset_id: str, payload: AssetPatchRequest, request: Request) ->
     user = current_user(request)
     asset = _asset_for_user(asset_id, user, require_manage=True)
     changes = payload.model_dump(exclude_unset=True)
+    raw_assignments = changes.pop("responsibilities", None)
+    assignments = (
+        _validate_contact_assignments(asset["companyId"], payload.responsibilities or [])
+        if raw_assignments is not None else None
+    )
+    if assignments is not None and "metadata" not in changes:
+        changes["metadata"] = _responsibility_metadata(asset.get("metadata"), asset["companyId"], assignments)
     if "metadata" in changes:
         try:
             changes["metadata"] = core.normalise_metadata(
-                changes["metadata"],
+                _responsibility_metadata(changes["metadata"], asset["companyId"], assignments)
+                if assignments is not None else changes["metadata"],
                 changes.get("status", asset.get("status")),
             )
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
     with core.LOCK:
         updated = REPOSITORY.update_asset(asset_id, changes, user["id"])
+        if updated and assignments is not None:
+            REPOSITORY.replace_asset_responsibilities(
+                asset_id, assignments, asset["companyId"], user["id"], reason="Ownership updated from CI editor",
+            )
     if not updated:
         raise HTTPException(404, "Asset not found")
-    return core.asset_view(updated)
+    return core.asset_view(REPOSITORY.get_asset(asset_id) or updated)
 
 
 @api.post("/api/demo-data", tags=["assets"])
@@ -1227,6 +1585,56 @@ def create_change(payload: ChangeCreateRequest, request: Request) -> dict:
             raise HTTPException(400, str(error)) from error
         change = REPOSITORY.create_change(change, user["id"])
     return change
+
+
+@api.patch("/api/changes/{change_id}", tags=["change control"])
+def update_change(change_id: str, payload: ChangeUpdateRequest, request: Request) -> dict:
+    user = current_user(request)
+    current = _change_for_user(change_id, user)
+    _company_for_change(current["companyId"], user, require_manage=True)
+    if int(current.get("revision") or 1) != payload.expectedRevision:
+        raise HTTPException(409, "This change was updated by another user. Reload it before saving.")
+    values = payload.model_dump(exclude_unset=True)
+    try:
+        updated = update_change_record(
+            current,
+            values,
+            user,
+            [core.asset_view(item) for item in REPOSITORY.list_assets()],
+            REPOSITORY.list_relationships(),
+        )
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    with core.LOCK:
+        stored = REPOSITORY.update_change(change_id, updated, user["id"], action="updated")
+    if not stored:
+        raise HTTPException(404, "Change package not found")
+    return stored
+
+
+@api.post("/api/changes/{change_id}/transition", tags=["change control"])
+def transition_change(change_id: str, payload: ChangeTransitionRequest, request: Request) -> dict:
+    user = current_user(request)
+    current = _change_for_user(change_id, user)
+    _company_for_change(current["companyId"], user, require_manage=True)
+    if int(current.get("revision") or 1) != payload.expectedRevision:
+        raise HTTPException(409, "This change was updated by another user. Reload it before changing status.")
+    values = payload.model_dump()
+    try:
+        updated = transition_change_record(current, payload.status, values, user)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    with core.LOCK:
+        stored = REPOSITORY.update_change(
+            change_id,
+            updated,
+            user["id"],
+            action=f"status_{payload.status}",
+            reason=payload.reason,
+        )
+    if not stored:
+        raise HTTPException(404, "Change package not found")
+    return stored
 
 
 @api.get("/api/changes/{change_id}/pdf", tags=["change control"])

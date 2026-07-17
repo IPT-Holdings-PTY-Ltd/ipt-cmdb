@@ -22,6 +22,25 @@ function filteredAssets(records: Asset[], params: GetListParams): Asset[] {
   return result;
 }
 
+function withOwnerSelections(record: Asset): Asset & { ownerSelections: Record<string, string> } {
+  const ownerSelections = Object.fromEntries(
+    (record.responsibilities || []).filter(item => !item.effectiveUntil && item.isPrimary).map(item => [item.role, item.contactId]),
+  );
+  return { ...record, ownerSelections };
+}
+
+function assetPayload(data: Record<string, unknown>) {
+  const payload = { ...data };
+  const selections = payload.ownerSelections as Record<string, string> | undefined;
+  delete payload.ownerSelections;
+  if (selections) {
+    payload.responsibilities = Object.entries(selections)
+      .filter(([, contactId]) => Boolean(contactId))
+      .map(([role, contactId]) => ({ role, contactId, isPrimary: true, escalationOrder: 1 }));
+  }
+  return payload;
+}
+
 const provider = {
   async getList(resource: string, params: GetListParams) {
     if (resource !== 'assets') throw new Error(`Unsupported resource: ${resource}`);
@@ -32,17 +51,17 @@ const provider = {
   },
   async getOne(resource: string, params: { id: string | number }) {
     if (resource !== 'assets') throw new Error(`Unsupported resource: ${resource}`);
-    return { data: await apiFetch<Asset>(`/api/v2/assets/${params.id}`) };
+    return { data: withOwnerSelections(await apiFetch<Asset>(`/api/v2/assets/${params.id}`)) };
   },
   async create(resource: string, params: { data: Record<string, unknown> }) {
     if (resource !== 'assets') throw new Error(`Unsupported resource: ${resource}`);
     const companyId = currentCompanyId();
     if (!companyId || companyId === '__root__') throw new Error('Select a customer before adding an asset');
-    return { data: await apiFetch<Asset>('/api/assets', { method: 'POST', body: JSON.stringify({ ...params.data, companyId }) }) };
+    return { data: await apiFetch<Asset>('/api/assets', { method: 'POST', body: JSON.stringify({ ...assetPayload(params.data), companyId }) }) };
   },
   async update(resource: string, params: { id: string | number; data: Record<string, unknown> }) {
     if (resource !== 'assets') throw new Error(`Unsupported resource: ${resource}`);
-    return { data: await apiFetch<Asset>(`/api/assets/${params.id}`, { method: 'PATCH', body: JSON.stringify(params.data) }) };
+    return { data: await apiFetch<Asset>(`/api/assets/${params.id}`, { method: 'PATCH', body: JSON.stringify(assetPayload(params.data)) }) };
   },
   async delete() { throw new Error('Asset deletion is intentionally disabled; retire the CI instead.'); },
   async getMany(resource: string, params: { ids: Array<string | number> }) {
