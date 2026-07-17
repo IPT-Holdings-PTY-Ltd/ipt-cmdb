@@ -1,4 +1,5 @@
 """Request-scoped audit helpers shared by the API and repositories."""
+
 from __future__ import annotations
 
 from contextvars import ContextVar, Token
@@ -6,16 +7,28 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-
 SENSITIVE_PARTS = (
-    "password", "secret", "token", "authorization", "cookie", "credential",
-    "privatekey", "private_key", "connectionstring", "connection_string",
-    "databaseurl", "database_url", "logodataurl", "logo_data_url",
+    "password",
+    "secret",
+    "token",
+    "authorization",
+    "cookie",
+    "credential",
+    "privatekey",
+    "private_key",
+    "connectionstring",
+    "connection_string",
+    "databaseurl",
+    "database_url",
+    "logodataurl",
+    "logo_data_url",
 )
 
 
 @dataclass(frozen=True)
 class AuditContext:
+    """Carry request provenance into repository-generated audit events."""
+
     request_id: str = ""
     correlation_id: str = ""
     source_system: str = "web"
@@ -23,19 +36,25 @@ class AuditContext:
     user_agent: str = ""
 
 
-_context: ContextVar[AuditContext] = ContextVar("cmdb_audit_context", default=AuditContext())
+_context: ContextVar[AuditContext | None] = ContextVar("cmdb_audit_context", default=None)
 
 
-def set_audit_context(context: AuditContext) -> Token:
+def set_audit_context(context: AuditContext) -> Token[AuditContext | None]:
+    """Activate request audit metadata and return its reset token."""
+
     return _context.set(context)
 
 
-def reset_audit_context(token: Token) -> None:
+def reset_audit_context(token: Token[AuditContext | None]) -> None:
+    """Restore the audit context that preceded ``token``."""
+
     _context.reset(token)
 
 
 def current_audit_context() -> AuditContext:
-    return _context.get()
+    """Return current request metadata or an empty background-job context."""
+
+    return _context.get() or AuditContext()
 
 
 def _sensitive(key: str) -> bool:
@@ -77,6 +96,8 @@ def field_changes(before: dict | None, after: dict | None) -> list[dict]:
 
 
 def event_category(entity_type: str, action: str) -> str:
+    """Map an audited entity and action to a stable governance category."""
+
     if entity_type in {"authentication", "session"}:
         return "authentication"
     if entity_type in {"user", "access_group", "role", "permission"}:
@@ -93,6 +114,8 @@ def event_category(entity_type: str, action: str) -> str:
 
 
 def entity_name(before: dict | None, after: dict | None, fallback: str = "") -> str:
+    """Derive a human-readable entity label from an audit snapshot."""
+
     value = after or before or {}
     for key in ("name", "displayName", "display_name", "title", "number", "email"):
         if value.get(key):

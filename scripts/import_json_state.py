@@ -1,4 +1,5 @@
 """Explicitly merge an original JSON development store into canonical PostgreSQL."""
+
 from __future__ import annotations
 
 import json
@@ -10,6 +11,8 @@ from src.cmdb.repository import PostgresCmdbRepository
 
 
 def main() -> None:
+    """Merge the configured JSON development store into canonical PostgreSQL."""
+
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         raise SystemExit("DATABASE_URL is required.")
@@ -19,10 +22,16 @@ def main() -> None:
     try:
         import psycopg
     except ImportError as error:
-        raise SystemExit("Install dependencies first: python -m pip install -r requirements.txt") from error
+        raise SystemExit(
+            "Install dependencies first: python -m pip install -r requirements.txt"
+        ) from error
     state = json.loads(source.read_text(encoding="utf-8"))
     root = Path(__file__).parents[1]
-    connection_factory = lambda: psycopg.connect(database_url, connect_timeout=8)
+
+    def connection_factory():
+        """Open a short-lived connection to the configured PostgreSQL database."""
+        return psycopg.connect(database_url, connect_timeout=8)
+
     apply_migrations(connection_factory, root)
     repository = PostgresCmdbRepository(state, lambda _value: None, connection_factory)
     result = repository.import_state(state)

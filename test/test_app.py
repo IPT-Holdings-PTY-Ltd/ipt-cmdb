@@ -1,6 +1,22 @@
 import unittest
 from datetime import date
-from app import allowed, asset_metadata, attention_items, backup_document, build_seed_state, can_manage, customer_overview, dashboard_snapshot, normalise_metadata, preview_backup, relationship_exists, restore_backup, would_create_dependency_cycle
+
+from app import (
+    allowed,
+    asset_metadata,
+    attention_items,
+    backup_document,
+    build_seed_state,
+    can_manage,
+    customer_overview,
+    dashboard_snapshot,
+    normalise_metadata,
+    preview_backup,
+    relationship_exists,
+    restore_backup,
+    would_create_dependency_cycle,
+)
+
 
 class CompanyScopeTests(unittest.TestCase):
     def test_client_is_limited_to_its_assigned_company(self):
@@ -24,7 +40,8 @@ class CompanyScopeTests(unittest.TestCase):
         self.assertEqual(metadata["lifecycle"], "retired")
 
     def test_metadata_rejects_non_object_values(self):
-        with self.assertRaises(ValueError): normalise_metadata("not a metadata object")
+        with self.assertRaises(ValueError):
+            normalise_metadata("not a metadata object")
 
     def test_metadata_includes_a_distinct_subscription_renewal_date(self):
         metadata = normalise_metadata({"renewalDate": "2027-07-10"})
@@ -35,7 +52,14 @@ class CompanyScopeTests(unittest.TestCase):
         self.assertEqual(metadata["endOfLifeDate"], "2028-01-01")
 
     def test_metadata_supports_layered_network_views(self):
-        metadata = normalise_metadata({"displayLayer": "network", "networkZone": "Core", "vlanId": "110", "subnet": "10.10.110.0/24"})
+        metadata = normalise_metadata(
+            {
+                "displayLayer": "network",
+                "networkZone": "Core",
+                "vlanId": "110",
+                "subnet": "10.10.110.0/24",
+            }
+        )
         self.assertEqual(metadata["displayLayer"], "network")
         self.assertEqual(metadata["networkZone"], "Core")
         self.assertEqual(metadata["vlanId"], "110")
@@ -45,14 +69,43 @@ class CompanyScopeTests(unittest.TestCase):
             normalise_metadata({"displayLayer": "mystery"})
 
     def test_attention_items_include_overdue_and_customer_context(self):
-        assets = [{"id": "ci-1", "companyId": "acme", "name": "Renewal CI", "type": "Software", "metadata": {"renewalDate": "2026-07-01", "technicalOwner": "MSP Licensing"}}]
-        items = attention_items(assets, [{"id": "acme", "name": "Acme Manufacturing"}], today=date(2026, 7, 10))
+        assets = [
+            {
+                "id": "ci-1",
+                "companyId": "acme",
+                "name": "Renewal CI",
+                "type": "Software",
+                "metadata": {
+                    "renewalDate": "2026-07-01",
+                    "technicalOwner": "MSP Licensing",
+                },
+            }
+        ]
+        items = attention_items(
+            assets,
+            [{"id": "acme", "name": "Acme Manufacturing"}],
+            today=date(2026, 7, 10),
+        )
         self.assertEqual(items[0]["days"], -9)
         self.assertEqual(items[0]["companyName"], "Acme Manufacturing")
 
     def test_customer_overview_includes_customers_without_attention_items(self):
-        companies = [{"id": "acme", "name": "Acme"}, {"id": "northwind", "name": "Northwind"}]
-        overview = customer_overview(companies, [{"id": "ci-1", "companyId": "acme", "name": "CI", "type": "Server", "metadata": {"criticality": "critical"}}])
+        companies = [
+            {"id": "acme", "name": "Acme"},
+            {"id": "northwind", "name": "Northwind"},
+        ]
+        overview = customer_overview(
+            companies,
+            [
+                {
+                    "id": "ci-1",
+                    "companyId": "acme",
+                    "name": "CI",
+                    "type": "Server",
+                    "metadata": {"criticality": "critical"},
+                }
+            ],
+        )
         self.assertEqual(overview[0]["assetCount"], 1)
         self.assertEqual(overview[0]["criticalCount"], 1)
         self.assertEqual(overview[1]["assetCount"], 0)
@@ -60,11 +113,37 @@ class CompanyScopeTests(unittest.TestCase):
     def test_dashboard_snapshot_links_business_systems_to_supporting_cis(self):
         companies = [{"id": "acme", "name": "Acme"}]
         assets = [
-            {"id": "sage", "companyId": "acme", "name": "Sage 200", "type": "Business system", "status": "Active", "source": "manual", "metadata": {"businessOwner": "Finance", "displayLayer": "business"}},
-            {"id": "app", "companyId": "acme", "name": "APP01", "type": "Virtual machine", "status": "Active", "source": "manual", "metadata": {"technicalOwner": "MSP", "displayLayer": "compute"}},
+            {
+                "id": "sage",
+                "companyId": "acme",
+                "name": "Sage 200",
+                "type": "Business system",
+                "status": "Active",
+                "source": "manual",
+                "metadata": {"businessOwner": "Finance", "displayLayer": "business"},
+            },
+            {
+                "id": "app",
+                "companyId": "acme",
+                "name": "APP01",
+                "type": "Virtual machine",
+                "status": "Active",
+                "source": "manual",
+                "metadata": {"technicalOwner": "MSP", "displayLayer": "compute"},
+            },
         ]
-        relationships = [{"id": "r1", "fromId": "sage", "toId": "app", "type": "depends_on", "impactPolicy": "required"}]
-        result = dashboard_snapshot(companies, assets, relationships, company_id="acme", today=date(2026, 7, 16))
+        relationships = [
+            {
+                "id": "r1",
+                "fromId": "sage",
+                "toId": "app",
+                "type": "depends_on",
+                "impactPolicy": "required",
+            }
+        ]
+        result = dashboard_snapshot(
+            companies, assets, relationships, company_id="acme", today=date(2026, 7, 16)
+        )
         self.assertEqual(result["scope"], "customer")
         self.assertEqual(result["summary"]["businessSystems"], 1)
         self.assertEqual(result["businessSystems"][0]["supportCount"], 1)
@@ -93,8 +172,20 @@ class CompanyScopeTests(unittest.TestCase):
             preview_backup(backup)
 
     def test_restore_rejects_backup_without_platform_admin(self):
-        invalid = {"format": "cmdb-hub-backup", "version": 1, "state": {"companies": [], "users": [], "assets": [], "relationships": [], "integrations": [], "syncRuns": []}}
-        with self.assertRaises(ValueError): restore_backup(invalid)
+        invalid = {
+            "format": "cmdb-hub-backup",
+            "version": 1,
+            "state": {
+                "companies": [],
+                "users": [],
+                "assets": [],
+                "relationships": [],
+                "integrations": [],
+                "syncRuns": [],
+            },
+        }
+        with self.assertRaises(ValueError):
+            restore_backup(invalid)
 
     def test_symmetric_relationship_rejects_reverse_duplicate(self):
         relationships = [{"fromId": "switch", "toId": "server", "type": "connected_to"}]
@@ -112,4 +203,6 @@ class CompanyScopeTests(unittest.TestCase):
         self.assertTrue(would_create_dependency_cycle(relationships, "database", "portal"))
         self.assertFalse(would_create_dependency_cycle(relationships, "reporting", "database"))
 
-if __name__ == "__main__": unittest.main()
+
+if __name__ == "__main__":
+    unittest.main()

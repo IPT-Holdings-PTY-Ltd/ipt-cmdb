@@ -1,0 +1,28 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["frontend/dist", "node_modules"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "SIM", "RUF", "D100", "D101", "D102", "D103"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.per-file-ignores]
+"app.py" = ["D103"]
+"backend/main.py" = ["D103"]
+"src/cmdb/repository.py" = ["D102", "D103"]
+"test/**/*.py" = ["D"]
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+explicit_package_bases = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+show_error_codes = true
+exclude = ["frontend/", "node_modules/", "test/"]

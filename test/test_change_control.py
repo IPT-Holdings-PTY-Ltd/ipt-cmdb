@@ -12,13 +12,66 @@ from src.cmdb.change_control import (
     update_change_record,
 )
 
-
 ASSETS = [
-    {"id": "db", "companyId": "acme", "name": "DB01", "type": "Server", "source": "ncentral", "metadata": {"criticality": "critical", "environment": "production", "technicalOwner": "Platform Team", "site": "HQ"}},
-    {"id": "app", "companyId": "acme", "name": "APP01", "type": "Server", "source": "ncentral", "metadata": {"criticality": "high", "environment": "production", "serviceOwner": "Applications"}},
-    {"id": "portal", "companyId": "acme", "name": "Customer Portal", "type": "Software", "source": "manual", "metadata": {"criticality": "high", "environment": "production"}},
-    {"id": "sage", "companyId": "acme", "name": "Sage 200", "type": "Business system", "source": "manual", "metadata": {"criticality": "critical", "environment": "production", "businessOwner": "Finance Director", "signoffDelegate": "Financial Controller", "signoffRequired": "yes", "department": "Finance", "userPopulation": "42 users", "rtoHours": "4", "rpoHours": "1"}},
-    {"id": "other", "companyId": "northwind", "name": "OTHER", "type": "Server", "source": "ncentral", "metadata": {}},
+    {
+        "id": "db",
+        "companyId": "acme",
+        "name": "DB01",
+        "type": "Server",
+        "source": "ncentral",
+        "metadata": {
+            "criticality": "critical",
+            "environment": "production",
+            "technicalOwner": "Platform Team",
+            "site": "HQ",
+        },
+    },
+    {
+        "id": "app",
+        "companyId": "acme",
+        "name": "APP01",
+        "type": "Server",
+        "source": "ncentral",
+        "metadata": {
+            "criticality": "high",
+            "environment": "production",
+            "serviceOwner": "Applications",
+        },
+    },
+    {
+        "id": "portal",
+        "companyId": "acme",
+        "name": "Customer Portal",
+        "type": "Software",
+        "source": "manual",
+        "metadata": {"criticality": "high", "environment": "production"},
+    },
+    {
+        "id": "sage",
+        "companyId": "acme",
+        "name": "Sage 200",
+        "type": "Business system",
+        "source": "manual",
+        "metadata": {
+            "criticality": "critical",
+            "environment": "production",
+            "businessOwner": "Finance Director",
+            "signoffDelegate": "Financial Controller",
+            "signoffRequired": "yes",
+            "department": "Finance",
+            "userPopulation": "42 users",
+            "rtoHours": "4",
+            "rpoHours": "1",
+        },
+    },
+    {
+        "id": "other",
+        "companyId": "northwind",
+        "name": "OTHER",
+        "type": "Server",
+        "source": "ncentral",
+        "metadata": {},
+    },
 ]
 
 RELATIONSHIPS = [
@@ -60,7 +113,11 @@ class ChangeControlTests(unittest.TestCase):
         change = self._change()
         updated = update_change_record(
             change,
-            {"expectedRevision": 1, "title": "Database maintenance revised", "scopeAssetIds": ["app"]},
+            {
+                "expectedRevision": 1,
+                "title": "Database maintenance revised",
+                "scopeAssetIds": ["app"],
+            },
             {"id": "operator", "email": "operator@example.com"},
             ASSETS,
             RELATIONSHIPS,
@@ -73,28 +130,56 @@ class ChangeControlTests(unittest.TestCase):
     def test_approval_and_failure_transitions_are_distinct_and_auditable(self):
         actor = {"id": "operator", "email": "operator@example.com"}
         change = self._change()
-        for status in ("impact_review", "awaiting_approval", "approved", "scheduled", "implementing"):
-            change = transition_change_record(change, status, {"reason": f"Move to {status}"}, actor)
+        for status in (
+            "impact_review",
+            "awaiting_approval",
+            "approved",
+            "scheduled",
+            "implementing",
+        ):
+            change = transition_change_record(
+                change, status, {"reason": f"Move to {status}"}, actor
+            )
         self.assertEqual(change["approvals"][-1]["decision"], "approved")
         change = transition_change_record(
-            change, "failed",
-            {"reason": "Database service did not recover", "actualOutageMinutes": 18, "validationResult": "Health check failed"},
+            change,
+            "failed",
+            {
+                "reason": "Database service did not recover",
+                "actualOutageMinutes": 18,
+                "validationResult": "Health check failed",
+            },
             actor,
         )
         self.assertEqual(change["outcome"], "failed")
         self.assertEqual(change["actualOutageMinutes"], 18)
-        change = transition_change_record(change, "backed_out", {"reason": "Snapshot restored", "rollbackResult": "Service recovered"}, actor)
+        change = transition_change_record(
+            change,
+            "backed_out",
+            {"reason": "Snapshot restored", "rollbackResult": "Service recovered"},
+            actor,
+        )
         self.assertTrue(change["rollbackExecuted"])
         self.assertEqual(change["outcome"], "backed_out")
         self.assertEqual(change["statusHistory"][-1]["toStatus"], "backed_out")
 
     def test_invalid_transition_is_rejected(self):
         with self.assertRaises(ValueError):
-            transition_change_record(self._change(), "completed", {"reason": "Skipped controls"}, {"id": "admin", "email": "admin@example.com"})
+            transition_change_record(
+                self._change(),
+                "completed",
+                {"reason": "Skipped controls"},
+                {"id": "admin", "email": "admin@example.com"},
+            )
 
     def test_informational_relationship_does_not_propagate_impact(self):
         relationships = [
-            {"fromId": "sage", "toId": "db", "type": "depends_on", "impactPolicy": "informational"},
+            {
+                "fromId": "sage",
+                "toId": "db",
+                "type": "depends_on",
+                "impactPolicy": "informational",
+            },
         ]
         snapshot = build_impact_snapshot("acme", ["db"], ASSETS, relationships)
         self.assertEqual([item["assetId"] for item in snapshot], ["db"])
@@ -107,7 +192,10 @@ class ChangeControlTests(unittest.TestCase):
         self.assertEqual(by_id["erp"]["impactSeverity"], "protected")
         self.assertIn("1 eligible host", by_id["vm-1"]["virtualizationDecision"])
         self.assertEqual(preview["summary"]["protectedVmCount"], 1)
-        self.assertIn("protected by verified HA capacity", " ".join(preview["summary"]["suggestedRisk"]["factors"]))
+        self.assertIn(
+            "protected by verified HA capacity",
+            " ".join(preview["summary"]["suggestedRisk"]["factors"]),
+        )
 
     def test_multi_host_change_exhausts_cluster_failover(self):
         assets, relationships = self._virtualization_fixture()
@@ -126,7 +214,11 @@ class ChangeControlTests(unittest.TestCase):
 
     def test_pdf_contains_change_and_impact_details(self):
         change = self._change()
-        pdf = render_change_pdf(change, {"id": "acme", "name": "Acme Manufacturing"}, {"name": "CMDB Hub", "accent": "#4cc7b1"})
+        pdf = render_change_pdf(
+            change,
+            {"id": "acme", "name": "Acme Manufacturing"},
+            {"name": "CMDB Hub", "accent": "#4cc7b1"},
+        )
         self.assertTrue(pdf.startswith(b"%PDF"))
         self.assertGreater(len(pdf), 5000)
         text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(pdf)).pages)
@@ -147,7 +239,11 @@ class ChangeControlTests(unittest.TestCase):
             "reportFooter": "IPT Holdings | Controlled document",
             "confidentialityLabel": "Customer confidential",
         }
-        reader = PdfReader(BytesIO(render_change_pdf(change, {"id": "acme", "name": "Acme Manufacturing"}, branding)))
+        reader = PdfReader(
+            BytesIO(
+                render_change_pdf(change, {"id": "acme", "name": "Acme Manufacturing"}, branding)
+            )
+        )
         text = "\n".join(page.extract_text() or "" for page in reader.pages)
         self.assertGreater(len(list(reader.pages[0].images)), 0)
         self.assertIn("IPT Holdings | Controlled document", text)
@@ -189,20 +285,111 @@ class ChangeControlTests(unittest.TestCase):
     @staticmethod
     def _virtualization_fixture():
         assets = [
-            {"id": "cluster", "companyId": "acme", "name": "PROD-CL01", "type": "Virtualization cluster", "source": "manual", "metadata": {"haEnabled": "yes", "minimumHosts": "1", "capacityStatus": "sufficient", "operationalStatus": "healthy"}},
-            {"id": "host-1", "companyId": "acme", "name": "ESX01", "type": "Hypervisor host", "source": "manual", "metadata": {"powerState": "running", "maintenanceMode": "no", "operationalStatus": "healthy"}},
-            {"id": "host-2", "companyId": "acme", "name": "ESX02", "type": "Hypervisor host", "source": "manual", "metadata": {"powerState": "running", "maintenanceMode": "no", "operationalStatus": "healthy"}},
-            {"id": "vm-1", "companyId": "acme", "name": "ERP01", "type": "Virtual machine", "source": "manual", "metadata": {"haEnabled": "yes", "mobility": "automatic", "protectionStatus": "protected", "virtualizationPlatform": "VMware vSphere", "clusterName": "PROD-CL01"}},
-            {"id": "ds-1", "companyId": "acme", "name": "DATASTORE01", "type": "Datastore", "source": "manual", "metadata": {}},
-            {"id": "erp", "companyId": "acme", "name": "ERP", "type": "Business system", "source": "manual", "metadata": {"businessOwner": "Finance"}},
+            {
+                "id": "cluster",
+                "companyId": "acme",
+                "name": "PROD-CL01",
+                "type": "Virtualization cluster",
+                "source": "manual",
+                "metadata": {
+                    "haEnabled": "yes",
+                    "minimumHosts": "1",
+                    "capacityStatus": "sufficient",
+                    "operationalStatus": "healthy",
+                },
+            },
+            {
+                "id": "host-1",
+                "companyId": "acme",
+                "name": "ESX01",
+                "type": "Hypervisor host",
+                "source": "manual",
+                "metadata": {
+                    "powerState": "running",
+                    "maintenanceMode": "no",
+                    "operationalStatus": "healthy",
+                },
+            },
+            {
+                "id": "host-2",
+                "companyId": "acme",
+                "name": "ESX02",
+                "type": "Hypervisor host",
+                "source": "manual",
+                "metadata": {
+                    "powerState": "running",
+                    "maintenanceMode": "no",
+                    "operationalStatus": "healthy",
+                },
+            },
+            {
+                "id": "vm-1",
+                "companyId": "acme",
+                "name": "ERP01",
+                "type": "Virtual machine",
+                "source": "manual",
+                "metadata": {
+                    "haEnabled": "yes",
+                    "mobility": "automatic",
+                    "protectionStatus": "protected",
+                    "virtualizationPlatform": "VMware vSphere",
+                    "clusterName": "PROD-CL01",
+                },
+            },
+            {
+                "id": "ds-1",
+                "companyId": "acme",
+                "name": "DATASTORE01",
+                "type": "Datastore",
+                "source": "manual",
+                "metadata": {},
+            },
+            {
+                "id": "erp",
+                "companyId": "acme",
+                "name": "ERP",
+                "type": "Business system",
+                "source": "manual",
+                "metadata": {"businessOwner": "Finance"},
+            },
         ]
         relationships = [
-            {"fromId": "host-1", "toId": "cluster", "type": "member_of", "impactPolicy": "informational"},
-            {"fromId": "host-2", "toId": "cluster", "type": "member_of", "impactPolicy": "informational"},
-            {"fromId": "vm-1", "toId": "cluster", "type": "member_of", "impactPolicy": "informational"},
-            {"fromId": "host-1", "toId": "vm-1", "type": "hosts", "impactPolicy": "required"},
-            {"fromId": "vm-1", "toId": "ds-1", "type": "stored_on", "impactPolicy": "required"},
-            {"fromId": "erp", "toId": "vm-1", "type": "depends_on", "impactPolicy": "required"},
+            {
+                "fromId": "host-1",
+                "toId": "cluster",
+                "type": "member_of",
+                "impactPolicy": "informational",
+            },
+            {
+                "fromId": "host-2",
+                "toId": "cluster",
+                "type": "member_of",
+                "impactPolicy": "informational",
+            },
+            {
+                "fromId": "vm-1",
+                "toId": "cluster",
+                "type": "member_of",
+                "impactPolicy": "informational",
+            },
+            {
+                "fromId": "host-1",
+                "toId": "vm-1",
+                "type": "hosts",
+                "impactPolicy": "required",
+            },
+            {
+                "fromId": "vm-1",
+                "toId": "ds-1",
+                "type": "stored_on",
+                "impactPolicy": "required",
+            },
+            {
+                "fromId": "erp",
+                "toId": "vm-1",
+                "type": "depends_on",
+                "impactPolicy": "required",
+            },
         ]
         return assets, relationships
 

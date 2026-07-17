@@ -4,6 +4,7 @@ FastAPI owns the complete public API surface. PostgreSQL is the sole
 operational source of truth whenever a database is configured; the local state
 repository exists only for setup, development and isolated unit tests.
 """
+
 from __future__ import annotations
 
 import base64
@@ -14,7 +15,7 @@ import re
 import secrets
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 import app as core
+from src.cmdb.audit import AuditContext, reset_audit_context, set_audit_context
 from src.cmdb.change_control import (
     change_pdf_filename,
     create_change_record,
@@ -31,11 +33,17 @@ from src.cmdb.change_control import (
     transition_change_record,
     update_change_record,
 )
-from src.cmdb.audit import AuditContext, reset_audit_context, set_audit_context
-from src.cmdb.data_quality import RULES as DATA_QUALITY_RULES, evaluate_data_quality
+from src.cmdb.data_quality import RULES as DATA_QUALITY_RULES
+from src.cmdb.data_quality import evaluate_data_quality
+from src.cmdb.reports import (
+    build_report,
+    render_csv,
+    render_pdf,
+    render_xlsx,
+    report_catalog,
+    report_filename,
+)
 from src.cmdb.repository import PostgresCmdbRepository, StateRepository, canonical_uuid
-from src.cmdb.reports import build_report, render_csv, render_pdf, render_xlsx, report_catalog, report_filename
-
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST", ROOT / "frontend" / "dist"))
@@ -53,37 +61,61 @@ api = FastAPI(
 async def audit_and_correlation_context(request: Request, call_next):
     """Correlate diagnostics and audit evidence without logging credentials."""
     requested_id = request.headers.get("x-request-id", "").strip()
-    request_id = requested_id[:100] if re.fullmatch(r"[A-Za-z0-9._:-]{1,100}", requested_id) else str(uuid.uuid4())
+    request_id = (
+        requested_id[:100]
+        if re.fullmatch(r"[A-Za-z0-9._:-]{1,100}", requested_id)
+        else str(uuid.uuid4())
+    )
     correlation = request.headers.get("x-correlation-id", "").strip()[:100] or request_id
     forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
     client_address = forwarded or (request.client.host if request.client else "")
-    token = set_audit_context(AuditContext(
-        request_id=request_id,
-        correlation_id=correlation,
-        source_system=request.headers.get("x-cmdb-source", "web")[:80] or "web",
-        client_address=client_address[:120],
-        user_agent=request.headers.get("user-agent", "")[:500],
-    ))
+    token = set_audit_context(
+        AuditContext(
+            request_id=request_id,
+            correlation_id=correlation,
+            source_system=request.headers.get("x-cmdb-source", "web")[:80] or "web",
+            client_address=client_address[:120],
+            user_agent=request.headers.get("user-agent", "")[:500],
+        )
+    )
     started = time.perf_counter()
     try:
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Correlation-ID"] = correlation
-        if request.url.path.startswith("/api/") and response.status_code in {401, 403} and request.url.path != "/api/login":
+        if (
+            request.url.path.startswith("/api/")
+            and response.status_code in {401, 403}
+            and request.url.path != "/api/login"
+        ):
             actor = getattr(request.state, "current_user", None)
             try:
                 REPOSITORY.record_audit_event(
-                    None, actor.get("id") if actor else None, "authorization", canonical_uuid("authorization", f"{request.method}:{request.url.path}"),
-                    "access_denied", outcome="denied", severity="warning",
-                    metadata={"method": request.method, "path": request.url.path, "statusCode": response.status_code},
+                    None,
+                    actor.get("id") if actor else None,
+                    "authorization",
+                    canonical_uuid("authorization", f"{request.method}:{request.url.path}"),
+                    "access_denied",
+                    outcome="denied",
+                    severity="warning",
+                    metadata={
+                        "method": request.method,
+                        "path": request.url.path,
+                        "statusCode": response.status_code,
+                    },
                 )
             except Exception:
                 LOGGER.exception("audit_denial_record_failed")
         LOGGER.info(
             "request_complete",
-            extra={"request_id": request_id, "correlation_id": correlation, "method": request.method,
-                   "path": request.url.path, "status_code": response.status_code,
-                   "duration_ms": round((time.perf_counter() - started) * 1000, 2)},
+            extra={
+                "request_id": request_id,
+                "correlation_id": correlation,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+            },
         )
         return response
     finally:
@@ -138,7 +170,9 @@ REPOSITORY = _build_repository()
 def _easy_auth_email(request: Request) -> str | None:
     if os.getenv("AUTH_MODE", "local").lower() != "easy_auth":
         return None
-    principal_name_header = os.getenv("ENTRA_PRINCIPAL_NAME_HEADER", "x-ms-client-principal-name").lower()
+    principal_name_header = os.getenv(
+        "ENTRA_PRINCIPAL_NAME_HEADER", "x-ms-client-principal-name"
+    ).lower()
     principal_name = request.headers.get(principal_name_header)
     if principal_name:
         return principal_name.strip().lower()
@@ -150,7 +184,9 @@ def _easy_auth_email(request: Request) -> str | None:
         principal = json.loads(base64.b64decode(encoded).decode("utf-8"))
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    claims = {claim.get("typ", "").lower(): claim.get("val") for claim in principal.get("claims", [])}
+    claims = {
+        claim.get("typ", "").lower(): claim.get("val") for claim in principal.get("claims", [])
+    }
     claim_names = [
         item.strip().lower()
         for item in os.getenv(
@@ -167,7 +203,10 @@ def _easy_auth_email(request: Request) -> str | None:
 
 
 def _local_login_enabled() -> bool:
-    return os.getenv("AUTH_MODE", "local").lower() == "local" or os.getenv("ALLOW_LOCAL_BREAK_GLASS", "false").lower() == "true"
+    return (
+        os.getenv("AUTH_MODE", "local").lower() == "local"
+        or os.getenv("ALLOW_LOCAL_BREAK_GLASS", "false").lower() == "true"
+    )
 
 
 def current_user(request: Request) -> dict:
@@ -185,7 +224,7 @@ def current_user(request: Request) -> dict:
 
     token = request.headers.get("authorization", "").removeprefix("Bearer ")
     session = core.SESSIONS.get(token)
-    if not session or session["expiresAt"] <= datetime.now(timezone.utc):
+    if not session or session["expiresAt"] <= datetime.now(UTC):
         core.SESSIONS.pop(token, None)
         raise HTTPException(401, "Sign in required")
     user = next((item for item in users if item["id"] == session["userId"]), None)
@@ -208,23 +247,31 @@ def _company(company_id: str) -> dict:
 
 
 def _known_company(company_id: str | None) -> bool:
-    return bool(company_id and any(company["id"] == company_id for company in REPOSITORY.list_companies()))
+    return bool(
+        company_id and any(company["id"] == company_id for company in REPOSITORY.list_companies())
+    )
 
 
 def _company_for_user(company_id: str, user: dict, require_manage: bool = False) -> dict:
     company = _company(company_id)
-    permitted = core.can_manage(user, company_id) if require_manage else core.allowed(user, company_id)
+    permitted = (
+        core.can_manage(user, company_id) if require_manage else core.allowed(user, company_id)
+    )
     if not permitted:
         raise HTTPException(403, "You do not have access to this company")
     return company
 
 
 class LoginRequest(BaseModel):
+    """Validate local password login credentials."""
+
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=1, max_length=512)
 
 
 class DatabaseSettingsRequest(BaseModel):
+    """Validate PostgreSQL connection and initialization settings."""
+
     url: str | None = None
     host: str | None = None
     port: int = Field(default=5432, ge=1, le=65535)
@@ -236,6 +283,8 @@ class DatabaseSettingsRequest(BaseModel):
 
 
 class BackupRestoreRequest(BaseModel):
+    """Accept a portable backup document for restore operations."""
+
     model_config = ConfigDict(extra="allow")
 
     format: str
@@ -246,17 +295,23 @@ class BackupRestoreRequest(BaseModel):
 
 
 class CompanyCreateRequest(BaseModel):
+    """Validate a new customer tenant."""
+
     name: str = Field(min_length=1, max_length=100)
     slug: str = Field(default="", max_length=100)
 
 
 class AccessGroupRequest(BaseModel):
+    """Validate a reusable customer access group."""
+
     id: str = ""
     name: str = Field(min_length=1, max_length=80)
     companyIds: list[str] = Field(min_length=1)
 
 
 class UserCreateRequest(BaseModel):
+    """Validate a root or customer portal account."""
+
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=8, max_length=512)
     accountType: str
@@ -266,6 +321,8 @@ class UserCreateRequest(BaseModel):
 
 
 class ContactCreateRequest(BaseModel):
+    """Validate a customer contact profile."""
+
     companyId: str = Field(min_length=1)
     displayName: str = Field(min_length=1, max_length=180)
     firstName: str = Field(default="", max_length=100)
@@ -283,6 +340,8 @@ class ContactCreateRequest(BaseModel):
 
 
 class ContactPatchRequest(BaseModel):
+    """Validate editable contact profile and lifecycle fields."""
+
     displayName: str | None = Field(default=None, min_length=1, max_length=180)
     firstName: str | None = Field(default=None, max_length=100)
     lastName: str | None = Field(default=None, max_length=100)
@@ -300,15 +359,21 @@ class ContactPatchRequest(BaseModel):
 
 
 class PortalUserCreateRequest(BaseModel):
+    """Validate temporary credentials for linked portal access."""
+
     password: str = Field(min_length=8, max_length=512)
 
 
 class ContactReassignRequest(BaseModel):
+    """Validate a bulk responsibility handover."""
+
     replacementContactId: str = Field(min_length=1)
     reason: str = Field(min_length=4, max_length=1000)
 
 
 class ResponsibilityInput(BaseModel):
+    """Describe one contact responsibility assigned to a CI."""
+
     contactId: str = Field(min_length=1)
     role: str = Field(min_length=1, max_length=80)
     isPrimary: bool = True
@@ -317,6 +382,8 @@ class ResponsibilityInput(BaseModel):
 
 
 class AssetCreateRequest(BaseModel):
+    """Validate a new configuration item."""
+
     companyId: str = Field(min_length=1)
     name: str = Field(min_length=1, max_length=240)
     type: str = Field(min_length=1, max_length=120)
@@ -327,6 +394,8 @@ class AssetCreateRequest(BaseModel):
 
 
 class AssetPatchRequest(BaseModel):
+    """Validate editable configuration item fields."""
+
     name: str | None = Field(default=None, min_length=1, max_length=240)
     type: str | None = Field(default=None, min_length=1, max_length=120)
     status: str | None = Field(default=None, max_length=80)
@@ -336,6 +405,8 @@ class AssetPatchRequest(BaseModel):
 
 
 class RelationshipCreateRequest(BaseModel):
+    """Validate a relationship between two configuration items."""
+
     fromId: str = Field(min_length=1)
     toId: str = Field(min_length=1)
     type: str = "related_to"
@@ -343,6 +414,8 @@ class RelationshipCreateRequest(BaseModel):
 
 
 class DataQualityExceptionRequest(BaseModel):
+    """Validate a governed data-quality exception."""
+
     companyId: str = Field(min_length=1)
     ruleKey: str = Field(min_length=1, max_length=80)
     entityId: str = Field(min_length=1)
@@ -351,12 +424,16 @@ class DataQualityExceptionRequest(BaseModel):
 
 
 class ReconciliationDecisionRequest(BaseModel):
+    """Validate a source-record reconciliation decision."""
+
     decision: str = Field(pattern="^(use_existing|create_new|ignore)$")
     notes: str = Field(min_length=4, max_length=2000)
     targetAssetId: str | None = None
 
 
 class FieldAuthorityRequest(BaseModel):
+    """Validate field-level integration authority."""
+
     companyId: str = Field(min_length=1)
     ciType: str = Field(default="*", min_length=1, max_length=120)
     fieldName: str = Field(min_length=1, max_length=160)
@@ -365,6 +442,8 @@ class FieldAuthorityRequest(BaseModel):
 
 
 class BrandingRequest(BaseModel):
+    """Validate MSP or customer branding settings."""
+
     scope: str = "customer"
     companyId: str | None = None
     name: str = Field(default="", max_length=80)
@@ -382,12 +461,16 @@ class BrandingRequest(BaseModel):
 
 
 class ChangeImpactRequest(BaseModel):
+    """Validate the scope used for change impact analysis."""
+
     companyId: str = Field(min_length=1)
     scopeAssetIds: list[str] = Field(min_length=1)
     outageExpected: bool = False
 
 
 class ChangeCreateRequest(ChangeImpactRequest):
+    """Validate a new change-control record."""
+
     title: str = Field(min_length=1, max_length=240)
     changeType: str = "normal"
     category: str = "infrastructure"
@@ -408,6 +491,8 @@ class ChangeCreateRequest(ChangeImpactRequest):
 
 
 class ChangeUpdateRequest(BaseModel):
+    """Validate an optimistic-concurrency change update."""
+
     expectedRevision: int = Field(ge=1)
     scopeAssetIds: list[str] | None = None
     title: str | None = Field(default=None, min_length=1, max_length=240)
@@ -431,6 +516,8 @@ class ChangeUpdateRequest(BaseModel):
 
 
 class ChangeTransitionRequest(BaseModel):
+    """Validate a change lifecycle transition."""
+
     status: str = Field(min_length=1, max_length=80)
     expectedRevision: int = Field(ge=1)
     reason: str = Field(default="", max_length=8000)
@@ -464,17 +551,29 @@ def login(payload: LoginRequest, request: Request) -> dict:
     user = REPOSITORY.authenticate(email, payload.password)
     if not user:
         REPOSITORY.record_audit_event(
-            None, None, "authentication", canonical_uuid("authentication", email), "login_failed",
-            outcome="failed", severity="warning", actor_type="anonymous", metadata={"email": email, "mode": "local"},
+            None,
+            None,
+            "authentication",
+            canonical_uuid("authentication", email),
+            "login_failed",
+            outcome="failed",
+            severity="warning",
+            actor_type="anonymous",
+            metadata={"email": email, "mode": "local"},
         )
         raise HTTPException(401, "Invalid credentials")
     token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=core.SESSION_TTL_SECONDS)
+    expires_at = datetime.now(UTC) + timedelta(seconds=core.SESSION_TTL_SECONDS)
     core.SESSIONS[token] = {"userId": user["id"], "expiresAt": expires_at}
     request.state.current_user = user
     REPOSITORY.record_audit_event(
-        None, user["id"], "authentication", user["id"], "login_succeeded",
-        after={"email": user["email"], "role": user["role"]}, metadata={"mode": "local"},
+        None,
+        user["id"],
+        "authentication",
+        user["id"],
+        "login_succeeded",
+        after={"email": user["email"], "role": user["role"]},
+        metadata={"mode": "local"},
     )
     return {
         "token": token,
@@ -491,8 +590,16 @@ def auth_config() -> dict:
         "mode": mode,
         "external": external,
         "localLoginEnabled": _local_login_enabled(),
-        "externalLoginUrl": os.getenv("ENTRA_LOGIN_URL", "/.auth/login/aad?post_login_redirect_uri=/" ) if external else "",
-        "externalLogoutUrl": os.getenv("ENTRA_LOGOUT_URL", "/.auth/logout?post_logout_redirect_uri=/#/login") if external else "",
+        "externalLoginUrl": os.getenv(
+            "ENTRA_LOGIN_URL", "/.auth/login/aad?post_login_redirect_uri=/"
+        )
+        if external
+        else "",
+        "externalLogoutUrl": os.getenv(
+            "ENTRA_LOGOUT_URL", "/.auth/logout?post_logout_redirect_uri=/#/login"
+        )
+        if external
+        else "",
     }
 
 
@@ -502,11 +609,21 @@ def logout(request: Request) -> Response:
     session = core.SESSIONS.get(bearer)
     user = None
     if session:
-        user = next((item for item in REPOSITORY.list_users() if item["id"] == session["userId"]), None)
+        user = next(
+            (item for item in REPOSITORY.list_users() if item["id"] == session["userId"]),
+            None,
+        )
     core.SESSIONS.pop(bearer, None)
     if user:
         request.state.current_user = user
-        REPOSITORY.record_audit_event(None, user["id"], "session", user["id"], "logout", after={"email": user["email"]})
+        REPOSITORY.record_audit_event(
+            None,
+            user["id"],
+            "session",
+            user["id"],
+            "logout",
+            after={"email": user["email"]},
+        )
     return Response(status_code=204)
 
 
@@ -527,7 +644,9 @@ def database_test(payload: DatabaseSettingsRequest, request: Request) -> dict:
     user = current_user(request)
     _require_role(user, {"platform_admin"}, "Database configuration requires platform admin role")
     try:
-        result = core.test_database_url(core.database_url_from_settings(payload.model_dump(exclude_none=True)))
+        result = core.test_database_url(
+            core.database_url_from_settings(payload.model_dump(exclude_none=True))
+        )
     except (TypeError, ValueError) as error:
         raise HTTPException(400, str(error)) from error
     if not result["ok"]:
@@ -568,7 +687,18 @@ def database_backup(request: Request) -> dict:
     user = current_user(request)
     _require_role(user, {"platform_admin"}, "Database backup requires platform admin role")
     document = core.backup_document(REPOSITORY.export_state())
-    REPOSITORY.record_audit_event(None, user["id"], "portable_export", canonical_uuid("portable_export", document["createdAt"]), "exported", after={"createdAt": document["createdAt"], "format": document["format"], "version": document["version"]})
+    REPOSITORY.record_audit_event(
+        None,
+        user["id"],
+        "portable_export",
+        canonical_uuid("portable_export", document["createdAt"]),
+        "exported",
+        after={
+            "createdAt": document["createdAt"],
+            "format": document["format"],
+            "version": document["version"],
+        },
+    )
     return document
 
 
@@ -592,11 +722,33 @@ def database_restore(payload: BackupRestoreRequest, request: Request) -> dict:
         state = document["state"]
         state.setdefault("branding", {})
         state.setdefault("mspBranding", core.DB.get("mspBranding", {}))
-        state.setdefault("accessGroups", [{"id": "all-managed-customers", "name": "All managed customers", "companyIds": ["*"], "system": True}])
+        state.setdefault(
+            "accessGroups",
+            [
+                {
+                    "id": "all-managed-customers",
+                    "name": "All managed customers",
+                    "companyIds": ["*"],
+                    "system": True,
+                }
+            ],
+        )
         state.setdefault("changes", [])
         with core.LOCK:
             imported = REPOSITORY.import_state(state, user["id"])
-        REPOSITORY.record_audit_event(None, user["id"], "recovery", canonical_uuid("recovery", payload.createdAt or str(uuid.uuid4())), "portable_import_completed", after={"restoredFrom": payload.createdAt, "companies": imported.get("companies"), "assets": imported.get("assets")}, severity="warning")
+        REPOSITORY.record_audit_event(
+            None,
+            user["id"],
+            "recovery",
+            canonical_uuid("recovery", payload.createdAt or str(uuid.uuid4())),
+            "portable_import_completed",
+            after={
+                "restoredFrom": payload.createdAt,
+                "companies": imported.get("companies"),
+                "assets": imported.get("assets"),
+            },
+            severity="warning",
+        )
         return {
             "message": "Portable backup imported successfully.",
             "companies": imported.get("companies", len(state["companies"])),
@@ -622,7 +774,10 @@ def create_company(payload: CompanyCreateRequest, request: Request) -> dict:
     slug = re.sub(r"[^a-z0-9]+", "-", (payload.slug or name).strip().lower()).strip("-")[:48]
     if not name or not slug:
         raise HTTPException(400, "Customer name is required")
-    if any(company["id"] == slug or company["name"].lower() == name.lower() for company in REPOSITORY.list_companies()):
+    if any(
+        company["id"] == slug or company["name"].lower() == name.lower()
+        for company in REPOSITORY.list_companies()
+    ):
         raise HTTPException(409, "A customer with that name or ID already exists")
     company = {"id": slug, "name": name, "externalIds": {}}
     with core.LOCK:
@@ -633,7 +788,11 @@ def create_company(payload: CompanyCreateRequest, request: Request) -> dict:
 @api.get("/api/root-attention", tags=["customers"])
 def root_attention(request: Request) -> list[dict]:
     user = current_user(request)
-    _require_role(user, {"platform_admin", "msp_operator"}, "MSP overview requires root or MSP role")
+    _require_role(
+        user,
+        {"platform_admin", "msp_operator"},
+        "MSP overview requires root or MSP role",
+    )
     assets = [asset for asset in REPOSITORY.list_assets() if core.allowed(user, asset["companyId"])]
     return core.attention_items(assets, REPOSITORY.list_companies())
 
@@ -641,8 +800,14 @@ def root_attention(request: Request) -> list[dict]:
 @api.get("/api/root-overview", tags=["customers"])
 def root_overview(request: Request) -> list[dict]:
     user = current_user(request)
-    _require_role(user, {"platform_admin", "msp_operator"}, "MSP overview requires root or MSP role")
-    companies = [company for company in REPOSITORY.list_companies() if core.allowed(user, company["id"])]
+    _require_role(
+        user,
+        {"platform_admin", "msp_operator"},
+        "MSP overview requires root or MSP role",
+    )
+    companies = [
+        company for company in REPOSITORY.list_companies() if core.allowed(user, company["id"])
+    ]
     assets = [asset for asset in REPOSITORY.list_assets() if core.allowed(user, asset["companyId"])]
     return core.customer_overview(companies, assets)
 
@@ -653,23 +818,52 @@ def dashboard(request: Request, companyId: str | None = None) -> dict:
     if companyId:
         _company_for_user(companyId, user)
     else:
-        _require_role(user, {"platform_admin", "msp_operator"}, "MSP dashboard requires root or MSP role")
-    companies = [company for company in REPOSITORY.list_companies() if core.allowed(user, company["id"])]
+        _require_role(
+            user,
+            {"platform_admin", "msp_operator"},
+            "MSP dashboard requires root or MSP role",
+        )
+    companies = [
+        company for company in REPOSITORY.list_companies() if core.allowed(user, company["id"])
+    ]
     assets = [asset for asset in REPOSITORY.list_assets() if core.allowed(user, asset["companyId"])]
-    asset_ids = {asset["id"] for asset in assets if not companyId or asset["companyId"] == companyId}
-    relationships = [item for item in REPOSITORY.list_relationships() if item["fromId"] in asset_ids and item["toId"] in asset_ids]
+    asset_ids = {
+        asset["id"] for asset in assets if not companyId or asset["companyId"] == companyId
+    }
+    relationships = [
+        item
+        for item in REPOSITORY.list_relationships()
+        if item["fromId"] in asset_ids and item["toId"] in asset_ids
+    ]
     changes = [item for item in REPOSITORY.list_changes() if core.allowed(user, item["companyId"])]
     integrations = REPOSITORY.list_integrations() if not companyId else []
     sync_runs = REPOSITORY.list_sync_runs() if not companyId else []
-    return core.dashboard_snapshot(companies, assets, relationships, changes, integrations, sync_runs, company_id=companyId)
+    return core.dashboard_snapshot(
+        companies,
+        assets,
+        relationships,
+        changes,
+        integrations,
+        sync_runs,
+        company_id=companyId,
+    )
 
 
-def _validate_group(payload: AccessGroupRequest, current_id: str | None = None) -> tuple[str, list[str]]:
+def _validate_group(
+    payload: AccessGroupRequest, current_id: str | None = None
+) -> tuple[str, list[str]]:
     name = payload.name.strip()[:80]
     company_ids = sorted(set(payload.companyIds))
-    if not name or not company_ids or not all(_known_company(company_id) for company_id in company_ids):
+    if (
+        not name
+        or not company_ids
+        or not all(_known_company(company_id) for company_id in company_ids)
+    ):
         raise HTTPException(400, "Provide a group name and at least one valid customer")
-    if any(item["id"] != current_id and item["name"].lower() == name.lower() for item in REPOSITORY.list_access_groups()):
+    if any(
+        item["id"] != current_id and item["name"].lower() == name.lower()
+        for item in REPOSITORY.list_access_groups()
+    ):
         raise HTTPException(409, "A group with that name already exists")
     return name, company_ids
 
@@ -677,14 +871,17 @@ def _validate_group(payload: AccessGroupRequest, current_id: str | None = None) 
 @api.get("/api/access-groups", tags=["access"])
 def list_access_groups(request: Request) -> list[dict]:
     user = current_user(request)
-    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access groups require root or MSP role")
+    _require_role(
+        user,
+        {"platform_admin", "msp_operator"},
+        "MSP access groups require root or MSP role",
+    )
     visible = []
     for group in REPOSITORY.list_access_groups():
         company_ids = [
             company["id"]
             for company in REPOSITORY.list_companies()
-            if core.allowed(user, company["id"])
-            and company["id"] in group["companyIds"]
+            if core.allowed(user, company["id"]) and company["id"] in group["companyIds"]
         ]
         if company_ids:
             visible.append(
@@ -701,7 +898,11 @@ def list_access_groups(request: Request) -> list[dict]:
 @api.post("/api/access-groups", status_code=201, tags=["access"])
 def create_access_group(payload: AccessGroupRequest, request: Request) -> dict:
     actor = current_user(request)
-    _require_role(actor, {"platform_admin"}, "Customer group management requires platform admin role")
+    _require_role(
+        actor,
+        {"platform_admin"},
+        "Customer group management requires platform admin role",
+    )
     name, company_ids = _validate_group(payload)
     group_id = re.sub(r"[^a-z0-9]+", "-", (payload.id or name).lower()).strip("-")[:48]
     if not group_id:
@@ -717,23 +918,41 @@ def create_access_group(payload: AccessGroupRequest, request: Request) -> dict:
 @api.put("/api/access-groups/{group_id}", tags=["access"])
 def update_access_group(group_id: str, payload: AccessGroupRequest, request: Request) -> dict:
     actor = current_user(request)
-    _require_role(actor, {"platform_admin"}, "Customer group management requires platform admin role")
-    group = next((item for item in REPOSITORY.list_access_groups() if item["id"] == group_id), None)
+    _require_role(
+        actor,
+        {"platform_admin"},
+        "Customer group management requires platform admin role",
+    )
+    group = next(
+        (item for item in REPOSITORY.list_access_groups() if item["id"] == group_id),
+        None,
+    )
     if not group:
         raise HTTPException(404, "Customer group not found")
     if group.get("system") or group["id"] == "all-managed-customers":
         raise HTTPException(400, "The All managed customers group is dynamic and cannot be edited")
     name, company_ids = _validate_group(payload, group_id)
     with core.LOCK:
-        group = REPOSITORY.update_access_group(group_id, {"name": name, "companyIds": company_ids}, actor["id"])
+        group = REPOSITORY.update_access_group(
+            group_id, {"name": name, "companyIds": company_ids}, actor["id"]
+        )
+    if group is None:
+        raise HTTPException(404, "Customer group not found")
     return group
 
 
 @api.delete("/api/access-groups/{group_id}", tags=["access"])
 def delete_access_group(group_id: str, request: Request) -> dict:
     actor = current_user(request)
-    _require_role(actor, {"platform_admin"}, "Customer group management requires platform admin role")
-    group = next((item for item in REPOSITORY.list_access_groups() if item["id"] == group_id), None)
+    _require_role(
+        actor,
+        {"platform_admin"},
+        "Customer group management requires platform admin role",
+    )
+    group = next(
+        (item for item in REPOSITORY.list_access_groups() if item["id"] == group_id),
+        None,
+    )
     if not group:
         raise HTTPException(404, "Customer group not found")
     if group.get("system") or group["id"] == "all-managed-customers":
@@ -759,29 +978,44 @@ def rbac_effective(userId: str, request: Request) -> dict:
         raise HTTPException(404, "User not found")
     template = next((item for item in core.ROLE_TEMPLATES if item["id"] == target["role"]), None)
     companies = REPOSITORY.list_companies()
-    customer_ids = [company["id"] for company in companies] if target["role"] == "platform_admin" else target["companyIds"]
+    customer_ids = (
+        [company["id"] for company in companies]
+        if target["role"] == "platform_admin"
+        else target["companyIds"]
+    )
     customers = [company["name"] for company in companies if company["id"] in customer_ids]
     return {
         "user": core.visible_user(target),
         "role": template,
         "customers": customers,
-        "scope": "All customers" if target["role"] == "platform_admin" else ", ".join(customers) or "No customer access",
+        "scope": "All customers"
+        if target["role"] == "platform_admin"
+        else ", ".join(customers) or "No customer access",
     }
 
 
 @api.get("/api/users", tags=["access"])
 def list_users(request: Request, companyId: str | None = None) -> list[dict]:
     user = current_user(request)
-    _require_role(user, {"platform_admin", "msp_operator"}, "User management requires MSP operator or platform admin role")
+    _require_role(
+        user,
+        {"platform_admin", "msp_operator"},
+        "User management requires MSP operator or platform admin role",
+    )
     if companyId:
         _company_for_user(companyId, user)
     records = [
         item
         for item in REPOSITORY.list_users()
-        if user["role"] == "platform_admin" or any(core.allowed(user, company_id) for company_id in item["companyIds"])
+        if user["role"] == "platform_admin"
+        or any(core.allowed(user, company_id) for company_id in item["companyIds"])
     ]
     if companyId:
-        records = [item for item in records if companyId in item["companyIds"] or item["role"] == "platform_admin"]
+        records = [
+            item
+            for item in records
+            if companyId in item["companyIds"] or item["role"] == "platform_admin"
+        ]
     return [core.visible_user(item) for item in records]
 
 
@@ -807,11 +1041,19 @@ def create_user(payload: UserCreateRequest, request: Request) -> dict:
                 if company["id"] in group["companyIds"]
             )
         assigned_companies = sorted(company_ids)
-        if not assigned_companies or not all(_known_company(company_id) for company_id in assigned_companies):
-            raise HTTPException(400, "Choose at least one valid customer permission or access group")
+        if not assigned_companies or not all(
+            _known_company(company_id) for company_id in assigned_companies
+        ):
+            raise HTTPException(
+                400, "Choose at least one valid customer permission or access group"
+            )
         role = "msp_operator"
     elif payload.accountType == "customer":
-        if not payload.companyId or not _known_company(payload.companyId) or not core.can_manage(actor, payload.companyId):
+        if (
+            not payload.companyId
+            or not _known_company(payload.companyId)
+            or not core.can_manage(actor, payload.companyId)
+        ):
             raise HTTPException(403, "Choose a customer you manage")
         assigned_companies = [payload.companyId]
         role = "client_reader"
@@ -832,8 +1074,13 @@ def create_user(payload: UserCreateRequest, request: Request) -> dict:
 
 CONTACT_STATUSES = {"active", "on_leave", "left_company", "inactive"}
 RESPONSIBILITY_ROLES = {
-    "business_owner", "service_owner", "technical_owner", "custodian",
-    "change_approver", "signoff_delegate", "support_contact",
+    "business_owner",
+    "service_owner",
+    "technical_owner",
+    "custodian",
+    "change_approver",
+    "signoff_delegate",
+    "support_contact",
 }
 RESPONSIBILITY_METADATA_FIELDS = {
     "business_owner": "businessOwner",
@@ -852,7 +1099,9 @@ def _contact_for_user(contact_id: str, user: dict, require_manage: bool = False)
     return contact
 
 
-def _contact_values(payload: ContactCreateRequest | ContactPatchRequest, current: dict | None = None) -> dict:
+def _contact_values(
+    payload: ContactCreateRequest | ContactPatchRequest, current: dict | None = None
+) -> dict:
     values = {**(current or {}), **payload.model_dump(exclude_unset=True)}
     values.pop("reason", None)
     values["displayName"] = str(values.get("displayName") or "").strip()
@@ -864,12 +1113,23 @@ def _contact_values(payload: ContactCreateRequest | ContactPatchRequest, current
     values["status"] = values.get("status") or "active"
     if values["status"] not in CONTACT_STATUSES:
         raise HTTPException(400, "Choose a valid contact status")
-    for field in ("firstName", "lastName", "phone", "mobile", "jobTitle", "department", "location", "timezone"):
+    for field in (
+        "firstName",
+        "lastName",
+        "phone",
+        "mobile",
+        "jobTitle",
+        "department",
+        "location",
+        "timezone",
+    ):
         values[field] = str(values.get(field) or "").strip()
     return values
 
 
-def _validate_contact_assignments(company_id: str, assignments: list[ResponsibilityInput]) -> list[dict]:
+def _validate_contact_assignments(
+    company_id: str, assignments: list[ResponsibilityInput]
+) -> list[dict]:
     contacts = {item["id"]: item for item in REPOSITORY.list_contacts(company_id)}
     normalized = []
     seen: set[tuple[str, str]] = set()
@@ -895,17 +1155,25 @@ def _validate_contact_assignments(company_id: str, assignments: list[Responsibil
     return normalized
 
 
-def _responsibility_metadata(metadata: dict | None, company_id: str, assignments: list[dict]) -> dict:
+def _responsibility_metadata(
+    metadata: dict | None, company_id: str, assignments: list[dict]
+) -> dict:
     result = dict(metadata or {})
     for field in RESPONSIBILITY_METADATA_FIELDS.values():
         result[field] = ""
     contacts = {item["id"]: item for item in REPOSITORY.list_contacts(company_id)}
-    ordered = sorted(assignments, key=lambda item: (not item.get("isPrimary", True), int(item.get("escalationOrder", 1))))
+    ordered = sorted(
+        assignments,
+        key=lambda item: (
+            not item.get("isPrimary", True),
+            int(item.get("escalationOrder", 1)),
+        ),
+    )
     for assignment in ordered:
-        field = RESPONSIBILITY_METADATA_FIELDS.get(assignment["role"])
+        metadata_field = RESPONSIBILITY_METADATA_FIELDS.get(assignment["role"])
         contact = contacts.get(assignment["contactId"])
-        if field and contact and not result.get(field):
-            result[field] = contact["displayName"]
+        if metadata_field and contact and not result.get(metadata_field):
+            result[metadata_field] = contact["displayName"]
     return result
 
 
@@ -915,9 +1183,14 @@ def list_contacts(request: Request, companyId: str | None = None) -> list[dict]:
     if companyId:
         _company_for_user(companyId, user)
     else:
-        _require_role(user, {"platform_admin", "msp_operator"}, "MSP contact directory requires a root role")
+        _require_role(
+            user,
+            {"platform_admin", "msp_operator"},
+            "MSP contact directory requires a root role",
+        )
     return [
-        item for item in REPOSITORY.list_contacts(companyId)
+        item
+        for item in REPOSITORY.list_contacts(companyId)
         if core.allowed(user, item["companyId"])
     ]
 
@@ -928,7 +1201,9 @@ def get_contact(contact_id: str, request: Request) -> dict:
     return {
         **contact,
         "responsibilities": REPOSITORY.list_contact_responsibilities(
-            contact["companyId"], contact_id=contact_id, include_inactive=True,
+            contact["companyId"],
+            contact_id=contact_id,
+            include_inactive=True,
         ),
     }
 
@@ -938,16 +1213,24 @@ def create_contact(payload: ContactCreateRequest, request: Request) -> dict:
     actor = current_user(request)
     _company_for_user(payload.companyId, actor, require_manage=True)
     values = _contact_values(payload)
-    if values["email"] and any(item["email"].lower() == values["email"] for item in REPOSITORY.list_contacts(payload.companyId)):
+    if values["email"] and any(
+        item["email"].lower() == values["email"]
+        for item in REPOSITORY.list_contacts(payload.companyId)
+    ):
         raise HTTPException(409, "A contact with this email already exists for the customer")
     if values.get("managerContactId"):
         manager = _contact_for_user(values["managerContactId"], actor)
         if manager["companyId"] != payload.companyId:
             raise HTTPException(400, "Choose a manager from the same customer")
     contact = {
-        "id": str(uuid.uuid4()), "companyId": payload.companyId, "linkedUserId": None,
-        **values, "source": "manual", "syncStatus": "not_synced",
-        "lastSeen": core.now(), "lastSynced": None,
+        "id": str(uuid.uuid4()),
+        "companyId": payload.companyId,
+        "linkedUserId": None,
+        **values,
+        "source": "manual",
+        "syncStatus": "not_synced",
+        "lastSeen": core.now(),
+        "lastSynced": None,
     }
     with core.LOCK:
         return REPOSITORY.create_contact(contact, actor["id"])
@@ -969,15 +1252,26 @@ def update_contact(contact_id: str, payload: ContactPatchRequest, request: Reque
             raise HTTPException(400, "Choose another contact from the same customer as manager")
     if values["status"] in {"left_company", "inactive"} and len(payload.reason.strip()) < 4:
         raise HTTPException(400, "Enter a reason when offboarding or deactivating a contact")
-    if values["status"] in {"left_company", "inactive"} and current.get("responsibilityCount", 0) > 0:
-        raise HTTPException(409, "Reassign this contact's active responsibilities before offboarding")
-    values.pop("responsibilityCount", None); values.pop("portalUser", None)
+    if (
+        values["status"] in {"left_company", "inactive"}
+        and current.get("responsibilityCount", 0) > 0
+    ):
+        raise HTTPException(
+            409, "Reassign this contact's active responsibilities before offboarding"
+        )
+    values.pop("responsibilityCount", None)
+    values.pop("portalUser", None)
     with core.LOCK:
         if values["status"] in {"left_company", "inactive"} and current.get("linkedUserId"):
             REPOSITORY.set_user_status(
-                current["linkedUserId"], "disabled", actor["id"], reason=payload.reason.strip()
+                current["linkedUserId"],
+                "disabled",
+                actor["id"],
+                reason=payload.reason.strip(),
             )
-        stored = REPOSITORY.update_contact(contact_id, values, actor["id"], reason=payload.reason.strip())
+        stored = REPOSITORY.update_contact(
+            contact_id, values, actor["id"], reason=payload.reason.strip()
+        )
     if not stored:
         raise HTTPException(404, "Contact not found")
     return stored
@@ -997,16 +1291,21 @@ def reassign_contact(contact_id: str, payload: ContactReassignRequest, request: 
     transferred = 0
     with core.LOCK:
         for asset_id in asset_ids:
-            assignments = REPOSITORY.list_contact_responsibilities(current["companyId"], asset_id=asset_id)
+            assignments = REPOSITORY.list_contact_responsibilities(
+                current["companyId"], asset_id=asset_id
+            )
             existing_replacement_roles = {
                 item["role"] for item in assignments if item["contactId"] == replacement["id"]
             }
             revised = []
             for item in assignments:
                 assignment = {
-                    "contactId": item["contactId"], "role": item["role"],
-                    "isPrimary": item["isPrimary"], "escalationOrder": item["escalationOrder"],
-                    "notes": item.get("notes", ""), "source": "manual",
+                    "contactId": item["contactId"],
+                    "role": item["role"],
+                    "isPrimary": item["isPrimary"],
+                    "escalationOrder": item["escalationOrder"],
+                    "notes": item.get("notes", ""),
+                    "source": "manual",
                 }
                 if item["contactId"] == current["id"]:
                     transferred += 1
@@ -1015,7 +1314,11 @@ def reassign_contact(contact_id: str, payload: ContactReassignRequest, request: 
                     assignment["contactId"] = replacement["id"]
                 revised.append(assignment)
             REPOSITORY.replace_asset_responsibilities(
-                asset_id, revised, current["companyId"], actor["id"], reason=payload.reason.strip(),
+                asset_id,
+                revised,
+                current["companyId"],
+                actor["id"],
+                reason=payload.reason.strip(),
             )
     return {
         "contact": REPOSITORY.get_contact(contact_id),
@@ -1026,7 +1329,9 @@ def reassign_contact(contact_id: str, payload: ContactReassignRequest, request: 
 
 
 @api.post("/api/contacts/{contact_id}/portal-user", status_code=201, tags=["contacts"])
-def create_contact_portal_user(contact_id: str, payload: PortalUserCreateRequest, request: Request) -> dict:
+def create_contact_portal_user(
+    contact_id: str, payload: PortalUserCreateRequest, request: Request
+) -> dict:
     actor = current_user(request)
     contact = _contact_for_user(contact_id, actor, require_manage=True)
     if contact.get("linkedUserId"):
@@ -1035,20 +1340,41 @@ def create_contact_portal_user(contact_id: str, payload: PortalUserCreateRequest
         raise HTTPException(409, "Portal access cannot be created for an inactive contact")
     if not contact.get("email"):
         raise HTTPException(400, "Add an email address before creating portal access")
-    existing = next((item for item in REPOSITORY.list_users() if item["email"].lower() == contact["email"].lower()), None)
+    existing = next(
+        (
+            item
+            for item in REPOSITORY.list_users()
+            if item["email"].lower() == contact["email"].lower()
+        ),
+        None,
+    )
     if existing:
         if not core.allowed(existing, contact["companyId"]):
-            raise HTTPException(409, "An existing account with this email does not have access to this customer")
+            raise HTTPException(
+                409,
+                "An existing account with this email does not have access to this customer",
+            )
         user = existing
     else:
         user = {
-            "id": str(uuid.uuid4()), "email": contact["email"], "role": "client_reader",
-            "companyIds": [contact["companyId"]], "groupIds": [], "accountType": "customer",
+            "id": str(uuid.uuid4()),
+            "email": contact["email"],
+            "role": "client_reader",
+            "companyIds": [contact["companyId"]],
+            "groupIds": [],
+            "accountType": "customer",
         }
         with core.LOCK:
             user = REPOSITORY.create_user(user, payload.password, actor["id"])
     with core.LOCK:
-        stored = REPOSITORY.update_contact(contact_id, {"linkedUserId": user["id"]}, actor["id"], reason="Portal access linked")
+        stored = REPOSITORY.update_contact(
+            contact_id,
+            {"linkedUserId": user["id"]},
+            actor["id"],
+            reason="Portal access linked",
+        )
+    if stored is None:
+        raise HTTPException(404, "Contact not found")
     return stored
 
 
@@ -1064,11 +1390,20 @@ def list_contact_responsibilities(
     if companyId:
         _company_for_user(companyId, user)
     else:
-        _require_role(user, {"platform_admin", "msp_operator"}, "MSP responsibility view requires a root role")
+        _require_role(
+            user,
+            {"platform_admin", "msp_operator"},
+            "MSP responsibility view requires a root role",
+        )
     return [
-        item for item in REPOSITORY.list_contact_responsibilities(
-            companyId, contact_id=contactId, asset_id=assetId, include_inactive=includeInactive,
-        ) if core.allowed(user, item["companyId"])
+        item
+        for item in REPOSITORY.list_contact_responsibilities(
+            companyId,
+            contact_id=contactId,
+            asset_id=assetId,
+            include_inactive=includeInactive,
+        )
+        if core.allowed(user, item["companyId"])
     ]
 
 
@@ -1101,7 +1436,11 @@ def get_public_branding() -> dict:
 def get_branding(request: Request, scope: str | None = None, companyId: str | None = None) -> dict:
     user = current_user(request)
     if scope == "msp":
-        _require_role(user, {"platform_admin", "msp_operator"}, "MSP branding requires root or MSP role")
+        _require_role(
+            user,
+            {"platform_admin", "msp_operator"},
+            "MSP branding requires root or MSP role",
+        )
         return REPOSITORY.get_msp_branding()
     if companyId:
         _company_for_user(companyId, user)
@@ -1117,7 +1456,11 @@ def get_branding(request: Request, scope: str | None = None, companyId: str | No
 def update_branding(payload: BrandingRequest, request: Request) -> dict:
     user = current_user(request)
     if payload.scope == "msp":
-        _require_role(user, {"platform_admin", "msp_operator"}, "MSP branding requires root or MSP role")
+        _require_role(
+            user,
+            {"platform_admin", "msp_operator"},
+            "MSP branding requires root or MSP role",
+        )
         brand = {
             "name": (payload.name or "CMDB Hub")[:80],
             "accent": _validated_colour(payload.accent, "#50d5b9"),
@@ -1165,7 +1508,8 @@ def list_assets(request: Request, companyId: str | None = None) -> list[dict]:
     return [
         core.asset_view(item)
         for item in REPOSITORY.list_assets()
-        if (not companyId or item["companyId"] == companyId) and core.allowed(user, item["companyId"])
+        if (not companyId or item["companyId"] == companyId)
+        and core.allowed(user, item["companyId"])
     ]
 
 
@@ -1203,7 +1547,11 @@ def create_asset(payload: AssetCreateRequest, request: Request) -> dict:
         stored = REPOSITORY.create_asset(asset, user["id"])
         if assignments:
             REPOSITORY.replace_asset_responsibilities(
-                stored["id"], assignments, payload.companyId, user["id"], reason="Initial ownership assigned",
+                stored["id"],
+                assignments,
+                payload.companyId,
+                user["id"],
+                reason="Initial ownership assigned",
             )
     return core.asset_view(REPOSITORY.get_asset(stored["id"]) or stored)
 
@@ -1216,15 +1564,19 @@ def update_asset(asset_id: str, payload: AssetPatchRequest, request: Request) ->
     raw_assignments = changes.pop("responsibilities", None)
     assignments = (
         _validate_contact_assignments(asset["companyId"], payload.responsibilities or [])
-        if raw_assignments is not None else None
+        if raw_assignments is not None
+        else None
     )
     if assignments is not None and "metadata" not in changes:
-        changes["metadata"] = _responsibility_metadata(asset.get("metadata"), asset["companyId"], assignments)
+        changes["metadata"] = _responsibility_metadata(
+            asset.get("metadata"), asset["companyId"], assignments
+        )
     if "metadata" in changes:
         try:
             changes["metadata"] = core.normalise_metadata(
                 _responsibility_metadata(changes["metadata"], asset["companyId"], assignments)
-                if assignments is not None else changes["metadata"],
+                if assignments is not None
+                else changes["metadata"],
                 changes.get("status", asset.get("status")),
             )
         except ValueError as error:
@@ -1233,7 +1585,11 @@ def update_asset(asset_id: str, payload: AssetPatchRequest, request: Request) ->
         updated = REPOSITORY.update_asset(asset_id, changes, user["id"])
         if updated and assignments is not None:
             REPOSITORY.replace_asset_responsibilities(
-                asset_id, assignments, asset["companyId"], user["id"], reason="Ownership updated from CI editor",
+                asset_id,
+                assignments,
+                asset["companyId"],
+                user["id"],
+                reason="Ownership updated from CI editor",
             )
     if not updated:
         raise HTTPException(404, "Asset not found")
@@ -1288,7 +1644,12 @@ def demo_data(request: Request) -> dict:
         if core.relationship_exists(relationships, from_id, to_id, item["type"]):
             continue
         stored = REPOSITORY.create_relationship(
-            {**item, "id": canonical_uuid("relationship", item["id"]), "fromId": from_id, "toId": to_id},
+            {
+                **item,
+                "id": canonical_uuid("relationship", item["id"]),
+                "fromId": from_id,
+                "toId": to_id,
+            },
             "acme",
             user["id"],
         )
@@ -1305,9 +1666,14 @@ def list_relationships(request: Request, companyId: str | None = None) -> list[d
     asset_ids = {
         item["id"]
         for item in REPOSITORY.list_assets()
-        if core.allowed(user, item["companyId"]) and (not companyId or item["companyId"] == companyId)
+        if core.allowed(user, item["companyId"])
+        and (not companyId or item["companyId"] == companyId)
     }
-    return [item for item in REPOSITORY.list_relationships() if item["fromId"] in asset_ids and item["toId"] in asset_ids]
+    return [
+        item
+        for item in REPOSITORY.list_relationships()
+        if item["fromId"] in asset_ids and item["toId"] in asset_ids
+    ]
 
 
 @api.post("/api/relationships", status_code=201, tags=["relationships"])
@@ -1332,8 +1698,11 @@ def create_relationship(payload: RelationshipCreateRequest, request: Request) ->
     ):
         raise HTTPException(409, "That dependency would create a cycle")
     relationship = {
-        "id": str(uuid.uuid4()), "fromId": from_asset["id"], "toId": to_asset["id"],
-        "type": payload.type, "impactPolicy": payload.impactPolicy,
+        "id": str(uuid.uuid4()),
+        "fromId": from_asset["id"],
+        "toId": to_asset["id"],
+        "type": payload.type,
+        "impactPolicy": payload.impactPolicy,
     }
     with core.LOCK:
         return REPOSITORY.create_relationship(relationship, from_asset["companyId"], user["id"])
@@ -1341,7 +1710,10 @@ def create_relationship(payload: RelationshipCreateRequest, request: Request) ->
 
 @api.delete("/api/relationships/{relationship_id}", tags=["relationships"])
 def delete_relationship(relationship_id: str, request: Request) -> dict:
-    relationship = next((item for item in REPOSITORY.list_relationships() if item["id"] == relationship_id), None)
+    relationship = next(
+        (item for item in REPOSITORY.list_relationships() if item["id"] == relationship_id),
+        None,
+    )
     if not relationship:
         raise HTTPException(404, "Relationship not found")
     source = REPOSITORY.get_asset(relationship["fromId"])
@@ -1356,10 +1728,16 @@ def delete_relationship(relationship_id: str, request: Request) -> dict:
     return {"deletedId": relationship_id}
 
 
-def _quality_company_scope(company_id: str | None, user: dict, *, require_manage: bool = False) -> list[dict]:
+def _quality_company_scope(
+    company_id: str | None, user: dict, *, require_manage: bool = False
+) -> list[dict]:
     if company_id:
         return [_company_for_user(company_id, user, require_manage=require_manage)]
-    _require_role(user, {"platform_admin", "msp_operator"}, "MSP data quality requires a root role")
+    _require_role(
+        user,
+        {"platform_admin", "msp_operator"},
+        "MSP data quality requires a root role",
+    )
     return [company for company in REPOSITORY.list_companies() if core.allowed(user, company["id"])]
 
 
@@ -1368,16 +1746,36 @@ def get_data_quality(request: Request, companyId: str | None = None) -> dict:
     user = current_user(request)
     companies = _quality_company_scope(companyId, user)
     company_ids = {company["id"] for company in companies}
-    assets = [core.asset_view(item) for item in REPOSITORY.list_assets() if item["companyId"] in company_ids]
+    assets = [
+        core.asset_view(item)
+        for item in REPOSITORY.list_assets()
+        if item["companyId"] in company_ids
+    ]
     asset_ids = {item["id"] for item in assets}
-    relationships = [item for item in REPOSITORY.list_relationships() if item["fromId"] in asset_ids and item["toId"] in asset_ids]
-    exceptions = [item for item in REPOSITORY.list_data_quality_exceptions(companyId) if item["companyId"] in company_ids]
+    relationships = [
+        item
+        for item in REPOSITORY.list_relationships()
+        if item["fromId"] in asset_ids and item["toId"] in asset_ids
+    ]
+    exceptions = [
+        item
+        for item in REPOSITORY.list_data_quality_exceptions(companyId)
+        if item["companyId"] in company_ids
+    ]
     result = evaluate_data_quality(companies, assets, relationships, exceptions)
-    candidates = [item for item in REPOSITORY.list_reconciliation_candidates(companyId, "pending") if item.get("companyId") in company_ids]
+    candidates = [
+        item
+        for item in REPOSITORY.list_reconciliation_candidates(companyId, "pending")
+        if item.get("companyId") in company_ids
+    ]
     result["summary"]["pendingReconciliationCount"] = len(candidates)
     result["candidates"] = candidates
     result["exceptions"] = [item for item in exceptions if item.get("state") == "active"]
-    result["fieldAuthority"] = [item for item in REPOSITORY.list_field_authority(companyId) if item["companyId"] in company_ids]
+    result["fieldAuthority"] = [
+        item
+        for item in REPOSITORY.list_field_authority(companyId)
+        if item["companyId"] in company_ids
+    ]
     return result
 
 
@@ -1396,17 +1794,27 @@ def create_data_quality_exception(payload: DataQualityExceptionRequest, request:
         except ValueError as error:
             raise HTTPException(400, "Choose a valid exception expiry") from error
     with core.LOCK:
-        return REPOSITORY.create_data_quality_exception({
-            "id": str(uuid.uuid4()), "companyId": payload.companyId, "ruleKey": payload.ruleKey,
-            "entityType": "configuration_item", "entityId": asset["id"],
-            "reason": payload.reason.strip(), "expiresAt": payload.expiresAt,
-        }, user["id"])
+        return REPOSITORY.create_data_quality_exception(
+            {
+                "id": str(uuid.uuid4()),
+                "companyId": payload.companyId,
+                "ruleKey": payload.ruleKey,
+                "entityType": "configuration_item",
+                "entityId": asset["id"],
+                "reason": payload.reason.strip(),
+                "expiresAt": payload.expiresAt,
+            },
+            user["id"],
+        )
 
 
 @api.delete("/api/data-quality/exceptions/{exception_id}", tags=["governance"])
 def resolve_data_quality_exception(exception_id: str, request: Request) -> dict:
     user = current_user(request)
-    current = next((item for item in REPOSITORY.list_data_quality_exceptions() if item["id"] == exception_id), None)
+    current = next(
+        (item for item in REPOSITORY.list_data_quality_exceptions() if item["id"] == exception_id),
+        None,
+    )
     if not current:
         raise HTTPException(404, "Exception not found")
     _company_for_user(current["companyId"], user, require_manage=True)
@@ -1418,17 +1826,32 @@ def resolve_data_quality_exception(exception_id: str, request: Request) -> dict:
 
 
 @api.get("/api/reconciliation-candidates", tags=["integrations"])
-def list_reconciliation_candidates(request: Request, companyId: str | None = None, state: str | None = "pending") -> list[dict]:
+def list_reconciliation_candidates(
+    request: Request, companyId: str | None = None, state: str | None = "pending"
+) -> list[dict]:
     user = current_user(request)
     companies = _quality_company_scope(companyId, user)
     company_ids = {item["id"] for item in companies}
-    return [item for item in REPOSITORY.list_reconciliation_candidates(companyId, state) if item.get("companyId") in company_ids]
+    return [
+        item
+        for item in REPOSITORY.list_reconciliation_candidates(companyId, state)
+        if item.get("companyId") in company_ids
+    ]
 
 
 @api.patch("/api/reconciliation-candidates/{candidate_id}", tags=["integrations"])
-def decide_reconciliation_candidate(candidate_id: str, payload: ReconciliationDecisionRequest, request: Request) -> dict:
+def decide_reconciliation_candidate(
+    candidate_id: str, payload: ReconciliationDecisionRequest, request: Request
+) -> dict:
     user = current_user(request)
-    candidate = next((item for item in REPOSITORY.list_reconciliation_candidates() if item["id"] == candidate_id), None)
+    candidate = next(
+        (
+            item
+            for item in REPOSITORY.list_reconciliation_candidates()
+            if item["id"] == candidate_id
+        ),
+        None,
+    )
     if not candidate:
         raise HTTPException(404, "Reconciliation candidate not found")
     company_id = candidate.get("companyId")
@@ -1444,7 +1867,13 @@ def decide_reconciliation_candidate(candidate_id: str, payload: ReconciliationDe
     elif payload.targetAssetId:
         raise HTTPException(400, "A target CI is only valid for an existing-CI decision")
     with core.LOCK:
-        result = REPOSITORY.resolve_reconciliation_candidate(candidate_id, payload.decision, payload.notes.strip(), payload.targetAssetId, user["id"])
+        result = REPOSITORY.resolve_reconciliation_candidate(
+            candidate_id,
+            payload.decision,
+            payload.notes.strip(),
+            payload.targetAssetId,
+            user["id"],
+        )
     if not result:
         raise HTTPException(409, "That candidate has already been reviewed")
     return result
@@ -1455,7 +1884,11 @@ def list_field_authority(request: Request, companyId: str | None = None) -> list
     user = current_user(request)
     companies = _quality_company_scope(companyId, user)
     company_ids = {item["id"] for item in companies}
-    return [item for item in REPOSITORY.list_field_authority(companyId) if item["companyId"] in company_ids]
+    return [
+        item
+        for item in REPOSITORY.list_field_authority(companyId)
+        if item["companyId"] in company_ids
+    ]
 
 
 @api.put("/api/field-authority", tags=["integrations"])
@@ -1467,11 +1900,15 @@ def upsert_field_authority(payload: FieldAuthorityRequest, request: Request) -> 
 
 
 @api.delete("/api/field-authority", tags=["integrations"])
-def delete_field_authority(request: Request, companyId: str, ciType: str, fieldName: str, provider: str) -> dict:
+def delete_field_authority(
+    request: Request, companyId: str, ciType: str, fieldName: str, provider: str
+) -> dict:
     user = current_user(request)
     _company_for_user(companyId, user, require_manage=True)
     with core.LOCK:
-        deleted = REPOSITORY.delete_field_authority(companyId, ciType, fieldName, provider, user["id"])
+        deleted = REPOSITORY.delete_field_authority(
+            companyId, ciType, fieldName, provider, user["id"]
+        )
     if not deleted:
         raise HTTPException(404, "Source authority rule not found")
     return {"deleted": True}
@@ -1480,7 +1917,11 @@ def delete_field_authority(request: Request, companyId: str, ciType: str, fieldN
 @api.get("/api/integrations", tags=["integrations"])
 def list_integrations(request: Request) -> list[dict]:
     user = current_user(request)
-    _require_role(user, {"platform_admin", "msp_operator"}, "MSP integration tools require root or MSP role")
+    _require_role(
+        user,
+        {"platform_admin", "msp_operator"},
+        "MSP integration tools require root or MSP role",
+    )
     records = []
     for item in REPOSITORY.list_integrations():
         if item.get("scope", "msp") != "msp":
@@ -1491,7 +1932,9 @@ def list_integrations(request: Request) -> list[dict]:
                 **item,
                 "scope": "msp",
                 "enabled": configured or item["enabled"],
-                "status": "Ready" if configured and item["status"] == "Not configured" else item["status"],
+                "status": "Ready"
+                if configured and item["status"] == "Not configured"
+                else item["status"],
             }
         )
     return records
@@ -1500,10 +1943,17 @@ def list_integrations(request: Request) -> list[dict]:
 @api.post("/api/integrations/{kind}/sync", tags=["integrations"])
 def run_integration_sync(kind: str, request: Request) -> dict:
     user = current_user(request)
-    _require_role(user, {"platform_admin", "msp_operator"}, "Sync requires MSP operator or platform admin role")
+    _require_role(
+        user,
+        {"platform_admin", "msp_operator"},
+        "Sync requires MSP operator or platform admin role",
+    )
     if kind not in {"connectwise", "ncentral", "passportal"}:
         raise HTTPException(404, "Integration not found")
-    if not any(item["type"] == kind and item.get("scope", "msp") == "msp" for item in REPOSITORY.list_integrations()):
+    if not any(
+        item["type"] == kind and item.get("scope", "msp") == "msp"
+        for item in REPOSITORY.list_integrations()
+    ):
         raise HTTPException(404, "Integration not found")
     run = core.execute_sync(kind)
     with core.LOCK:
@@ -1513,7 +1963,11 @@ def run_integration_sync(kind: str, request: Request) -> dict:
 @api.get("/api/sync-runs", tags=["integrations"])
 def list_sync_runs(request: Request) -> list[dict]:
     user = current_user(request)
-    _require_role(user, {"platform_admin", "msp_operator"}, "Sync history requires root or MSP role")
+    _require_role(
+        user,
+        {"platform_admin", "msp_operator"},
+        "Sync history requires root or MSP role",
+    )
     return REPOSITORY.list_sync_runs()
 
 
@@ -1521,7 +1975,9 @@ def _company_for_change(company_id: str, user: dict, require_manage: bool = Fals
     company = next((item for item in REPOSITORY.list_companies() if item["id"] == company_id), None)
     if not company:
         raise HTTPException(404, "Customer not found")
-    permitted = core.can_manage(user, company_id) if require_manage else core.allowed(user, company_id)
+    permitted = (
+        core.can_manage(user, company_id) if require_manage else core.allowed(user, company_id)
+    )
     if not permitted:
         raise HTTPException(403, "You do not have change-control access for this customer")
     return company
@@ -1559,7 +2015,8 @@ def list_changes(request: Request, companyId: str | None = None) -> list[dict]:
     changes = [
         item
         for item in REPOSITORY.list_changes()
-        if (not companyId or item["companyId"] == companyId) and core.allowed(user, item["companyId"])
+        if (not companyId or item["companyId"] == companyId)
+        and core.allowed(user, item["companyId"])
     ]
     return sorted(changes, key=lambda item: item.get("createdAt", ""), reverse=True)
 
@@ -1569,7 +2026,7 @@ def create_change(payload: ChangeCreateRequest, request: Request) -> dict:
     user = current_user(request)
     company = _company_for_change(payload.companyId, user, require_manage=True)
     with core.LOCK:
-        year = datetime.now(timezone.utc).year
+        year = datetime.now(UTC).year
         number = REPOSITORY.next_change_number(year)
         try:
             change = create_change_record(
@@ -1593,7 +2050,9 @@ def update_change(change_id: str, payload: ChangeUpdateRequest, request: Request
     current = _change_for_user(change_id, user)
     _company_for_change(current["companyId"], user, require_manage=True)
     if int(current.get("revision") or 1) != payload.expectedRevision:
-        raise HTTPException(409, "This change was updated by another user. Reload it before saving.")
+        raise HTTPException(
+            409, "This change was updated by another user. Reload it before saving."
+        )
     values = payload.model_dump(exclude_unset=True)
     try:
         updated = update_change_record(
@@ -1618,7 +2077,10 @@ def transition_change(change_id: str, payload: ChangeTransitionRequest, request:
     current = _change_for_user(change_id, user)
     _company_for_change(current["companyId"], user, require_manage=True)
     if int(current.get("revision") or 1) != payload.expectedRevision:
-        raise HTTPException(409, "This change was updated by another user. Reload it before changing status.")
+        raise HTTPException(
+            409,
+            "This change was updated by another user. Reload it before changing status.",
+        )
     values = payload.model_dump()
     try:
         updated = transition_change_record(current, payload.status, values, user)
@@ -1641,7 +2103,9 @@ def transition_change(change_id: str, payload: ChangeTransitionRequest, request:
 def download_change_pdf(change_id: str, request: Request) -> Response:
     user = current_user(request)
     change = _change_for_user(change_id, user)
-    company = next(item for item in REPOSITORY.list_companies() if item["id"] == change["companyId"])
+    company = next(
+        item for item in REPOSITORY.list_companies() if item["id"] == change["companyId"]
+    )
     pdf = render_change_pdf(change, company, REPOSITORY.get_msp_branding())
     return Response(
         pdf,
@@ -1674,14 +2138,28 @@ def list_audit_events(
     if companyId:
         _company_for_user(companyId, user)
     else:
-        _require_role(user, {"platform_admin", "msp_operator"}, "MSP audit requires root or MSP role")
+        _require_role(
+            user,
+            {"platform_admin", "msp_operator"},
+            "MSP audit requires root or MSP role",
+        )
     records = REPOSITORY.list_audit_events(
-        companyId, actor_id=actorId, category=category, action=action,
-        entity_type=entityType, entity_id=entityId, outcome=outcome,
-        search=search, limit=max(1, min(limit, 1000)),
+        companyId,
+        actor_id=actorId,
+        category=category,
+        action=action,
+        entity_type=entityType,
+        entity_id=entityId,
+        outcome=outcome,
+        search=search,
+        limit=max(1, min(limit, 1000)),
     )
     if not companyId and user["role"] != "platform_admin":
-        records = [item for item in records if item.get("companyId") is None or core.allowed(user, item["companyId"])]
+        records = [
+            item
+            for item in records
+            if item.get("companyId") is None or core.allowed(user, item["companyId"])
+        ]
     if dateFrom:
         records = [item for item in records if item.get("createdAt", "") >= dateFrom]
     if dateTo:
@@ -1695,7 +2173,11 @@ def _governance_report(report_id: str, user: dict, company_id: str | None) -> di
     if company_id:
         _company_for_user(company_id, user)
     else:
-        _require_role(user, {"platform_admin", "msp_operator"}, "MSP reports require root or MSP role")
+        _require_role(
+            user,
+            {"platform_admin", "msp_operator"},
+            "MSP reports require root or MSP role",
+        )
     if report_id == "access-review" and user["role"] != "platform_admin":
         raise HTTPException(403, "Effective access reporting requires platform admin role")
     if report_id == "integration-health" and not root_scope:
@@ -1703,11 +2185,19 @@ def _governance_report(report_id: str, user: dict, company_id: str | None) -> di
     companies = [item for item in REPOSITORY.list_companies() if core.allowed(user, item["id"])]
     assets = [item for item in REPOSITORY.list_assets() if core.allowed(user, item["companyId"])]
     asset_ids = {item["id"] for item in assets if not company_id or item["companyId"] == company_id}
-    relationships = [item for item in REPOSITORY.list_relationships() if item["fromId"] in asset_ids and item["toId"] in asset_ids]
+    relationships = [
+        item
+        for item in REPOSITORY.list_relationships()
+        if item["fromId"] in asset_ids and item["toId"] in asset_ids
+    ]
     changes = [item for item in REPOSITORY.list_changes() if core.allowed(user, item["companyId"])]
     audit_events = REPOSITORY.list_audit_events(company_id, limit=1000)
     if root_scope and user["role"] != "platform_admin":
-        audit_events = [item for item in audit_events if item.get("companyId") is None or core.allowed(user, item["companyId"])]
+        audit_events = [
+            item
+            for item in audit_events
+            if item.get("companyId") is None or core.allowed(user, item["companyId"])
+        ]
     return build_report(
         report_id,
         companies=companies,
@@ -1728,7 +2218,11 @@ def reports_catalog(request: Request, companyId: str | None = None) -> list[dict
     if companyId:
         _company_for_user(companyId, user)
     else:
-        _require_role(user, {"platform_admin", "msp_operator"}, "MSP reports require root or MSP role")
+        _require_role(
+            user,
+            {"platform_admin", "msp_operator"},
+            "MSP reports require root or MSP role",
+        )
     records = report_catalog(companyId is None)
     if user["role"] != "platform_admin":
         records = [item for item in records if item["id"] != "access-review"]
@@ -1742,11 +2236,17 @@ def preview_report(report_id: str, request: Request, companyId: str | None = Non
         report = _governance_report(report_id, user, companyId)
     except ValueError as error:
         raise HTTPException(404, str(error)) from error
-    return {**report, "rows": report["rows"][:100], "previewLimited": len(report["rows"]) > 100}
+    return {
+        **report,
+        "rows": report["rows"][:100],
+        "previewLimited": len(report["rows"]) > 100,
+    }
 
 
 @api.get("/api/reports/{report_id}/download", tags=["governance"])
-def download_report(report_id: str, request: Request, format: str = "pdf", companyId: str | None = None) -> Response:
+def download_report(
+    report_id: str, request: Request, format: str = "pdf", companyId: str | None = None
+) -> Response:
     user = current_user(request)
     if format not in {"pdf", "xlsx", "csv"}:
         raise HTTPException(400, "Choose PDF, XLSX or CSV")
@@ -1758,21 +2258,39 @@ def download_report(report_id: str, request: Request, format: str = "pdf", compa
     if format == "csv":
         content, media_type = render_csv(report), "text/csv; charset=utf-8"
     elif format == "xlsx":
-        content, media_type = render_xlsx(report, branding), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        content, media_type = (
+            render_xlsx(report, branding),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
     else:
         content, media_type = render_pdf(report, branding), "application/pdf"
     REPOSITORY.record_audit_event(
-        companyId, user["id"], "report", canonical_uuid("report", f"{report_id}:{report['generatedAt']}"),
-        "downloaded", after={"reportId": report_id, "title": report["title"], "format": format, "rowCount": report["summary"]["rowCount"]},
+        companyId,
+        user["id"],
+        "report",
+        canonical_uuid("report", f"{report_id}:{report['generatedAt']}"),
+        "downloaded",
+        after={
+            "reportId": report_id,
+            "title": report["title"],
+            "format": format,
+            "rowCount": report["summary"]["rowCount"],
+        },
     )
-    return Response(content, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{report_filename(report, format)}"'})
+    return Response(
+        content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{report_filename(report, format)}"'
+        },
+    )
 
 
 @api.get("/{path:path}", include_in_schema=False)
 def react_application(path: str):
     if not FRONTEND_DIST.exists():
         return HTMLResponse(
-            '<h1>Frontend build is missing</h1><p>Run <code>npm run build</code> and restart the application.</p>',
+            "<h1>Frontend build is missing</h1><p>Run <code>npm run build</code> and restart the application.</p>",
             status_code=503,
         )
     candidate = (FRONTEND_DIST / path).resolve()

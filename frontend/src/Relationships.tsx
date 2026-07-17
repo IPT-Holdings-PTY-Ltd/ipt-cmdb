@@ -283,23 +283,30 @@ function initialNodes(assets: Asset[], companyId: string, connectable: boolean, 
 }
 
 async function elkLayout(nodes: Node<CiNodeData>[], edges: Edge[], direction: LayoutDirection) {
-  const { default: ELK } = await import('elkjs/lib/elk.bundled.js');
-  const elk = new ELK();
-  const graph = await elk.layout({
-    id: 'root',
-    layoutOptions: {
-      'elk.algorithm': 'layered',
-      'elk.direction': direction,
-      'elk.spacing.nodeNode': '72',
-      'elk.layered.spacing.nodeNodeBetweenLayers': '120',
-      'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
-      'elk.edgeRouting': 'ORTHOGONAL',
-    },
-    children: nodes.map(node => ({ id: node.id, width: 230, height: 94 })),
-    edges: edges.map(edge => ({ id: edge.id, sources: [edge.source], targets: [edge.target] })),
-  });
-  const positions = new Map((graph.children || []).map(node => [node.id, { x: node.x || 0, y: node.y || 0 }]));
-  return nodes.map(node => ({ ...node, position: positions.get(node.id) || node.position }));
+  const [{ default: ELK }, { default: workerUrl }] = await Promise.all([
+    import('elkjs/lib/elk-api.js'),
+    import('elkjs/lib/elk-worker.min.js?url'),
+  ]);
+  const elk = new ELK({ workerUrl });
+  try {
+    const graph = await elk.layout({
+      id: 'root',
+      layoutOptions: {
+        'elk.algorithm': 'layered',
+        'elk.direction': direction,
+        'elk.spacing.nodeNode': '72',
+        'elk.layered.spacing.nodeNodeBetweenLayers': '120',
+        'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
+        'elk.edgeRouting': 'ORTHOGONAL',
+      },
+      children: nodes.map(node => ({ id: node.id, width: 230, height: 94 })),
+      edges: edges.map(edge => ({ id: edge.id, sources: [edge.source], targets: [edge.target] })),
+    });
+    const positions = new Map((graph.children || []).map(node => [node.id, { x: node.x || 0, y: node.y || 0 }]));
+    return nodes.map(node => ({ ...node, position: positions.get(node.id) || node.position }));
+  } finally {
+    elk.terminateWorker();
+  }
 }
 
 function gridLayout(nodes: Node<CiNodeData>[]) {
