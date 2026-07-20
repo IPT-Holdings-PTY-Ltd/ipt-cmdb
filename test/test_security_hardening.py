@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import app as core
@@ -156,7 +157,25 @@ class ApiExposureSecurityTests(unittest.TestCase):
         self.assertIn("db.internal", " ".join(logs.output))
 
     def test_static_file_mount_rejects_encoded_parent_traversal(self):
-        response = TestClient(backend_main.api).get("/%2e%2e/app.py")
+        temporary_base = Path(__file__).resolve().parents[1] / "tmp"
+        temporary_base.mkdir(exist_ok=True)
+        root = temporary_base / f"static-files-{uuid.uuid4()}"
+        frontend_dist = root / "dist"
+        index_path = frontend_dist / "index.html"
+        source_path = root / "app.py"
+        frontend_dist.mkdir(parents=True)
+        try:
+            index_path.write_text("<h1>CMDB Hub</h1>", encoding="utf-8")
+            source_path.write_text("CMDB Hub transitional state", encoding="utf-8")
+            isolated_api = FastAPI()
+            backend_main.mount_frontend(isolated_api, frontend_dist)
+
+            response = TestClient(isolated_api).get("/%2e%2e/app.py")
+        finally:
+            index_path.unlink(missing_ok=True)
+            source_path.unlink(missing_ok=True)
+            frontend_dist.rmdir()
+            root.rmdir()
 
         self.assertEqual(response.status_code, 404)
         self.assertNotIn("CMDB Hub transitional state", response.text)

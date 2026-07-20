@@ -3154,15 +3154,17 @@ def download_report(
     )
 
 
-if FRONTEND_DIST.exists():
-    api.mount(
-        "/",
-        StaticFiles(directory=FRONTEND_DIST, html=True),
-        name="frontend",
-    )
-else:
+def mount_frontend(application: FastAPI, frontend_dist: Path) -> None:
+    """Mount a compiled frontend or a stable build-required fallback page."""
+    if frontend_dist.is_dir():
+        application.mount(
+            "/",
+            StaticFiles(directory=frontend_dist, html=True),
+            name="frontend",
+        )
+        return
 
-    @api.get("/{path:path}", include_in_schema=False)
+    @application.get("/{path:path}", include_in_schema=False)
     def missing_react_application(path: str):
         """Explain how to build the frontend without accessing request-derived paths."""
 
@@ -3170,6 +3172,9 @@ else:
             "<h1>Frontend build is missing</h1><p>Run <code>npm run build</code> and restart the application.</p>",
             status_code=503,
         )
+
+
+mount_frontend(api, FRONTEND_DIST)
 
 
 app = api
