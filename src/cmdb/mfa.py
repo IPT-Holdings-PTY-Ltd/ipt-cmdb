@@ -9,6 +9,7 @@ import io
 import os
 import secrets
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pyotp
 import qrcode  # type: ignore[import-untyped]
@@ -24,9 +25,18 @@ def encryption_key(value: str | None = None) -> bytes:
     """Decode the 256-bit URL-safe base64 key used for TOTP seed encryption."""
 
     configured = value if value is not None else os.getenv("MFA_ENCRYPTION_KEY", "")
+    if value is None and not configured:
+        key_file = os.getenv("MFA_ENCRYPTION_KEY_FILE", "").strip()
+        if key_file:
+            try:
+                configured = Path(key_file).read_text(encoding="utf-8").strip()
+            except OSError as error:
+                raise MfaConfigurationError(
+                    "TOTP enrollment cannot read the configured MFA key file"
+                ) from error
     if not configured:
         raise MfaConfigurationError(
-            "TOTP enrollment is unavailable until MFA_ENCRYPTION_KEY is configured"
+            "TOTP enrollment is unavailable until an MFA encryption key is configured"
         )
     try:
         decoded = base64.urlsafe_b64decode(configured.encode("ascii"))

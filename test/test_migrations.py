@@ -10,6 +10,7 @@ class FakeCursor:
     def __init__(self, history: dict[str, str | None]):
         self.history = history
         self.rows = []
+        self.statements = []
 
     def __enter__(self):
         return self
@@ -19,6 +20,7 @@ class FakeCursor:
 
     def execute(self, sql, params=None):
         normalized = " ".join(sql.split()).lower()
+        self.statements.append(normalized)
         if normalized.startswith("select version, checksum from schema_migrations"):
             self.rows = sorted(self.history.items())
         elif normalized.startswith("update schema_migrations set checksum"):
@@ -43,10 +45,21 @@ class FakeConnection:
         return False
 
     def cursor(self):
-        return FakeCursor(self.history)
+        cursor = FakeCursor(self.history)
+        self.last_cursor = cursor
+        return cursor
 
 
 class MigrationTests(unittest.TestCase):
+    def test_migrations_take_a_transaction_scoped_advisory_lock(self):
+        connection = FakeConnection({})
+
+        apply_migrations(lambda: connection, ROOT)
+
+        self.assertTrue(
+            connection.last_cursor.statements[0].startswith("select pg_advisory_xact_lock")
+        )
+
     def test_plan_is_ordered_and_latest_version_is_incremental_migration(self):
         plan = migration_plan(ROOT)
         self.assertEqual(

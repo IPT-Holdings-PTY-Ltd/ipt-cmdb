@@ -102,10 +102,23 @@ findings while dependency advisories are initially reported without blocking mer
 | Configuration | Behaviour |
 |---|---|
 | `DATABASE_URL` set | Canonical PostgreSQL mode; migrations run at startup |
+| `DATABASE_URL_FILE` set | Canonical PostgreSQL mode using a container-mounted secret file |
 | No URL, default settings | Database setup-only mode; operational APIs fail closed |
 | `ALLOW_LOCAL_DEVELOPMENT=true` | Explicit lightweight development repository; never use in production |
 
 `DATABASE_SEED_MODE` accepts `empty`, `demo` or `current` for a previously uninitialised PostgreSQL database.
+
+To exercise the first-start UI instead of setting `DATABASE_URL`, generate a dedicated key and
+provide it before starting FastAPI:
+
+```powershell
+$env:DATABASE_CONFIG_ENCRYPTION_KEY = python -c "import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
+Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue
+python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 3000
+```
+
+The saved `database-config.json` contains authenticated ciphertext, not the PostgreSQL password.
+Keep the key stable across restarts. Losing it requires re-entering the database connection.
 
 ## API exploration
 

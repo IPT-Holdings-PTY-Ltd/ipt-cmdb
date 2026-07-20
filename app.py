@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import base64
-import contextlib
 import hashlib
 import json
+import logging
 import os
 import threading
 import uuid
@@ -17,9 +17,19 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
+from src.cmdb.database_config import (
+    DatabaseConfigError,
+    decrypt_database_url,
+    write_encrypted_database_url,
+)
+from src.cmdb.database_config import (
+    encryption_key as database_config_encryption_key,
+)
 from src.cmdb.migrations import apply_migrations, latest_schema_version
+from src.cmdb.repository import hash_password
 
 ROOT = Path(__file__).parent
+LOGGER = logging.getLogger("cmdb.core")
 DATA_DIR = Path(os.getenv("DATA_DIR", ROOT / "data"))
 DATA_FILE = DATA_DIR / "cmdb.json"
 DATABASE_CONFIG_FILE = DATA_DIR / "database-config.json"
@@ -147,19 +157,41 @@ def now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-def saved_database_url() -> tuple[str | None, str]:
+def saved_database_url() -> tuple[str | None, str, str | None]:
+    """Load database configuration without exposing credential material."""
+
     if os.getenv("DATABASE_URL"):
-        return os.environ["DATABASE_URL"], "environment"
+        return os.environ["DATABASE_URL"], "environment", None
+    if os.getenv("DATABASE_URL_FILE"):
+        try:
+            database_url = Path(os.environ["DATABASE_URL_FILE"]).read_text(encoding="utf-8").strip()
+        except OSError:
+            LOGGER.exception("database_url_secret_file_unreadable")
+            return None, "environment file", "The database secret file cannot be read"
+        if not database_url:
+            return None, "environment file", "The database secret file is empty"
+        return database_url, "environment file", None
     if DATABASE_CONFIG_FILE.exists():
         try:
             value = json.loads(DATABASE_CONFIG_FILE.read_text(encoding="utf-8"))
-            return value.get("url"), "saved local configuration"
-        except (OSError, json.JSONDecodeError):
-            return None, "not configured"
-    return None, "not configured"
+            if value.get("url"):
+                key = database_config_encryption_key()
+                database_url = str(value["url"])
+                write_encrypted_database_url(DATABASE_CONFIG_FILE, database_url, key)
+                LOGGER.warning("legacy_plaintext_database_configuration_migrated")
+                return database_url, "encrypted local configuration", None
+            return decrypt_database_url(value), "encrypted local configuration", None
+        except (DatabaseConfigError, OSError, json.JSONDecodeError):
+            LOGGER.exception("saved_database_configuration_unavailable")
+            return (
+                None,
+                "encrypted local configuration",
+                "Saved database settings are unavailable; verify the database configuration key",
+            )
+    return None, "not configured", None
 
 
-DATABASE_URL, DATABASE_SOURCE = saved_database_url()
+DATABASE_URL, DATABASE_SOURCE, DATABASE_ERROR = saved_database_url()
 
 
 def postgres_connection(database_url: str | None = None):
@@ -215,6 +247,28 @@ def build_seed_state(mode: str, source: dict | None = None) -> dict:
         ]
         if not administrators:
             administrators = [deepcopy(SEED["users"][0])]
+        bootstrap_email = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
+        bootstrap_password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "").strip()
+        bootstrap_password_file = os.getenv("BOOTSTRAP_ADMIN_PASSWORD_FILE", "").strip()
+        if bootstrap_email:
+            administrators[0]["email"] = bootstrap_email
+        if not bootstrap_password and bootstrap_password_file:
+            try:
+                bootstrap_password = (
+                    Path(bootstrap_password_file).read_text(encoding="utf-8").strip()
+                )
+            except OSError as error:
+                raise RuntimeError(
+                    "The bootstrap administrator password file cannot be read"
+                ) from error
+        if bootstrap_password:
+            if len(bootstrap_password) < 16:
+                raise RuntimeError(
+                    "The bootstrap administrator password must contain at least 16 characters"
+                )
+            administrators[0]["passwordHash"] = hash_password(bootstrap_password)
+            administrators[0].pop("password", None)
+            administrators[0]["mfaRequired"] = True
         state = {
             "companies": [],
             "users": administrators,
@@ -359,12 +413,18 @@ def safe_database_settings() -> dict:
 
 
 def database_status() -> dict:
+    try:
+        database_config_encryption_key()
+        ui_config_persistence_ready = True
+    except DatabaseConfigError:
+        ui_config_persistence_ready = False
     status = {
         "configured": bool(DATABASE_URL),
         "available": DATABASE_MODE == "PostgreSQL",
         "mode": DATABASE_MODE,
         "source": DATABASE_SOURCE,
-        "managedByEnvironment": DATABASE_SOURCE == "environment",
+        "managedByEnvironment": DATABASE_SOURCE in {"environment", "environment file"},
+        "uiConfigPersistenceReady": ui_config_persistence_ready,
         "error": DATABASE_ERROR,
         "settings": safe_database_settings(),
         "expectedSchemaVersion": SCHEMA_VERSION,
@@ -372,11 +432,12 @@ def database_status() -> dict:
     if DATABASE_URL:
         try:
             status.update(database_diagnostics())
-        except Exception as error:
+        except Exception:
+            LOGGER.exception("database_diagnostics_failed")
             status.update(
                 {
                     "available": False,
-                    "diagnosticError": str(error).split("\n", 1)[0][:240],
+                    "diagnosticError": "Database diagnostics failed; review server logs",
                 }
             )
     return status
@@ -385,8 +446,12 @@ def database_status() -> dict:
 def test_database_url(database_url: str) -> dict:
     try:
         return database_diagnostics(database_url)
-    except Exception as error:
-        return {"ok": False, "error": str(error).split("\n", 1)[0][:240]}
+    except Exception:
+        LOGGER.exception("database_connection_test_failed")
+        return {
+            "ok": False,
+            "error": "Unable to connect using the supplied database settings",
+        }
 
 
 def save_database_settings(data: dict) -> dict:
@@ -405,6 +470,10 @@ def save_database_settings(data: dict) -> dict:
             "error": "This connection is managed by the environment. Update the Container App or Key Vault reference and restart the service.",
         }
     database_url = database_url_from_settings(data)
+    try:
+        config_key = database_config_encryption_key()
+    except DatabaseConfigError as error:
+        return {"ok": False, "error": str(error)}
     test = test_database_url(database_url)
     if not test["ok"]:
         return test
@@ -425,13 +494,10 @@ def save_database_settings(data: dict) -> dict:
     target_state = legacy_row[0] if legacy_row else build_seed_state(seed_mode, DB)
     DB.clear()
     DB.update(deepcopy(target_state))
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    DATABASE_CONFIG_FILE.write_text(json.dumps({"url": database_url}), encoding="utf-8")
-    with contextlib.suppress(OSError):
-        os.chmod(DATABASE_CONFIG_FILE, 0o600)
+    write_encrypted_database_url(DATABASE_CONFIG_FILE, database_url, config_key)
     DATABASE_URL, DATABASE_SOURCE, DATABASE_ERROR, DATABASE_MODE = (
         database_url,
-        "saved local configuration",
+        "encrypted local configuration",
         None,
         "PostgreSQL",
     )
@@ -468,7 +534,8 @@ def load_db() -> dict:
                     return legacy_row[0]
                 return build_seed_state(os.getenv("DATABASE_SEED_MODE", "current").lower(), SEED)
         except Exception as error:
-            DATABASE_ERROR = str(error).split("\n", 1)[0][:240]
+            LOGGER.exception("configured_postgresql_unavailable")
+            DATABASE_ERROR = "Configured PostgreSQL is unavailable; review server logs"
             DATABASE_MODE = "PostgreSQL unavailable"
             raise RuntimeError(f"Configured PostgreSQL is unavailable: {DATABASE_ERROR}") from error
     local_state = load_local_db()

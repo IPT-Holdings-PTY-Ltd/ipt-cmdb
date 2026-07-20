@@ -28,7 +28,15 @@ Every customer-scoped API operation must enforce the current user's allowed comp
 
 ### Authentication
 
-Local authentication is for development. Production should use Microsoft Entra ID through a trusted gateway such as Azure Container Apps/App Service authentication. The gateway must remove spoofed inbound identity headers before injecting verified values.
+Production should normally use Microsoft Entra ID through a trusted gateway such as
+Azure Container Apps/App Service authentication. The gateway must remove spoofed inbound
+identity headers before injecting verified values.
+
+The dedicated compact appliance may use local authentication only when it is initialized
+with a unique random bootstrap password, remains private until first-login authenticator
+enrollment completes, enforces `LOCAL_MFA_POLICY=all`, terminates HTTPS at a restricted
+reverse proxy, and is covered by login monitoring and tested recovery. Local authentication
+must not reuse demo credentials or be shared across customer instances.
 
 `ALLOW_LOCAL_BREAK_GLASS`, `ALLOW_UI_DATABASE_CONFIG` and `ALLOW_LOCAL_DEVELOPMENT` should remain `false` in production.
 
@@ -45,6 +53,8 @@ Personal tokens are intended for bounded CMDB automation, not interactive admini
 ### Secrets
 
 - Keep `DATABASE_URL` and provider credentials in Key Vault or an equivalent secret store.
+- Prefer `DATABASE_URL_FILE` for container secret mounts. If the first-start UI must persist a
+  connection, provide a separate `DATABASE_CONFIG_ENCRYPTION_KEY`; never reuse the MFA key.
 - Keep `MFA_ENCRYPTION_KEY` in Key Vault and use the same value across every application replica.
 - Never expose secrets through frontend configuration, logs, API responses or portable exports.
 - Use dedicated, least-privilege provider identities.
