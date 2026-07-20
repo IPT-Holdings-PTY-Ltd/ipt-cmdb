@@ -1,6 +1,8 @@
 import base64
+import os
 import unittest
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 import pyotp
 
@@ -28,6 +30,16 @@ class MfaTests(unittest.TestCase):
             encryption_key("")
         with self.assertRaises(MfaConfigurationError):
             encryption_key(base64.urlsafe_b64encode(b"short").decode("ascii"))
+
+    def test_encryption_key_can_be_loaded_from_secret_file(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"MFA_ENCRYPTION_KEY": "", "MFA_ENCRYPTION_KEY_FILE": "/run/secrets/mfa"},
+            ),
+            patch("src.cmdb.mfa.Path.read_text", return_value=self.encoded_key),
+        ):
+            self.assertEqual(encryption_key(), self.key)
 
     def test_totp_seed_is_authenticated_to_its_user(self):
         secret = new_totp_secret()

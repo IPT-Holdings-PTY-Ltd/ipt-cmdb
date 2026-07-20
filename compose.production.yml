@@ -1,0 +1,57 @@
+services:
+  cmdb:
+    image: ${CMDB_IMAGE:?Set CMDB_IMAGE to an immutable image tag or digest}
+    ports:
+      - "${CMDB_BIND_ADDRESS:-127.0.0.1}:${CMDB_PORT:-3000}:3000"
+    environment:
+      PORT: "3000"
+      DATA_DIR: /app/data
+      DATABASE_URL_FILE: /run/secrets/database_url
+      DATABASE_SEED_MODE: empty
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?Set BOOTSTRAP_ADMIN_EMAIL}
+      BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/bootstrap_admin_password
+      AUTH_MODE: ${AUTH_MODE:-easy_auth}
+      ENTRA_LOGIN_URL: ${ENTRA_LOGIN_URL:-/.auth/login/aad?post_login_redirect_uri=/}
+      ENTRA_LOGOUT_URL: ${ENTRA_LOGOUT_URL:-/.auth/logout?post_logout_redirect_uri=/#/login}
+      ENTRA_PRINCIPAL_HEADER: ${ENTRA_PRINCIPAL_HEADER:-x-ms-client-principal}
+      ENTRA_PRINCIPAL_NAME_HEADER: ${ENTRA_PRINCIPAL_NAME_HEADER:-x-ms-client-principal-name}
+      ENTRA_EMAIL_CLAIMS: ${ENTRA_EMAIL_CLAIMS:-preferred_username,http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress,emails}
+      ALLOW_LOCAL_BREAK_GLASS: ${ALLOW_LOCAL_BREAK_GLASS:-false}
+      MFA_ENCRYPTION_KEY_FILE: /run/secrets/mfa_encryption_key
+      LOCAL_MFA_POLICY: ${LOCAL_MFA_POLICY:-admins}
+      ALLOW_UI_DATABASE_CONFIG: "false"
+      ALLOW_LOCAL_DEVELOPMENT: "false"
+    secrets:
+      - database_url
+      - bootstrap_admin_password
+      - mfa_encryption_key
+    volumes:
+      - cmdb-runtime:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: ${CMDB_MEMORY_LIMIT:-1g}
+    cpus: ${CMDB_CPU_LIMIT:-1.0}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3000/api/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+secrets:
+  database_url:
+    file: ${DATABASE_URL_SECRET_FILE:?Set DATABASE_URL_SECRET_FILE}
+  mfa_encryption_key:
+    file: ${MFA_ENCRYPTION_KEY_SECRET_FILE:?Set MFA_ENCRYPTION_KEY_SECRET_FILE}
+  bootstrap_admin_password:
+    file: ${BOOTSTRAP_ADMIN_PASSWORD_SECRET_FILE:?Set BOOTSTRAP_ADMIN_PASSWORD_SECRET_FILE}
+
+volumes:
+  cmdb-runtime:

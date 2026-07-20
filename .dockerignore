@@ -2,9 +2,17 @@
 .agents
 .codex
 __pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.pre-commit-cache
+pytest-cache-files-*
 node_modules
 frontend/dist
 data
 outputs
 work
+.appliance
+backups
+tmp*
 *.pyc

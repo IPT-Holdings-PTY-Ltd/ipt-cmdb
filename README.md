@@ -46,11 +46,12 @@ docker compose up --build -d
 
 Open <http://localhost:3000>. The Compose stack starts the application and PostgreSQL, applies database migrations and seeds the demo workspace.
 
-Check readiness:
+Check process health and database readiness:
 
 ```powershell
 docker compose ps
-Invoke-RestMethod http://localhost:3000/api/health
+Invoke-RestMethod http://localhost:3000/api/live
+Invoke-RestMethod http://localhost:3000/api/ready
 ```
 
 The development identities all use the password `ChangeMe!`:
@@ -62,6 +63,21 @@ The development identities all use the password `ChangeMe!`:
 | `client@acme.example` | Customer reader | Acme Manufacturing only |
 
 These identities are demo data. Never expose them on a public deployment.
+
+## Compact customer appliance
+
+For a cost-effective dedicated instance on one Docker host, use the production appliance
+profile. It starts one CMDB container and one PostgreSQL container with generated secrets,
+mandatory first-login MFA, persistent volumes, and verified backup/restore tooling:
+
+```powershell
+.\scripts\Initialize-Appliance.ps1 -AdminEmail owner@example.com -InstanceName customer-acme
+$environment = '.appliance\customer-acme\.env.appliance'
+docker compose --env-file $environment -f compose.appliance.yml up -d
+```
+
+See the [compact Docker appliance runbook](docs/deployment/APPLIANCE.md) before exposing
+the instance or scheduling backups.
 
 ## Developer workflow
 
@@ -129,7 +145,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime, tenancy, identity and re
 - [Governance, audit and reporting](docs/GOVERNANCE.md)
 - [Data quality and reconciliation](docs/DATA_QUALITY.md)
 - [Integration design and provider boundaries](docs/INTEGRATIONS.md)
-- [Azure/container deployment](docs/DEPLOYMENT.md)
+- [Deployment selector and production contract](docs/DEPLOYMENT.md)
+- [Self-hosted container deployment](docs/deployment/SELF_HOSTED.md)
+- [Compact Docker appliance](docs/deployment/APPLIANCE.md)
+- [Azure Container Apps deployment](docs/deployment/AZURE_CONTAINER_APPS.md)
 - [Operations, upgrades and recovery](docs/OPERATIONS.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)

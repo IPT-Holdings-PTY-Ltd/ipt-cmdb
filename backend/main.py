@@ -21,8 +21,9 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.staticfiles import StaticFiles
 
 import app as core
 from src.cmdb.audit import AuditContext, reset_audit_context, set_audit_context
@@ -146,6 +147,8 @@ async def require_operational_database(request: Request, call_next):
     if core.DATABASE_MODE != "database setup" or not request.url.path.startswith("/api/"):
         return await call_next(request)
     allowed = {
+        "/api/live",
+        "/api/ready",
         "/api/health",
         "/api/v2/health",
         "/api/auth/config",
@@ -679,15 +682,43 @@ class ChangeTransitionRequest(BaseModel):
 @api.get("/api/v2/health", tags=["platform"])
 @api.get("/api/health", tags=["platform"])
 def health() -> dict:
+    database_unavailable = core.DATABASE_MODE == "PostgreSQL unavailable"
+    database_available = core.DATABASE_MODE == "PostgreSQL"
     return {
-        "status": "setup_required" if core.DATABASE_MODE == "database setup" else "ok",
+        "status": "setup_required"
+        if core.DATABASE_MODE == "database setup"
+        else "degraded"
+        if database_unavailable
+        else "ok",
         "api": "FastAPI",
         "databaseMode": core.DATABASE_MODE,
         "repositoryMode": REPOSITORY.mode,
-        "repositoryError": core.DATABASE_ERROR,
+        "databaseAvailable": database_available,
         "expectedSchemaVersion": core.SCHEMA_VERSION,
         "authentication": os.getenv("AUTH_MODE", "local"),
     }
+
+
+@api.get("/api/live", tags=["platform"])
+def liveness() -> dict[str, str]:
+    """Confirm that the API process can accept HTTP requests."""
+
+    return {"status": "alive", "api": "FastAPI"}
+
+
+@api.get("/api/ready", tags=["platform"])
+def readiness() -> JSONResponse:
+    """Report whether the canonical PostgreSQL repository is ready for traffic."""
+
+    ready = core.DATABASE_MODE == "PostgreSQL" and REPOSITORY.mode == "canonical_postgresql"
+    return JSONResponse(
+        {
+            "status": "ready" if ready else "not_ready",
+            "databaseAvailable": ready,
+            "expectedSchemaVersion": core.SCHEMA_VERSION,
+        },
+        status_code=200 if ready else 503,
+    )
 
 
 def _user_by_id(user_id: str) -> dict | None:
@@ -1083,8 +1114,11 @@ def database_config(payload: DatabaseSettingsRequest, request: Request) -> dict:
             core.DB.update(repository.export_state())
         REPOSITORY = repository
     except Exception as error:
-        core.DATABASE_ERROR = f"Database prepared but repository activation failed: {str(error).splitlines()[0][:180]}"
-        raise HTTPException(500, core.DATABASE_ERROR) from error
+        LOGGER.exception("database_repository_activation_failed")
+        core.DATABASE_ERROR = (
+            "Database prepared but repository activation failed; review server logs"
+        )
+        raise HTTPException(500, "Database activation failed; review server logs") from error
     return {**result, "repositoryMode": REPOSITORY.mode}
 
 
@@ -3120,19 +3154,22 @@ def download_report(
     )
 
 
-@api.get("/{path:path}", include_in_schema=False)
-def react_application(path: str):
-    if not FRONTEND_DIST.exists():
+if FRONTEND_DIST.exists():
+    api.mount(
+        "/",
+        StaticFiles(directory=FRONTEND_DIST, html=True),
+        name="frontend",
+    )
+else:
+
+    @api.get("/{path:path}", include_in_schema=False)
+    def missing_react_application(path: str):
+        """Explain how to build the frontend without accessing request-derived paths."""
+
         return HTMLResponse(
             "<h1>Frontend build is missing</h1><p>Run <code>npm run build</code> and restart the application.</p>",
             status_code=503,
         )
-    candidate = (FRONTEND_DIST / path).resolve()
-    if path and candidate.is_file() and FRONTEND_DIST.resolve() in candidate.parents:
-        return FileResponse(candidate)
-    if not path:
-        return FileResponse(FRONTEND_DIST / "index.html")
-    return Response(status_code=404)
 
 
 app = api

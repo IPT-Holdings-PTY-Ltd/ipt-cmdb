@@ -3,7 +3,13 @@ services:
   api:
     project: .
     host: containerapp
-    language: docker
+    language: python
     docker:
       path: ./Dockerfile
       context: .
+      platform: amd64
+      remoteBuild: true
+infra:
+  provider: bicep
+  path: infra
+  module: main

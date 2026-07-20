@@ -19,6 +19,7 @@ from app import (
     restore_backup,
     would_create_dependency_cycle,
 )
+from src.cmdb.repository import verify_password
 
 
 class CompanyScopeTests(unittest.TestCase):
@@ -165,6 +166,25 @@ class CompanyScopeTests(unittest.TestCase):
         self.assertEqual(state["companies"], [])
         self.assertEqual(state["assets"], [])
         self.assertTrue(any(user["role"] == "platform_admin" for user in state["users"]))
+
+    def test_empty_seed_uses_protected_bootstrap_admin_credentials(self):
+        password = "unique-bootstrap-password-2026"
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "BOOTSTRAP_ADMIN_EMAIL": "owner@example.com",
+                    "BOOTSTRAP_ADMIN_PASSWORD_FILE": "/run/secrets/bootstrap-password",
+                },
+            ),
+            patch("app.Path.read_text", return_value=password),
+        ):
+            state = build_seed_state("empty")
+
+        administrator = state["users"][0]
+        self.assertEqual(administrator["email"], "owner@example.com")
+        self.assertTrue(verify_password(password, administrator["passwordHash"]))
+        self.assertTrue(administrator["mfaRequired"])
 
     def test_portable_backup_preview_detects_tampering(self):
         backup = backup_document()

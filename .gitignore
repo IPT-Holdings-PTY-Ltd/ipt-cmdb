@@ -18,11 +18,15 @@ frontend/dist/
 .env
 .env.*
 !.env.example
+!.env.production.example
 data/
 work/
 tmp/
 output/
 outputs/
+backups/
+appliance-secrets/
+.appliance/
 *.backup.json
 cmdb-hub-backup-*.json
 

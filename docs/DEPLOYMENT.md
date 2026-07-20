@@ -1,93 +1,110 @@
-# Container and Azure deployment
+# Deployment guide
 
-## Deployment status
+IPT CMDB supports three explicit deployment profiles. Choose one profile and do
+not promote the development Compose file into production.
 
-The repository contains a production-style multi-stage `Dockerfile`, a Compose development stack and an `azure.yaml` service descriptor. It does not yet include opinionated Bicep or Terraform for a complete Azure environment. Provision the supporting Azure resources through your organisation's infrastructure-as-code process.
+| Profile | Intended use | Database | Authentication | Entry point |
+|---|---|---|---|---|
+| Local Compose | Development and controlled evaluation | Included PostgreSQL | Demo local accounts | `docker-compose.yml` |
+| Compact appliance | Small production instance on one Docker host | Included PostgreSQL container | Local TOTP or trusted identity proxy | `compose.appliance.yml` |
+| Self-hosted containers | VM or container host production | External PostgreSQL | Trusted OIDC/identity proxy | `compose.production.yml` |
+| Azure Container Apps | Azure production baseline | Private PostgreSQL Flexible Server | Container Apps Entra authentication | `azure.yaml` + `infra/` |
 
-## Container contract
+Detailed runbooks:
 
-- listens on port `3000`;
-- serves the compiled SPA and `/api` from one origin;
-- exposes `/api/health` and `/api/v2/health`;
-- requires writable temporary space only for explicitly configured local data;
-- uses PostgreSQL for all production operational state;
-- applies compatible database migrations during startup.
+- [Self-hosted container deployment](deployment/SELF_HOSTED.md)
+- [Compact Docker appliance](deployment/APPLIANCE.md)
+- [Azure Container Apps deployment](deployment/AZURE_CONTAINER_APPS.md)
+- [Local development](LOCAL_DEVELOPMENT.md)
 
-## Required production services
+## Runtime contract
 
-- Azure Container Apps or an equivalent container runtime;
-- Azure Database for PostgreSQL Flexible Server;
-- Microsoft Entra ID authentication through Container Apps/App Service authentication or a trusted identity-aware proxy;
-- Azure Key Vault for database and provider credentials;
-- Log Analytics/Application Insights;
-- a custom domain and managed certificate;
-- PostgreSQL backups and point-in-time restore;
-- Container Apps Jobs, Functions or another worker runtime for scheduled integrations.
+Every deployment uses the same application image:
 
-## Core environment variables
+- port `3000` serves the SPA and `/api` from one origin;
+- `/api/live` proves that the process is accepting HTTP requests;
+- `/api/ready` returns `200` only when the canonical PostgreSQL repository is ready;
+- `/api/health` is an operator-safe informational status and is not a readiness probe;
+- production operational state lives in PostgreSQL;
+- compatible, checksum-protected forward-only migrations run during startup;
+- migrations hold a PostgreSQL transaction-scoped advisory lock, preventing two
+  replicas from modifying the schema concurrently;
+- no production secret is sent to the browser or returned by health responses.
 
-| Variable | Production guidance |
+The container image runs as the unprivileged `cmdb` user. The production Compose
+profile additionally makes the root filesystem read-only, drops Linux capabilities,
+and mounts only a small runtime volume and temporary filesystem.
+
+## Required environment settings
+
+| Variable | Production value |
 |---|---|
-| `PORT` | Keep `3000` unless the platform injects another value |
-| `DATABASE_URL` | Key Vault-backed PostgreSQL connection string; SSL required |
-| `DATABASE_SEED_MODE` | `empty` for a new platform; ignored after initialisation |
-| `AUTH_MODE` | `easy_auth` behind the Azure authentication boundary |
-| `ALLOW_LOCAL_BREAK_GLASS` | `false` unless an audited emergency design requires it |
-| `MFA_ENCRYPTION_KEY` | Stable URL-safe base64 encoding of 32 random bytes from Key Vault; required for local TOTP |
-| `LOCAL_MFA_POLICY` | `optional`, `admins` or `all`; applies only to local accounts |
-| `ALLOW_UI_DATABASE_CONFIG` | `false`; production database settings are infrastructure-owned |
-| `ALLOW_LOCAL_DEVELOPMENT` | Always `false` |
-| `ENTRA_LOGIN_URL` | Runtime login endpoint, normally `/.auth/login/aad?...` |
-| `ENTRA_LOGOUT_URL` | Runtime logout endpoint |
-| `ENTRA_PRINCIPAL_HEADER` | Header containing the encoded principal |
-| `ENTRA_PRINCIPAL_NAME_HEADER` | Optional direct user/email header |
-| `ENTRA_EMAIL_CLAIMS` | Ordered accepted email claim names |
+| `DATABASE_URL` or `DATABASE_URL_FILE` | PostgreSQL URL with TLS, normally `sslmode=require` |
+| `DATABASE_SEED_MODE` | `empty` |
+| `AUTH_MODE` | `easy_auth` behind a trusted identity boundary |
+| `MFA_ENCRYPTION_KEY` or `MFA_ENCRYPTION_KEY_FILE` | Stable URL-safe base64 encoding of 32 random bytes |
+| `ALLOW_UI_DATABASE_CONFIG` | `false` |
+| `ALLOW_LOCAL_DEVELOPMENT` | `false` |
+| `ALLOW_LOCAL_BREAK_GLASS` | `false` unless a separately approved emergency design exists |
+| `BOOTSTRAP_ADMIN_EMAIL` | First platform administrator for a blank database |
+| `BOOTSTRAP_ADMIN_PASSWORD` or `_FILE` | Random initial password supplied through the secret store |
 
-See `.env.example` for provider variables. Never commit populated values.
+Provider credentials belong in a secret manager. See `.env.example` for the full
+runtime configuration surface; never commit populated values.
 
-## Entra ID boundary
+## Identity boundary
 
-1. Configure Azure authentication to require an authenticated Microsoft identity.
-2. Configure the application's login/logout URLs to match the hosting surface.
-3. Ensure the proxy strips untrusted inbound identity headers and injects its own verified headers.
-4. Create the corresponding CMDB user and customer/group assignments.
-5. Keep API authorization enabled; external authentication does not replace tenant checks.
+`AUTH_MODE=easy_auth` trusts identity headers. It is safe only when the application
+is unreachable except through a gateway that authenticates the user, removes any
+client-supplied identity headers, and injects verified values. Azure Container Apps
+authentication provides that boundary in the Azure profile. A self-hosted deployment
+must provide an equivalent OIDC-aware reverse proxy.
 
-If an authenticated Entra user is not mapped to a CMDB account, access should be denied rather than auto-provisioned with broad scope.
+External authentication does not replace application authorization. The Entra email
+must map to an enabled CMDB user, and customer/group/RBAC scope is still enforced by
+the API. Unmapped identities are denied.
 
-Entra identities should receive MFA through Conditional Access. Application TOTP is reserved for local and deliberately enabled break-glass identities. Every container replica must receive the same `MFA_ENCRYPTION_KEY`; changing it without re-encrypting stored seeds prevents enrolled users from completing TOTP.
+## Database lifecycle
 
-## PostgreSQL
+The application can initialize an empty PostgreSQL database and migrate an older
+supported CMDB schema. It does not create the PostgreSQL server itself outside the
+Azure IaC profile. The runtime role currently needs DDL rights because migrations run
+during startup.
 
-Use a private endpoint or equivalent network restriction. The runtime database role needs access to the CMDB schema and permission to apply packaged migrations. If schema changes are managed by a separate deployment identity, run the migration command in a controlled pre-deployment job and give the web role only runtime privileges.
+For a production release:
 
-The application creates schema objects inside an existing database. It does not provision the PostgreSQL server or database.
+1. Confirm a recent recovery point or tested backup.
+2. Review new files under `db/migrations`.
+3. Deploy the immutable image to staging.
+4. Require `/api/live` and `/api/ready` to pass.
+5. Test identity mapping, tenant switching, one asset read, and one PDF report.
+6. Promote the same image digest.
 
-## Suggested release flow
+Application rollback is safe only when the older image understands the already-applied
+schema. Migrations are forward-only; do not casually reverse them.
 
-1. Pull or build the immutable image produced from a `v*` Git tag.
-2. Review release notes and migration files.
-3. Verify a recent PostgreSQL recovery point or backup.
-4. Deploy to a staging revision and check `/api/health`.
-5. Exercise login, tenant switching, asset reads and a PDF generation smoke test.
-6. Shift traffic to the new revision.
-7. Monitor error rate, database connections and migration status.
+## Current scaling boundary
 
-Rollback the application revision only when the older image supports the already-applied database schema. Database migrations are forward-only; restore PostgreSQL only through an approved recovery procedure.
+The Azure baseline intentionally uses one replica. Schema migrations are serialized,
+but first-ever repository seeding has not yet been certified under simultaneous cold
+starts. Complete that concurrency test and move initialization to a deployment job
+before raising `maxReplicas`.
 
-## Integration workers
+## Production checklist
 
-Provider collection should not run as a long web request in production. Use a scheduled Container Apps Job or queue-driven worker with:
-
-- the same canonical repository package;
-- least-privilege, read-only provider credentials;
-- per-connection locking;
-- retry with backoff and provider rate-limit handling;
-- durable sync-run and reconciliation records;
-- no browser-facing secret output.
+- Immutable image tag or digest, vulnerability scanned before release
+- PostgreSQL private networking, backups, PITR retention, and restore rehearsal
+- Entra Conditional Access/MFA or equivalent OIDC policy
+- Key Vault or protected container secret files
+- HTTPS-only public endpoint and restrictive ingress/firewall rules
+- Central logs, alerts for readiness failure and HTTP 5xx, and request correlation
+- Root/admin user review and local break-glass policy
+- Restore and application rollback runbooks tested in a non-production environment
 
 ## References
 
-- [Azure Container Apps authentication and authorization](https://learn.microsoft.com/azure/container-apps/authentication)
-- [Azure Developer CLI `azure.yaml` schema](https://learn.microsoft.com/azure/developer/azure-developer-cli/azd-schema)
-- [Azure Database for PostgreSQL backup and restore](https://learn.microsoft.com/azure/postgresql/backup-restore/concepts-backup-restore)
+- [Azure Container Apps authentication](https://learn.microsoft.com/azure/container-apps/authentication)
+- [Azure Container Apps health probes](https://learn.microsoft.com/azure/container-apps/health-probes)
+- [Azure Container Apps Key Vault references](https://learn.microsoft.com/azure/container-apps/manage-secrets)
+- [Azure Developer CLI schema](https://learn.microsoft.com/azure/developer/azure-developer-cli/azd-schema)
+- [Docker Compose secrets](https://docs.docker.com/reference/compose-file/secrets/)

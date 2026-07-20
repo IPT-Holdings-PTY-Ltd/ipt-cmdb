@@ -4,7 +4,10 @@
 
 `GET /api/health` returns the API state, repository mode, expected schema version and authentication mode. A healthy production response should identify PostgreSQL and `canonical_postgresql` without a repository error.
 
-Use platform health probes against `/api/v2/health`. Treat database/schema failures as unavailable; do not route production traffic to a local fallback.
+Use liveness probes against `/api/live` and traffic readiness probes against `/api/ready`.
+Treat database/schema failures as unavailable; do not route production traffic to a
+local fallback. `/api/health` and `/api/v2/health` remain informational compatibility
+surfaces rather than traffic gates.
 
 ## Routine checks
 
@@ -57,6 +60,10 @@ A recovery exercise should verify:
 6. generated change documents remain available.
 
 Azure PostgreSQL restores create a new server rather than overwriting the source. Plan DNS/connection-string cutover and reapply required network and high-availability settings during the runbook. See [Microsoft's backup and restore guidance](https://learn.microsoft.com/azure/postgresql/backup-restore/concepts-backup-restore).
+
+The compact appliance provides checksum-producing `pg_dump` and destructive, explicitly
+invoked `pg_restore` tool containers. See the [appliance runbook](deployment/APPLIANCE.md)
+for scheduling, restore rehearsal, and external-database cutover.
 
 ## Local Docker operations
 

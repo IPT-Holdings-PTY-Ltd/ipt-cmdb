@@ -1,0 +1,137 @@
+services:
+  cmdb:
+    image: ${CMDB_IMAGE:?Set CMDB_IMAGE to an immutable image tag or digest}
+    ports:
+      - "${CMDB_BIND_ADDRESS:-127.0.0.1}:${CMDB_PORT:-3000}:3000"
+    environment:
+      PORT: "3000"
+      DATA_DIR: /app/data
+      DATABASE_URL_FILE: /run/secrets/database_url
+      DATABASE_SEED_MODE: empty
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?Set BOOTSTRAP_ADMIN_EMAIL}
+      BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/bootstrap_admin_password
+      AUTH_MODE: ${AUTH_MODE:-local}
+      ENTRA_LOGIN_URL: ${ENTRA_LOGIN_URL:-/.auth/login/aad?post_login_redirect_uri=/}
+      ENTRA_LOGOUT_URL: ${ENTRA_LOGOUT_URL:-/.auth/logout?post_logout_redirect_uri=/#/login}
+      ENTRA_PRINCIPAL_HEADER: ${ENTRA_PRINCIPAL_HEADER:-x-ms-client-principal}
+      ENTRA_PRINCIPAL_NAME_HEADER: ${ENTRA_PRINCIPAL_NAME_HEADER:-x-ms-client-principal-name}
+      ALLOW_LOCAL_BREAK_GLASS: "false"
+      MFA_ENCRYPTION_KEY_FILE: /run/secrets/mfa_encryption_key
+      LOCAL_MFA_POLICY: ${LOCAL_MFA_POLICY:-all}
+      ALLOW_UI_DATABASE_CONFIG: "false"
+      ALLOW_LOCAL_DEVELOPMENT: "false"
+    secrets:
+      - database_url
+      - bootstrap_admin_password
+      - mfa_encryption_key
+    volumes:
+      - cmdb-runtime:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: ${CMDB_APP_MEMORY_LIMIT:-1g}
+    cpus: ${CMDB_APP_CPU_LIMIT:-1.0}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3000/api/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_DB: cmdb
+      POSTGRES_USER: cmdb
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - cmdb-postgres:/var/lib/postgresql/data
+    shm_size: 256mb
+    mem_limit: ${CMDB_POSTGRES_MEMORY_LIMIT:-1g}
+    cpus: ${CMDB_POSTGRES_CPU_LIMIT:-1.0}
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    stop_grace_period: 1m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cmdb -d cmdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  backup:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    profiles: ["tools"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DATABASE: cmdb
+      POSTGRES_USER: cmdb
+    secrets:
+      - postgres_password
+    volumes:
+      - ${CMDB_BACKUP_DIRECTORY:?Set CMDB_BACKUP_DIRECTORY}:/backups
+      - ./scripts/appliance-backup.sh:/opt/cmdb/appliance-backup.sh:ro
+    entrypoint: ["/bin/sh", "/opt/cmdb/appliance-backup.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  restore:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    profiles: ["tools"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DATABASE: cmdb
+      POSTGRES_USER: cmdb
+      BACKUP_FILE: ${BACKUP_FILE:-}
+    secrets:
+      - postgres_password
+    volumes:
+      - ${CMDB_BACKUP_DIRECTORY:?Set CMDB_BACKUP_DIRECTORY}:/backups:ro
+      - ./scripts/appliance-restore.sh:/opt/cmdb/appliance-restore.sh:ro
+    entrypoint: ["/bin/sh", "/opt/cmdb/appliance-restore.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+secrets:
+  database_url:
+    file: ${CMDB_SECRET_DIRECTORY:?Set CMDB_SECRET_DIRECTORY}/database-url.txt
+  postgres_password:
+    file: ${CMDB_SECRET_DIRECTORY:?Set CMDB_SECRET_DIRECTORY}/postgres-password.txt
+  bootstrap_admin_password:
+    file: ${CMDB_SECRET_DIRECTORY:?Set CMDB_SECRET_DIRECTORY}/bootstrap-admin-password.txt
+  mfa_encryption_key:
+    file: ${CMDB_SECRET_DIRECTORY:?Set CMDB_SECRET_DIRECTORY}/mfa-encryption-key.txt
+
+volumes:
+  cmdb-postgres:
+  cmdb-runtime:
