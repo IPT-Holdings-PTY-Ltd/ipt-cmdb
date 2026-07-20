@@ -187,6 +187,40 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.state["auditEvents"][0]["entityType"], "msp_branding")
         self.assertNotIn("data:image", self.state["auditEvents"][0]["after"]["logoDataUrl"])
 
+    def test_email_configuration_and_outbox_are_audited_but_not_exported(self):
+        configured = self.repository.update_email_connection(
+            {
+                "enabled": True,
+                "authMode": "client_secret",
+                "senderAddress": "cmdb@example.com",
+                "clientSecretEncrypted": "ciphertext",
+                "clientSecretNonce": "nonce",
+                "status": "configured",
+            },
+            "admin",
+        )
+        message = self.repository.create_email_outbox(
+            {
+                "idempotencyKey": "test:1",
+                "to": ["tech@example.com"],
+                "subject": "Test",
+                "bodyHtml": "<p>Secret operational content</p>",
+            },
+            "admin",
+        )
+        accepted = self.repository.update_email_outbox(
+            message["id"],
+            {"status": "accepted", "attempts": 1, "acceptedAt": "2026-07-20T12:00:00Z"},
+            "admin",
+        )
+        self.assertEqual(configured["status"], "configured")
+        self.assertEqual(accepted["status"], "accepted")
+        self.assertNotIn("bodyHtml", self.repository.list_email_outbox()[0])
+        self.assertEqual(self.state["auditEvents"][0]["entityType"], "email_message")
+        exported = self.repository.export_state()
+        self.assertNotIn("emailConnection", exported)
+        self.assertNotIn("emailOutbox", exported)
+
     def test_customer_branding_is_scoped_persisted_and_audited(self):
         self.assertEqual(self.repository.get_company_branding("acme")["name"], "Acme")
         stored = self.repository.update_company_branding(

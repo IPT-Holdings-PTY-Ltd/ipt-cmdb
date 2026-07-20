@@ -31,6 +31,7 @@ IPT CMDB combines a tenant-aware asset inventory, business-system modelling, int
 | Data quality | MSP/customer quality scores, prioritized findings, audited exceptions, reconciliation review and per-customer field authority |
 | Reports | Controlled MSP/customer report catalogue with branded PDF, filterable XLSX and UTF-8 CSV exports |
 | Integrations | Root control plane and connectivity boundary; production ingestion/mapping is the next delivery increment |
+| Email | Root-managed Microsoft Graph sender, Azure managed identity or app credentials, Exchange mailbox scoping, audited outbox and test delivery |
 
 Passportal passwords, secure notes and credential values are explicitly out of scope. Only approved metadata associations should enter the CMDB.
 
@@ -129,6 +130,7 @@ flowchart LR
     CW[ConnectWise Manage] --> WORKERS[Read-only sync workers]
     NC[N-central] --> WORKERS
     PP[Passportal metadata] --> WORKERS
+    API -->|Application Mail.Send| GRAPH[Microsoft Graph / Exchange Online]
     WORKERS --> MAP[Mapping and reconciliation]
     MAP --> PG
 ```
@@ -145,6 +147,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime, tenancy, identity and re
 - [Governance, audit and reporting](docs/GOVERNANCE.md)
 - [Data quality and reconciliation](docs/DATA_QUALITY.md)
 - [Integration design and provider boundaries](docs/INTEGRATIONS.md)
+- [Microsoft 365 email delivery](docs/MICROSOFT_365_EMAIL.md)
 - [Deployment selector and production contract](docs/DEPLOYMENT.md)
 - [Self-hosted container deployment](docs/deployment/SELF_HOSTED.md)
 - [Compact Docker appliance](docs/deployment/APPLIANCE.md)
