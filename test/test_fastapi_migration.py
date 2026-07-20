@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 import app as core
 import backend.main as backend_main
+from src.cmdb.email_delivery import DeliveryResult
 from src.cmdb.repository import StateRepository
 
 api = backend_main.api
@@ -159,6 +160,51 @@ class FastApiMigrationTests(unittest.TestCase):
                 response = self.client.get("/api/assets", headers=self._headers(email))
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual({item["id"] for item in response.json()}, expected_ids)
+
+    def test_root_email_configuration_is_write_only_and_test_delivery_is_audited(self):
+        admin_headers = self._headers("admin@example.com")
+        operator_headers = self._headers("operator@example.com")
+        key = base64.urlsafe_b64encode(b"e" * 32).decode("ascii")
+        with patch.dict(os.environ, {"MFA_ENCRYPTION_KEY": key}, clear=False):
+            response = self.client.put(
+                "/api/email/config",
+                headers=admin_headers,
+                json={
+                    "enabled": True,
+                    "authMode": "client_secret",
+                    "tenantId": "00000000-0000-0000-0000-000000000001",
+                    "clientId": "00000000-0000-0000-0000-000000000002",
+                    "senderAddress": "cmdb@example.com",
+                    "senderName": "CMDB Hub",
+                    "clientSecret": "write-only-secret",
+                    "expectedRevision": 1,
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertTrue(response.json()["hasClientSecret"])
+            self.assertNotIn("clientSecretEncrypted", response.json())
+            self.assertNotIn("write-only-secret", json.dumps(core.DB))
+            self.assertEqual(
+                self.client.get("/api/email/config", headers=operator_headers).status_code,
+                403,
+            )
+            with patch.object(
+                backend_main.EMAIL_SENDER,
+                "send",
+                return_value=DeliveryResult(202, "graph-request"),
+            ):
+                sent = self.client.post(
+                    "/api/email/test",
+                    headers=admin_headers,
+                    json={"recipient": "tech@example.com"},
+                )
+            self.assertEqual(sent.status_code, 200, sent.text)
+            self.assertEqual(sent.json()["status"], "accepted")
+            self.assertEqual(sent.json()["providerRequestId"], "graph-request")
+            history = self.client.get("/api/email/outbox", headers=admin_headers)
+            self.assertEqual(history.status_code, 200)
+            self.assertEqual(history.json()[0]["status"], "accepted")
+            self.assertNotIn("bodyHtml", history.json()[0])
 
     def test_authorization_matrix_enforces_customer_write_scope(self):
         cases = [

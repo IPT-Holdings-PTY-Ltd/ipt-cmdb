@@ -37,6 +37,14 @@ from src.cmdb.change_control import (
 )
 from src.cmdb.data_quality import RULES as DATA_QUALITY_RULES
 from src.cmdb.data_quality import evaluate_data_quality
+from src.cmdb.email_delivery import (
+    EmailConfigurationError,
+    EmailDeliveryError,
+    GraphEmailSender,
+    exchange_rbac_script,
+    public_email_connection,
+    valid_email_address,
+)
 from src.cmdb.mfa import (
     MfaConfigurationError,
     decrypt_secret,
@@ -67,6 +75,7 @@ from src.cmdb.repository import (
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST", ROOT / "frontend" / "dist"))
 LOGGER = logging.getLogger("cmdb.api")
+EMAIL_SENDER = GraphEmailSender()
 
 
 api = FastAPI(
@@ -608,6 +617,31 @@ class BrandingRequest(BaseModel):
     welcomeMessage: str = Field(default="", max_length=180)
     reportFooter: str = Field(default="", max_length=180)
     confidentialityLabel: str = Field(default="", max_length=80)
+
+
+class EmailConfigurationRequest(BaseModel):
+    """Validate the root-managed Microsoft 365 email connection."""
+
+    enabled: bool = False
+    authMode: str = Field(
+        default="managed_identity",
+        pattern="^(managed_identity|client_secret|certificate)$",
+    )
+    tenantId: str = Field(default="", max_length=80)
+    clientId: str = Field(default="", max_length=80)
+    managedIdentityClientId: str = Field(default="", max_length=80)
+    senderAddress: str = Field(default="", max_length=320)
+    senderName: str = Field(default="", max_length=160)
+    replyTo: str = Field(default="", max_length=320)
+    clientSecret: str = Field(default="", max_length=2048)
+    expectedRevision: int | None = Field(default=None, ge=1)
+
+
+class EmailTestRequest(BaseModel):
+    """Validate an explicit administrative email test."""
+
+    recipient: str = Field(min_length=3, max_length=320)
+    subject: str = Field(default="CMDB Hub Microsoft 365 email test", max_length=240)
 
 
 class ChangeImpactRequest(BaseModel):
@@ -2358,6 +2392,194 @@ def update_branding(payload: BrandingRequest, request: Request) -> dict:
     }
     with core.LOCK:
         return REPOSITORY.update_company_branding(payload.companyId, brand, user["id"])
+
+
+def _email_connection_for_delivery() -> tuple[dict, str]:
+    connection = REPOSITORY.get_email_connection()
+    client_secret = ""
+    if connection.get("authMode") == "client_secret":
+        encrypted = str(connection.get("clientSecretEncrypted") or "")
+        nonce = str(connection.get("clientSecretNonce") or "")
+        if encrypted and nonce:
+            try:
+                client_secret = decrypt_secret(encrypted, nonce, "email:msp")
+            except MfaConfigurationError as error:
+                raise EmailConfigurationError(
+                    "Stored email credentials cannot be decrypted by this installation"
+                ) from error
+    return connection, client_secret
+
+
+def _attempt_email_delivery(message_id: str, actor_id: str) -> dict:
+    message = REPOSITORY.get_email_outbox(message_id)
+    if not message:
+        raise HTTPException(404, "Email outbox item not found")
+    connection, client_secret = _email_connection_for_delivery()
+    attempts = int(message.get("attempts") or 0) + 1
+    REPOSITORY.update_email_outbox(
+        message_id,
+        {"status": "sending", "attempts": attempts, "lastError": ""},
+        actor_id,
+    )
+    try:
+        result = EMAIL_SENDER.send(connection, message, client_secret=client_secret)
+    except (EmailConfigurationError, EmailDeliveryError) as error:
+        failure = str(error)[:500]
+        REPOSITORY.update_email_outbox(
+            message_id,
+            {"status": "failed", "attempts": attempts, "lastError": failure},
+            actor_id,
+        )
+        REPOSITORY.update_email_connection(
+            {**connection, "status": "error", "lastError": failure}, actor_id
+        )
+        raise HTTPException(502, failure) from error
+    accepted_at = core.now()
+    delivered = REPOSITORY.update_email_outbox(
+        message_id,
+        {
+            "status": "accepted",
+            "attempts": attempts,
+            "acceptedAt": accepted_at,
+            "lastError": "",
+            "providerRequestId": result.provider_request_id,
+        },
+        actor_id,
+    )
+    REPOSITORY.update_email_connection(
+        {
+            **connection,
+            "status": "verified",
+            "lastTestAt": accepted_at,
+            "lastError": "",
+        },
+        actor_id,
+    )
+    return delivered or {}
+
+
+@api.get("/api/email/config", tags=["email"])
+def get_email_configuration(request: Request) -> dict:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Email configuration requires platform admin access")
+    return public_email_connection(REPOSITORY.get_email_connection())
+
+
+@api.put("/api/email/config", tags=["email"])
+def update_email_configuration(payload: EmailConfigurationRequest, request: Request) -> dict:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Email configuration requires platform admin access")
+    current = REPOSITORY.get_email_connection()
+    if payload.expectedRevision and payload.expectedRevision != int(current.get("revision") or 1):
+        raise HTTPException(409, "Email settings changed. Reload them before saving.")
+    sender = payload.senderAddress.strip().lower()
+    reply_to = payload.replyTo.strip().lower()
+    if sender and not valid_email_address(sender):
+        raise HTTPException(400, "Enter a valid sender mailbox")
+    if reply_to and not valid_email_address(reply_to):
+        raise HTTPException(400, "Enter a valid reply-to address")
+    if payload.authMode in {"client_secret", "certificate"} and (
+        not payload.tenantId.strip() or not payload.clientId.strip()
+    ):
+        raise HTTPException(400, "Tenant ID and application client ID are required")
+    encrypted = current.get("clientSecretEncrypted", "")
+    nonce = current.get("clientSecretNonce", "")
+    if payload.clientSecret:
+        try:
+            encrypted, nonce = encrypt_secret(payload.clientSecret, "email:msp")
+        except MfaConfigurationError as error:
+            raise HTTPException(
+                503,
+                "Configure MFA_ENCRYPTION_KEY before storing an application secret",
+            ) from error
+    if payload.authMode == "client_secret" and not encrypted:
+        raise HTTPException(400, "Enter a client secret before selecting client-secret mode")
+    ready = bool(sender) and (
+        payload.authMode == "managed_identity"
+        or bool(payload.tenantId.strip() and payload.clientId.strip())
+    )
+    connection = {
+        "enabled": payload.enabled,
+        "authMode": payload.authMode,
+        "tenantId": payload.tenantId.strip(),
+        "clientId": payload.clientId.strip(),
+        "managedIdentityClientId": payload.managedIdentityClientId.strip(),
+        "senderAddress": sender,
+        "senderName": payload.senderName.strip(),
+        "replyTo": reply_to,
+        "graphBaseUrl": "https://graph.microsoft.com/v1.0",
+        "clientSecretEncrypted": encrypted,
+        "clientSecretNonce": nonce,
+        "status": "configured"
+        if payload.enabled and ready
+        else "disabled"
+        if not payload.enabled
+        else "not_configured",
+        "lastError": "",
+    }
+    with core.LOCK:
+        stored = REPOSITORY.update_email_connection(connection, user["id"])
+    return public_email_connection(stored)
+
+
+@api.post("/api/email/test", tags=["email"])
+def send_email_test(payload: EmailTestRequest, request: Request) -> dict:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Email testing requires platform admin access")
+    recipient = payload.recipient.strip().lower()
+    if not valid_email_address(recipient):
+        raise HTTPException(400, "Enter a valid test recipient")
+    brand = REPOSITORY.get_msp_branding()
+    identifier = f"email-test:{user['id']}:{uuid.uuid4()}"
+    message = {
+        "idempotencyKey": identifier,
+        "to": [recipient],
+        "subject": payload.subject.strip() or "CMDB Hub Microsoft 365 email test",
+        "bodyHtml": (
+            f"<h2>{brand.get('name', 'CMDB Hub')} email is ready</h2>"
+            "<p>This test message was explicitly requested by a platform administrator.</p>"
+            f"<p>Request time: {core.now()}</p>"
+        ),
+        "bodyText": "Microsoft 365 email delivery is ready.",
+        "templateKey": "platform_email_test",
+        "templateVersion": 1,
+    }
+    with core.LOCK:
+        queued = REPOSITORY.create_email_outbox(message, user["id"])
+    return _attempt_email_delivery(queued["id"], user["id"])
+
+
+@api.get("/api/email/outbox", tags=["email"])
+def list_email_outbox(request: Request, limit: int = 100) -> list[dict]:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Email delivery history requires admin access")
+    return REPOSITORY.list_email_outbox(limit)
+
+
+@api.post("/api/email/outbox/{message_id}/retry", tags=["email"])
+def retry_email_outbox(message_id: str, request: Request) -> dict:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Email retry requires platform admin access")
+    message = REPOSITORY.get_email_outbox(message_id)
+    if not message:
+        raise HTTPException(404, "Email outbox item not found")
+    if message.get("status") not in {"failed", "queued"}:
+        raise HTTPException(409, "Only queued or failed messages can be retried")
+    if int(message.get("attempts") or 0) >= int(message.get("maxAttempts") or 5):
+        raise HTTPException(409, "This message reached its retry limit")
+    return _attempt_email_delivery(message_id, user["id"])
+
+
+@api.get("/api/email/exchange-rbac-script", tags=["email"])
+def get_exchange_rbac_script(request: Request) -> Response:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Email setup requires platform admin access")
+    script = exchange_rbac_script(REPOSITORY.get_email_connection())
+    return Response(
+        script,
+        media_type="text/plain",
+        headers={"Content-Disposition": "attachment; filename=configure-cmdb-exchange-rbac.ps1"},
+    )
 
 
 def _asset_for_user(asset_id: str, user: dict, require_manage: bool = False) -> dict:

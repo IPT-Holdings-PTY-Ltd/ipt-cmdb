@@ -101,6 +101,41 @@ def main() -> None:
         assert repository.migrate_legacy_company_branding() == 1
         assert repository.get_company_branding("acme")["name"] == "Acme Service Portal"
         assert repository.get_company_branding("acme")["accent"] == "#123456"
+        email_connection = repository.update_email_connection(
+            {
+                "enabled": False,
+                "authMode": "managed_identity",
+                "senderAddress": "cmdb@example.com",
+                "status": "configured",
+            },
+            user_id,
+        )
+        assert email_connection["senderAddress"] == "cmdb@example.com"
+        queued_email = repository.create_email_outbox(
+            {
+                "idempotencyKey": "upgrade-verification-email",
+                "to": ["tech@example.com"],
+                "subject": "Upgrade verification",
+                "bodyText": "PostgreSQL email outbox is operational.",
+            },
+            user_id,
+        )
+        duplicate_email = repository.create_email_outbox(
+            {
+                "idempotencyKey": "upgrade-verification-email",
+                "to": ["tech@example.com"],
+                "subject": "Upgrade verification",
+            },
+            user_id,
+        )
+        assert duplicate_email["id"] == queued_email["id"]
+        accepted_email = repository.update_email_outbox(
+            queued_email["id"],
+            {"status": "accepted", "attempts": 1, "acceptedAt": "2026-07-20T12:00:00Z"},
+            user_id,
+        )
+        assert accepted_email and accepted_email["status"] == "accepted"
+        assert "bodyText" not in repository.list_email_outbox()[0]
         with factory() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT id FROM companies WHERE slug = 'acme'")
             company_id = str(cursor.fetchone()[0])
@@ -173,7 +208,8 @@ def main() -> None:
         assert apply_migrations(factory, ROOT) == []
         print(
             f"Upgrade verified: versions={','.join(versions)} "
-            "customer_branding=preserved legacy_state=retired relationship_reconnect=verified"
+            "customer_branding=preserved legacy_state=retired "
+            "relationship_reconnect=verified email_outbox=verified"
         )
     finally:
         with (

@@ -16,6 +16,9 @@ import InsertPhotoOutlined from '@mui/icons-material/InsertPhotoOutlined';
 import BlockOutlined from '@mui/icons-material/BlockOutlined';
 import ContentCopyOutlined from '@mui/icons-material/ContentCopyOutlined';
 import KeyOutlined from '@mui/icons-material/KeyOutlined';
+import EmailOutlined from '@mui/icons-material/EmailOutlined';
+import SendOutlined from '@mui/icons-material/SendOutlined';
+import DownloadOutlined from '@mui/icons-material/DownloadOutlined';
 import {
   Alert, Box, Button, Card, CardContent, Checkbox, Chip, CircularProgress, Dialog, DialogActions, DialogContent,
   DialogTitle, Divider, FormControl, FormControlLabel, Grid, InputLabel, List, ListItem, ListItemIcon, ListItemText,
@@ -24,7 +27,7 @@ import {
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Title, useNotify } from 'react-admin';
 import { Navigate } from 'react-router-dom';
-import { apiFetch, getSession } from './session';
+import { apiDownload, apiFetch, getSession } from './session';
 import type { AccessGroup, AccessGroupImpact, ApiToken, Company, Integration, RoleTemplate, SyncRun, User } from './types';
 import { useWorkspace } from './workspace';
 import { DEFAULT_MSP_BRAND, useMspBranding, type Brand } from './branding';
@@ -35,6 +38,16 @@ type DatabaseStatus = { configured: boolean; available: boolean; mode: string; s
 type DatabaseSettings = { host?: string; port?: number | string; database?: string; username?: string; password?: string; sslmode?: string; seedMode?: 'current' | 'empty' | 'demo' };
 type RestorePreview = { valid: boolean; version: number; createdAt?: string; companies: number; users: number; assets: number; relationships: number; changes: number; warning: string };
 type EffectiveAccess = { user: User; role: RoleTemplate; customers: string[]; scope: string };
+type EmailConnection = {
+  id: string; enabled: boolean; authMode: 'managed_identity' | 'client_secret' | 'certificate';
+  tenantId: string; clientId: string; managedIdentityClientId: string; senderAddress: string;
+  senderName: string; replyTo: string; status: string; lastTestAt?: string | null;
+  lastError?: string; revision: number; hasClientSecret: boolean; certificateConfigured: boolean;
+};
+type EmailOutboxItem = {
+  id: string; to: string[]; subject: string; status: string; attempts: number;
+  createdAt: string; acceptedAt?: string | null; lastError?: string;
+};
 
 const titleSx = { mb: 3 };
 
@@ -650,6 +663,100 @@ export function IntegrationsPage() {
           color: "text.secondary",
           mb: 2
         }}>Adapter checks and review-gated discovery results.</Typography>{!runs.length ? <Alert severity="info">No sync attempts yet.</Alert> : <TableContainer><Table size="small"><TableHead><TableRow><TableCell>Source</TableCell><TableCell>Status</TableCell><TableCell>Result</TableCell><TableCell>Finished</TableCell></TableRow></TableHead><TableBody>{runs.slice(0, 10).map(run => <TableRow key={run.id}><TableCell>{run.type}</TableCell><TableCell><Chip size="small" label={run.status} color={run.status === 'success' ? 'success' : run.status === 'failed' ? 'error' : 'warning'} /></TableCell><TableCell>{run.message}</TableCell><TableCell>{run.finishedAt ? new Date(run.finishedAt).toLocaleString() : 'In progress'}</TableCell></TableRow>)}</TableBody></Table></TableContainer>}</CardContent></Card>
+    </RootGuard>
+  );
+}
+
+export function EmailPage() {
+  const [connection, setConnection] = useState<EmailConnection | null>(null);
+  const [clientSecret, setClientSecret] = useState('');
+  const [recipient, setRecipient] = useState(getSession()?.user.email || '');
+  const [outbox, setOutbox] = useState<EmailOutboxItem[]>([]);
+  const [notice, setNotice] = useState<Notice>(null);
+  const [busy, setBusy] = useState('');
+  const load = async () => {
+    try {
+      const [configured, messages] = await Promise.all([
+        apiFetch<EmailConnection>('/api/email/config'),
+        apiFetch<EmailOutboxItem[]>('/api/email/outbox?limit=50'),
+      ]);
+      setConnection(configured);
+      setOutbox(messages);
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Email configuration could not be loaded.' });
+    }
+  };
+  useEffect(() => { void load(); }, []);
+  const update = (key: keyof EmailConnection, value: string | boolean) => setConnection(current => current ? { ...current, [key]: value } : current);
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    if (!connection) return;
+    setBusy('save'); setNotice(null);
+    try {
+      const stored = await apiFetch<EmailConnection>('/api/email/config', {
+        method: 'PUT',
+        body: JSON.stringify({
+          enabled: connection.enabled, authMode: connection.authMode, tenantId: connection.tenantId,
+          clientId: connection.clientId, managedIdentityClientId: connection.managedIdentityClientId,
+          senderAddress: connection.senderAddress, senderName: connection.senderName,
+          replyTo: connection.replyTo, clientSecret, expectedRevision: connection.revision,
+        }),
+      });
+      setConnection(stored); setClientSecret('');
+      setNotice({ severity: 'success', message: 'Microsoft 365 email settings saved. Send a test to verify Graph and mailbox scope.' });
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Email settings could not be saved.' });
+    } finally { setBusy(''); }
+  }
+  async function sendTest() {
+    setBusy('test'); setNotice({ severity: 'info', message: 'Submitting a test message to Microsoft Graph…' });
+    try {
+      await apiFetch('/api/email/test', { method: 'POST', body: JSON.stringify({ recipient }) });
+      setNotice({ severity: 'success', message: 'Microsoft Graph accepted the test message. Delivery can still be subject to Exchange processing and policy.' });
+      await load();
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'The test message failed.' });
+      await load();
+    } finally { setBusy(''); }
+  }
+  async function retry(item: EmailOutboxItem) {
+    setBusy(item.id); setNotice(null);
+    try {
+      await apiFetch(`/api/email/outbox/${item.id}/retry`, { method: 'POST' });
+      setNotice({ severity: 'success', message: 'Microsoft Graph accepted the retried message.' });
+      await load();
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Retry failed.' });
+      await load();
+    } finally { setBusy(''); }
+  }
+  async function downloadScript() {
+    try {
+      const result = await apiDownload('/api/email/exchange-rbac-script');
+      const url = URL.createObjectURL(result.blob);
+      const link = documentRef().createElement('a'); link.href = url; link.download = result.filename; link.click(); URL.revokeObjectURL(url);
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Setup script could not be generated.' });
+    }
+  }
+  return (
+    <RootGuard adminOnly><Title title="Microsoft 365 email" /><PageHeading eyebrow="Operations" title="Email delivery" copy="Configure one MSP-wide Microsoft Graph sender for platform notifications. Credentials are write-only, delivery is audited, and messages enter a durable outbox before sending." action={connection && <Chip label={connection.status.replaceAll('_', ' ')} color={connection.status === 'verified' ? 'success' : connection.status === 'error' ? 'error' : 'warning'} />} />
+      {notice && <Alert severity={notice.severity} sx={{ mb: 2 }}>{notice.message}</Alert>}
+      {!connection ? <LoadingCard /> : <Grid container spacing={3}>
+        <Grid size={{ xs: 12, xl: 7 }}><Card><CardContent><Stack component="form" spacing={2.5} onSubmit={save}>
+          <Box><Typography variant="h5">Microsoft Graph connection</Typography><Typography color="text.secondary">Managed identity is recommended in Azure. Certificate credentials suit portable Docker deployments; client secrets are available for simpler initial setup.</Typography></Box>
+          <FormControlLabel control={<Checkbox checked={connection.enabled} onChange={(_, checked) => update('enabled', checked)} />} label="Enable outbound platform email" />
+          <FormControl fullWidth><InputLabel>Authentication</InputLabel><Select label="Authentication" value={connection.authMode} onChange={event => update('authMode', event.target.value)}><MenuItem value="managed_identity">Azure managed identity</MenuItem><MenuItem value="certificate">Application certificate</MenuItem><MenuItem value="client_secret">Application client secret</MenuItem></Select></FormControl>
+          {connection.authMode !== 'managed_identity' && <Grid container spacing={2}><Grid size={{ xs: 12, md: 6 }}><TextField fullWidth label="Tenant ID" value={connection.tenantId} onChange={event => update('tenantId', event.target.value)} required /></Grid><Grid size={{ xs: 12, md: 6 }}><TextField fullWidth label="Application client ID" value={connection.clientId} onChange={event => update('clientId', event.target.value)} required /></Grid></Grid>}
+          {connection.authMode === 'managed_identity' && <TextField fullWidth label="User-assigned managed identity client ID (optional)" value={connection.managedIdentityClientId} onChange={event => update('managedIdentityClientId', event.target.value)} helperText="Leave blank to use the system-assigned identity." />}
+          {connection.authMode === 'client_secret' && <TextField fullWidth type="password" label={connection.hasClientSecret ? 'Replace client secret (optional)' : 'Client secret'} value={clientSecret} onChange={event => setClientSecret(event.target.value)} helperText={connection.hasClientSecret ? 'A secret is stored encrypted. Leave blank to retain it.' : 'Stored encrypted using the application secret key.'} required={!connection.hasClientSecret} />}
+          {connection.authMode === 'certificate' && <Alert severity={connection.certificateConfigured ? 'success' : 'warning'}>Certificate material is never uploaded through the browser. Mount it into the container and configure EMAIL_CERTIFICATE_PATH plus EMAIL_CERTIFICATE_PASSWORD_FILE. {connection.certificateConfigured ? 'A certificate path is present on this host.' : 'This host has no certificate path configured yet.'}</Alert>}
+          <Grid container spacing={2}><Grid size={{ xs: 12, md: 6 }}><TextField fullWidth label="Sender mailbox" type="email" value={connection.senderAddress} onChange={event => update('senderAddress', event.target.value)} required={connection.enabled} /></Grid><Grid size={{ xs: 12, md: 6 }}><TextField fullWidth label="Sender display name" value={connection.senderName} onChange={event => update('senderName', event.target.value)} /></Grid><Grid size={{ xs: 12 }}><TextField fullWidth label="Reply-to address (optional)" type="email" value={connection.replyTo} onChange={event => update('replyTo', event.target.value)} /></Grid></Grid>
+          <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}><Button type="submit" variant="contained" startIcon={<EmailOutlined />} disabled={Boolean(busy)}>{busy === 'save' ? 'Saving…' : 'Save settings'}</Button><Button type="button" variant="outlined" startIcon={<DownloadOutlined />} onClick={downloadScript}>Exchange RBAC script</Button></Stack>
+        </Stack></CardContent></Card></Grid>
+        <Grid size={{ xs: 12, xl: 5 }}><Stack spacing={3}><Card><CardContent><Typography variant="h5">Send verification message</Typography><Typography color="text.secondary" sx={{ mb: 2 }}>This creates an audited outbox item and submits it once. A 202 response confirms provider acceptance, not final mailbox delivery.</Typography><TextField fullWidth type="email" label="Test recipient" value={recipient} onChange={event => setRecipient(event.target.value)} /><Button fullWidth sx={{ mt: 2 }} variant="contained" startIcon={<SendOutlined />} disabled={Boolean(busy) || !connection.enabled || !recipient} onClick={sendTest}>{busy === 'test' ? 'Sending…' : 'Send test email'}</Button>{connection.lastTestAt && <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1.5 }}>Last accepted {new Date(connection.lastTestAt).toLocaleString()}</Typography>}</CardContent></Card><Card><CardContent><Typography variant="h5">Least-privilege setup</Typography><List dense><ListItem disableGutters><ListItemText primary="Application Mail.Send" secondary="Use Exchange Online Application RBAC to scope the app to the configured sender mailbox." /></ListItem><ListItem disableGutters><ListItemText primary="Do not add an unscoped duplicate grant" secondary="Exchange and Entra permission grants are additive." /></ListItem><ListItem disableGutters><ListItemText primary="Secrets stay outside backups" secondary="Portable exports omit credentials and email bodies." /></ListItem></List></CardContent></Card></Stack></Grid>
+        <Grid size={{ xs: 12 }}><Card><CardContent><Typography variant="h5">Delivery outbox</Typography><Typography color="text.secondary" sx={{ mb: 2 }}>Recent provider submissions and sanitized failures.</Typography>{!outbox.length ? <Alert severity="info">No email attempts yet.</Alert> : <TableContainer><Table size="small"><TableHead><TableRow><TableCell>Created</TableCell><TableCell>Recipient</TableCell><TableCell>Subject</TableCell><TableCell>Status</TableCell><TableCell>Attempts</TableCell><TableCell align="right">Action</TableCell></TableRow></TableHead><TableBody>{outbox.map(item => <TableRow key={item.id}><TableCell>{new Date(item.createdAt).toLocaleString()}</TableCell><TableCell>{item.to.join(', ')}</TableCell><TableCell>{item.subject}</TableCell><TableCell><Chip size="small" label={item.status} color={item.status === 'accepted' ? 'success' : item.status === 'failed' ? 'error' : 'warning'} /></TableCell><TableCell>{item.attempts}</TableCell><TableCell align="right">{item.status === 'failed' && <Button size="small" disabled={Boolean(busy)} onClick={() => retry(item)}>Retry</Button>}</TableCell></TableRow>)}</TableBody></Table></TableContainer>}</CardContent></Card></Grid>
+      </Grid>}
     </RootGuard>
   );
 }

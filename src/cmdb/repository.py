@@ -54,6 +54,24 @@ DEFAULT_MSP_BRANDING = {
     "reportFooter": "",
     "confidentialityLabel": "Internal use only",
 }
+DEFAULT_EMAIL_CONNECTION = {
+    "id": "msp-email",
+    "scope": "msp",
+    "provider": "microsoft_graph",
+    "enabled": False,
+    "authMode": "managed_identity",
+    "tenantId": "",
+    "clientId": "",
+    "managedIdentityClientId": "",
+    "senderAddress": "",
+    "senderName": "",
+    "replyTo": "",
+    "graphBaseUrl": "https://graph.microsoft.com/v1.0",
+    "status": "not_configured",
+    "lastTestAt": None,
+    "lastError": "",
+    "revision": 1,
+}
 OWNER_RESPONSIBILITY_ROLES = {
     "business_owner",
     "service_owner",
@@ -80,6 +98,20 @@ def branding_audit_value(brand: dict) -> dict:
     value = deepcopy(brand)
     if value.get("logoDataUrl"):
         value["logoDataUrl"] = f"[embedded logo: {value.get('logoFileName') or 'unnamed'}]"
+    return value
+
+
+def email_connection_audit_value(connection: dict) -> dict:
+    """Return email configuration metadata without encrypted credentials."""
+
+    hidden = {
+        "clientSecretEncrypted",
+        "clientSecretNonce",
+        "certificatePasswordEncrypted",
+        "certificatePasswordNonce",
+    }
+    value = {key: deepcopy(item) for key, item in connection.items() if key not in hidden}
+    value["hasClientSecret"] = bool(connection.get("clientSecretEncrypted"))
     return value
 
 
@@ -141,6 +173,8 @@ class StateRepository:
         self.state.setdefault("mfaRecoveryCodes", [])
         self.state.setdefault("loginChallenges", [])
         self.state.setdefault("sessions", [])
+        self.state.setdefault("emailConnection", deepcopy(DEFAULT_EMAIL_CONNECTION))
+        self.state.setdefault("emailOutbox", [])
 
     def list_companies(self) -> list[dict]:
         return deepcopy(self.state["companies"])
@@ -2043,10 +2077,155 @@ class StateRepository:
         self.save_state(self.state)
         return deepcopy(stored)
 
+    def get_email_connection(self) -> dict:
+        """Return the MSP-wide outbound email connection including encrypted material."""
+
+        return {
+            **deepcopy(DEFAULT_EMAIL_CONNECTION),
+            **deepcopy(self.state.get("emailConnection") or {}),
+        }
+
+    def update_email_connection(self, connection: dict, actor_id: str | None = None) -> dict:
+        """Persist and audit an MSP-wide outbound email connection."""
+
+        before = self.get_email_connection()
+        stored = {
+            **before,
+            **deepcopy(connection),
+            "id": "msp-email",
+            "scope": "msp",
+            "provider": "microsoft_graph",
+            "updatedAt": utc_now(),
+            "revision": int(before.get("revision") or 0) + 1,
+        }
+        self.state["emailConnection"] = stored
+        self._audit(
+            None,
+            actor_id,
+            "email_connection",
+            "msp-email",
+            "updated",
+            email_connection_audit_value(before),
+            email_connection_audit_value(stored),
+        )
+        self.save_state(self.state)
+        return deepcopy(stored)
+
+    def create_email_outbox(self, message: dict, actor_id: str | None = None) -> dict:
+        """Queue a provider-neutral outbound message with an idempotency key."""
+
+        existing = next(
+            (
+                item
+                for item in self.state.get("emailOutbox", [])
+                if item.get("idempotencyKey") == message.get("idempotencyKey")
+            ),
+            None,
+        )
+        if existing:
+            return deepcopy(existing)
+        stored = {
+            "id": str(uuid.uuid4()),
+            "companyId": None,
+            "connectionId": "msp-email",
+            "to": [],
+            "cc": [],
+            "bcc": [],
+            "subject": "",
+            "bodyHtml": "",
+            "bodyText": "",
+            "templateKey": "manual",
+            "templateVersion": 1,
+            "status": "queued",
+            "attempts": 0,
+            "maxAttempts": 5,
+            "nextAttemptAt": utc_now(),
+            "acceptedAt": None,
+            "lastError": "",
+            "providerRequestId": "",
+            "createdBy": actor_id,
+            "createdAt": utc_now(),
+            "updatedAt": utc_now(),
+            **deepcopy(message),
+        }
+        self.state["emailOutbox"] = [stored, *self.state.get("emailOutbox", [])[:999]]
+        self._audit(
+            stored.get("companyId"),
+            actor_id,
+            "email_message",
+            stored["id"],
+            "queued",
+            None,
+            {key: value for key, value in stored.items() if key not in {"bodyHtml", "bodyText"}},
+        )
+        self.save_state(self.state)
+        return deepcopy(stored)
+
+    def list_email_outbox(self, limit: int = 100) -> list[dict]:
+        """List recent delivery records without message bodies."""
+
+        records = sorted(
+            self.state.get("emailOutbox", []),
+            key=lambda item: item.get("createdAt", ""),
+            reverse=True,
+        )[: max(1, min(limit, 500))]
+        return [
+            {
+                key: deepcopy(value)
+                for key, value in item.items()
+                if key not in {"bodyHtml", "bodyText"}
+            }
+            for item in records
+        ]
+
+    def get_email_outbox(self, message_id: str) -> dict | None:
+        """Return one complete outbox item for an authorized delivery attempt."""
+
+        item = next(
+            (item for item in self.state.get("emailOutbox", []) if item["id"] == message_id),
+            None,
+        )
+        return deepcopy(item) if item else None
+
+    def update_email_outbox(
+        self, message_id: str, changes: dict, actor_id: str | None = None
+    ) -> dict | None:
+        """Record a delivery attempt, acceptance, or sanitized failure."""
+
+        item = next(
+            (item for item in self.state.get("emailOutbox", []) if item["id"] == message_id),
+            None,
+        )
+        if not item:
+            return None
+        before_status = item.get("status")
+        item.update(deepcopy(changes))
+        item["updatedAt"] = utc_now()
+        self._audit(
+            item.get("companyId"),
+            actor_id,
+            "email_message",
+            message_id,
+            f"delivery_{item.get('status', 'updated')}",
+            {"status": before_status},
+            {
+                "status": item.get("status"),
+                "attempts": item.get("attempts"),
+                "providerRequestId": item.get("providerRequestId"),
+            },
+            outcome="failure" if item.get("status") == "failed" else "success",
+            severity="warning" if item.get("status") == "failed" else "informational",
+            reason=str(item.get("lastError") or ""),
+        )
+        self.save_state(self.state)
+        return deepcopy(item)
+
     def export_state(self) -> dict:
         state = deepcopy(self.state)
-        # API credentials are installation-bound secrets and are never portable.
+        # Credentials and message bodies are installation-bound and never portable.
         state.pop("apiTokens", None)
+        state.pop("emailConnection", None)
+        state.pop("emailOutbox", None)
         return state
 
     def import_state(self, state: dict, actor_id: str | None = None) -> dict[str, int]:
@@ -5077,6 +5256,295 @@ class PostgresCmdbRepository(StateRepository):
         self._refresh_state_mirror()
         self.save_state(self.state)
         return self.get_company_branding(company_id)
+
+    def get_email_connection(self) -> dict:
+        """Load the singleton MSP email connection from canonical PostgreSQL."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, enabled, auth_mode, tenant_id, client_id,
+                       managed_identity_client_id, sender_address, sender_name,
+                       reply_to, graph_base_url, client_secret_encrypted,
+                       client_secret_nonce, status, last_test_at, last_error,
+                       revision, created_at, updated_at
+                FROM email_connections WHERE scope = 'msp'
+                """
+            )
+            row = cursor.fetchone()
+        if not row:
+            return deepcopy(DEFAULT_EMAIL_CONNECTION)
+        return {
+            "id": str(row[0]),
+            "scope": "msp",
+            "provider": "microsoft_graph",
+            "enabled": bool(row[1]),
+            "authMode": row[2],
+            "tenantId": row[3] or "",
+            "clientId": row[4] or "",
+            "managedIdentityClientId": row[5] or "",
+            "senderAddress": row[6] or "",
+            "senderName": row[7] or "",
+            "replyTo": row[8] or "",
+            "graphBaseUrl": row[9],
+            "clientSecretEncrypted": row[10] or "",
+            "clientSecretNonce": row[11] or "",
+            "status": row[12],
+            "lastTestAt": self._timestamp(row[13]) or None,
+            "lastError": row[14] or "",
+            "revision": row[15],
+            "createdAt": self._timestamp(row[16]),
+            "updatedAt": self._timestamp(row[17]),
+        }
+
+    def update_email_connection(self, connection: dict, actor_id: str | None = None) -> dict:
+        """Upsert and audit the singleton MSP email connection."""
+
+        before = self.get_email_connection()
+        stored = {**before, **deepcopy(connection)}
+        connection_uuid = canonical_uuid("email_connection", "msp-email")
+        with self.connection_factory() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO email_connections (
+                    id, scope, provider, enabled, auth_mode, tenant_id, client_id,
+                    managed_identity_client_id, sender_address, sender_name, reply_to,
+                    graph_base_url, client_secret_encrypted, client_secret_nonce,
+                    status, last_test_at, last_error, revision, updated_by, updated_at
+                ) VALUES (
+                    %s::uuid, 'msp', 'microsoft_graph', %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s::timestamptz, %s, 1,
+                    %s::uuid, now()
+                )
+                ON CONFLICT (scope) DO UPDATE SET
+                    enabled = EXCLUDED.enabled,
+                    auth_mode = EXCLUDED.auth_mode,
+                    tenant_id = EXCLUDED.tenant_id,
+                    client_id = EXCLUDED.client_id,
+                    managed_identity_client_id = EXCLUDED.managed_identity_client_id,
+                    sender_address = EXCLUDED.sender_address,
+                    sender_name = EXCLUDED.sender_name,
+                    reply_to = EXCLUDED.reply_to,
+                    graph_base_url = EXCLUDED.graph_base_url,
+                    client_secret_encrypted = EXCLUDED.client_secret_encrypted,
+                    client_secret_nonce = EXCLUDED.client_secret_nonce,
+                    status = EXCLUDED.status,
+                    last_test_at = EXCLUDED.last_test_at,
+                    last_error = EXCLUDED.last_error,
+                    revision = email_connections.revision + 1,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = now()
+                """,
+                (
+                    connection_uuid,
+                    bool(stored.get("enabled")),
+                    stored.get("authMode", "managed_identity"),
+                    stored.get("tenantId") or None,
+                    stored.get("clientId") or None,
+                    stored.get("managedIdentityClientId") or None,
+                    stored.get("senderAddress") or None,
+                    stored.get("senderName") or None,
+                    stored.get("replyTo") or None,
+                    stored.get("graphBaseUrl") or "https://graph.microsoft.com/v1.0",
+                    stored.get("clientSecretEncrypted") or None,
+                    stored.get("clientSecretNonce") or None,
+                    stored.get("status", "configured"),
+                    stored.get("lastTestAt") or None,
+                    stored.get("lastError") or None,
+                    actor_id,
+                ),
+            )
+            self._insert_audit(
+                cursor,
+                None,
+                actor_id,
+                "email_connection",
+                connection_uuid,
+                "updated",
+                email_connection_audit_value(before),
+                email_connection_audit_value(stored),
+            )
+        return self.get_email_connection()
+
+    def create_email_outbox(self, message: dict, actor_id: str | None = None) -> dict:
+        """Insert an idempotent provider-neutral email into the canonical outbox."""
+
+        connection = self.get_email_connection()
+        if connection.get("id") == "msp-email":
+            connection = self.update_email_connection(connection, actor_id)
+        message_id = str(uuid.uuid4())
+        company_id = message.get("companyId")
+        with self.connection_factory() as database, database.cursor() as cursor:
+            company_uuid = None
+            if company_id:
+                cursor.execute("SELECT id FROM companies WHERE slug = %s", (company_id,))
+                company_row = cursor.fetchone()
+                company_uuid = str(company_row[0]) if company_row else None
+            cursor.execute(
+                """
+                INSERT INTO email_outbox (
+                    id, company_id, connection_id, idempotency_key, to_addresses,
+                    cc_addresses, bcc_addresses, subject, body_html, body_text,
+                    template_key, template_version, status, attempts, max_attempts,
+                    next_attempt_at, created_by
+                ) VALUES (
+                    %s::uuid, %s::uuid, %s::uuid, %s, %s::jsonb, %s::jsonb,
+                    %s::jsonb, %s, %s, %s, %s, %s, 'queued', 0, %s, now(), %s::uuid
+                )
+                ON CONFLICT (idempotency_key) DO UPDATE
+                    SET idempotency_key = EXCLUDED.idempotency_key
+                RETURNING id
+                """,
+                (
+                    message_id,
+                    company_uuid,
+                    connection["id"],
+                    message["idempotencyKey"],
+                    json.dumps(message.get("to") or []),
+                    json.dumps(message.get("cc") or []),
+                    json.dumps(message.get("bcc") or []),
+                    message.get("subject") or "",
+                    message.get("bodyHtml") or None,
+                    message.get("bodyText") or None,
+                    message.get("templateKey", "manual"),
+                    int(message.get("templateVersion") or 1),
+                    int(message.get("maxAttempts") or 5),
+                    actor_id,
+                ),
+            )
+            message_id = str(cursor.fetchone()[0])
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "email_message",
+                message_id,
+                "queued",
+                None,
+                {
+                    "to": message.get("to") or [],
+                    "subject": message.get("subject") or "",
+                    "templateKey": message.get("templateKey", "manual"),
+                },
+            )
+        return self.get_email_outbox(message_id) or {}
+
+    def list_email_outbox(self, limit: int = 100) -> list[dict]:
+        """List recent email delivery records without their bodies."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT eo.id, c.slug, eo.connection_id, eo.idempotency_key,
+                       eo.to_addresses, eo.cc_addresses, eo.bcc_addresses,
+                       eo.subject, eo.template_key, eo.template_version, eo.status,
+                       eo.attempts, eo.max_attempts, eo.next_attempt_at,
+                       eo.accepted_at, eo.last_error, eo.provider_request_id,
+                       eo.created_by, eo.created_at, eo.updated_at
+                FROM email_outbox eo
+                LEFT JOIN companies c ON c.id = eo.company_id
+                ORDER BY eo.created_at DESC
+                LIMIT %s
+                """,
+                (max(1, min(limit, 500)),),
+            )
+            return [self._email_outbox_row(row, include_body=False) for row in cursor.fetchall()]
+
+    def get_email_outbox(self, message_id: str) -> dict | None:
+        """Load one complete email outbox record."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT eo.id, c.slug, eo.connection_id, eo.idempotency_key,
+                       eo.to_addresses, eo.cc_addresses, eo.bcc_addresses,
+                       eo.subject, eo.template_key, eo.template_version, eo.status,
+                       eo.attempts, eo.max_attempts, eo.next_attempt_at,
+                       eo.accepted_at, eo.last_error, eo.provider_request_id,
+                       eo.created_by, eo.created_at, eo.updated_at,
+                       eo.body_html, eo.body_text
+                FROM email_outbox eo
+                LEFT JOIN companies c ON c.id = eo.company_id
+                WHERE eo.id = %s::uuid
+                """,
+                (message_id,),
+            )
+            row = cursor.fetchone()
+        return self._email_outbox_row(row, include_body=True) if row else None
+
+    def update_email_outbox(
+        self, message_id: str, changes: dict, actor_id: str | None = None
+    ) -> dict | None:
+        """Persist one outbox delivery outcome and write governance evidence."""
+
+        current = self.get_email_outbox(message_id)
+        if not current:
+            return None
+        stored = {**current, **deepcopy(changes)}
+        with self.connection_factory() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE email_outbox SET status = %s, attempts = %s,
+                    next_attempt_at = %s::timestamptz,
+                    accepted_at = %s::timestamptz, last_error = %s,
+                    provider_request_id = %s, updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (
+                    stored.get("status", "queued"),
+                    int(stored.get("attempts") or 0),
+                    stored.get("nextAttemptAt") or None,
+                    stored.get("acceptedAt") or None,
+                    stored.get("lastError") or None,
+                    stored.get("providerRequestId") or None,
+                    message_id,
+                ),
+            )
+            self._insert_audit(
+                cursor,
+                stored.get("companyId"),
+                actor_id,
+                "email_message",
+                message_id,
+                f"delivery_{stored.get('status', 'updated')}",
+                {"status": current.get("status")},
+                {
+                    "status": stored.get("status"),
+                    "attempts": stored.get("attempts"),
+                    "providerRequestId": stored.get("providerRequestId"),
+                },
+                outcome="failure" if stored.get("status") == "failed" else "success",
+                severity="warning" if stored.get("status") == "failed" else "informational",
+                reason=str(stored.get("lastError") or ""),
+            )
+        return self.get_email_outbox(message_id)
+
+    def _email_outbox_row(self, row: Any, *, include_body: bool) -> dict:
+        record = {
+            "id": str(row[0]),
+            "companyId": row[1],
+            "connectionId": str(row[2]),
+            "idempotencyKey": row[3],
+            "to": row[4] or [],
+            "cc": row[5] or [],
+            "bcc": row[6] or [],
+            "subject": row[7],
+            "templateKey": row[8],
+            "templateVersion": row[9],
+            "status": row[10],
+            "attempts": row[11],
+            "maxAttempts": row[12],
+            "nextAttemptAt": self._timestamp(row[13]) or None,
+            "acceptedAt": self._timestamp(row[14]) or None,
+            "lastError": row[15] or "",
+            "providerRequestId": row[16] or "",
+            "createdBy": str(row[17]) if row[17] else None,
+            "createdAt": self._timestamp(row[18]),
+            "updatedAt": self._timestamp(row[19]),
+        }
+        if include_body:
+            record.update(bodyHtml=row[20] or "", bodyText=row[21] or "")
+        return record
 
     def export_state(self) -> dict:
         """Assemble a portable document from canonical tables, never a JSON mirror."""
