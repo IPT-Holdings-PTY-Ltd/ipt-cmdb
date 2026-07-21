@@ -6485,24 +6485,20 @@ class PostgresCmdbRepository(StateRepository):
     def list_notification_preferences(self, company_id: str | None = None) -> list[dict]:
         """Load notification choices for contacts and portal users."""
 
-        parameters: list[Any] = []
-        where = ""
-        if company_id:
-            where = "WHERE company.slug = %s"
-            parameters.append(company_id)
+        company_filter = company_id or None
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
-                f"""
+                """
                 SELECT preference.id, company.slug, preference.contact_id,
                        preference.user_id, preference.email_enabled,
                        preference.event_types, preference.digest_mode,
                        preference.created_at, preference.updated_at
                 FROM notification_preferences preference
                 JOIN companies company ON company.id = preference.company_id
-                {where}
+                WHERE (%s::text IS NULL OR company.slug = %s)
                 ORDER BY company.name, preference.created_at
                 """,
-                tuple(parameters),
+                (company_filter, company_filter),
             )
             return [
                 {
@@ -6706,15 +6702,11 @@ class PostgresCmdbRepository(StateRepository):
     ) -> list[dict]:
         """List recent notification evidence, optionally for one customer."""
 
-        parameters: list[Any] = []
-        where = ""
-        if company_id:
-            where = "WHERE company.slug = %s"
-            parameters.append(company_id)
-        parameters.append(max(1, min(limit, 500)))
+        company_filter = company_id or None
+        row_limit = max(1, min(limit, 500))
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
-                f"""
+                """
                 SELECT event.id, company.slug, rule.id, rule.name, event.event_type,
                        event.entity_type, event.entity_id, event.entity_name,
                        event.dedupe_key, event.status, event.recipients,
@@ -6723,11 +6715,11 @@ class PostgresCmdbRepository(StateRepository):
                 FROM notification_events event
                 JOIN companies company ON company.id = event.company_id
                 JOIN notification_rules rule ON rule.id = event.rule_id
-                {where}
+                WHERE (%s::text IS NULL OR company.slug = %s)
                 ORDER BY event.created_at DESC
                 LIMIT %s
                 """,
-                tuple(parameters),
+                (company_filter, company_filter, row_limit),
             )
             return [
                 {

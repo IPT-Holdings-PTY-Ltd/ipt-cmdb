@@ -214,6 +214,10 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         self.assertEqual(repository.get_msp_branding()["name"], "IPT CMDB")
         self.assertEqual(repository.get_company_branding("acme")["name"], "Acme CMDB")
         self.assertEqual(repository.list_sync_runs()[0]["status"], "success")
+        self.assertEqual(repository.list_notification_preferences(), [])
+        self.assertEqual(repository.list_notification_preferences("acme"), [])
+        self.assertEqual(repository.list_notification_events(), [])
+        self.assertEqual(repository.list_notification_events("acme"), [])
 
         updated = repository.update_asset(
             sql01["id"], {"name": "SQL-PROD", "metadata": sql01["metadata"]}, actor_id
