@@ -4,13 +4,39 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Optional semantic-version tag supplied by the release workflow
+        required: false
+        type: string
+        default: ''
+      source_ref:
+        description: Commit or ref to build
+        required: false
+        type: string
+        default: ''
+      publish_latest:
+        description: Also publish the stable latest tag
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      image_digest:
+        description: Published multi-architecture image digest
+        value: ${{ jobs.build-and-push.outputs.image_digest }}
+      image_name:
+        description: Normalized GHCR image name
+        value: ${{ jobs.build-and-push.outputs.image_name }}
 
 permissions:
   contents: read
   packages: write
+  id-token: write
+  attestations: write
 
 concurrency:
-  group: container-${{ github.ref }}
+  group: container-${{ inputs.release_tag || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -21,10 +47,21 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      image_name: ${{ steps.image.outputs.name }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
+
+      - name: Normalize image name
+        id: image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: echo "name=${IMAGE,,}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -37,12 +74,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},value=${{ inputs.release_tag || github.ref_name }},enable=${{ inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.release_tag || github.ref_name }},enable=${{ inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/v') }}
             type=sha,prefix=sha-
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=latest,enable=${{ (inputs.release_tag != '' && inputs.publish_latest) || (inputs.release_tag == '' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-')) }}
 
       - name: Build and publish
         id: build
@@ -58,11 +96,20 @@ jobs:
           provenance: mode=max
           sbom: true
 
+      - name: Attest published image
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
       - name: Summarize image
         run: |
-          echo "### Published container" >> "$GITHUB_STEP_SUMMARY"
-          echo "Digest: \`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Tags:" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo '${{ steps.meta.outputs.tags }}' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Published container"
+            echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "Tags:"
+            echo '```'
+            echo '${{ steps.meta.outputs.tags }}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

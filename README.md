@@ -1,6 +1,7 @@
 # IPT CMDB
 
 [![CI](https://github.com/IPT-Holdings-PTY-Ltd/ipt-cmdb/actions/workflows/ci.yml/badge.svg)](https://github.com/IPT-Holdings-PTY-Ltd/ipt-cmdb/actions/workflows/ci.yml)
+[![Release](https://github.com/IPT-Holdings-PTY-Ltd/ipt-cmdb/actions/workflows/release.yml/badge.svg)](https://github.com/IPT-Holdings-PTY-Ltd/ipt-cmdb/actions/workflows/release.yml)
 [![Container](https://img.shields.io/badge/container-ghcr.io-2496ed?logo=docker&logoColor=white)](https://github.com/IPT-Holdings-PTY-Ltd/ipt-cmdb/pkgs/container/ipt-cmdb)
 [![License](https://img.shields.io/badge/license-MIT-50d5b9.svg)](LICENSE)
 
@@ -157,6 +158,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime, tenancy, identity and re
 - [Compact Docker appliance](docs/deployment/APPLIANCE.md)
 - [Azure Container Apps deployment](docs/deployment/AZURE_CONTAINER_APPS.md)
 - [Operations, upgrades and recovery](docs/OPERATIONS.md)
+- [Release process and container publishing](docs/RELEASING.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Support](SUPPORT.md)
