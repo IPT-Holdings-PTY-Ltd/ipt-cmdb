@@ -18,7 +18,7 @@ import re
 import secrets
 import time
 import uuid
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -124,8 +124,12 @@ async def application_lifespan(_application: FastAPI):
     finally:
         if task:
             task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+            # Gathering the cancelled task lets its cleanup handlers finish.
+            shutdown_result = (await asyncio.gather(task, return_exceptions=True))[0]
+            if isinstance(shutdown_result, BaseException) and not isinstance(
+                shutdown_result, asyncio.CancelledError
+            ):
+                raise shutdown_result
 
 
 api = FastAPI(

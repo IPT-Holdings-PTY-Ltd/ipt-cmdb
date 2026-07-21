@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import os
@@ -116,6 +117,28 @@ class FastApiMigrationTests(unittest.TestCase):
 
     def _headers(self, email: str, password: str = "ChangeMe!") -> dict[str, str]:
         return {"Authorization": f"Bearer {self._login(email, password)}"}
+
+    def test_notification_worker_finishes_cleanup_during_shutdown(self):
+        events: list[str] = []
+
+        async def worker() -> None:
+            events.append("started")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("stopped")
+
+        async def exercise_lifespan() -> None:
+            with (
+                patch.dict(os.environ, {"NOTIFICATION_WORKER_ENABLED": "true"}),
+                patch.object(backend_main, "_notification_worker_loop", worker),
+            ):
+                async with backend_main.application_lifespan(api):
+                    await asyncio.sleep(0)
+                    self.assertEqual(events, ["started"])
+            self.assertEqual(events, ["started", "stopped"])
+
+        asyncio.run(exercise_lifespan())
 
     def test_authorization_matrix_enforces_customer_read_scope(self):
         routes = [
