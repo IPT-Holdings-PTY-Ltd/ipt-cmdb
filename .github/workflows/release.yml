@@ -1,0 +1,168 @@
+name: Create release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version, for example 0.3.0 or 0.3.0-rc.1
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      target_sha: ${{ steps.release.outputs.target_sha }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      publish_latest: ${{ steps.release.outputs.publish_latest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Validate version and repository state
+        id: release
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${REQUESTED_VERSION#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "Version must use semantic versioning, such as 0.3.0 or 0.3.0-rc.1." >&2
+            exit 1
+          fi
+
+          tag="v$version"
+          if git show-ref --tags --verify --quiet "refs/tags/$tag"; then
+            echo "Tag $tag already exists." >&2
+            exit 1
+          fi
+
+          package_version="$(node -p "require('./package.json').version")"
+          if [[ "$package_version" != "$version" ]]; then
+            echo "package.json is $package_version; update it to $version before releasing." >&2
+            exit 1
+          fi
+          if ! grep -Fq "## [$version]" CHANGELOG.md; then
+            echo "CHANGELOG.md must contain a published ## [$version] section." >&2
+            exit 1
+          fi
+
+          prerelease=false
+          publish_latest=true
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+            publish_latest=false
+          fi
+
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "target_sha=$(git rev-parse HEAD)"
+            echo "prerelease=$prerelease"
+            echo "publish_latest=$publish_latest"
+          } >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: Required quality gates
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      test_ref: ${{ needs.prepare.outputs.target_sha }}
+
+  release-approval:
+    name: Release approval
+    needs: [prepare, quality]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Confirm release candidate
+        run: |
+          echo "Releasing ${{ needs.prepare.outputs.tag }}"
+          echo "Commit ${{ needs.prepare.outputs.target_sha }}"
+
+  publish-image:
+    name: Publish release image
+    needs: [prepare, release-approval]
+    uses: ./.github/workflows/container-image.yml
+    with:
+      release_tag: ${{ needs.prepare.outputs.tag }}
+      source_ref: ${{ needs.prepare.outputs.target_sha }}
+      publish_latest: ${{ fromJSON(needs.prepare.outputs.publish_latest) }}
+
+  publish-release:
+    name: Publish GitHub release
+    needs: [prepare, publish-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+      IMAGE_NAME: ${{ needs.publish-image.outputs.image_name }}
+      IMAGE_DIGEST: ${{ needs.publish-image.outputs.image_digest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.target_sha }}
+
+      - name: Create release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > release-manifest.txt <<EOF
+          IPT CMDB release: $TAG
+          Commit: $TARGET_SHA
+          Container: $IMAGE_NAME:$VERSION
+          Digest: $IMAGE_DIGEST
+          EOF
+
+      - name: Create GitHub release and tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          options=(
+            "$TAG"
+            "release-manifest.txt#Release manifest"
+            --target "$TARGET_SHA"
+            --title "IPT CMDB $TAG"
+            --generate-notes
+            --fail-on-no-commits
+            --notes "Container: \`$IMAGE_NAME:$VERSION\`  
+          Digest: \`$IMAGE_DIGEST\`"
+          )
+          if [[ "$PRERELEASE" == "true" ]]; then
+            options+=(--prerelease --latest=false)
+          else
+            options+=(--latest=true)
+          fi
+          gh release create "${options[@]}"
+
+      - name: Summarize release
+        run: |
+          {
+            echo "### Published $TAG"
+            echo "- Commit: \`$TARGET_SHA\`"
+            echo "- Container: \`$IMAGE_NAME:$VERSION\`"
+            echo "- Digest: \`$IMAGE_DIGEST\`"
+            echo "- Release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1329,6 +1329,128 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(current["approvals"][-1]["decision"], "declined")
         self.assertTrue(any(item["toStatus"] == "declined" for item in current["statusHistory"]))
 
+    def test_change_approval_links_are_scoped_hashed_single_use_and_audited(self):
+        headers = self._headers("admin@example.com")
+        core.DB["assets"].append(
+            {
+                "id": "business-system-1",
+                "companyId": "acme",
+                "name": "Sage 200",
+                "type": "Business system",
+                "status": "Active",
+                "source": "manual",
+                "fields": {
+                    "criticality": "critical",
+                    "signoffRequired": "yes",
+                    "businessOwner": "Finance Director",
+                },
+            }
+        )
+        core.DB["relationships"].append(
+            {
+                "id": "relationship-approval-test",
+                "fromId": "business-system-1",
+                "toId": "asset-1",
+                "type": "depends_on",
+                "impactPolicy": "required",
+            }
+        )
+        core.DB["contacts"].append(
+            {
+                "id": "finance-approver",
+                "companyId": "acme",
+                "displayName": "Financial Controller",
+                "email": "controller@acme.example",
+                "status": "active",
+            }
+        )
+        core.DB["contactResponsibilities"].append(
+            {
+                "id": "responsibility-approval-test",
+                "companyId": "acme",
+                "assetId": "business-system-1",
+                "contactId": "finance-approver",
+                "role": "signoff_delegate",
+                "isPrimary": True,
+                "effectiveUntil": None,
+            }
+        )
+        backend_main.REPOSITORY.update_email_connection(
+            {
+                "enabled": True,
+                "authMode": "managed_identity",
+                "senderAddress": "cmdb@example.com",
+                "status": "verified",
+            },
+            None,
+        )
+        created = self.client.post(
+            "/api/changes",
+            headers=headers,
+            json={
+                "companyId": "acme",
+                "scopeAssetIds": ["asset-1"],
+                "title": "Patch domain controller",
+                "reason": "Apply security updates",
+                "implementationPlan": "Validate backup and install updates",
+                "validationPlan": "Check directory and Sage health",
+                "rollbackPlan": "Restore the VM snapshot",
+            },
+        ).json()
+        current = created
+        for status in ("impact_review", "awaiting_approval"):
+            response = self.client.post(
+                f"/api/changes/{current['id']}/transition",
+                headers=headers,
+                json={"status": status, "expectedRevision": current["revision"]},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            current = response.json()
+
+        with (
+            patch.dict(os.environ, {"PUBLIC_BASE_URL": "http://localhost:3000"}, clear=False),
+            patch.object(
+                backend_main.EMAIL_SENDER,
+                "send",
+                return_value=DeliveryResult(202, "graph-change-approval"),
+            ) as send_mock,
+        ):
+            sent = self.client.post(
+                f"/api/changes/{current['id']}/approval-requests",
+                headers=headers,
+                json={"expectedRevision": current["revision"], "expiresInHours": 24},
+            )
+        self.assertEqual(sent.status_code, 201, sent.text)
+        self.assertEqual(sent.json()[0]["approverEmail"], "controller@acme.example")
+        self.assertEqual(sent.json()[0]["deliveryStatus"], "accepted")
+        self.assertNotIn("tokenHash", sent.json()[0])
+        body_text = send_mock.call_args.args[1]["bodyText"]
+        raw_token = body_text.split("token=", 1)[1].splitlines()[0]
+        self.assertTrue(raw_token.startswith("cmdb_approval_"))
+        self.assertNotIn(raw_token, json.dumps(core.DB))
+
+        validated = self.client.post("/api/change-approvals/validate", json={"token": raw_token})
+        self.assertEqual(validated.status_code, 200, validated.text)
+        self.assertEqual(validated.json()["change"]["businessSystems"][0]["name"], "Sage 200")
+        self.assertNotIn("approverEmail", validated.json())
+
+        approved = self.client.post(
+            "/api/change-approvals/respond",
+            json={"token": raw_token, "decision": "approved", "comments": "Window approved"},
+        )
+        self.assertEqual(approved.status_code, 200, approved.text)
+        self.assertEqual(approved.json()["changeStatus"], "approved")
+        reused = self.client.post(
+            "/api/change-approvals/respond",
+            json={"token": raw_token, "decision": "approved", "comments": "Use again"},
+        )
+        self.assertEqual(reused.status_code, 404)
+        stored = backend_main.REPOSITORY.get_change(current["id"])
+        self.assertEqual(stored["approvals"][-1]["actorEmail"], "controller@acme.example")
+        self.assertTrue(
+            any(event["action"] == "external_approved" for event in core.DB["auditEvents"])
+        )
+
     def test_integration_check_is_root_scoped_and_persisted_by_repository(self):
         client_token = self._login("client@acme.example")
         forbidden = self.client.get(

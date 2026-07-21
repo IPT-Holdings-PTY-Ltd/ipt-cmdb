@@ -210,6 +210,64 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         self.assertEqual(
             repository.get_change(repository.list_changes()[0]["id"])["number"], "CHG-2026-0001"
         )
+        change_id = repository.list_changes()[0]["id"]
+        approval = repository.create_change_approval_request(
+            {
+                "id": str(uuid.uuid4()),
+                "changeId": change_id,
+                "companyId": "acme",
+                "batchId": str(uuid.uuid4()),
+                "changeRevision": 1,
+                "approverContactId": sage["responsibilities"][0]["contactId"],
+                "approverName": "Finance Owner",
+                "approverEmail": "finance@acme.example",
+                "responsibilityRole": "business_owner",
+                "scope": [{"type": "business_system", "id": sage["id"], "name": "Sage 200"}],
+                "status": "pending",
+                "tokenHash": "a" * 64,
+                "expiresAt": "2099-01-01T00:00:00Z",
+            },
+            actor_id,
+        )
+        self.assertNotIn("tokenHash", approval)
+        self.assertEqual(
+            repository.list_change_approval_requests(change_id)[0]["status"], "pending"
+        )
+        self.assertEqual(
+            repository.get_change_approval_request_by_token("a" * 64)["approverEmail"],
+            "finance@acme.example",
+        )
+        decided = repository.decide_change_approval_request("a" * 64, "approved", "Approved")
+        self.assertEqual(decided["status"], "approved")
+        replacement = repository.create_change_approval_request(
+            {
+                **approval,
+                "id": str(uuid.uuid4()),
+                "batchId": str(uuid.uuid4()),
+                "status": "pending",
+                "tokenHash": "b" * 64,
+                "expiresAt": "2099-01-01T00:00:00Z",
+            },
+            actor_id,
+        )
+        self.assertEqual(repository.revoke_change_approval_requests(change_id, actor_id), 1)
+        self.assertEqual(
+            next(
+                item
+                for item in repository.list_change_approval_requests(change_id)
+                if item["id"] == replacement["id"]
+            )["status"],
+            "revoked",
+        )
+        revocation_events = repository.list_audit_events(
+            "acme",
+            action="revoked",
+            entity_type="change_approval_request",
+            entity_id=replacement["id"],
+        )
+        self.assertEqual(len(revocation_events), 1)
+        self.assertEqual(revocation_events[0]["after"]["status"], "revoked")
+        self.assertEqual(revocation_events[0]["actorUserId"], actor_id)
         self.assertEqual(repository.next_change_number(2026), "CHG-2026-0002")
         self.assertEqual(repository.get_msp_branding()["name"], "IPT CMDB")
         self.assertEqual(repository.get_company_branding("acme")["name"], "Acme CMDB")

@@ -1,6 +1,13 @@
 name: CI
 
 on:
+  workflow_call:
+    inputs:
+      test_ref:
+        description: Commit or ref to validate
+        required: false
+        type: string
+        default: ''
   pull_request:
   push:
     branches: [main]
@@ -33,6 +40,8 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.test_ref || github.sha }}
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -78,6 +87,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.test_ref || github.sha }}
+      - name: Lint GitHub Actions workflows
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'

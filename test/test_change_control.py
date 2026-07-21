@@ -6,7 +6,9 @@ from pypdf import PdfReader
 from src.cmdb.change_control import (
     build_impact_snapshot,
     create_change_record,
+    derive_change_approvers,
     preview_change_impact,
+    record_external_approval,
     render_change_pdf,
     transition_change_record,
     update_change_record,
@@ -63,6 +65,16 @@ ASSETS = [
             "rtoHours": "4",
             "rpoHours": "1",
         },
+        "responsibilities": [
+            {
+                "contactId": "finance-contact",
+                "contactName": "Financial Controller",
+                "contactEmail": "controller@example.com",
+                "role": "signoff_delegate",
+                "isPrimary": True,
+                "effectiveUntil": None,
+            }
+        ],
     },
     {
         "id": "other",
@@ -108,6 +120,46 @@ class ChangeControlTests(unittest.TestCase):
         self.assertEqual(change["revision"], 1)
         self.assertEqual(len(change["impactSnapshot"]), 4)
         self.assertEqual(change["statusHistory"][0]["toStatus"], "draft")
+
+    def test_approval_plan_uses_structured_business_system_delegate(self):
+        plan = derive_change_approvers(self._change())
+        self.assertEqual(plan["missing"], [])
+        self.assertEqual(len(plan["approvers"]), 1)
+        self.assertEqual(plan["approvers"][0]["approverEmail"], "controller@example.com")
+        self.assertEqual(plan["approvers"][0]["responsibilityRoles"], ["signoff_delegate"])
+        self.assertEqual(plan["approvers"][0]["scope"][0]["name"], "Sage 200")
+
+    def test_approval_plan_reports_required_system_without_deliverable_owner(self):
+        change = self._change()
+        change["impactSummary"]["businessSystems"][0]["responsibilities"] = []
+        plan = derive_change_approvers(change)
+        self.assertEqual(plan["approvers"], [])
+        self.assertEqual(plan["missing"][0]["name"], "Sage 200")
+
+    def test_external_approval_evidence_completes_change_when_batch_is_complete(self):
+        actor = {"id": "operator", "email": "operator@example.com"}
+        change = self._change()
+        change = transition_change_record(change, "impact_review", {}, actor)
+        change = transition_change_record(change, "awaiting_approval", {}, actor)
+        updated = record_external_approval(
+            change,
+            {
+                "id": "request-1",
+                "batchId": "batch-1",
+                "approverName": "Financial Controller",
+                "approverEmail": "controller@example.com",
+                "approverContactId": "finance-contact",
+                "responsibilityRole": "signoff_delegate",
+                "scope": [{"type": "business_system", "id": "sage", "name": "Sage 200"}],
+                "decidedAt": "2026-07-15T10:00:00Z",
+            },
+            "approved",
+            "Approved for the maintenance window",
+            True,
+        )
+        self.assertEqual(updated["status"], "approved")
+        self.assertEqual(updated["approvals"][-1]["actorEmail"], "controller@example.com")
+        self.assertEqual(updated["statusHistory"][-1]["toStatus"], "approved")
 
     def test_edit_creates_revision_and_refreshes_impact(self):
         change = self._change()
