@@ -6,6 +6,8 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ### Added
 
+- Change approval batches derived from structured business-system ownership, with Microsoft 365 invitations, expiring single-use public review links, multi-approver completion, decline handling and immutable decision evidence.
+- Technician-facing approval delivery/status controls and a branded, login-free external sign-off page scoped to each approver's affected business systems.
 - Governance navigation with MSP- and customer-scoped Audit Center and Reports Center.
 - Append-only audit v2 schema with actor attribution, source, outcome, severity, sanitised field changes and request correlation.
 - Authentication, authorization-denial, portable-export, recovery and report-download audit coverage.
@@ -19,7 +21,7 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Self-service **My security** controls plus per-user and environment-level MFA enforcement policy.
 - Platform-admin-only MFA reset with local administrator step-up verification, typed target confirmation, optional ticket evidence, discoverable disabled states, detailed audit metadata and immediate target-session revocation.
 - Replaced root user-management customer checkboxes with a scalable, search-driven scope selector, collapsed selections, filtered bulk management, group/direct/effective counts and assignment-source preview.
-- Blank-database and forward-upgrade coverage for schema `2026.07.17.5`.
+- Blank-database and forward-upgrade coverage through schema `2026.07.21.4`.
 
 ### Planned
 

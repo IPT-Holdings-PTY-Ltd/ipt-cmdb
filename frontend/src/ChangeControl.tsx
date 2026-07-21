@@ -9,6 +9,7 @@ import RateReviewOutlined from '@mui/icons-material/RateReviewOutlined';
 import ReportProblemOutlined from '@mui/icons-material/ReportProblemOutlined';
 import RestartAltOutlined from '@mui/icons-material/RestartAltOutlined';
 import ScheduleOutlined from '@mui/icons-material/ScheduleOutlined';
+import SendOutlined from '@mui/icons-material/SendOutlined';
 import UndoOutlined from '@mui/icons-material/UndoOutlined';
 import VisibilityOutlined from '@mui/icons-material/VisibilityOutlined';
 import {
@@ -20,7 +21,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Title } from 'react-admin';
 import { useSearchParams } from 'react-router-dom';
 import { apiDownload, apiFetch, getSession } from './session';
-import type { Asset, ChangeImpactPreview, ChangePackage } from './types';
+import type { Asset, ChangeApprovalRequest, ChangeImpactPreview, ChangePackage } from './types';
 import { useWorkspace } from './workspace';
 
 type ChangeForm = {
@@ -127,6 +128,8 @@ export function ChangeControlPage() {
   const [saved, setSaved] = useState<ChangePackage | null>(null);
   const [editing, setEditing] = useState<ChangePackage | null>(null);
   const [selectedChange, setSelectedChange] = useState<ChangePackage | null>(null);
+  const [approvalRequests, setApprovalRequests] = useState<ChangeApprovalRequest[]>([]);
+  const [approvalsLoading, setApprovalsLoading] = useState(false);
   const [statusFilter, setStatusFilter] = useState('active');
   const [transitionTarget, setTransitionTarget] = useState<string | null>(null);
   const [transitionData, setTransitionData] = useState({
@@ -160,6 +163,17 @@ export function ChangeControlPage() {
     const selected = assets.find(asset => asset.id === assetId);
     if (selected) setScopeAssets([selected]);
   }, [assets, scopeAssets.length, searchParams]);
+
+  useEffect(() => {
+    let active = true;
+    if (!selectedChange || !canCreate) { setApprovalRequests([]); return; }
+    setApprovalsLoading(true);
+    apiFetch<ChangeApprovalRequest[]>(`/api/changes/${encodeURIComponent(selectedChange.id)}/approval-requests`)
+      .then(records => { if (active) setApprovalRequests(records); })
+      .catch(error => { if (active) setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Approval history could not be loaded.' }); })
+      .finally(() => { if (active) setApprovalsLoading(false); });
+    return () => { active = false; };
+  }, [selectedChange?.id, selectedChange?.status, canCreate]);
 
   useEffect(() => {
     let active = true;
@@ -223,6 +237,24 @@ export function ChangeControlPage() {
       setNotice({ severity: 'success', message: scheduleEdit ? `${updated.number} schedule was updated.` : `${updated.number} is now ${sentence(updated.status)}.` });
     } catch (error) {
       setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'The change could not be updated.' });
+    } finally { setSaving(false); }
+  };
+
+  const sendApprovalRequests = async () => {
+    if (!selectedChange) return;
+    const replacing = approvalRequests.some(item => item.status === 'pending');
+    if (replacing && !window.confirm('Replace the current approval batch? Existing pending links will stop working.')) return;
+    setSaving(true); setNotice(null);
+    try {
+      const records = await apiFetch<ChangeApprovalRequest[]>(`/api/changes/${encodeURIComponent(selectedChange.id)}/approval-requests`, {
+        method: 'POST', body: JSON.stringify({ expectedRevision: selectedChange.revision || 1, expiresInHours: 72 }),
+      });
+      setApprovalRequests(records);
+      const accepted = records.filter(item => item.deliveryStatus === 'accepted' && item.batchId === records[0]?.batchId).length;
+      const failed = records.filter(item => item.deliveryStatus === 'failed' && item.batchId === records[0]?.batchId).length;
+      setNotice({ severity: failed ? 'info' : 'success', message: `${accepted} approval request(s) accepted by Microsoft 365${failed ? `; ${failed} delivery attempt(s) need attention.` : '.'}` });
+    } catch (error) {
+      setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Approval requests could not be sent.' });
     } finally { setSaving(false); }
   };
 
@@ -439,11 +471,12 @@ export function ChangeControlPage() {
               <Grid size={{ xs: 12, md: 4 }}><Paper variant="outlined" sx={{ p: 2, height: '100%' }}><Typography variant="h6">Implementation plan</Typography><Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{selectedChange.implementationPlan}</Typography></Paper></Grid>
               <Grid size={{ xs: 12, md: 4 }}><Paper variant="outlined" sx={{ p: 2, height: '100%' }}><Typography variant="h6">Validation</Typography><Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{selectedChange.validationPlan}</Typography></Paper></Grid>
               <Grid size={{ xs: 12, md: 4 }}><Paper variant="outlined" sx={{ p: 2, height: '100%' }}><Typography variant="h6">Rollback</Typography><Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{selectedChange.rollbackPlan}</Typography>{selectedChange.rollbackResult && <Typography variant="body2" sx={{ mt: 1, fontWeight: 700 }}>Result: {selectedChange.rollbackResult}</Typography>}</Paper></Grid>
+              {selectedChange.status === 'awaiting_approval' && <Grid size={{ xs: 12 }}><Paper variant="outlined" sx={{ p: 2 }}><Stack direction={{ xs: 'column', md: 'row' }} spacing={2} sx={{ justifyContent: 'space-between', alignItems: { md: 'center' } }}><Box><Typography variant="h6">External sign-off workflow</Typography><Typography variant="body2" color="text.secondary">Approvers are resolved from active business-system sign-off delegates and owners. Links expire after 72 hours.</Typography></Box><Button variant="contained" startIcon={<SendOutlined />} disabled={saving || approvalsLoading} onClick={() => void sendApprovalRequests()}>{approvalRequests.some(item => item.status === 'pending') ? 'Replace approval batch' : 'Send approval requests'}</Button></Stack>{approvalsLoading ? <CircularProgress size={24} sx={{ mt: 2 }} /> : approvalRequests.length ? <Stack spacing={1} sx={{ mt: 2 }}>{approvalRequests.slice(0, 20).map(item => <Box key={item.id} sx={{ p: 1.5, border: '1px solid', borderColor: 'divider', borderRadius: 1.5 }}><Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ justifyContent: 'space-between', alignItems: { sm: 'center' } }}><Box><Typography sx={{ fontWeight: 750 }}>{item.approverName} · {item.approverEmail}</Typography><Typography variant="caption" color="text.secondary">{item.scope.map(scope => scope.name).filter(Boolean).join(', ') || 'Entire change'} · expires {formatDate(item.expiresAt)}</Typography></Box><Stack direction="row" spacing={1}><Chip size="small" label={sentence(item.deliveryStatus)} color={item.deliveryStatus === 'accepted' ? 'success' : item.deliveryStatus === 'failed' ? 'error' : 'default'} /><Chip size="small" label={sentence(item.status)} color={item.status === 'approved' ? 'success' : item.status === 'declined' ? 'error' : item.status === 'pending' ? 'warning' : 'default'} /></Stack></Stack>{item.lastError && <Alert severity="error" sx={{ mt: 1 }}>{item.lastError}</Alert>}</Box>)}</Stack> : <Alert severity="info" sx={{ mt: 2 }}>No approval links have been sent yet.</Alert>}</Paper></Grid>}
               <Grid size={{ xs: 12, md: 6 }}><Paper variant="outlined" sx={{ p: 2 }}><Typography variant="h6">Approval evidence</Typography>{!(selectedChange.approvals || []).length ? <Typography sx={{ color: 'text.secondary' }}>No approval decision has been recorded.</Typography> : <Stack spacing={1} sx={{ mt: 1 }}>{(selectedChange.approvals || []).map(item => <Box key={item.id}><Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}><Chip size="small" color={item.decision === 'approved' ? 'success' : 'error'} label={sentence(item.decision)} /><Typography sx={{ fontWeight: 700 }}>{item.actorEmail}</Typography></Stack><Typography variant="body2">{item.comments || 'No comments'}</Typography><Typography variant="caption" sx={{ color: 'text.secondary' }}>{formatDate(item.createdAt)}</Typography></Box>)}</Stack>}</Paper></Grid>
               <Grid size={{ xs: 12, md: 6 }}><Paper variant="outlined" sx={{ p: 2 }}><Typography variant="h6">Lifecycle history</Typography><Stack spacing={1} sx={{ mt: 1 }}>{[...(selectedChange.statusHistory || [])].reverse().map(item => <Box key={item.id} sx={{ borderLeft: '2px solid', borderColor: 'divider', pl: 1.5 }}><Typography sx={{ fontWeight: 700 }}>{sentence(item.toStatus)}</Typography><Typography variant="body2">{item.reason || 'No comment'}</Typography><Typography variant="caption" sx={{ color: 'text.secondary' }}>{item.actorEmail || 'System'} · {formatDate(item.createdAt)}</Typography></Box>)}</Stack></Paper></Grid>
             </Grid>
           </DialogContent>
-          <DialogActions sx={{ flexWrap: 'wrap', gap: 1, justifyContent: 'space-between' }}><Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap' }}><Button startIcon={<DownloadOutlined />} onClick={() => void downloadChange(selectedChange)}>PDF</Button>{canCreate && ['draft', 'impact_review'].includes(selectedChange.status) && <Button startIcon={<EditOutlined />} onClick={() => beginEdit(selectedChange)}>Edit</Button>}{canCreate && ['approved', 'scheduled'].includes(selectedChange.status) && <Button startIcon={<ScheduleOutlined />} onClick={() => openTransition(selectedChange, 'edit_schedule')}>Edit schedule</Button>}</Stack><Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>{canCreate && (transitions[selectedChange.status] || []).map(target => <Button key={target} variant={['approved', 'completed', 'closed'].includes(target) ? 'contained' : 'outlined'} color={['declined', 'cancelled', 'failed'].includes(target) ? 'error' : target === 'backed_out' ? 'warning' : 'primary'} startIcon={target === 'approved' || target === 'completed' || target === 'closed' ? <CheckCircleOutlined /> : target === 'implementing' ? <PlayArrowOutlined /> : target === 'failed' || target === 'declined' ? <ReportProblemOutlined /> : target === 'backed_out' ? <UndoOutlined /> : target === 'cancelled' ? <CancelOutlined /> : <RateReviewOutlined />} onClick={() => openTransition(selectedChange, target)}>{transitionLabels[target]}</Button>)}<Button onClick={() => setSelectedChange(null)}>Close</Button></Stack></DialogActions>
+          <DialogActions sx={{ flexWrap: 'wrap', gap: 1, justifyContent: 'space-between' }}><Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap' }}><Button startIcon={<DownloadOutlined />} onClick={() => void downloadChange(selectedChange)}>PDF</Button>{canCreate && ['draft', 'impact_review'].includes(selectedChange.status) && <Button startIcon={<EditOutlined />} onClick={() => beginEdit(selectedChange)}>Edit</Button>}{canCreate && ['approved', 'scheduled'].includes(selectedChange.status) && <Button startIcon={<ScheduleOutlined />} onClick={() => openTransition(selectedChange, 'edit_schedule')}>Edit schedule</Button>}</Stack><Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>{canCreate && (transitions[selectedChange.status] || []).filter(target => target !== 'approved' || !approvalRequests.length).map(target => <Button key={target} variant={['approved', 'completed', 'closed'].includes(target) ? 'contained' : 'outlined'} color={['declined', 'cancelled', 'failed'].includes(target) ? 'error' : target === 'backed_out' ? 'warning' : 'primary'} startIcon={target === 'approved' || target === 'completed' || target === 'closed' ? <CheckCircleOutlined /> : target === 'implementing' ? <PlayArrowOutlined /> : target === 'failed' || target === 'declined' ? <ReportProblemOutlined /> : target === 'backed_out' ? <UndoOutlined /> : target === 'cancelled' ? <CancelOutlined /> : <RateReviewOutlined />} onClick={() => openTransition(selectedChange, target)}>{transitionLabels[target]}</Button>)}<Button onClick={() => setSelectedChange(null)}>Close</Button></Stack></DialogActions>
         </>}
       </Dialog>
 

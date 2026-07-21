@@ -9,7 +9,7 @@ import { WorkspaceLayout } from './Layout';
 import { LoginPage } from './LoginPage';
 import { WorkspaceProvider } from './workspace';
 import { BrandingProvider, useMspBranding } from './branding';
-import { lazy, Suspense, useMemo } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 
 const AssetList = lazy(() => import('./assets').then(module => ({ default: module.AssetList })));
 const AssetShow = lazy(() => import('./assets').then(module => ({ default: module.AssetShow })));
@@ -34,6 +34,7 @@ const NotificationsPage = lazy(() => import('./Notifications').then(module => ({
 const BrandingPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.BrandingPage })));
 const DatabasePage = lazy(() => import('./RootAdmin').then(module => ({ default: module.DatabasePage })));
 const SecurityPage = lazy(() => import('./SecurityPage').then(module => ({ default: module.SecurityPage })));
+const ChangeApprovalPage = lazy(() => import('./ChangeApprovalPage').then(module => ({ default: module.ChangeApprovalPage })));
 
 function RouteLoadingFallback() {
   return <Box sx={{ display: 'grid', minHeight: '45vh', placeItems: 'center' }}><CircularProgress aria-label="Loading workspace" /></Box>;
@@ -83,5 +84,11 @@ function BrandedApplication() {
 }
 
 export function App() {
-  return <BrandingProvider><BrandedApplication /></BrandingProvider>;
+  const [publicApproval, setPublicApproval] = useState(window.location.hash.split('?')[0] === '#/approve');
+  useEffect(() => {
+    const routeChanged = () => setPublicApproval(window.location.hash.split('?')[0] === '#/approve');
+    window.addEventListener('hashchange', routeChanged);
+    return () => window.removeEventListener('hashchange', routeChanged);
+  }, []);
+  return <BrandingProvider><Suspense fallback={<RouteLoadingFallback />}>{publicApproval ? <ChangeApprovalPage /> : <BrandedApplication />}</Suspense></BrandingProvider>;
 }

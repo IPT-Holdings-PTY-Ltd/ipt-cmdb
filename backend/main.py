@@ -34,7 +34,9 @@ from src.cmdb.audit import AuditContext, reset_audit_context, set_audit_context
 from src.cmdb.change_control import (
     change_pdf_filename,
     create_change_record,
+    derive_change_approvers,
     preview_change_impact,
+    record_external_approval,
     render_change_pdf,
     transition_change_record,
     update_change_record,
@@ -843,6 +845,27 @@ class ChangeTransitionRequest(BaseModel):
     validationResult: str = Field(default="", max_length=8000)
     rollbackResult: str = Field(default="", max_length=8000)
     closureNotes: str = Field(default="", max_length=8000)
+
+
+class ChangeApprovalCreateRequest(BaseModel):
+    """Validate creation or replacement of an external approval batch."""
+
+    expectedRevision: int = Field(ge=1)
+    expiresInHours: int = Field(default=72, ge=1, le=168)
+
+
+class ChangeApprovalResponseRequest(BaseModel):
+    """Validate a one-time external approval response."""
+
+    token: str = Field(min_length=32, max_length=512)
+    decision: str = Field(pattern="^(approved|declined)$")
+    comments: str = Field(default="", max_length=4000)
+
+
+class ChangeApprovalValidateRequest(BaseModel):
+    """Validate the bearer value used to open an external review."""
+
+    token: str = Field(min_length=32, max_length=512)
 
 
 @api.get("/api/v2/health", tags=["platform"])
@@ -3946,6 +3969,125 @@ def _change_for_user(change_id: str, user: dict) -> dict:
     return change
 
 
+def _approval_email_message(change: dict, approver: dict, raw_token: str, expires_at: str) -> dict:
+    """Build a branded approval invitation without persisting its bearer token."""
+
+    base_url = _public_base_url()
+    if not base_url:
+        raise EmailConfigurationError("PUBLIC_BASE_URL is not safe for change approvals")
+    brand = REPOSITORY.get_msp_branding()
+    raw_brand_name = str(brand.get("name") or "CMDB Hub")
+    approval_url = f"{base_url}/#/approve?token={quote(raw_token, safe='')}"
+    safe_url = html.escape(approval_url, quote=True)
+    accent = html.escape(str(brand.get("accent") or "#50d5b9"), quote=True)
+    approver_name = html.escape(str(approver.get("approverName") or "Approver"))
+    change_number = html.escape(str(change.get("number") or "Change"))
+    title = html.escape(str(change.get("title") or ""))
+    company = html.escape(str(change.get("companyName") or ""))
+    scope_names = ", ".join(
+        str(item.get("name") or "") for item in approver.get("scope") or [] if item.get("name")
+    )
+    safe_scope = html.escape(scope_names or "Entire change")
+    return {
+        "idempotencyKey": f"change-approval:{uuid.uuid4()}",
+        "to": [approver["approverEmail"]],
+        "subject": f"Approval required: {change.get('number')} - {change.get('title')}",
+        "bodyHtml": (
+            f'<div style="font-family:Arial,sans-serif;color:#172033;max-width:640px">'
+            f"<h2>{html.escape(raw_brand_name)} change approval</h2>"
+            f"<p>Hello {approver_name},</p>"
+            f"<p>Your approval is required for <strong>{change_number} - {title}</strong> "
+            f"for {company}.</p><p><strong>Your scope:</strong> {safe_scope}</p>"
+            f'<p><a href="{safe_url}" style="display:inline-block;padding:12px 18px;'
+            f"background:{accent};color:#07111f;text-decoration:none;border-radius:6px;"
+            '">Review change</a></p>'
+            f"<p>This single-use link expires at {html.escape(expires_at)}. "
+            "Do not forward it to another person.</p></div>"
+        ),
+        "bodyText": (
+            f"Hello {approver.get('approverName') or 'Approver'},\n\n"
+            f"Review {change.get('number')} - {change.get('title')} for "
+            f"{change.get('companyName')}.\nScope: {scope_names or 'Entire change'}\n\n"
+            f"{approval_url}\n\nThis single-use link expires at {expires_at}."
+        ),
+    }
+
+
+def _public_change_approval(record: dict, change: dict) -> dict:
+    """Return the minimum change context an external approver needs."""
+
+    brand = REPOSITORY.get_msp_branding()
+    summary = change.get("impactSummary") or {}
+    system_ids = {
+        str(item.get("id"))
+        for item in record.get("scope") or []
+        if item.get("type") == "business_system"
+    }
+    business_systems = [
+        {
+            "id": item.get("assetId"),
+            "name": item.get("name"),
+            "criticality": item.get("criticality"),
+            "impactSeverity": item.get("impactSeverity"),
+            "department": item.get("department"),
+            "userPopulation": item.get("userPopulation"),
+        }
+        for item in summary.get("businessSystems") or []
+        if not system_ids or str(item.get("assetId")) in system_ids
+    ]
+    return {
+        "requestId": record["id"],
+        "status": record["status"],
+        "expiresAt": record["expiresAt"],
+        "approverName": record.get("approverName", ""),
+        "scope": record.get("scope") or [],
+        "branding": {
+            "name": brand.get("name") or "CMDB Hub",
+            "logoText": brand.get("logoText") or "C",
+            "logoDataUrl": brand.get("logoDataUrl") or "",
+            "accent": brand.get("accent") or "#50d5b9",
+            "supportEmail": brand.get("supportEmail") or "",
+        },
+        "change": {
+            "number": change.get("number"),
+            "title": change.get("title"),
+            "companyName": change.get("companyName"),
+            "status": change.get("status"),
+            "changeType": change.get("changeType"),
+            "priority": change.get("priority"),
+            "riskLevel": change.get("riskLevel"),
+            "plannedStart": change.get("plannedStart"),
+            "plannedEnd": change.get("plannedEnd"),
+            "outageExpected": change.get("outageExpected"),
+            "reason": change.get("reason"),
+            "businessImpact": change.get("businessImpact"),
+            "implementationPlan": change.get("implementationPlan"),
+            "validationPlan": change.get("validationPlan"),
+            "rollbackPlan": change.get("rollbackPlan"),
+            "requester": (change.get("createdBy") or {}).get("email", ""),
+            "businessSystems": business_systems,
+        },
+    }
+
+
+def _approval_request_for_token(raw_token: str) -> tuple[dict, dict]:
+    """Resolve and validate a public approval link without disclosing failure details."""
+
+    record = REPOSITORY.get_change_approval_request_by_token(opaque_token_hash(raw_token))
+    if not record or record.get("status") != "pending":
+        raise HTTPException(404, "This approval link is invalid or no longer available")
+    try:
+        expires_at = datetime.fromisoformat(str(record["expiresAt"]).replace("Z", "+00:00"))
+    except (KeyError, ValueError, TypeError) as error:
+        raise HTTPException(404, "This approval link is invalid or no longer available") from error
+    if expires_at <= datetime.now(UTC):
+        raise HTTPException(404, "This approval link is invalid or no longer available")
+    change = REPOSITORY.get_change(record["changeId"])
+    if not change or change.get("status") != "awaiting_approval":
+        raise HTTPException(404, "This approval link is invalid or no longer available")
+    return record, change
+
+
 @api.post("/api/changes/impact-preview", tags=["change control"])
 def change_impact_preview(payload: ChangeImpactRequest, request: Request) -> dict:
     user = current_user(request)
@@ -4026,6 +4168,182 @@ def update_change(change_id: str, payload: ChangeUpdateRequest, request: Request
     return stored
 
 
+@api.get("/api/changes/{change_id}/approval-requests", tags=["change control"])
+def list_change_approvals(change_id: str, request: Request) -> list[dict]:
+    """List delivery and decision evidence for authorized technicians."""
+
+    user = current_user(request)
+    change = _change_for_user(change_id, user)
+    _company_for_change(change["companyId"], user, require_manage=True)
+    return REPOSITORY.list_change_approval_requests(change_id)
+
+
+@api.post(
+    "/api/changes/{change_id}/approval-requests",
+    status_code=201,
+    tags=["change control"],
+)
+def create_change_approvals(
+    change_id: str,
+    payload: ChangeApprovalCreateRequest,
+    request: Request,
+) -> list[dict]:
+    """Create a new approval batch and send its single-use review links."""
+
+    user = current_user(request)
+    change = _change_for_user(change_id, user)
+    _company_for_change(change["companyId"], user, require_manage=True)
+    if change.get("status") != "awaiting_approval":
+        raise HTTPException(409, "Move the change to awaiting approval before requesting sign-off")
+    if int(change.get("revision") or 1) != payload.expectedRevision:
+        raise HTTPException(409, "This change was updated. Reload it before requesting approval.")
+    base_url = _public_base_url()
+    connection, client_secret = _email_connection_for_delivery()
+    if not base_url:
+        raise HTTPException(409, "Configure a safe PUBLIC_BASE_URL before sending approvals")
+    if not (
+        connection.get("enabled")
+        and connection.get("senderAddress")
+        and connection.get("status") in {"configured", "verified"}
+    ):
+        raise HTTPException(
+            409, "Configure and enable Microsoft 365 email before sending approvals"
+        )
+    plan = derive_change_approvers(change)
+    if plan["missing"]:
+        names = ", ".join(item["name"] for item in plan["missing"][:5])
+        raise HTTPException(
+            409,
+            f"Add an email-enabled sign-off delegate or business owner for: {names}",
+        )
+    if not plan["approvers"]:
+        raise HTTPException(409, "Add at least one approver with a valid email address")
+
+    batch_id = str(uuid.uuid4())
+    expires_at = (
+        (datetime.now(UTC) + timedelta(hours=payload.expiresInHours))
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    deliveries: list[tuple[dict, str, dict]] = []
+    with core.LOCK:
+        REPOSITORY.revoke_change_approval_requests(
+            change_id,
+            user["id"],
+            "Replaced by a new approval batch",
+        )
+        for approver in plan["approvers"]:
+            raw_token = f"cmdb_approval_{secrets.token_urlsafe(32)}"
+            record = REPOSITORY.create_change_approval_request(
+                {
+                    "id": str(uuid.uuid4()),
+                    "changeId": change_id,
+                    "companyId": change["companyId"],
+                    "batchId": batch_id,
+                    "changeRevision": int(change["revision"]),
+                    "approverContactId": approver.get("approverContactId"),
+                    "approverUserId": None,
+                    "approverName": approver["approverName"],
+                    "approverEmail": approver["approverEmail"],
+                    "responsibilityRole": ",".join(approver["responsibilityRoles"]),
+                    "scope": approver["scope"],
+                    "status": "pending",
+                    "tokenHash": opaque_token_hash(raw_token),
+                    "expiresAt": expires_at,
+                    "deliveryStatus": "pending",
+                },
+                user["id"],
+            )
+            deliveries.append((record, raw_token, approver))
+
+    for record, raw_token, approver in deliveries:
+        try:
+            result = EMAIL_SENDER.send(
+                connection,
+                _approval_email_message(change, approver, raw_token, expires_at),
+                client_secret=client_secret,
+            )
+        except (EmailConfigurationError, EmailDeliveryError) as error:
+            REPOSITORY.update_change_approval_request(
+                record["id"],
+                {"deliveryStatus": "failed", "lastError": str(error)[:500]},
+                user["id"],
+            )
+        else:
+            REPOSITORY.update_change_approval_request(
+                record["id"],
+                {
+                    "deliveryStatus": "accepted",
+                    "providerRequestId": result.provider_request_id,
+                    "lastError": "",
+                },
+                user["id"],
+            )
+    return REPOSITORY.list_change_approval_requests(change_id)
+
+
+@api.post("/api/change-approvals/validate", tags=["change approvals"])
+def validate_change_approval(payload: ChangeApprovalValidateRequest) -> dict:
+    """Return a constrained review package for a valid public approval link."""
+
+    record, change = _approval_request_for_token(payload.token)
+    return _public_change_approval(record, change)
+
+
+@api.post("/api/change-approvals/respond", tags=["change approvals"])
+def respond_to_change_approval(payload: ChangeApprovalResponseRequest) -> dict:
+    """Consume a single-use link and apply the batch's lifecycle outcome."""
+
+    token_hash = opaque_token_hash(payload.token)
+    with core.LOCK:
+        pending, change = _approval_request_for_token(payload.token)
+        decided = REPOSITORY.decide_change_approval_request(
+            token_hash,
+            payload.decision,
+            payload.comments,
+        )
+        if not decided:
+            raise HTTPException(409, "This approval link has already been used or has expired")
+        batch = [
+            item
+            for item in REPOSITORY.list_change_approval_requests(change["id"])
+            if item.get("batchId") == pending.get("batchId")
+        ]
+        if payload.decision == "declined":
+            REPOSITORY.revoke_change_approval_requests(
+                change["id"],
+                None,
+                "Approval batch ended after a decline",
+                pending.get("batchId"),
+            )
+        all_approved = bool(batch) and all(item.get("status") == "approved" for item in batch)
+        updated = record_external_approval(
+            change,
+            decided,
+            payload.decision,
+            payload.comments,
+            all_approved,
+        )
+        stored = REPOSITORY.update_change(
+            change["id"],
+            updated,
+            None,
+            action=f"external_{payload.decision}",
+            reason=payload.comments,
+        )
+    if not stored:
+        raise HTTPException(404, "This approval link is invalid or no longer available")
+    return {
+        "decision": payload.decision,
+        "changeStatus": stored["status"],
+        "message": (
+            "Your decision has been recorded."
+            if stored["status"] != "awaiting_approval"
+            else "Your approval has been recorded. Other required approvals are still pending."
+        ),
+    }
+
+
 @api.post("/api/changes/{change_id}/transition", tags=["change control"])
 def transition_change(change_id: str, payload: ChangeTransitionRequest, request: Request) -> dict:
     user = current_user(request)
@@ -4035,6 +4353,12 @@ def transition_change(change_id: str, payload: ChangeTransitionRequest, request:
         raise HTTPException(
             409,
             "This change was updated by another user. Reload it before changing status.",
+        )
+    approval_requests = REPOSITORY.list_change_approval_requests(change_id)
+    if payload.status == "approved" and approval_requests:
+        raise HTTPException(
+            409,
+            "This change uses external sign-off and will approve automatically when the batch completes.",
         )
     values = payload.model_dump()
     try:
@@ -4051,6 +4375,16 @@ def transition_change(change_id: str, payload: ChangeTransitionRequest, request:
         )
     if not stored:
         raise HTTPException(404, "Change package not found")
+    if current.get("status") == "awaiting_approval" and payload.status in {
+        "impact_review",
+        "declined",
+        "cancelled",
+    }:
+        REPOSITORY.revoke_change_approval_requests(
+            change_id,
+            user["id"],
+            f"Change moved to {payload.status.replace('_', ' ')}",
+        )
     return stored
 
 

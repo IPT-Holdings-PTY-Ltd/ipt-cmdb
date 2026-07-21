@@ -16,6 +16,8 @@ from datetime import UTC, datetime
 from html import escape
 from io import BytesIO
 
+EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
 CHANGE_TYPES = {"standard", "normal", "emergency"}
 CHANGE_CATEGORIES = {
     "infrastructure",
@@ -219,6 +221,22 @@ def _asset_snapshot(
     service_owner = str(metadata.get("serviceOwner") or "").strip()
     technical_owner = str(metadata.get("technicalOwner") or "").strip()
     custodian = str(metadata.get("custodian") or "").strip()
+    responsibilities = []
+    for responsibility in asset.get("responsibilities") or []:
+        role_name = str(responsibility.get("role") or "").strip().lower()
+        contact_email = str(responsibility.get("contactEmail") or "").strip().lower()
+        if not role_name:
+            continue
+        responsibilities.append(
+            {
+                "contactId": responsibility.get("contactId"),
+                "contactName": str(responsibility.get("contactName") or "").strip(),
+                "contactEmail": contact_email,
+                "role": role_name,
+                "isPrimary": bool(responsibility.get("isPrimary", True)),
+                "effectiveUntil": responsibility.get("effectiveUntil"),
+            }
+        )
     return {
         "assetId": asset["id"],
         "name": asset.get("name", asset["id"]),
@@ -241,6 +259,7 @@ def _asset_snapshot(
         "businessOwner": str(metadata.get("businessOwner") or "").strip(),
         "signoffDelegate": str(metadata.get("signoffDelegate") or "").strip(),
         "signoffRequired": str(metadata.get("signoffRequired") or "yes").strip(),
+        "responsibilities": responsibilities,
         "department": str(metadata.get("department") or "").strip(),
         "userPopulation": str(metadata.get("userPopulation") or "").strip(),
         "rtoHours": str(metadata.get("rtoHours") or "").strip(),
@@ -455,6 +474,7 @@ def impact_summary(snapshot: list[dict], risk: dict) -> dict:
                 "rtoHours",
                 "rpoHours",
                 "impactSeverity",
+                "responsibilities",
             )
         }
         for item in snapshot
@@ -503,6 +523,168 @@ def impact_summary(snapshot: list[dict], risk: dict) -> dict:
         "outageVmCount": sum(item.get("impactSeverity") == "outage" for item in virtualization),
         "suggestedRisk": risk,
     }
+
+
+def derive_change_approvers(change: dict) -> dict:
+    """Resolve approval recipients from the frozen change-impact snapshot.
+
+    Structured, effective-dated CI responsibilities are authoritative. Legacy
+    free-text owner fields are accepted only when their value is itself an
+    email address, preventing a display name from being treated as a delivery
+    destination.
+    """
+
+    resolved: dict[str, dict] = {}
+    missing: list[dict] = []
+
+    def add_approver(
+        email: object,
+        name: object,
+        role: str,
+        scope: dict,
+        contact_id: object = None,
+    ) -> bool:
+        address = str(email or "").strip().lower()
+        if not EMAIL_PATTERN.fullmatch(address):
+            return False
+        record = resolved.setdefault(
+            address,
+            {
+                "approverEmail": address,
+                "approverName": str(name or address).strip() or address,
+                "approverContactId": contact_id,
+                "responsibilityRoles": [],
+                "scope": [],
+            },
+        )
+        if role not in record["responsibilityRoles"]:
+            record["responsibilityRoles"].append(role)
+        if scope not in record["scope"]:
+            record["scope"].append(scope)
+        if not record.get("approverContactId") and contact_id:
+            record["approverContactId"] = contact_id
+        return True
+
+    configured_approver = str(change.get("approver") or "").strip()
+    if EMAIL_PATTERN.fullmatch(configured_approver.lower()):
+        add_approver(
+            configured_approver,
+            configured_approver,
+            "change_approver",
+            {"type": "change", "id": change.get("id"), "name": change.get("number")},
+        )
+
+    for system in (change.get("impactSummary") or {}).get("businessSystems") or []:
+        signoff_required = str(system.get("signoffRequired") or "yes").strip().lower()
+        if signoff_required in {"no", "false", "0", "not_required"}:
+            continue
+        system_scope = {
+            "type": "business_system",
+            "id": system.get("assetId"),
+            "name": system.get("name") or "Business system",
+        }
+        responsibilities = [
+            item
+            for item in system.get("responsibilities") or []
+            if not item.get("effectiveUntil")
+            and item.get("role") in {"signoff_delegate", "business_owner"}
+        ]
+        responsibilities.sort(
+            key=lambda item: (
+                0 if item.get("role") == "signoff_delegate" else 1,
+                0 if item.get("isPrimary", True) else 1,
+            )
+        )
+        selected = next(
+            (
+                item
+                for item in responsibilities
+                if EMAIL_PATTERN.fullmatch(str(item.get("contactEmail") or "").strip().lower())
+            ),
+            None,
+        )
+        if selected:
+            add_approver(
+                selected.get("contactEmail"),
+                selected.get("contactName"),
+                str(selected.get("role")),
+                system_scope,
+                selected.get("contactId"),
+            )
+            continue
+        fallback_role = "signoff_delegate" if system.get("signoffDelegate") else "business_owner"
+        fallback_value = system.get("signoffDelegate") or system.get("businessOwner")
+        if not add_approver(fallback_value, fallback_value, fallback_role, system_scope):
+            missing.append(
+                {
+                    "assetId": system.get("assetId"),
+                    "name": system.get("name") or "Business system",
+                    "reason": "No active sign-off delegate or business owner with an email address",
+                }
+            )
+
+    approvers = sorted(resolved.values(), key=lambda item: item["approverEmail"])
+    for item in approvers:
+        item["responsibilityRoles"].sort()
+    return {"approvers": approvers, "missing": missing}
+
+
+def record_external_approval(
+    change: dict,
+    approval_request: dict,
+    decision: str,
+    comments: str,
+    all_approved: bool,
+) -> dict:
+    """Append external decision evidence and apply its lifecycle consequence."""
+
+    normalized_decision = str(decision or "").strip().lower()
+    if normalized_decision not in {"approved", "declined"}:
+        raise ValueError("Choose approved or declined")
+    if change.get("status") != "awaiting_approval":
+        raise ValueError("This change is no longer awaiting approval")
+    timestamp = str(approval_request.get("decidedAt") or utc_now())
+    updated = deepcopy(change)
+    updated["updatedAt"] = timestamp
+    updated["revision"] = int(change.get("revision") or 1) + 1
+    evidence = {
+        "id": str(uuid.uuid4()),
+        "requestId": approval_request.get("id"),
+        "batchId": approval_request.get("batchId"),
+        "decision": normalized_decision,
+        "comments": str(comments or "").strip()[:8000],
+        "actorId": approval_request.get("approverUserId"),
+        "actorEmail": approval_request.get("approverEmail", ""),
+        "approverName": approval_request.get("approverName", ""),
+        "approverContactId": approval_request.get("approverContactId"),
+        "responsibilityRole": approval_request.get("responsibilityRole", ""),
+        "scope": deepcopy(approval_request.get("scope") or []),
+        "createdAt": timestamp,
+    }
+    updated["approvals"] = [*(updated.get("approvals") or []), evidence]
+    target = (
+        "declined" if normalized_decision == "declined" else "approved" if all_approved else None
+    )
+    if target:
+        updated["status"] = target
+        reason = evidence["comments"] or (
+            "External approver declined the change"
+            if target == "declined"
+            else "All required external approvals received"
+        )
+        updated["statusHistory"] = [
+            *(updated.get("statusHistory") or []),
+            {
+                "id": str(uuid.uuid4()),
+                "fromStatus": "awaiting_approval",
+                "toStatus": target,
+                "reason": reason,
+                "actorId": approval_request.get("approverUserId"),
+                "actorEmail": approval_request.get("approverEmail", ""),
+                "createdAt": timestamp,
+            },
+        ]
+    return updated
 
 
 def preview_change_impact(
@@ -1474,16 +1656,30 @@ def render_change_pdf(change: dict, company: dict, branding: dict) -> bytes:
     story.append(record_table)
 
     story.extend([Spacer(1, 8 * mm), Paragraph("Approval", styles["Section"])])
-    approval_rows = [["Approver", "Comments / signature", "Decision", "Date"]]
+    approval_rows: list[list[object]] = [["Approver", "Comments / signature", "Decision", "Date"]]
     recorded_approvals = change.get("approvals") or []
     if recorded_approvals:
         for decision in recorded_approvals:
+            approver_identity = decision.get("approverName") or decision.get("actorEmail")
+            if decision.get("approverName") and decision.get("actorEmail"):
+                approver_identity = f"{decision['approverName']}\n{decision['actorEmail']}"
+            role = _label(decision.get("responsibilityRole"))
+            if decision.get("responsibilityRole"):
+                approver_identity = f"{approver_identity}\n{role}"
+            scope_names = ", ".join(
+                str(item.get("name") or "")
+                for item in decision.get("scope") or []
+                if item.get("name")
+            )
+            comments = str(decision.get("comments") or "")
+            if scope_names:
+                comments = f"{comments}\nScope: {scope_names}".strip()
             approval_rows.append(
                 [
-                    decision.get("actorEmail") or "Recorded approver",
-                    decision.get("comments") or "",
-                    _label(decision.get("decision")),
-                    decision.get("createdAt") or "",
+                    Paragraph(_safe(approver_identity or "Recorded approver"), styles["Cell"]),
+                    Paragraph(_safe(comments), styles["Cell"]),
+                    Paragraph(_safe(_label(decision.get("decision"))), styles["Cell"]),
+                    Paragraph(_safe(decision.get("createdAt") or ""), styles["Cell"]),
                 ]
             )
     else:

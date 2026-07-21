@@ -220,6 +220,7 @@ class StateRepository:
         )
         self.state.setdefault("notificationPreferences", [])
         self.state.setdefault("notificationEvents", [])
+        self.state.setdefault("changeApprovalRequests", [])
 
     def list_companies(self) -> list[dict]:
         return deepcopy(self.state["companies"])
@@ -1617,6 +1618,288 @@ class StateRepository:
         return self.get_change(stored["id"])
 
     @staticmethod
+    def _approval_from_row(row: tuple, *, include_token: bool = False) -> dict:
+        (
+            request_id,
+            change_id,
+            company_slug,
+            batch_id,
+            change_revision,
+            approver_contact_id,
+            approver_user_id,
+            approver_name,
+            approver_email,
+            responsibility_role,
+            scope_value,
+            status,
+            token_hash,
+            expires_at,
+            delivery_status,
+            provider_request_id,
+            last_error,
+            decision_comments,
+            decided_at,
+            created_at,
+            updated_at,
+        ) = row
+        record = {
+            "id": str(request_id),
+            "changeId": str(change_id),
+            "companyId": company_slug,
+            "batchId": str(batch_id),
+            "changeRevision": int(change_revision),
+            "approverContactId": str(approver_contact_id) if approver_contact_id else None,
+            "approverUserId": str(approver_user_id) if approver_user_id else None,
+            "approverName": approver_name,
+            "approverEmail": str(approver_email),
+            "responsibilityRole": responsibility_role,
+            "scope": scope_value or [],
+            "status": status,
+            "expiresAt": StateRepository._timestamp(expires_at),
+            "deliveryStatus": delivery_status,
+            "providerRequestId": provider_request_id or "",
+            "lastError": last_error or "",
+            "decisionComments": decision_comments or "",
+            "decidedAt": StateRepository._timestamp(decided_at),
+            "createdAt": StateRepository._timestamp(created_at),
+            "updatedAt": StateRepository._timestamp(updated_at),
+        }
+        if include_token:
+            record["tokenHash"] = token_hash
+        return record
+
+    @staticmethod
+    def _approval_select_sql() -> str:
+        return """
+            SELECT request.id, request.change_id, company.slug, request.batch_id,
+                   request.change_revision, request.approver_contact_id,
+                   request.approver_user_id, request.approver_name,
+                   request.approver_email::text, request.responsibility_role,
+                   request.scope, request.status, request.token_hash,
+                   request.expires_at, request.delivery_status,
+                   request.provider_request_id, request.last_error,
+                   request.decision_comments, request.decided_at,
+                   request.created_at, request.updated_at
+            FROM change_approval_requests request
+            JOIN companies company ON company.id = request.company_id
+        """
+
+    def _postgres_create_change_approval_request(
+        self, record: dict, actor_id: str | None = None
+    ) -> dict:
+        stored = {**deepcopy(record), "id": str(record.get("id") or uuid.uuid4())}
+        actor_uuid = canonical_uuid("user", actor_id) if actor_id else None
+        with self.connection_factory() as connection, connection.cursor() as cursor:  # type: ignore[attr-defined]  # Bound to PostgreSQL subclass below.
+            cursor.execute(
+                """
+                INSERT INTO change_approval_requests (
+                    id, change_id, company_id, batch_id, change_revision,
+                    approver_contact_id, approver_user_id, approver_name,
+                    approver_email, responsibility_role, scope, status, token_hash,
+                    expires_at, delivery_status, provider_request_id, last_error, created_by
+                ) VALUES (
+                    %s::uuid, %s::uuid,
+                    (SELECT id FROM companies WHERE slug = %s), %s::uuid, %s,
+                    %s::uuid, %s::uuid, %s, %s, %s, %s::jsonb, %s, %s,
+                    %s::timestamptz, %s, %s, %s, %s::uuid
+                )
+                """,
+                (
+                    stored["id"],
+                    stored["changeId"],
+                    stored["companyId"],
+                    stored["batchId"],
+                    int(stored["changeRevision"]),
+                    stored.get("approverContactId"),
+                    stored.get("approverUserId"),
+                    stored["approverName"],
+                    stored["approverEmail"],
+                    stored["responsibilityRole"],
+                    json.dumps(stored.get("scope") or []),
+                    stored.get("status", "pending"),
+                    stored["tokenHash"],
+                    stored["expiresAt"],
+                    stored.get("deliveryStatus", "pending"),
+                    stored.get("providerRequestId") or None,
+                    stored.get("lastError") or None,
+                    actor_uuid,
+                ),
+            )
+            cursor.execute(
+                self._approval_select_sql() + " WHERE request.id = %s::uuid", (stored["id"],)
+            )
+            created = self._approval_from_row(cursor.fetchone())
+            self._insert_audit(  # type: ignore[attr-defined]  # Bound to PostgreSQL subclass below.
+                cursor,
+                stored["companyId"],
+                actor_id,
+                "change_approval_request",
+                stored["id"],
+                "created",
+                None,
+                created,
+            )
+        return created
+
+    def _postgres_list_change_approval_requests(self, change_id: str) -> list[dict]:
+        try:
+            parsed_id = str(uuid.UUID(change_id))
+        except (ValueError, TypeError):
+            return []
+        with self.connection_factory() as connection, connection.cursor() as cursor:  # type: ignore[attr-defined]  # Bound to PostgreSQL subclass below.
+            cursor.execute(
+                self._approval_select_sql()
+                + " WHERE request.change_id = %s::uuid ORDER BY request.created_at DESC, request.id",
+                (parsed_id,),
+            )
+            return [self._approval_from_row(row) for row in cursor.fetchall()]
+
+    def _postgres_get_change_approval_request_by_token(self, token_hash: str) -> dict | None:
+        with self.connection_factory() as connection, connection.cursor() as cursor:  # type: ignore[attr-defined]  # Bound to PostgreSQL subclass below.
+            cursor.execute(
+                self._approval_select_sql() + " WHERE request.token_hash = %s",
+                (token_hash,),
+            )
+            row = cursor.fetchone()
+            return self._approval_from_row(row, include_token=True) if row else None
+
+    def _postgres_update_change_approval_request(
+        self,
+        request_id: str,
+        changes: dict,
+        actor_id: str | None = None,
+    ) -> dict | None:
+        try:
+            parsed_id = str(uuid.UUID(request_id))
+        except (ValueError, TypeError):
+            return None
+        with self.connection_factory() as connection, connection.cursor() as cursor:  # type: ignore[attr-defined]  # Bound to PostgreSQL subclass below.
+            cursor.execute(
+                self._approval_select_sql() + " WHERE request.id = %s::uuid", (parsed_id,)
+            )
+            existing_row = cursor.fetchone()
+            if not existing_row:
+                return None
+            existing = self._approval_from_row(existing_row)
+            cursor.execute(
+                """
+                UPDATE change_approval_requests SET
+                    delivery_status = COALESCE(%s, delivery_status),
+                    provider_request_id = CASE WHEN %s THEN %s ELSE provider_request_id END,
+                    last_error = CASE WHEN %s THEN %s ELSE last_error END,
+                    updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (
+                    changes.get("deliveryStatus"),
+                    "providerRequestId" in changes,
+                    changes.get("providerRequestId") or None,
+                    "lastError" in changes,
+                    changes.get("lastError") or None,
+                    parsed_id,
+                ),
+            )
+            if not cursor.rowcount:
+                return None
+            cursor.execute(
+                self._approval_select_sql() + " WHERE request.id = %s::uuid", (parsed_id,)
+            )
+            updated = self._approval_from_row(cursor.fetchone())
+            self._insert_audit(  # type: ignore[attr-defined]  # Bound to PostgreSQL subclass below.
+                cursor,
+                updated["companyId"],
+                actor_id,
+                "change_approval_request",
+                parsed_id,
+                "delivery_updated",
+                existing,
+                updated,
+            )
+        return updated
+
+    def _postgres_decide_change_approval_request(
+        self, token_hash: str, decision: str, comments: str
+    ) -> dict | None:
+        with self.connection_factory() as connection, connection.cursor() as cursor:  # type: ignore[attr-defined]  # Bound to PostgreSQL subclass below.
+            cursor.execute(
+                """
+                UPDATE change_approval_requests SET
+                    status = %s, decision_comments = %s, decided_at = now(), updated_at = now()
+                WHERE token_hash = %s AND status = 'pending' AND expires_at > now()
+                RETURNING id
+                """,
+                (decision, str(comments or "").strip()[:8000], token_hash),
+            )
+            row = cursor.fetchone()
+            if not row:
+                cursor.execute(
+                    """
+                    UPDATE change_approval_requests SET status = 'expired', updated_at = now()
+                    WHERE token_hash = %s AND status = 'pending' AND expires_at <= now()
+                    """,
+                    (token_hash,),
+                )
+                return None
+            cursor.execute(
+                self._approval_select_sql() + " WHERE request.id = %s::uuid", (str(row[0]),)
+            )
+            return self._approval_from_row(cursor.fetchone())
+
+    def _postgres_revoke_change_approval_requests(
+        self,
+        change_id: str,
+        actor_id: str | None = None,
+        reason: str = "Approval request replaced",
+        batch_id: str | None = None,
+    ) -> int:
+        try:
+            parsed_change_id = str(uuid.UUID(change_id))
+            parsed_batch_id = str(uuid.UUID(batch_id)) if batch_id else None
+        except (ValueError, TypeError):
+            return 0
+        with self.connection_factory() as connection, connection.cursor() as cursor:  # type: ignore[attr-defined]  # Bound to PostgreSQL subclass below.
+            cursor.execute(
+                self._approval_select_sql()
+                + """
+                  WHERE request.change_id = %s::uuid AND request.status = 'pending'
+                    AND (%s::uuid IS NULL OR request.batch_id = %s::uuid)
+                  ORDER BY request.created_at, request.id
+                """,
+                (parsed_change_id, parsed_batch_id, parsed_batch_id),
+            )
+            existing = [self._approval_from_row(row) for row in cursor.fetchall()]
+            if not existing:
+                return 0
+            cursor.execute(
+                """
+                UPDATE change_approval_requests SET
+                    status = 'revoked', last_error = %s, updated_at = now()
+                WHERE change_id = %s::uuid AND status = 'pending'
+                  AND (%s::uuid IS NULL OR batch_id = %s::uuid)
+                """,
+                (reason[:2000], parsed_change_id, parsed_batch_id, parsed_batch_id),
+            )
+            revoked_count = max(0, cursor.rowcount)
+            for before in existing:
+                cursor.execute(
+                    self._approval_select_sql() + " WHERE request.id = %s::uuid",
+                    (before["id"],),
+                )
+                after = self._approval_from_row(cursor.fetchone())
+                self._insert_audit(  # type: ignore[attr-defined]  # Bound to PostgreSQL subclass below.
+                    cursor,
+                    before["companyId"],
+                    actor_id,
+                    "change_approval_request",
+                    before["id"],
+                    "revoked",
+                    before,
+                    after,
+                    reason=reason,
+                )
+            return revoked_count
+
+    @staticmethod
     def _change_select_sql() -> str:
         return """
             SELECT cr.id, c.slug, c.name, cr.change_number, cr.title, cr.status,
@@ -2072,6 +2355,152 @@ class StateRepository:
         )
         self.save_state(self.state)
         return deepcopy(current)
+
+    @staticmethod
+    def _approval_public(record: dict) -> dict:
+        """Return approval evidence without the bearer-token verifier."""
+
+        return {key: deepcopy(value) for key, value in record.items() if key != "tokenHash"}
+
+    def create_change_approval_request(self, record: dict, actor_id: str | None = None) -> dict:
+        """Persist a hashed, expiring approval request."""
+
+        stored = deepcopy(record)
+        stored.setdefault("id", str(uuid.uuid4()))
+        stored.setdefault("status", "pending")
+        stored.setdefault("deliveryStatus", "pending")
+        stored.setdefault("createdAt", utc_now())
+        stored.setdefault("updatedAt", stored["createdAt"])
+        self.state["changeApprovalRequests"].append(stored)
+        self._audit(
+            stored.get("companyId"),
+            actor_id,
+            "change_approval_request",
+            stored["id"],
+            "created",
+            None,
+            self._approval_public(stored),
+        )
+        self.save_state(self.state)
+        return self._approval_public(stored)
+
+    def list_change_approval_requests(self, change_id: str) -> list[dict]:
+        """List public approval evidence for one change."""
+
+        records = [
+            self._approval_public(item)
+            for item in self.state["changeApprovalRequests"]
+            if item.get("changeId") == change_id
+        ]
+        return sorted(records, key=lambda item: item.get("createdAt", ""), reverse=True)
+
+    def get_change_approval_request_by_token(self, token_hash: str) -> dict | None:
+        """Resolve an approval request by its one-way bearer-token verifier."""
+
+        record = next(
+            (
+                item
+                for item in self.state["changeApprovalRequests"]
+                if hmac.compare_digest(str(item.get("tokenHash") or ""), token_hash)
+            ),
+            None,
+        )
+        return deepcopy(record) if record else None
+
+    def update_change_approval_request(
+        self,
+        request_id: str,
+        changes: dict,
+        actor_id: str | None = None,
+    ) -> dict | None:
+        """Update delivery metadata without changing approval identity or scope."""
+
+        allowed = {"deliveryStatus", "providerRequestId", "lastError"}
+        record = next(
+            (item for item in self.state["changeApprovalRequests"] if item["id"] == request_id),
+            None,
+        )
+        if not record:
+            return None
+        before = self._approval_public(record)
+        for key in allowed:
+            if key in changes:
+                record[key] = deepcopy(changes[key])
+        record["updatedAt"] = utc_now()
+        self._audit(
+            record.get("companyId"),
+            actor_id,
+            "change_approval_request",
+            request_id,
+            "delivery_updated",
+            before,
+            self._approval_public(record),
+        )
+        self.save_state(self.state)
+        return self._approval_public(record)
+
+    def decide_change_approval_request(
+        self, token_hash: str, decision: str, comments: str
+    ) -> dict | None:
+        """Atomically consume a pending approval token in the local repository."""
+
+        record = next(
+            (
+                item
+                for item in self.state["changeApprovalRequests"]
+                if hmac.compare_digest(str(item.get("tokenHash") or ""), token_hash)
+            ),
+            None,
+        )
+        if not record or record.get("status") != "pending":
+            return None
+        expires_at = parse_timestamp(record.get("expiresAt"))
+        if not expires_at or expires_at <= datetime.now(UTC):
+            record["status"] = "expired"
+            record["updatedAt"] = utc_now()
+            self.save_state(self.state)
+            return None
+        timestamp = utc_now()
+        record.update(
+            status=decision,
+            decisionComments=str(comments or "").strip()[:8000],
+            decidedAt=timestamp,
+            updatedAt=timestamp,
+        )
+        self.save_state(self.state)
+        return self._approval_public(record)
+
+    def revoke_change_approval_requests(
+        self,
+        change_id: str,
+        actor_id: str | None = None,
+        reason: str = "Approval request replaced",
+        batch_id: str | None = None,
+    ) -> int:
+        """Revoke reusable approval links after replacement or lifecycle change."""
+
+        count = 0
+        for record in self.state["changeApprovalRequests"]:
+            if record.get("changeId") != change_id or record.get("status") != "pending":
+                continue
+            if batch_id and record.get("batchId") != batch_id:
+                continue
+            before = self._approval_public(record)
+            record.update(status="revoked", lastError=reason[:2000], updatedAt=utc_now())
+            self._audit(
+                record.get("companyId"),
+                actor_id,
+                "change_approval_request",
+                record["id"],
+                "revoked",
+                before,
+                self._approval_public(record),
+                reason=reason,
+            )
+            count += 1
+        if count:
+            self.save_state(self.state)
+        return count
 
     def list_integrations(self) -> list[dict]:
         return deepcopy(self.state.get("integrations", []))
@@ -2685,6 +3114,7 @@ class StateRepository:
         state.pop("emailOutbox", None)
         state.pop("notificationEvents", None)
         state.pop("passwordResets", None)
+        state.pop("changeApprovalRequests", None)
         return state
 
     def import_state(self, state: dict, actor_id: str | None = None) -> dict[str, int]:
@@ -2725,6 +3155,7 @@ class StateRepository:
         )
         self.state.setdefault("notificationPreferences", [])
         self.state.setdefault("notificationEvents", [])
+        self.state.setdefault("changeApprovalRequests", [])
         self.state.setdefault("passwordResets", [])
         self.state["apiTokens"] = []
         self.save_state(self.state)
@@ -2805,6 +3236,14 @@ class PostgresCmdbRepository(StateRepository):
     next_change_number = StateRepository._postgres_next_change_number
     create_change = StateRepository._postgres_create_change
     update_change = StateRepository._postgres_update_change
+    create_change_approval_request = StateRepository._postgres_create_change_approval_request
+    list_change_approval_requests = StateRepository._postgres_list_change_approval_requests
+    get_change_approval_request_by_token = (
+        StateRepository._postgres_get_change_approval_request_by_token
+    )
+    update_change_approval_request = StateRepository._postgres_update_change_approval_request
+    decide_change_approval_request = StateRepository._postgres_decide_change_approval_request
+    revoke_change_approval_requests = StateRepository._postgres_revoke_change_approval_requests
 
     def __init__(
         self,

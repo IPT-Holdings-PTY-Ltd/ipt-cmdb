@@ -146,7 +146,7 @@ export type Asset = {
   lastSeen?: string;
   fields: Record<string, unknown>;
   metadata: AssetMetadata;
-  responsibilities: ContactResponsibility[];
+  responsibilities?: ContactResponsibility[];
 };
 
 export type Relationship = {
@@ -240,6 +240,7 @@ export type ChangeImpactItem = {
   businessOwner: string;
   signoffDelegate: string;
   signoffRequired: string;
+  responsibilities: ContactResponsibility[];
   department: string;
   userPopulation: string;
   rtoHours: string;
@@ -316,13 +317,32 @@ export type ChangePackage = {
   rollbackExecuted: boolean;
   rollbackResult: string;
   closureNotes: string;
-  approvals: Array<{ id: string; decision: 'approved' | 'declined'; comments: string; actorId?: string | null; actorEmail: string; createdAt: string }>;
+  approvals: Array<{ id: string; decision: 'approved' | 'declined'; comments: string; actorId?: string | null; actorEmail: string; approverName?: string; responsibilityRole?: string; scope?: Array<{ type: string; id?: string; name?: string }>; createdAt: string }>;
   statusHistory: Array<{ id: string; fromStatus?: string | null; toStatus: string; reason: string; actorId?: string | null; actorEmail: string; createdAt: string }>;
   createdBy: { id?: string | null; email: string };
   createdAt: string;
   impactSnapshot: ChangeImpactItem[];
   impactSummary: ChangeImpactPreview['summary'];
   integrationState: { connectwise: { status: string; ticketId: string | null; ticketUrl: string | null } };
+};
+
+export type ChangeApprovalRequest = {
+  id: string;
+  changeId: string;
+  batchId: string;
+  changeRevision: number;
+  approverName: string;
+  approverEmail: string;
+  responsibilityRole: string;
+  scope: Array<{ type: string; id?: string; name?: string }>;
+  status: 'pending' | 'approved' | 'declined' | 'expired' | 'revoked';
+  expiresAt: string;
+  deliveryStatus: 'pending' | 'accepted' | 'failed';
+  providerRequestId: string;
+  lastError: string;
+  decisionComments: string;
+  decidedAt: string;
+  createdAt: string;
 };
 
 export type AuditChange = { field: string; before: unknown; after: unknown };
