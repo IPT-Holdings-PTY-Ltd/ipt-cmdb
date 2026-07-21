@@ -83,6 +83,11 @@ azd env get-values
 Run `azd deploy api` after changing application code. Run `azd provision` after reviewing
 infrastructure changes.
 
+The IaC sets `PUBLIC_BASE_URL` to the generated Container App HTTPS origin so local
+break-glass accounts can receive safe recovery links. When a custom domain becomes the
+canonical entry point, supply that exact HTTPS origin through the optional
+`publicBaseUrl` Bicep parameter and reprovision.
+
 ## 4. Verify
 
 The auth boundary intentionally excludes only health endpoints. Test them first:

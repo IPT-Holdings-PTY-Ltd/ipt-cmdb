@@ -6,6 +6,7 @@ export type AuthConfiguration = {
   mode: string;
   external: boolean;
   localLoginEnabled: boolean;
+  passwordResetAvailable: boolean;
   externalLoginUrl: string;
   externalLogoutUrl: string;
   mfaAvailable: boolean;

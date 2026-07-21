@@ -15,7 +15,7 @@ import secrets
 import uuid
 from collections.abc import Callable
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from psycopg import sql
@@ -27,6 +27,7 @@ from src.cmdb.audit import (
     field_changes,
     sanitize_audit_value,
 )
+from src.cmdb.notifications import DEFAULT_NOTIFICATION_RULES, DEFAULT_NOTIFICATION_TEMPLATES
 
 CMDB_NAMESPACE = uuid.UUID("a12d44c4-64a7-4d6f-b829-3a8b691f0fa4")
 PROVIDER_TO_DB = {
@@ -62,6 +63,7 @@ DEFAULT_EMAIL_CONNECTION = {
     "authMode": "managed_identity",
     "tenantId": "",
     "clientId": "",
+    "servicePrincipalObjectId": "",
     "managedIdentityClientId": "",
     "senderAddress": "",
     "senderName": "",
@@ -119,6 +121,18 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
+def parse_timestamp(value: Any) -> datetime | None:
+    """Parse a stored UTC timestamp used by the local worker repository."""
+
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
 def canonical_uuid(kind: str, current_id: str) -> str:
     """Keep existing UUIDs and deterministically migrate prototype string IDs."""
     try:
@@ -173,8 +187,39 @@ class StateRepository:
         self.state.setdefault("mfaRecoveryCodes", [])
         self.state.setdefault("loginChallenges", [])
         self.state.setdefault("sessions", [])
+        self.state.setdefault("passwordResets", [])
         self.state.setdefault("emailConnection", deepcopy(DEFAULT_EMAIL_CONNECTION))
         self.state.setdefault("emailOutbox", [])
+        self.state.setdefault(
+            "notificationRules",
+            [
+                {
+                    **deepcopy(rule),
+                    "id": canonical_uuid("notification_rule", str(rule["key"])),
+                    "companyId": None,
+                    "fallbackAddresses": [],
+                    "maxAttempts": 5,
+                    "lastRunAt": None,
+                    "revision": 1,
+                }
+                for rule in DEFAULT_NOTIFICATION_RULES
+            ],
+        )
+        self.state.setdefault(
+            "notificationTemplates",
+            [
+                {
+                    **deepcopy(template),
+                    "id": canonical_uuid("notification_template", str(template["key"])),
+                    "companyId": None,
+                    "enabled": True,
+                    "version": 1,
+                }
+                for template in DEFAULT_NOTIFICATION_TEMPLATES
+            ],
+        )
+        self.state.setdefault("notificationPreferences", [])
+        self.state.setdefault("notificationEvents", [])
 
     def list_companies(self) -> list[dict]:
         return deepcopy(self.state["companies"])
@@ -315,7 +360,16 @@ class StateRepository:
         self.save_state(self.state)
         return self._effective_user(user)
 
-    def set_user_password(self, user_id: str, password: str, actor_id: str | None = None) -> bool:
+    def set_user_password(
+        self,
+        user_id: str,
+        password: str,
+        actor_id: str | None = None,
+        *,
+        action: str = "password_reset",
+    ) -> bool:
+        """Replace a local credential and record the supplied audit action."""
+
         user = next((item for item in self.state["users"] if item["id"] == user_id), None)
         if not user:
             return False
@@ -327,7 +381,7 @@ class StateRepository:
             actor_id,
             "user",
             user_id,
-            "password_reset",
+            action,
             None,
             {"passwordChanged": True},
         )
@@ -646,6 +700,144 @@ class StateRepository:
         if count:
             self.save_state(self.state)
         return count
+
+    def create_password_reset(
+        self,
+        reset: dict,
+        *,
+        identifier_limit: int = 3,
+        requester_limit: int = 20,
+    ) -> dict | None:
+        """Rate-limit and persist one hashed, short-lived recovery transaction."""
+
+        now = datetime.now(UTC)
+        identifier_cutoff = now - timedelta(minutes=15)
+        requester_cutoff = now - timedelta(hours=1)
+        records = self.state.get("passwordResets", [])
+        identifier_count = sum(
+            item.get("identifierHash") == reset["identifierHash"]
+            and (parse_timestamp(item.get("createdAt")) or datetime.min.replace(tzinfo=UTC))
+            >= identifier_cutoff
+            for item in records
+        )
+        requester_count = sum(
+            item.get("requesterHash") == reset["requesterHash"]
+            and (parse_timestamp(item.get("createdAt")) or datetime.min.replace(tzinfo=UTC))
+            >= requester_cutoff
+            for item in records
+        )
+        if identifier_count >= identifier_limit or requester_count >= requester_limit:
+            return None
+        stored = {
+            "id": str(uuid.uuid4()),
+            "userId": None,
+            "consumedAt": None,
+            "invalidatedAt": None,
+            "createdAt": utc_now(),
+            **deepcopy(reset),
+        }
+        self.state["passwordResets"] = [stored, *records[:999]]
+        if stored.get("userId"):
+            self._audit(
+                None,
+                stored["userId"],
+                "authentication",
+                stored["userId"],
+                "password_reset_requested",
+                None,
+                {"expiresAt": stored["expiresAt"]},
+                metadata={"delivery": "email"},
+            )
+        self.save_state(self.state)
+        return deepcopy(stored)
+
+    def get_password_reset(self, token_hash: str) -> dict | None:
+        """Return one live recovery transaction without exposing other tokens."""
+
+        reset = next(
+            (
+                item
+                for item in self.state.get("passwordResets", [])
+                if item.get("tokenHash") == token_hash
+                and item.get("userId")
+                and not item.get("consumedAt")
+                and not item.get("invalidatedAt")
+                and (parse_timestamp(item.get("expiresAt")) or datetime.min.replace(tzinfo=UTC))
+                > datetime.now(UTC)
+            ),
+            None,
+        )
+        if not reset:
+            return None
+        user = next(
+            (
+                item
+                for item in self.state["users"]
+                if item["id"] == reset["userId"]
+                and item.get("status", "active") == "active"
+                and (item.get("passwordHash") or item.get("password"))
+            ),
+            None,
+        )
+        return {**deepcopy(reset), "email": user["email"]} if user else None
+
+    def complete_password_reset(
+        self,
+        token_hash: str,
+        password: str,
+        *,
+        revoke_api_tokens: bool = True,
+    ) -> dict | None:
+        """Consume a recovery token, replace the password, and revoke credentials."""
+
+        reset = self.get_password_reset(token_hash)
+        if not reset:
+            return None
+        user = next(item for item in self.state["users"] if item["id"] == reset["userId"])
+        existing_hash = user.get("passwordHash")
+        if existing_hash and verify_password(password, existing_hash):
+            raise ValueError("New password must be different from the current password")
+        user["passwordHash"] = hash_password(password)
+        user.pop("password", None)
+        user["updatedAt"] = utc_now()
+        now = utc_now()
+        for item in self.state.get("passwordResets", []):
+            if item["tokenHash"] == token_hash:
+                item["consumedAt"] = now
+            elif item.get("userId") == user["id"] and not item.get("consumedAt"):
+                item["invalidatedAt"] = now
+        revoked_sessions = 0
+        for session in self.state.get("sessions", []):
+            if session["userId"] == user["id"] and not session.get("revokedAt"):
+                session["revokedAt"] = now
+                revoked_sessions += 1
+        revoked_tokens = 0
+        if revoke_api_tokens:
+            for token in self.state.get("apiTokens", []):
+                if token["userId"] == user["id"] and not token.get("revokedAt"):
+                    token["revokedAt"] = now
+                    revoked_tokens += 1
+        self._audit(
+            None,
+            user["id"],
+            "authentication",
+            user["id"],
+            "password_reset_completed",
+            None,
+            {"passwordChanged": True},
+            metadata={
+                "revokedSessions": revoked_sessions,
+                "revokedApiTokens": revoked_tokens,
+                "mfaPreserved": True,
+            },
+        )
+        self.save_state(self.state)
+        return {
+            "userId": user["id"],
+            "email": user["email"],
+            "revokedSessions": revoked_sessions,
+            "revokedApiTokens": revoked_tokens,
+        }
 
     @staticmethod
     def _public_api_token(token: dict) -> dict:
@@ -2213,12 +2405,277 @@ class StateRepository:
                 "attempts": item.get("attempts"),
                 "providerRequestId": item.get("providerRequestId"),
             },
-            outcome="failure" if item.get("status") == "failed" else "success",
-            severity="warning" if item.get("status") == "failed" else "informational",
+            outcome="failed" if item.get("status") in {"failed", "dead_letter"} else "success",
+            severity="warning"
+            if item.get("status") in {"failed", "dead_letter"}
+            else "informational",
             reason=str(item.get("lastError") or ""),
         )
         self.save_state(self.state)
         return deepcopy(item)
+
+    def claim_email_outbox(self, message_id: str | None = None) -> dict | None:
+        """Atomically claim one due message for a delivery worker."""
+
+        now = datetime.now(UTC)
+        stale_before = now - timedelta(minutes=15)
+        for item in self.state.get("emailOutbox", []):
+            if message_id and item.get("id") != message_id:
+                continue
+            status = item.get("status")
+            next_attempt = parse_timestamp(item.get("nextAttemptAt"))
+            updated_at = parse_timestamp(item.get("updatedAt"))
+            eligible = status in {"queued", "failed"} and (
+                next_attempt is None or next_attempt <= now
+            )
+            eligible = eligible or (
+                status == "sending" and updated_at is not None and updated_at <= stale_before
+            )
+            if not eligible or int(item.get("attempts") or 0) >= int(item.get("maxAttempts") or 5):
+                continue
+            before = {"status": status, "attempts": item.get("attempts", 0)}
+            item["status"] = "sending"
+            item["attempts"] = int(item.get("attempts") or 0) + 1
+            item["updatedAt"] = utc_now()
+            self._audit(
+                item.get("companyId"),
+                None,
+                "email_message",
+                item["id"],
+                "delivery_claimed",
+                before,
+                {"status": "sending", "attempts": item["attempts"]},
+                metadata={"worker": True},
+            )
+            self.save_state(self.state)
+            return deepcopy(item)
+        return None
+
+    def list_notification_rules(self) -> list[dict]:
+        """Return root and customer notification rules."""
+
+        return deepcopy(self.state.get("notificationRules", []))
+
+    def update_notification_rule(
+        self, rule_id: str, changes: dict, actor_id: str | None = None
+    ) -> dict | None:
+        """Update one notification rule with audit evidence."""
+
+        rule = next(
+            (item for item in self.state.get("notificationRules", []) if item["id"] == rule_id),
+            None,
+        )
+        if not rule:
+            return None
+        before = deepcopy(rule)
+        rule.update(deepcopy(changes))
+        rule["revision"] = int(before.get("revision") or 0) + 1
+        rule["updatedAt"] = utc_now()
+        self._audit(
+            rule.get("companyId"),
+            actor_id,
+            "notification_rule",
+            rule_id,
+            "updated",
+            before,
+            rule,
+        )
+        self.save_state(self.state)
+        return deepcopy(rule)
+
+    def mark_notification_rule_run(self, rule_id: str, run_at: str) -> None:
+        """Record scheduler progress without creating administrative audit noise."""
+
+        rule = next(
+            (item for item in self.state.get("notificationRules", []) if item["id"] == rule_id),
+            None,
+        )
+        if rule:
+            rule["lastRunAt"] = run_at
+            rule["updatedAt"] = run_at
+            self.save_state(self.state)
+
+    def list_notification_templates(self) -> list[dict]:
+        """Return editable notification templates."""
+
+        return deepcopy(self.state.get("notificationTemplates", []))
+
+    def update_notification_template(
+        self, template_id: str, changes: dict, actor_id: str | None = None
+    ) -> dict | None:
+        """Update one versioned notification template."""
+
+        template = next(
+            (
+                item
+                for item in self.state.get("notificationTemplates", [])
+                if item["id"] == template_id
+            ),
+            None,
+        )
+        if not template:
+            return None
+        before = deepcopy(template)
+        template.update(deepcopy(changes))
+        template["version"] = int(before.get("version") or 0) + 1
+        template["updatedAt"] = utc_now()
+        self._audit(
+            template.get("companyId"),
+            actor_id,
+            "notification_template",
+            template_id,
+            "updated",
+            before,
+            template,
+        )
+        self.save_state(self.state)
+        return deepcopy(template)
+
+    def list_notification_preferences(self, company_id: str | None = None) -> list[dict]:
+        """Return contact and portal-user notification preferences."""
+
+        return [
+            deepcopy(item)
+            for item in self.state.get("notificationPreferences", [])
+            if not company_id or item.get("companyId") == company_id
+        ]
+
+    def upsert_notification_preference(self, preference: dict, actor_id: str | None = None) -> dict:
+        """Create or update one recipient's channel and event choices."""
+
+        existing = next(
+            (
+                item
+                for item in self.state.get("notificationPreferences", [])
+                if (
+                    preference.get("contactId") and item.get("contactId") == preference["contactId"]
+                )
+                or (preference.get("userId") and item.get("userId") == preference["userId"])
+            ),
+            None,
+        )
+        before = deepcopy(existing) if existing else None
+        if existing:
+            existing.update(deepcopy(preference))
+            stored = existing
+        else:
+            stored = {
+                "id": str(uuid.uuid4()),
+                "emailEnabled": True,
+                "eventTypes": ["*"],
+                "digestMode": "instant",
+                **deepcopy(preference),
+            }
+            self.state.setdefault("notificationPreferences", []).append(stored)
+        stored["updatedAt"] = utc_now()
+        self._audit(
+            stored.get("companyId"),
+            actor_id,
+            "notification_preference",
+            stored["id"],
+            "updated" if before else "created",
+            before,
+            stored,
+        )
+        self.save_state(self.state)
+        return deepcopy(stored)
+
+    def create_notification_event(self, event: dict, actor_id: str | None = None) -> dict:
+        """Persist one deduplicated notification event."""
+
+        existing = next(
+            (
+                item
+                for item in self.state.get("notificationEvents", [])
+                if item.get("dedupeKey") == event.get("dedupeKey")
+            ),
+            None,
+        )
+        if existing:
+            return deepcopy(existing)
+        stored = {
+            "id": str(uuid.uuid4()),
+            "status": "pending",
+            "recipients": [],
+            "missingRoles": [],
+            "context": {},
+            "emailOutboxId": None,
+            "scheduledFor": utc_now(),
+            "createdAt": utc_now(),
+            "updatedAt": utc_now(),
+            **deepcopy(event),
+        }
+        self.state["notificationEvents"] = [
+            stored,
+            *self.state.get("notificationEvents", [])[:4999],
+        ]
+        self._audit(
+            stored.get("companyId"),
+            actor_id,
+            "notification_event",
+            stored["id"],
+            "created",
+            None,
+            {key: value for key, value in stored.items() if key != "context"},
+        )
+        self.save_state(self.state)
+        return deepcopy(stored)
+
+    def update_notification_event(
+        self, event_id: str, changes: dict, actor_id: str | None = None
+    ) -> dict | None:
+        """Update event status, recipient evidence, or linked outbox record."""
+
+        event = next(
+            (item for item in self.state.get("notificationEvents", []) if item["id"] == event_id),
+            None,
+        )
+        if not event:
+            return None
+        before = deepcopy(event)
+        event.update(deepcopy(changes))
+        event["updatedAt"] = utc_now()
+        self._audit(
+            event.get("companyId"),
+            actor_id,
+            "notification_event",
+            event_id,
+            "updated",
+            {"status": before.get("status")},
+            {"status": event.get("status"), "recipients": event.get("recipients")},
+        )
+        self.save_state(self.state)
+        return deepcopy(event)
+
+    def update_notification_event_for_outbox(
+        self, outbox_id: str, status: str, actor_id: str | None = None
+    ) -> dict | None:
+        """Mirror a terminal email state onto its notification event."""
+
+        event = next(
+            (
+                item
+                for item in self.state.get("notificationEvents", [])
+                if item.get("emailOutboxId") == outbox_id
+            ),
+            None,
+        )
+        return (
+            self.update_notification_event(event["id"], {"status": status}, actor_id)
+            if event
+            else None
+        )
+
+    def list_notification_events(
+        self, company_id: str | None = None, limit: int = 200
+    ) -> list[dict]:
+        """List recent notification events with tenant filtering."""
+
+        return [
+            deepcopy(item)
+            for item in self.state.get("notificationEvents", [])
+            if not company_id or item.get("companyId") == company_id
+        ][: max(1, min(limit, 500))]
 
     def export_state(self) -> dict:
         state = deepcopy(self.state)
@@ -2226,6 +2683,8 @@ class StateRepository:
         state.pop("apiTokens", None)
         state.pop("emailConnection", None)
         state.pop("emailOutbox", None)
+        state.pop("notificationEvents", None)
+        state.pop("passwordResets", None)
         return state
 
     def import_state(self, state: dict, actor_id: str | None = None) -> dict[str, int]:
@@ -2234,6 +2693,39 @@ class StateRepository:
         self.state.setdefault("auditEvents", [])
         self.state.setdefault("contacts", [])
         self.state.setdefault("contactResponsibilities", [])
+        self.state.setdefault("emailConnection", deepcopy(DEFAULT_EMAIL_CONNECTION))
+        self.state.setdefault("emailOutbox", [])
+        self.state.setdefault(
+            "notificationRules",
+            [
+                {
+                    **deepcopy(rule),
+                    "id": canonical_uuid("notification_rule", str(rule["key"])),
+                    "companyId": None,
+                    "fallbackAddresses": [],
+                    "maxAttempts": 5,
+                    "lastRunAt": None,
+                    "revision": 1,
+                }
+                for rule in DEFAULT_NOTIFICATION_RULES
+            ],
+        )
+        self.state.setdefault(
+            "notificationTemplates",
+            [
+                {
+                    **deepcopy(template),
+                    "id": canonical_uuid("notification_template", str(template["key"])),
+                    "companyId": None,
+                    "enabled": True,
+                    "version": 1,
+                }
+                for template in DEFAULT_NOTIFICATION_TEMPLATES
+            ],
+        )
+        self.state.setdefault("notificationPreferences", [])
+        self.state.setdefault("notificationEvents", [])
+        self.state.setdefault("passwordResets", [])
         self.state["apiTokens"] = []
         self.save_state(self.state)
         return {
@@ -3315,7 +3807,16 @@ class PostgresCmdbRepository(StateRepository):
             None,
         )
 
-    def set_user_password(self, user_id: str, password: str, actor_id: str | None = None) -> bool:
+    def set_user_password(
+        self,
+        user_id: str,
+        password: str,
+        actor_id: str | None = None,
+        *,
+        action: str = "password_reset",
+    ) -> bool:
+        """Replace a local credential and record the supplied audit action."""
+
         before = next(
             (item for item in self.list_users(include_inactive=True) if item["id"] == user_id),
             None,
@@ -3339,7 +3840,7 @@ class PostgresCmdbRepository(StateRepository):
                 actor_id,
                 "user",
                 user_id,
-                "password_reset",
+                action,
                 None,
                 {"passwordChanged": True},
             )
@@ -3667,6 +4168,209 @@ class PostgresCmdbRepository(StateRepository):
                 (user_id,),
             )
             return cursor.rowcount
+
+    def create_password_reset(
+        self,
+        reset: dict,
+        *,
+        identifier_limit: int = 3,
+        requester_limit: int = 20,
+    ) -> dict | None:
+        """Rate-limit and persist one recovery request across all API replicas."""
+
+        reset_id = str(uuid.uuid4())
+        with self.connection_factory() as database, database.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM auth_password_resets WHERE created_at < now() - interval '30 days'"
+            )
+            lock_keys = sorted(
+                (
+                    f"identifier:{reset['identifierHash']}",
+                    f"requester:{reset['requesterHash']}",
+                )
+            )
+            for lock_key in lock_keys:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (lock_key,),
+                )
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE identifier_hash = %s AND created_at >= now() - interval '15 minutes'
+                    ),
+                    COUNT(*) FILTER (
+                        WHERE requester_hash = %s AND created_at >= now() - interval '1 hour'
+                    )
+                FROM auth_password_resets
+                WHERE (identifier_hash = %s AND created_at >= now() - interval '15 minutes')
+                   OR (requester_hash = %s AND created_at >= now() - interval '1 hour')
+                """,
+                (
+                    reset["identifierHash"],
+                    reset["requesterHash"],
+                    reset["identifierHash"],
+                    reset["requesterHash"],
+                ),
+            )
+            identifier_count, requester_count = cursor.fetchone()
+            if identifier_count >= identifier_limit or requester_count >= requester_limit:
+                return None
+            cursor.execute(
+                """
+                INSERT INTO auth_password_resets (
+                    id, user_id, token_hash, identifier_hash, requester_hash, expires_at
+                ) VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s::timestamptz)
+                """,
+                (
+                    reset_id,
+                    reset.get("userId"),
+                    reset["tokenHash"],
+                    reset["identifierHash"],
+                    reset["requesterHash"],
+                    reset["expiresAt"],
+                ),
+            )
+            if reset.get("userId"):
+                self._insert_audit(
+                    cursor,
+                    None,
+                    reset["userId"],
+                    "authentication",
+                    reset["userId"],
+                    "password_reset_requested",
+                    None,
+                    {"expiresAt": reset["expiresAt"]},
+                    metadata={"delivery": "email"},
+                )
+        return {"id": reset_id, "createdAt": utc_now(), **deepcopy(reset)}
+
+    def get_password_reset(self, token_hash: str) -> dict | None:
+        """Load one live reset token for validation without exposing credentials."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT reset.id, reset.user_id, owner.email::text, reset.expires_at,
+                       reset.created_at
+                FROM auth_password_resets reset
+                JOIN users owner ON owner.id = reset.user_id
+                JOIN local_auth_credentials credential ON credential.user_id = owner.id
+                WHERE reset.token_hash = %s AND reset.consumed_at IS NULL
+                  AND reset.invalidated_at IS NULL AND reset.expires_at > now()
+                  AND owner.status = 'active'
+                """,
+                (token_hash,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "id": str(row[0]),
+            "userId": str(row[1]),
+            "email": row[2],
+            "expiresAt": self._timestamp(row[3]),
+            "createdAt": self._timestamp(row[4]),
+        }
+
+    def complete_password_reset(
+        self,
+        token_hash: str,
+        password: str,
+        *,
+        revoke_api_tokens: bool = True,
+    ) -> dict | None:
+        """Atomically consume recovery, rotate password, and revoke credentials."""
+
+        result: dict | None = None
+        with self.connection_factory() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT reset.id, owner.id, owner.email::text, credential.password_hash
+                FROM auth_password_resets reset
+                JOIN users owner ON owner.id = reset.user_id
+                JOIN local_auth_credentials credential ON credential.user_id = owner.id
+                WHERE reset.token_hash = %s AND reset.consumed_at IS NULL
+                  AND reset.invalidated_at IS NULL AND reset.expires_at > now()
+                  AND owner.status = 'active'
+                FOR UPDATE OF reset, credential
+                """,
+                (token_hash,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            reset_id, user_id, email, current_hash = row
+            if verify_password(password, current_hash):
+                raise ValueError("New password must be different from the current password")
+            cursor.execute(
+                """
+                UPDATE local_auth_credentials
+                SET password_hash = %s, updated_at = now()
+                WHERE user_id = %s::uuid
+                """,
+                (hash_password(password), user_id),
+            )
+            cursor.execute(
+                "UPDATE users SET updated_at = now() WHERE id = %s::uuid",
+                (user_id,),
+            )
+            cursor.execute(
+                "UPDATE auth_password_resets SET consumed_at = now() WHERE id = %s::uuid",
+                (reset_id,),
+            )
+            cursor.execute(
+                """
+                UPDATE auth_password_resets SET invalidated_at = now()
+                WHERE user_id = %s::uuid AND id <> %s::uuid
+                  AND consumed_at IS NULL AND invalidated_at IS NULL
+                """,
+                (user_id, reset_id),
+            )
+            cursor.execute(
+                """
+                UPDATE user_sessions SET revoked_at = now()
+                WHERE user_id = %s::uuid AND revoked_at IS NULL
+                """,
+                (user_id,),
+            )
+            revoked_sessions = cursor.rowcount
+            revoked_tokens = 0
+            if revoke_api_tokens:
+                cursor.execute(
+                    """
+                    UPDATE user_api_tokens
+                    SET revoked_at = now(), revoked_by_user_id = %s::uuid
+                    WHERE user_id = %s::uuid AND revoked_at IS NULL
+                    """,
+                    (user_id, user_id),
+                )
+                revoked_tokens = cursor.rowcount
+            self._insert_audit(
+                cursor,
+                None,
+                str(user_id),
+                "authentication",
+                str(user_id),
+                "password_reset_completed",
+                None,
+                {"passwordChanged": True},
+                metadata={
+                    "revokedSessions": revoked_sessions,
+                    "revokedApiTokens": revoked_tokens,
+                    "mfaPreserved": True,
+                },
+            )
+            result = {
+                "userId": str(user_id),
+                "email": email,
+                "revokedSessions": revoked_sessions,
+                "revokedApiTokens": revoked_tokens,
+            }
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return result
 
     def list_api_tokens(self, user_id: str) -> list[dict]:
         with self.connection_factory() as connection, connection.cursor() as cursor:
@@ -5264,7 +5968,8 @@ class PostgresCmdbRepository(StateRepository):
             cursor.execute(
                 """
                 SELECT id, enabled, auth_mode, tenant_id, client_id,
-                       managed_identity_client_id, sender_address, sender_name,
+                       service_principal_object_id, managed_identity_client_id,
+                       sender_address, sender_name,
                        reply_to, graph_base_url, client_secret_encrypted,
                        client_secret_nonce, status, last_test_at, last_error,
                        revision, created_at, updated_at
@@ -5282,19 +5987,20 @@ class PostgresCmdbRepository(StateRepository):
             "authMode": row[2],
             "tenantId": row[3] or "",
             "clientId": row[4] or "",
-            "managedIdentityClientId": row[5] or "",
-            "senderAddress": row[6] or "",
-            "senderName": row[7] or "",
-            "replyTo": row[8] or "",
-            "graphBaseUrl": row[9],
-            "clientSecretEncrypted": row[10] or "",
-            "clientSecretNonce": row[11] or "",
-            "status": row[12],
-            "lastTestAt": self._timestamp(row[13]) or None,
-            "lastError": row[14] or "",
-            "revision": row[15],
-            "createdAt": self._timestamp(row[16]),
-            "updatedAt": self._timestamp(row[17]),
+            "servicePrincipalObjectId": row[5] or "",
+            "managedIdentityClientId": row[6] or "",
+            "senderAddress": row[7] or "",
+            "senderName": row[8] or "",
+            "replyTo": row[9] or "",
+            "graphBaseUrl": row[10],
+            "clientSecretEncrypted": row[11] or "",
+            "clientSecretNonce": row[12] or "",
+            "status": row[13],
+            "lastTestAt": self._timestamp(row[14]) or None,
+            "lastError": row[15] or "",
+            "revision": row[16],
+            "createdAt": self._timestamp(row[17]),
+            "updatedAt": self._timestamp(row[18]),
         }
 
     def update_email_connection(self, connection: dict, actor_id: str | None = None) -> dict:
@@ -5308,11 +6014,12 @@ class PostgresCmdbRepository(StateRepository):
                 """
                 INSERT INTO email_connections (
                     id, scope, provider, enabled, auth_mode, tenant_id, client_id,
-                    managed_identity_client_id, sender_address, sender_name, reply_to,
+                    service_principal_object_id, managed_identity_client_id,
+                    sender_address, sender_name, reply_to,
                     graph_base_url, client_secret_encrypted, client_secret_nonce,
                     status, last_test_at, last_error, revision, updated_by, updated_at
                 ) VALUES (
-                    %s::uuid, 'msp', 'microsoft_graph', %s, %s, %s, %s, %s,
+                    %s::uuid, 'msp', 'microsoft_graph', %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s::timestamptz, %s, 1,
                     %s::uuid, now()
                 )
@@ -5321,6 +6028,7 @@ class PostgresCmdbRepository(StateRepository):
                     auth_mode = EXCLUDED.auth_mode,
                     tenant_id = EXCLUDED.tenant_id,
                     client_id = EXCLUDED.client_id,
+                    service_principal_object_id = EXCLUDED.service_principal_object_id,
                     managed_identity_client_id = EXCLUDED.managed_identity_client_id,
                     sender_address = EXCLUDED.sender_address,
                     sender_name = EXCLUDED.sender_name,
@@ -5341,6 +6049,7 @@ class PostgresCmdbRepository(StateRepository):
                     stored.get("authMode", "managed_identity"),
                     stored.get("tenantId") or None,
                     stored.get("clientId") or None,
+                    stored.get("servicePrincipalObjectId") or None,
                     stored.get("managedIdentityClientId") or None,
                     stored.get("senderAddress") or None,
                     stored.get("senderName") or None,
@@ -5513,8 +6222,12 @@ class PostgresCmdbRepository(StateRepository):
                     "attempts": stored.get("attempts"),
                     "providerRequestId": stored.get("providerRequestId"),
                 },
-                outcome="failure" if stored.get("status") == "failed" else "success",
-                severity="warning" if stored.get("status") == "failed" else "informational",
+                outcome="failed"
+                if stored.get("status") in {"failed", "dead_letter"}
+                else "success",
+                severity="warning"
+                if stored.get("status") in {"failed", "dead_letter"}
+                else "informational",
                 reason=str(stored.get("lastError") or ""),
             )
         return self.get_email_outbox(message_id)
@@ -5546,6 +6259,499 @@ class PostgresCmdbRepository(StateRepository):
             record.update(bodyHtml=row[20] or "", bodyText=row[21] or "")
         return record
 
+    def claim_email_outbox(self, message_id: str | None = None) -> dict | None:
+        """Claim one due outbox record with row locking for multi-replica safety."""
+
+        with self.connection_factory() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH candidate AS (
+                    SELECT eo.id, company.slug AS company_slug, eo.status AS previous_status,
+                           eo.attempts AS previous_attempts
+                    FROM email_outbox eo
+                    LEFT JOIN companies company ON company.id = eo.company_id
+                    WHERE (%s::uuid IS NULL OR eo.id = %s::uuid)
+                      AND eo.attempts < eo.max_attempts
+                      AND (
+                        (eo.status IN ('queued', 'failed') AND COALESCE(eo.next_attempt_at, now()) <= now())
+                        OR (eo.status = 'sending' AND eo.updated_at <= now() - interval '15 minutes')
+                      )
+                    ORDER BY eo.next_attempt_at NULLS FIRST, eo.created_at
+                    FOR UPDATE OF eo SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE email_outbox target
+                SET status = 'sending', attempts = target.attempts + 1,
+                    last_error = NULL, updated_at = now()
+                FROM candidate
+                WHERE target.id = candidate.id
+                RETURNING target.id, candidate.company_slug, candidate.previous_status,
+                          candidate.previous_attempts, target.attempts
+                """,
+                (message_id, message_id),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            self._insert_audit(
+                cursor,
+                row[1],
+                None,
+                "email_message",
+                str(row[0]),
+                "delivery_claimed",
+                {"status": row[2], "attempts": row[3]},
+                {"status": "sending", "attempts": row[4]},
+                metadata={"worker": True},
+            )
+        return self.get_email_outbox(str(row[0]))
+
+    def list_notification_rules(self) -> list[dict]:
+        """Load global and customer-specific notification rules."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT rule.id, company.slug, rule.rule_key, rule.name, rule.event_type,
+                       rule.enabled, rule.lead_days, rule.cadence, rule.recipient_roles,
+                       rule.fallback_addresses, rule.template_key, rule.max_attempts,
+                       rule.last_run_at, rule.revision, rule.created_at, rule.updated_at
+                FROM notification_rules rule
+                LEFT JOIN companies company ON company.id = rule.company_id
+                ORDER BY company.name NULLS FIRST, rule.name
+                """
+            )
+            return [
+                {
+                    "id": str(row[0]),
+                    "companyId": row[1],
+                    "key": row[2],
+                    "name": row[3],
+                    "eventType": row[4],
+                    "enabled": bool(row[5]),
+                    "leadDays": int(row[6]),
+                    "cadence": row[7],
+                    "recipientRoles": row[8] or [],
+                    "fallbackAddresses": row[9] or [],
+                    "templateKey": row[10],
+                    "maxAttempts": int(row[11]),
+                    "lastRunAt": self._timestamp(row[12]) or None,
+                    "revision": int(row[13]),
+                    "createdAt": self._timestamp(row[14]),
+                    "updatedAt": self._timestamp(row[15]),
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def update_notification_rule(
+        self, rule_id: str, changes: dict, actor_id: str | None = None
+    ) -> dict | None:
+        """Persist mutable rule controls and audit the change."""
+
+        before = next(
+            (item for item in self.list_notification_rules() if item["id"] == rule_id), None
+        )
+        if not before:
+            return None
+        stored = {**before, **deepcopy(changes)}
+        with self.connection_factory() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE notification_rules SET name = %s, enabled = %s, lead_days = %s,
+                    cadence = %s, recipient_roles = %s::jsonb,
+                    fallback_addresses = %s::jsonb, template_key = %s,
+                    max_attempts = %s, last_run_at = %s::timestamptz,
+                    revision = revision + 1, updated_by = %s::uuid, updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (
+                    stored["name"],
+                    bool(stored["enabled"]),
+                    int(stored["leadDays"]),
+                    stored["cadence"],
+                    json.dumps(stored.get("recipientRoles") or []),
+                    json.dumps(stored.get("fallbackAddresses") or []),
+                    stored["templateKey"],
+                    int(stored.get("maxAttempts") or 5),
+                    stored.get("lastRunAt") or None,
+                    actor_id,
+                    rule_id,
+                ),
+            )
+            self._insert_audit(
+                cursor,
+                stored.get("companyId"),
+                actor_id,
+                "notification_rule",
+                rule_id,
+                "updated",
+                before,
+                stored,
+            )
+        return next(
+            (item for item in self.list_notification_rules() if item["id"] == rule_id), None
+        )
+
+    def mark_notification_rule_run(self, rule_id: str, run_at: str) -> None:
+        """Record scheduler progress without incrementing the editable revision."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE notification_rules
+                SET last_run_at = %s::timestamptz, updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (run_at, rule_id),
+            )
+
+    def list_notification_templates(self) -> list[dict]:
+        """Load global and customer-specific message templates."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT template.id, company.slug, template.template_key, template.name,
+                       template.subject_template, template.html_template,
+                       template.text_template, template.enabled, template.version,
+                       template.created_at, template.updated_at
+                FROM notification_templates template
+                LEFT JOIN companies company ON company.id = template.company_id
+                ORDER BY company.name NULLS FIRST, template.name
+                """
+            )
+            return [
+                {
+                    "id": str(row[0]),
+                    "companyId": row[1],
+                    "key": row[2],
+                    "name": row[3],
+                    "subjectTemplate": row[4],
+                    "htmlTemplate": row[5],
+                    "textTemplate": row[6],
+                    "enabled": bool(row[7]),
+                    "version": int(row[8]),
+                    "createdAt": self._timestamp(row[9]),
+                    "updatedAt": self._timestamp(row[10]),
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def update_notification_template(
+        self, template_id: str, changes: dict, actor_id: str | None = None
+    ) -> dict | None:
+        """Persist a new version of an editable notification template."""
+
+        before = next(
+            (item for item in self.list_notification_templates() if item["id"] == template_id),
+            None,
+        )
+        if not before:
+            return None
+        stored = {**before, **deepcopy(changes)}
+        with self.connection_factory() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE notification_templates SET name = %s, subject_template = %s,
+                    html_template = %s, text_template = %s, enabled = %s,
+                    version = version + 1, updated_by = %s::uuid, updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (
+                    stored["name"],
+                    stored["subjectTemplate"],
+                    stored["htmlTemplate"],
+                    stored["textTemplate"],
+                    bool(stored["enabled"]),
+                    actor_id,
+                    template_id,
+                ),
+            )
+            self._insert_audit(
+                cursor,
+                stored.get("companyId"),
+                actor_id,
+                "notification_template",
+                template_id,
+                "updated",
+                before,
+                stored,
+            )
+        return next(
+            (item for item in self.list_notification_templates() if item["id"] == template_id),
+            None,
+        )
+
+    def list_notification_preferences(self, company_id: str | None = None) -> list[dict]:
+        """Load notification choices for contacts and portal users."""
+
+        parameters: list[Any] = []
+        where = ""
+        if company_id:
+            where = "WHERE company.slug = %s"
+            parameters.append(company_id)
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT preference.id, company.slug, preference.contact_id,
+                       preference.user_id, preference.email_enabled,
+                       preference.event_types, preference.digest_mode,
+                       preference.created_at, preference.updated_at
+                FROM notification_preferences preference
+                JOIN companies company ON company.id = preference.company_id
+                {where}
+                ORDER BY company.name, preference.created_at
+                """,
+                tuple(parameters),
+            )
+            return [
+                {
+                    "id": str(row[0]),
+                    "companyId": row[1],
+                    "contactId": str(row[2]) if row[2] else None,
+                    "userId": str(row[3]) if row[3] else None,
+                    "emailEnabled": bool(row[4]),
+                    "eventTypes": row[5] or ["*"],
+                    "digestMode": row[6],
+                    "createdAt": self._timestamp(row[7]),
+                    "updatedAt": self._timestamp(row[8]),
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def upsert_notification_preference(self, preference: dict, actor_id: str | None = None) -> dict:
+        """Upsert a contact or user email preference."""
+
+        with self.connection_factory() as database, database.cursor() as cursor:
+            cursor.execute("SELECT id FROM companies WHERE slug = %s", (preference["companyId"],))
+            company_row = cursor.fetchone()
+            if not company_row:
+                raise ValueError("Customer not found")
+            existing = next(
+                (
+                    item
+                    for item in self.list_notification_preferences(preference["companyId"])
+                    if (
+                        preference.get("contactId")
+                        and item.get("contactId") == preference["contactId"]
+                    )
+                    or (preference.get("userId") and item.get("userId") == preference["userId"])
+                ),
+                None,
+            )
+            preference_id = existing["id"] if existing else str(uuid.uuid4())
+            cursor.execute(
+                """
+                INSERT INTO notification_preferences (
+                    id, company_id, contact_id, user_id, email_enabled,
+                    event_types, digest_mode, updated_by, updated_at
+                ) VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, %s::jsonb, %s, %s::uuid, now())
+                ON CONFLICT (id) DO UPDATE SET email_enabled = EXCLUDED.email_enabled,
+                    event_types = EXCLUDED.event_types, digest_mode = EXCLUDED.digest_mode,
+                    updated_by = EXCLUDED.updated_by, updated_at = now()
+                """,
+                (
+                    preference_id,
+                    str(company_row[0]),
+                    preference.get("contactId"),
+                    preference.get("userId"),
+                    bool(preference.get("emailEnabled", True)),
+                    json.dumps(preference.get("eventTypes") or ["*"]),
+                    preference.get("digestMode", "instant"),
+                    actor_id,
+                ),
+            )
+            self._insert_audit(
+                cursor,
+                preference["companyId"],
+                actor_id,
+                "notification_preference",
+                preference_id,
+                "updated" if existing else "created",
+                existing,
+                preference,
+            )
+        return next(
+            item
+            for item in self.list_notification_preferences(preference["companyId"])
+            if item["id"] == preference_id
+        )
+
+    def create_notification_event(self, event: dict, actor_id: str | None = None) -> dict:
+        """Insert one idempotent notification event and audit its creation."""
+
+        event_id = str(uuid.uuid4())
+        with self.connection_factory() as database, database.cursor() as cursor:
+            cursor.execute("SELECT id FROM companies WHERE slug = %s", (event["companyId"],))
+            company_row = cursor.fetchone()
+            if not company_row:
+                raise ValueError("Customer not found")
+            cursor.execute(
+                """
+                INSERT INTO notification_events (
+                    id, company_id, rule_id, event_type, entity_type, entity_id,
+                    entity_name, dedupe_key, status, recipients, missing_roles,
+                    context, email_outbox_id, scheduled_for
+                ) VALUES (
+                    %s::uuid, %s::uuid, %s::uuid, %s, %s, %s::uuid, %s, %s, %s,
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::uuid, %s::timestamptz
+                ) ON CONFLICT (dedupe_key) DO NOTHING
+                RETURNING id
+                """,
+                (
+                    event_id,
+                    str(company_row[0]),
+                    event["ruleId"],
+                    event["eventType"],
+                    event["entityType"],
+                    canonical_uuid(event["entityType"], event["entityId"]),
+                    event["entityName"],
+                    event["dedupeKey"],
+                    event.get("status", "pending"),
+                    json.dumps(event.get("recipients") or []),
+                    json.dumps(event.get("missingRoles") or []),
+                    json.dumps(event.get("context") or {}),
+                    event.get("emailOutboxId"),
+                    event.get("scheduledFor") or utc_now(),
+                ),
+            )
+            created = cursor.fetchone()
+            if created:
+                self._insert_audit(
+                    cursor,
+                    event["companyId"],
+                    actor_id,
+                    "notification_event",
+                    event_id,
+                    "created",
+                    None,
+                    {key: value for key, value in event.items() if key != "context"},
+                )
+            else:
+                cursor.execute(
+                    "SELECT id FROM notification_events WHERE dedupe_key = %s",
+                    (event["dedupeKey"],),
+                )
+                event_id = str(cursor.fetchone()[0])
+        return next(
+            item for item in self.list_notification_events(limit=500) if item["id"] == event_id
+        )
+
+    def update_notification_event(
+        self, event_id: str, changes: dict, actor_id: str | None = None
+    ) -> dict | None:
+        """Update notification evidence after recipient resolution or delivery."""
+
+        before = next(
+            (item for item in self.list_notification_events(limit=500) if item["id"] == event_id),
+            None,
+        )
+        if not before:
+            return None
+        stored = {**before, **deepcopy(changes)}
+        with self.connection_factory() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE notification_events SET status = %s, recipients = %s::jsonb,
+                    missing_roles = %s::jsonb, context = %s::jsonb,
+                    email_outbox_id = %s::uuid, scheduled_for = %s::timestamptz,
+                    updated_at = now() WHERE id = %s::uuid
+                """,
+                (
+                    stored["status"],
+                    json.dumps(stored.get("recipients") or []),
+                    json.dumps(stored.get("missingRoles") or []),
+                    json.dumps(stored.get("context") or {}),
+                    stored.get("emailOutboxId"),
+                    stored.get("scheduledFor") or utc_now(),
+                    event_id,
+                ),
+            )
+            self._insert_audit(
+                cursor,
+                stored.get("companyId"),
+                actor_id,
+                "notification_event",
+                event_id,
+                "updated",
+                {"status": before.get("status")},
+                {"status": stored.get("status"), "recipients": stored.get("recipients")},
+            )
+        return next(
+            (item for item in self.list_notification_events(limit=500) if item["id"] == event_id),
+            None,
+        )
+
+    def update_notification_event_for_outbox(
+        self, outbox_id: str, status: str, actor_id: str | None = None
+    ) -> dict | None:
+        """Mirror outbox delivery status to its notification event."""
+
+        event = next(
+            (
+                item
+                for item in self.list_notification_events(limit=500)
+                if item.get("emailOutboxId") == outbox_id
+            ),
+            None,
+        )
+        return (
+            self.update_notification_event(event["id"], {"status": status}, actor_id)
+            if event
+            else None
+        )
+
+    def list_notification_events(
+        self, company_id: str | None = None, limit: int = 200
+    ) -> list[dict]:
+        """List recent notification evidence, optionally for one customer."""
+
+        parameters: list[Any] = []
+        where = ""
+        if company_id:
+            where = "WHERE company.slug = %s"
+            parameters.append(company_id)
+        parameters.append(max(1, min(limit, 500)))
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT event.id, company.slug, rule.id, rule.name, event.event_type,
+                       event.entity_type, event.entity_id, event.entity_name,
+                       event.dedupe_key, event.status, event.recipients,
+                       event.missing_roles, event.context, event.email_outbox_id,
+                       event.scheduled_for, event.created_at, event.updated_at
+                FROM notification_events event
+                JOIN companies company ON company.id = event.company_id
+                JOIN notification_rules rule ON rule.id = event.rule_id
+                {where}
+                ORDER BY event.created_at DESC
+                LIMIT %s
+                """,
+                tuple(parameters),
+            )
+            return [
+                {
+                    "id": str(row[0]),
+                    "companyId": row[1],
+                    "ruleId": str(row[2]),
+                    "ruleName": row[3],
+                    "eventType": row[4],
+                    "entityType": row[5],
+                    "entityId": str(row[6]),
+                    "entityName": row[7],
+                    "dedupeKey": row[8],
+                    "status": row[9],
+                    "recipients": row[10] or [],
+                    "missingRoles": row[11] or [],
+                    "context": row[12] or {},
+                    "emailOutboxId": str(row[13]) if row[13] else None,
+                    "scheduledFor": self._timestamp(row[14]),
+                    "createdAt": self._timestamp(row[15]),
+                    "updatedAt": self._timestamp(row[16]),
+                }
+                for row in cursor.fetchall()
+            ]
+
     def export_state(self) -> dict:
         """Assemble a portable document from canonical tables, never a JSON mirror."""
         return {
@@ -5553,6 +6759,9 @@ class PostgresCmdbRepository(StateRepository):
             "users": self.list_users(include_credentials=True),
             "contacts": self.list_contacts(),
             "contactResponsibilities": self.list_contact_responsibilities(include_inactive=True),
+            "notificationRules": self.list_notification_rules(),
+            "notificationTemplates": self.list_notification_templates(),
+            "notificationPreferences": self.list_notification_preferences(),
             "accessGroups": self.list_access_groups(),
             "assets": self.list_assets(),
             "relationships": self.list_relationships(),

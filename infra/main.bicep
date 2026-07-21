@@ -37,6 +37,9 @@ param entraClientSecret string = ''
 @description('Initial image used during provisioning. azd deploy replaces this with the built image.')
 param bootstrapImage string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
 
+@description('Optional external HTTPS origin. Set this when using a custom domain.')
+param publicBaseUrl string = ''
+
 @description('PostgreSQL SKU. Increase this for production workload and HA requirements.')
 param postgresSkuName string = 'Standard_B1ms'
 
@@ -393,6 +396,10 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
             {
               name: 'AUTH_MODE'
               value: enableEntraAuth ? 'easy_auth' : 'local'
+            }
+            {
+              name: 'PUBLIC_BASE_URL'
+              value: !empty(publicBaseUrl) ? publicBaseUrl : 'https://${appName}.${containerAppsEnvironment.properties.defaultDomain}'
             }
             {
               name: 'MFA_ENCRYPTION_KEY'

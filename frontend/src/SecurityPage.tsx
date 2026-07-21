@@ -1,8 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import SecurityOutlined from '@mui/icons-material/SecurityOutlined';
 import {
-  Alert, Box, Button, Card, CardContent, Chip, Dialog, DialogActions, DialogContent,
-  DialogTitle, Grid, Stack, TextField, Typography,
+  Alert, Box, Button, Card, CardContent, Checkbox, Chip, Dialog, DialogActions,
+  DialogContent, DialogTitle, FormControlLabel, Grid, Stack, TextField, Typography,
 } from '@mui/material';
 import { Title } from 'react-admin';
 import { apiFetch, setSession } from './session';
@@ -27,6 +27,11 @@ export function SecurityPage() {
   const [disableOpen, setDisableOpen] = useState(false);
   const [password, setPassword] = useState('');
   const [disableCode, setDisableCode] = useState('');
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [passwordMfaCode, setPasswordMfaCode] = useState('');
+  const [revokeApiTokens, setRevokeApiTokens] = useState(false);
 
   const load = async () => setStatus(await apiFetch<MfaStatus>('/api/me/mfa'));
   useEffect(() => { void load().catch(reason => setError(reason instanceof Error ? reason.message : 'Security settings could not be loaded')); }, []);
@@ -69,6 +74,21 @@ export function SecurityPage() {
     finally { setBusy(false); }
   }
 
+  async function changePassword(event: FormEvent) {
+    event.preventDefault(); setError(''); setNotice('');
+    if (newPassword !== confirmPassword) { setError('The new passwords do not match.'); return; }
+    setBusy(true);
+    try {
+      await apiFetch('/api/me/password', {
+        method: 'PUT',
+        body: JSON.stringify({ currentPassword, newPassword, mfaCode: passwordMfaCode, revokeApiTokens }),
+      });
+      setSession(null);
+      window.location.assign('/#/login?passwordChanged=1');
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Password could not be changed'); }
+    finally { setBusy(false); }
+  }
+
   return <Box>
     <Title title="My security" />
     <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} sx={{ justifyContent: 'space-between', alignItems: { md: 'center' }, mb: 3 }}>
@@ -97,6 +117,16 @@ export function SecurityPage() {
         <Typography variant="h5">Recovery codes</Typography><Typography color="text.secondary">Generate a replacement set after verifying your current authenticator. Every previous code is revoked immediately.</Typography>
         <TextField label="Current authenticator or recovery code" value={code} onChange={event => setCode(event.target.value)} disabled={!status?.enabled} />
         <Button type="submit" variant="outlined" disabled={busy || !status?.enabled || code.length < 6}>Replace recovery codes</Button>
+      </Stack></CardContent></Card></Grid>
+      <Grid size={{ xs: 12 }}><Card><CardContent><Stack component="form" spacing={2} onSubmit={changePassword} sx={{ maxWidth: 720 }}>
+        <Typography variant="h5">Change password</Typography>
+        <Typography color="text.secondary">Confirm your current password and choose a new one. All active browser sessions are signed out; your authenticator remains enabled.</Typography>
+        <TextField label="Current password" type="password" value={currentPassword} onChange={event => setCurrentPassword(event.target.value)} autoComplete="current-password" required />
+        <TextField label="New password" type="password" value={newPassword} onChange={event => setNewPassword(event.target.value)} autoComplete="new-password" required slotProps={{ htmlInput: { minLength: 12 } }} helperText="Use at least 12 characters." />
+        <TextField label="Confirm new password" type="password" value={confirmPassword} onChange={event => setConfirmPassword(event.target.value)} autoComplete="new-password" required />
+        {status?.enabled && <TextField label="Authenticator or recovery code" value={passwordMfaCode} onChange={event => setPasswordMfaCode(event.target.value)} autoComplete="one-time-code" required helperText="Required because MFA is enabled on this account." />}
+        <FormControlLabel control={<Checkbox checked={revokeApiTokens} onChange={event => setRevokeApiTokens(event.target.checked)} />} label="Also revoke my personal API tokens" />
+        <Button type="submit" variant="contained" disabled={busy || newPassword.length < 12 || newPassword !== confirmPassword || Boolean(status?.enabled && passwordMfaCode.length < 6)}>Change password and sign out</Button>
       </Stack></CardContent></Card></Grid>
     </Grid>}
     <Dialog open={disableOpen} onClose={() => setDisableOpen(false)} fullWidth maxWidth="xs"><Stack component="form" onSubmit={disableMfa}><DialogTitle>Disable authenticator</DialogTitle><DialogContent><Stack spacing={2} sx={{ pt: 1 }}><Alert severity="warning">This lowers account protection and signs out every active browser session.</Alert><TextField label="Current password" type="password" value={password} onChange={event => setPassword(event.target.value)} required /><TextField label="Authenticator or recovery code" value={disableCode} onChange={event => setDisableCode(event.target.value)} required /></Stack></DialogContent><DialogActions><Button onClick={() => setDisableOpen(false)}>Cancel</Button><Button type="submit" color="error" variant="contained" disabled={busy}>Disable and sign out</Button></DialogActions></Stack></Dialog>

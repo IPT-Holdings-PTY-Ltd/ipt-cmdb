@@ -7,8 +7,10 @@ repository exists only for setup, development and isolated unit tests.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import html
 import json
 import logging
 import os
@@ -16,11 +18,13 @@ import re
 import secrets
 import time
 import uuid
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlparse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.staticfiles import StaticFiles
@@ -57,6 +61,12 @@ from src.cmdb.mfa import (
     recovery_codes,
     verify_totp,
 )
+from src.cmdb.notifications import (
+    notification_candidates,
+    notification_dedupe_key,
+    render_notification_template,
+    resolve_notification_recipients,
+)
 from src.cmdb.reports import (
     build_report,
     render_csv,
@@ -78,10 +88,51 @@ LOGGER = logging.getLogger("cmdb.api")
 EMAIL_SENDER = GraphEmailSender()
 
 
+def _notification_worker_interval() -> int:
+    """Return a bounded worker interval even when deployment input is invalid."""
+
+    try:
+        configured = int(os.getenv("NOTIFICATION_WORKER_INTERVAL_SECONDS", "60"))
+    except ValueError:
+        LOGGER.warning("Invalid NOTIFICATION_WORKER_INTERVAL_SECONDS; using 60 seconds")
+        configured = 60
+    return max(15, min(configured, 3600))
+
+
+async def _notification_worker_loop() -> None:
+    """Periodically evaluate rules and drain the durable email outbox."""
+
+    interval = _notification_worker_interval()
+    while True:
+        try:
+            await asyncio.to_thread(_run_notification_scan)
+            await asyncio.to_thread(_process_notification_outbox)
+        except Exception:
+            LOGGER.exception("Notification worker cycle failed")
+        await asyncio.sleep(interval)
+
+
+@asynccontextmanager
+async def application_lifespan(_application: FastAPI):
+    """Run the optional notification worker and stop it cleanly on shutdown."""
+
+    task: asyncio.Task[None] | None = None
+    if os.getenv("NOTIFICATION_WORKER_ENABLED", "false").lower() in {"1", "true", "yes"}:
+        task = asyncio.create_task(_notification_worker_loop())
+    try:
+        yield
+    finally:
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
 api = FastAPI(
     title="CMDB Hub API",
     version="0.4.0",
     description="Tenant-aware CMDB API served directly by FastAPI.",
+    lifespan=application_lifespan,
 )
 
 
@@ -97,6 +148,7 @@ async def audit_and_correlation_context(request: Request, call_next):
     correlation = request.headers.get("x-correlation-id", "").strip()[:100] or request_id
     forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
     client_address = forwarded or (request.client.host if request.client else "")
+    request.state.client_address = client_address[:120]
     token = set_audit_context(
         AuditContext(
             request_id=request_id,
@@ -111,6 +163,7 @@ async def audit_and_correlation_context(request: Request, call_next):
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Correlation-ID"] = correlation
+        response.headers["Referrer-Policy"] = "no-referrer"
         if (
             request.url.path.startswith("/api/")
             and response.status_code in {401, 403}
@@ -470,6 +523,29 @@ class UserPasswordRequest(BaseModel):
     password: str = Field(min_length=12, max_length=512)
 
 
+class PasswordResetRequest(BaseModel):
+    """Validate a public local-account recovery request."""
+
+    email: str = Field(min_length=3, max_length=320)
+
+
+class PasswordResetCompleteRequest(BaseModel):
+    """Validate completion of a token-based password recovery."""
+
+    token: str = Field(min_length=32, max_length=512)
+    newPassword: str = Field(min_length=12, max_length=512)
+    revokeApiTokens: bool = True
+
+
+class PasswordChangeRequest(BaseModel):
+    """Validate an authenticated local password change."""
+
+    currentPassword: str = Field(min_length=1, max_length=512)
+    newPassword: str = Field(min_length=12, max_length=512)
+    mfaCode: str = Field(default="", max_length=100)
+    revokeApiTokens: bool = False
+
+
 class ApiTokenCreateRequest(BaseModel):
     """Validate a restricted, expiring personal API token."""
 
@@ -629,6 +705,7 @@ class EmailConfigurationRequest(BaseModel):
     )
     tenantId: str = Field(default="", max_length=80)
     clientId: str = Field(default="", max_length=80)
+    servicePrincipalObjectId: str = Field(default="", max_length=80)
     managedIdentityClientId: str = Field(default="", max_length=80)
     senderAddress: str = Field(default="", max_length=320)
     senderName: str = Field(default="", max_length=160)
@@ -637,11 +714,62 @@ class EmailConfigurationRequest(BaseModel):
     expectedRevision: int | None = Field(default=None, ge=1)
 
 
+class EmailSetupScriptRequest(BaseModel):
+    """Validate values embedded in a generated Exchange setup package."""
+
+    authMode: str = Field(
+        default="managed_identity",
+        pattern="^(managed_identity|client_secret|certificate)$",
+    )
+    tenantId: str = Field(default="", max_length=80)
+    clientId: str = Field(min_length=1, max_length=80)
+    servicePrincipalObjectId: str = Field(min_length=1, max_length=80)
+    senderAddress: str = Field(min_length=3, max_length=320)
+    senderName: str = Field(default="IPT CMDB", max_length=160)
+    createSharedMailbox: bool = False
+
+
 class EmailTestRequest(BaseModel):
     """Validate an explicit administrative email test."""
 
     recipient: str = Field(min_length=3, max_length=320)
     subject: str = Field(default="CMDB Hub Microsoft 365 email test", max_length=240)
+
+
+class NotificationRuleRequest(BaseModel):
+    """Validate editable notification timing, routing, and retry controls."""
+
+    name: str = Field(min_length=1, max_length=160)
+    enabled: bool = True
+    leadDays: int = Field(default=0, ge=0, le=3650)
+    cadence: str = Field(default="daily", pattern="^(immediate|daily|weekly)$")
+    recipientRoles: list[str] = Field(default_factory=list, max_length=12)
+    fallbackAddresses: list[str] = Field(default_factory=list, max_length=20)
+    templateKey: str = Field(min_length=1, max_length=100)
+    maxAttempts: int = Field(default=5, ge=1, le=20)
+    expectedRevision: int | None = Field(default=None, ge=1)
+
+
+class NotificationTemplateRequest(BaseModel):
+    """Validate safe constrained notification template content."""
+
+    name: str = Field(min_length=1, max_length=160)
+    subjectTemplate: str = Field(min_length=1, max_length=998)
+    htmlTemplate: str = Field(min_length=1, max_length=20_000)
+    textTemplate: str = Field(min_length=1, max_length=10_000)
+    enabled: bool = True
+    expectedVersion: int | None = Field(default=None, ge=1)
+
+
+class NotificationPreferenceRequest(BaseModel):
+    """Validate contact or portal-user notification preferences."""
+
+    companyId: str = Field(min_length=1, max_length=100)
+    contactId: str | None = None
+    userId: str | None = None
+    emailEnabled: bool = True
+    eventTypes: list[str] = Field(default_factory=lambda: ["*"], max_length=20)
+    digestMode: str = Field(default="instant", pattern="^(instant|daily|weekly)$")
 
 
 class ChangeImpactRequest(BaseModel):
@@ -875,6 +1003,258 @@ def _mfa_failure(user: dict, token_hash: str, action: str) -> None:
     )
 
 
+def _public_base_url() -> str | None:
+    """Return the configured, trusted origin used in security email links."""
+
+    configured = os.getenv("PUBLIC_BASE_URL", "http://localhost:3000").strip().rstrip("/")
+    parsed = urlparse(configured)
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or (parsed.scheme != "https" and parsed.hostname not in local_hosts)
+    ):
+        LOGGER.warning("Password recovery is unavailable because PUBLIC_BASE_URL is invalid")
+        return None
+    return configured
+
+
+def _password_reset_available() -> bool:
+    """Return whether local recovery can safely queue Microsoft 365 email."""
+
+    connection = REPOSITORY.get_email_connection()
+    return bool(
+        _local_login_enabled()
+        and _public_base_url()
+        and connection.get("enabled")
+        and connection.get("senderAddress")
+        and connection.get("status") in {"configured", "verified"}
+    )
+
+
+def _requester_hash(request: Request) -> str:
+    """Hash the request source so throttling does not retain a plain IP address."""
+
+    address = str(getattr(request.state, "client_address", "") or "unknown")
+    return hashlib.sha256(address.encode("utf-8")).hexdigest()
+
+
+def _password_reset_message(user: dict, raw_token: str) -> dict:
+    """Build a branded, single-use recovery email without persisting its token."""
+
+    base_url = _public_base_url()
+    if not base_url:
+        raise EmailConfigurationError("PUBLIC_BASE_URL is not safe for password recovery")
+    brand = REPOSITORY.get_msp_branding()
+    raw_brand_name = str(brand.get("name") or "CMDB Hub")
+    raw_support_email = str(brand.get("supportEmail") or "")
+    brand_name = html.escape(raw_brand_name)
+    support_email = html.escape(raw_support_email)
+    accent = html.escape(str(brand.get("accent") or "#50d5b9"), quote=True)
+    reset_url = f"{base_url}/#/login?resetToken={quote(raw_token, safe='')}"
+    safe_url = html.escape(reset_url, quote=True)
+    support = (
+        f'<p style="color:#64748b">Need help? Contact {support_email}.</p>' if support_email else ""
+    )
+    return {
+        "idempotencyKey": f"local-password-reset:{uuid.uuid4()}",
+        "to": [user["email"]],
+        "subject": f"Reset your {raw_brand_name} password",
+        "bodyHtml": (
+            f'<div style="font-family:Arial,sans-serif;color:#172033;max-width:600px">'
+            f"<h2>{brand_name} password reset</h2>"
+            "<p>We received a request to reset your local account password.</p>"
+            f'<p><a href="{safe_url}" style="display:inline-block;padding:12px 18px;'
+            f"background:{accent};color:#07111f;text-decoration:none;border-radius:6px;"
+            '">Reset password</a></p>'
+            "<p>This single-use link expires in 30 minutes. If you did not request this, "
+            "you can safely ignore this email.</p>"
+            f"{support}</div>"
+        ),
+        "bodyText": (
+            f"Reset your {raw_brand_name} local password within 30 minutes:\n"
+            f"{reset_url}\n\n"
+            "If you did not request this, you can safely ignore this email."
+        ),
+        "templateKey": "local_password_reset",
+        "templateVersion": 1,
+        "maxAttempts": 5,
+    }
+
+
+def _password_changed_message(email: str) -> dict:
+    """Build the post-change security notification for a local account."""
+
+    brand = REPOSITORY.get_msp_branding()
+    raw_brand_name = str(brand.get("name") or "CMDB Hub")
+    raw_support_email = str(brand.get("supportEmail") or "")
+    brand_name = html.escape(raw_brand_name)
+    support = (
+        f" Contact {raw_support_email} immediately if this was not you."
+        if raw_support_email
+        else " Contact your platform administrator immediately if this was not you."
+    )
+    html_support = (
+        f" Contact {html.escape(raw_support_email)} immediately if this was not you."
+        if raw_support_email
+        else " Contact your platform administrator immediately if this was not you."
+    )
+    return {
+        "idempotencyKey": f"local-password-changed:{uuid.uuid4()}",
+        "to": [email],
+        "subject": f"Your {raw_brand_name} password was changed",
+        "bodyHtml": (
+            f"<h2>{brand_name} password changed</h2>"
+            f"<p>Your local account password was changed at {html.escape(core.now())}.</p>"
+            f"<p>{html_support.strip()}</p>"
+        ),
+        "bodyText": (
+            f"Your {raw_brand_name} local account password was changed at {core.now()}.{support}"
+        ),
+        "templateKey": "local_password_changed",
+        "templateVersion": 1,
+        "maxAttempts": 5,
+    }
+
+
+def _process_password_reset_request(email: str, requester_hash: str) -> None:
+    """Create and send one recovery transaction after the generic response begins."""
+
+    try:
+        user = next(
+            (
+                item
+                for item in REPOSITORY.list_users()
+                if item.get("email", "").casefold() == email.casefold()
+                and item.get("authSource") == "local"
+            ),
+            None,
+        )
+        raw_token = f"cmdb_reset_{secrets.token_urlsafe(32)}"
+        expires_at = datetime.now(UTC) + timedelta(minutes=30)
+        stored = REPOSITORY.create_password_reset(
+            {
+                "tokenHash": opaque_token_hash(raw_token),
+                "userId": user["id"] if user else None,
+                "identifierHash": hashlib.sha256(email.encode("utf-8")).hexdigest(),
+                "requesterHash": requester_hash,
+                "expiresAt": expires_at.isoformat().replace("+00:00", "Z"),
+            }
+        )
+        if stored and user:
+            message = _password_reset_message(user, raw_token)
+            connection, client_secret = _email_connection_for_delivery()
+            try:
+                result = EMAIL_SENDER.send(connection, message, client_secret=client_secret)
+            except (EmailConfigurationError, EmailDeliveryError) as error:
+                REPOSITORY.record_audit_event(
+                    None,
+                    None,
+                    "authentication",
+                    user["id"],
+                    "password_reset_email_failed",
+                    outcome="failed",
+                    severity="warning",
+                    metadata={"error": str(error)[:200]},
+                )
+                LOGGER.warning("Password recovery email was not accepted")
+            else:
+                REPOSITORY.record_audit_event(
+                    None,
+                    None,
+                    "authentication",
+                    user["id"],
+                    "password_reset_email_accepted",
+                    metadata={"providerRequestId": result.provider_request_id},
+                )
+    except Exception:
+        LOGGER.exception("Password recovery request processing failed")
+
+
+def _deliver_security_email_quietly(message_id: str) -> None:
+    """Attempt background delivery without leaking provider failures publicly."""
+
+    try:
+        _attempt_email_delivery(message_id, None)
+    except HTTPException:
+        LOGGER.warning("Security email delivery was deferred", extra={"message_id": message_id})
+    except Exception:
+        LOGGER.exception("Security email delivery failed", extra={"message_id": message_id})
+
+
+def _queue_password_changed_email(email: str, background_tasks: BackgroundTasks) -> None:
+    """Queue and opportunistically deliver a password-change notice."""
+
+    if not _password_reset_available():
+        return
+    queued = REPOSITORY.create_email_outbox(_password_changed_message(email), None)
+    background_tasks.add_task(_deliver_security_email_quietly, queued["id"])
+
+
+@api.post("/api/password-reset/request", status_code=202, tags=["authentication"])
+def request_password_reset(
+    payload: PasswordResetRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict[str, str]:
+    """Queue a generic local-account recovery request without enumeration."""
+
+    generic = "If an eligible local account exists, a password reset email has been queued."
+    if not _password_reset_available():
+        return {"message": generic}
+    email = payload.email.strip().lower()
+    background_tasks.add_task(_process_password_reset_request, email, _requester_hash(request))
+    return {"message": generic}
+
+
+@api.get("/api/password-reset/validate", tags=["authentication"])
+def validate_password_reset(token: str = "") -> dict:
+    """Validate a recovery token without exposing account identity."""
+
+    reset = (
+        REPOSITORY.get_password_reset(opaque_token_hash(token))
+        if _local_login_enabled() and len(token) >= 32
+        else None
+    )
+    return {
+        "valid": bool(reset),
+        "expiresAt": reset.get("expiresAt") if reset else None,
+    }
+
+
+@api.post("/api/password-reset/complete", tags=["authentication"])
+def complete_password_reset(
+    payload: PasswordResetCompleteRequest,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """Consume a recovery token, change the password and revoke credentials."""
+
+    if not _local_login_enabled():
+        raise HTTPException(400, "Reset link is invalid or expired")
+    try:
+        completed = REPOSITORY.complete_password_reset(
+            opaque_token_hash(payload.token),
+            payload.newPassword,
+            revoke_api_tokens=payload.revokeApiTokens,
+        )
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    if not completed:
+        raise HTTPException(400, "Reset link is invalid or expired")
+    revoked_sessions = _revoke_user_sessions(completed["userId"])
+    _queue_password_changed_email(completed["email"], background_tasks)
+    return {
+        "message": "Password updated. Sign in with your new password.",
+        "revokedSessions": max(revoked_sessions, int(completed.get("revokedSessions") or 0)),
+        "revokedApiTokens": int(completed.get("revokedApiTokens") or 0),
+    }
+
+
 @api.post("/api/login", tags=["authentication"])
 def login(payload: LoginRequest, request: Request) -> dict:
     if not _local_login_enabled():
@@ -968,6 +1348,7 @@ def auth_config() -> dict:
         "mode": mode,
         "external": external,
         "localLoginEnabled": _local_login_enabled(),
+        "passwordResetAvailable": _password_reset_available(),
         "mfaAvailable": mfa_available,
         "localMfaPolicy": os.getenv("LOCAL_MFA_POLICY", "optional").strip().lower(),
         "externalLoginUrl": os.getenv(
@@ -1017,6 +1398,51 @@ def logout(request: Request) -> Response:
 def me(request: Request) -> dict:
     user = current_user(request)
     return {**core.public_user(user), "mfaRequired": _mfa_policy_requires(user)}
+
+
+@api.put("/api/me/password", tags=["authentication"])
+def change_my_password(
+    payload: PasswordChangeRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """Change the current local password after re-authentication."""
+
+    user = current_user(request)
+    if user.get("authSource") != "local":
+        raise HTTPException(409, "Your password is managed by Microsoft Entra ID")
+    if not REPOSITORY.authenticate(user["email"], payload.currentPassword):
+        raise HTTPException(400, "Current password or authenticator code was not accepted")
+    if REPOSITORY.authenticate(user["email"], payload.newPassword):
+        raise HTTPException(400, "New password must be different from the current password")
+    if user.get("mfaEnabled"):
+        try:
+            method = _verify_enabled_mfa(user, payload.mfaCode)
+        except MfaConfigurationError as error:
+            raise HTTPException(503, str(error)) from error
+        if not method:
+            raise HTTPException(400, "Current password or authenticator code was not accepted")
+    with core.LOCK:
+        changed = REPOSITORY.set_user_password(
+            user["id"],
+            payload.newPassword,
+            user["id"],
+            action="password_changed_by_user",
+        )
+        revoked_api_tokens = (
+            REPOSITORY.revoke_user_api_tokens(user["id"], user["id"])
+            if payload.revokeApiTokens
+            else 0
+        )
+    if not changed:
+        raise HTTPException(409, "Password could not be changed")
+    revoked_sessions = _revoke_user_sessions(user["id"])
+    _queue_password_changed_email(user["email"], background_tasks)
+    return {
+        "message": "Password changed. Sign in again with your new password.",
+        "revokedSessions": revoked_sessions,
+        "revokedApiTokens": revoked_api_tokens,
+    }
 
 
 @api.get("/api/me/mfa", tags=["authentication"])
@@ -2410,26 +2836,31 @@ def _email_connection_for_delivery() -> tuple[dict, str]:
     return connection, client_secret
 
 
-def _attempt_email_delivery(message_id: str, actor_id: str) -> dict:
-    message = REPOSITORY.get_email_outbox(message_id)
-    if not message:
-        raise HTTPException(404, "Email outbox item not found")
+def _deliver_claimed_email(message: dict, actor_id: str | None = None) -> dict:
+    """Deliver a previously claimed message and schedule a bounded retry on failure."""
+
+    message_id = message["id"]
     connection, client_secret = _email_connection_for_delivery()
-    attempts = int(message.get("attempts") or 0) + 1
-    REPOSITORY.update_email_outbox(
-        message_id,
-        {"status": "sending", "attempts": attempts, "lastError": ""},
-        actor_id,
-    )
+    attempts = int(message.get("attempts") or 0)
     try:
         result = EMAIL_SENDER.send(connection, message, client_secret=client_secret)
     except (EmailConfigurationError, EmailDeliveryError) as error:
         failure = str(error)[:500]
+        terminal = attempts >= int(message.get("maxAttempts") or 5)
+        status = "dead_letter" if terminal else "failed"
+        delay_minutes = min(5 * (2 ** max(attempts - 1, 0)), 360)
+        retry_at = (datetime.now(UTC) + timedelta(minutes=delay_minutes)).isoformat()
         REPOSITORY.update_email_outbox(
             message_id,
-            {"status": "failed", "attempts": attempts, "lastError": failure},
+            {
+                "status": status,
+                "attempts": attempts,
+                "lastError": failure,
+                "nextAttemptAt": retry_at,
+            },
             actor_id,
         )
+        REPOSITORY.update_notification_event_for_outbox(message_id, status, actor_id)
         REPOSITORY.update_email_connection(
             {**connection, "status": "error", "lastError": failure}, actor_id
         )
@@ -2446,6 +2877,7 @@ def _attempt_email_delivery(message_id: str, actor_id: str) -> dict:
         },
         actor_id,
     )
+    REPOSITORY.update_notification_event_for_outbox(message_id, "accepted", actor_id)
     REPOSITORY.update_email_connection(
         {
             **connection,
@@ -2456,6 +2888,180 @@ def _attempt_email_delivery(message_id: str, actor_id: str) -> dict:
         actor_id,
     )
     return delivered or {}
+
+
+def _attempt_email_delivery(message_id: str, actor_id: str | None) -> dict:
+    """Atomically claim and synchronously deliver one selected outbox item."""
+
+    if not REPOSITORY.get_email_outbox(message_id):
+        raise HTTPException(404, "Email outbox item not found")
+    message = REPOSITORY.claim_email_outbox(message_id)
+    if not message:
+        raise HTTPException(409, "Email is not due or has reached its retry limit")
+    return _deliver_claimed_email(message, actor_id)
+
+
+def _rule_is_due(rule: dict, now: datetime) -> bool:
+    """Return whether a rule's cadence allows another evaluation."""
+
+    last_run = rule.get("lastRunAt")
+    if not last_run:
+        return True
+    try:
+        parsed = datetime.fromisoformat(str(last_run).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if not parsed.tzinfo:
+        parsed = parsed.replace(tzinfo=UTC)
+    minimum = {
+        "immediate": timedelta(minutes=1),
+        "daily": timedelta(hours=20),
+        "weekly": timedelta(days=6),
+    }.get(str(rule.get("cadence")), timedelta(days=1))
+    return now - parsed >= minimum
+
+
+def _notification_template_for(
+    templates: list[dict], template_key: str, company_id: str
+) -> dict | None:
+    """Prefer a customer override before falling back to the global template."""
+
+    matching = [
+        item for item in templates if item.get("key") == template_key and item.get("enabled", True)
+    ]
+    return next(
+        (item for item in matching if item.get("companyId") == company_id),
+        next((item for item in matching if not item.get("companyId")), None),
+    )
+
+
+def _run_notification_scan(
+    actor_id: str | None = None,
+    company_id: str | None = None,
+    force: bool = False,
+) -> dict[str, int]:
+    """Evaluate due rules, resolve owners, and enqueue idempotent messages."""
+
+    now = datetime.now(UTC)
+    rules = REPOSITORY.list_notification_rules()
+    templates = REPOSITORY.list_notification_templates()
+    companies = REPOSITORY.list_companies()
+    assets = REPOSITORY.list_assets()
+    changes = REPOSITORY.list_changes()
+    responsibilities = REPOSITORY.list_contact_responsibilities(include_inactive=False)
+    preferences = REPOSITORY.list_notification_preferences()
+    summary = {
+        "rulesEvaluated": 0,
+        "candidates": 0,
+        "queued": 0,
+        "missingRecipients": 0,
+        "duplicates": 0,
+        "missingTemplates": 0,
+    }
+    for rule in rules:
+        if not rule.get("enabled"):
+            continue
+        if company_id and rule.get("companyId") not in {None, company_id}:
+            continue
+        if not force and not _rule_is_due(rule, now):
+            continue
+        scoped_rule = {**rule, "companyId": rule.get("companyId") or company_id}
+        candidates = notification_candidates(scoped_rule, assets, changes, companies)
+        summary["rulesEvaluated"] += 1
+        summary["candidates"] += len(candidates)
+        for candidate in candidates:
+            if company_id and candidate["companyId"] != company_id:
+                continue
+            dedupe_key = notification_dedupe_key(rule, candidate)
+            event = REPOSITORY.create_notification_event(
+                {
+                    "companyId": candidate["companyId"],
+                    "ruleId": rule["id"],
+                    "eventType": candidate["eventType"],
+                    "entityType": candidate["entityType"],
+                    "entityId": candidate["entityId"],
+                    "entityName": candidate["entityName"],
+                    "dedupeKey": dedupe_key,
+                    "context": candidate["context"],
+                },
+                actor_id,
+            )
+            if event.get("status") not in {"pending", "missing_recipient"}:
+                summary["duplicates"] += 1
+                continue
+            recipients, missing_roles = resolve_notification_recipients(
+                rule,
+                candidate,
+                responsibilities,
+                [item for item in preferences if item.get("companyId") == candidate["companyId"]],
+            )
+            if not recipients:
+                REPOSITORY.update_notification_event(
+                    event["id"],
+                    {
+                        "status": "missing_recipient",
+                        "recipients": [],
+                        "missingRoles": missing_roles,
+                        "context": candidate["context"],
+                    },
+                    actor_id,
+                )
+                summary["missingRecipients"] += 1
+                continue
+            template = _notification_template_for(
+                templates, str(rule.get("templateKey") or ""), candidate["companyId"]
+            )
+            if not template:
+                summary["missingTemplates"] += 1
+                continue
+            rendered = render_notification_template(template, candidate["context"])
+            queued = REPOSITORY.create_email_outbox(
+                {
+                    "companyId": candidate["companyId"],
+                    "idempotencyKey": f"notification:{dedupe_key}",
+                    "to": recipients,
+                    "subject": rendered["subject"],
+                    "bodyHtml": rendered["bodyHtml"],
+                    "bodyText": rendered["bodyText"],
+                    "templateKey": template["key"],
+                    "templateVersion": template.get("version", 1),
+                    "maxAttempts": rule.get("maxAttempts", 5),
+                },
+                actor_id,
+            )
+            REPOSITORY.update_notification_event(
+                event["id"],
+                {
+                    "status": "queued",
+                    "recipients": recipients,
+                    "missingRoles": missing_roles,
+                    "context": candidate["context"],
+                    "emailOutboxId": queued["id"],
+                },
+                actor_id,
+            )
+            summary["queued"] += 1
+        REPOSITORY.mark_notification_rule_run(rule["id"], now.isoformat())
+    return summary
+
+
+def _process_notification_outbox(limit: int = 20) -> dict[str, int]:
+    """Drain a bounded number of due messages without stopping on one failure."""
+
+    summary = {"processed": 0, "accepted": 0, "failed": 0, "deadLetter": 0}
+    for _index in range(max(1, min(limit, 100))):
+        message = REPOSITORY.claim_email_outbox()
+        if not message:
+            break
+        summary["processed"] += 1
+        try:
+            delivered = _deliver_claimed_email(message)
+            summary["accepted" if delivered.get("status") == "accepted" else "failed"] += 1
+        except HTTPException:
+            current = REPOSITORY.get_email_outbox(message["id"]) or {}
+            key = "deadLetter" if current.get("status") == "dead_letter" else "failed"
+            summary[key] += 1
+    return summary
 
 
 @api.get("/api/email/config", tags=["email"])
@@ -2503,6 +3109,7 @@ def update_email_configuration(payload: EmailConfigurationRequest, request: Requ
         "authMode": payload.authMode,
         "tenantId": payload.tenantId.strip(),
         "clientId": payload.clientId.strip(),
+        "servicePrincipalObjectId": payload.servicePrincipalObjectId.strip(),
         "managedIdentityClientId": payload.managedIdentityClientId.strip(),
         "senderAddress": sender,
         "senderName": payload.senderName.strip(),
@@ -2567,7 +3174,234 @@ def retry_email_outbox(message_id: str, request: Request) -> dict:
         raise HTTPException(409, "Only queued or failed messages can be retried")
     if int(message.get("attempts") or 0) >= int(message.get("maxAttempts") or 5):
         raise HTTPException(409, "This message reached its retry limit")
+    REPOSITORY.update_email_outbox(
+        message_id,
+        {"status": "queued", "nextAttemptAt": core.now(), "lastError": ""},
+        user["id"],
+    )
     return _attempt_email_delivery(message_id, user["id"])
+
+
+@api.post("/api/email/outbox/{message_id}/requeue", tags=["email"])
+def requeue_dead_letter(message_id: str, request: Request) -> dict:
+    """Reset a dead-letter message after an administrator resolves its cause."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Email requeue requires platform admin access")
+    message = REPOSITORY.get_email_outbox(message_id)
+    if not message:
+        raise HTTPException(404, "Email outbox item not found")
+    if message.get("status") != "dead_letter":
+        raise HTTPException(409, "Only dead-letter messages can be requeued")
+    stored = REPOSITORY.update_email_outbox(
+        message_id,
+        {
+            "status": "queued",
+            "attempts": 0,
+            "nextAttemptAt": core.now(),
+            "lastError": "",
+        },
+        user["id"],
+    )
+    REPOSITORY.update_notification_event_for_outbox(message_id, "queued", user["id"])
+    return stored or {}
+
+
+NOTIFICATION_RECIPIENT_ROLES = {
+    "business_owner",
+    "service_owner",
+    "technical_owner",
+    "custodian",
+    "change_approver",
+    "signoff_delegate",
+    "support_contact",
+}
+NOTIFICATION_EVENT_TYPES = {
+    "asset_renewal",
+    "asset_eol",
+    "change_approval",
+    "missing_owner",
+}
+
+
+@api.get("/api/notifications/status", tags=["notifications"])
+def get_notification_status(request: Request) -> dict:
+    """Summarize queue health and worker configuration for MSP administrators."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Notifications require platform admin access")
+    outbox = REPOSITORY.list_email_outbox(500)
+    events = REPOSITORY.list_notification_events(limit=500)
+    return {
+        "workerEnabled": os.getenv("NOTIFICATION_WORKER_ENABLED", "false").lower()
+        in {"1", "true", "yes"},
+        "workerIntervalSeconds": _notification_worker_interval(),
+        "email": public_email_connection(REPOSITORY.get_email_connection()),
+        "queued": sum(item.get("status") == "queued" for item in outbox),
+        "failed": sum(item.get("status") == "failed" for item in outbox),
+        "deadLetter": sum(item.get("status") == "dead_letter" for item in outbox),
+        "missingRecipients": sum(item.get("status") == "missing_recipient" for item in events),
+    }
+
+
+@api.get("/api/notifications/rules", tags=["notifications"])
+def list_notification_rules(request: Request) -> list[dict]:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Notification rules require admin access")
+    return REPOSITORY.list_notification_rules()
+
+
+@api.patch("/api/notifications/rules/{rule_id}", tags=["notifications"])
+def update_notification_rule(
+    rule_id: str, payload: NotificationRuleRequest, request: Request
+) -> dict:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Notification rules require admin access")
+    current = next(
+        (item for item in REPOSITORY.list_notification_rules() if item["id"] == rule_id),
+        None,
+    )
+    if not current:
+        raise HTTPException(404, "Notification rule not found")
+    if payload.expectedRevision and payload.expectedRevision != current.get("revision"):
+        raise HTTPException(409, "Notification rule changed. Reload it before saving.")
+    unknown_roles = set(payload.recipientRoles) - NOTIFICATION_RECIPIENT_ROLES
+    if unknown_roles:
+        raise HTTPException(400, f"Unknown recipient role: {sorted(unknown_roles)[0]}")
+    fallbacks = list(dict.fromkeys(item.strip().lower() for item in payload.fallbackAddresses))
+    if any(not valid_email_address(item) for item in fallbacks):
+        raise HTTPException(400, "Fallback recipients must be valid email addresses")
+    templates = REPOSITORY.list_notification_templates()
+    if not any(item.get("key") == payload.templateKey for item in templates):
+        raise HTTPException(400, "Choose an existing notification template")
+    stored = REPOSITORY.update_notification_rule(
+        rule_id,
+        {
+            "name": payload.name.strip(),
+            "enabled": payload.enabled,
+            "leadDays": payload.leadDays,
+            "cadence": payload.cadence,
+            "recipientRoles": list(dict.fromkeys(payload.recipientRoles)),
+            "fallbackAddresses": fallbacks,
+            "templateKey": payload.templateKey,
+            "maxAttempts": payload.maxAttempts,
+        },
+        user["id"],
+    )
+    return stored or {}
+
+
+@api.get("/api/notifications/templates", tags=["notifications"])
+def list_notification_templates(request: Request) -> list[dict]:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Notification templates require admin access")
+    return REPOSITORY.list_notification_templates()
+
+
+@api.patch("/api/notifications/templates/{template_id}", tags=["notifications"])
+def update_notification_template(
+    template_id: str, payload: NotificationTemplateRequest, request: Request
+) -> dict:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Notification templates require admin access")
+    current = next(
+        (item for item in REPOSITORY.list_notification_templates() if item["id"] == template_id),
+        None,
+    )
+    if not current:
+        raise HTTPException(404, "Notification template not found")
+    if payload.expectedVersion and payload.expectedVersion != current.get("version"):
+        raise HTTPException(409, "Notification template changed. Reload it before saving.")
+    unsafe = re.compile(r"<(script|iframe|object)|javascript\s*:", re.IGNORECASE)
+    if unsafe.search(payload.htmlTemplate):
+        raise HTTPException(400, "Template contains unsafe active content")
+    stored = REPOSITORY.update_notification_template(
+        template_id,
+        {
+            "name": payload.name.strip(),
+            "subjectTemplate": payload.subjectTemplate.strip(),
+            "htmlTemplate": payload.htmlTemplate.strip(),
+            "textTemplate": payload.textTemplate.strip(),
+            "enabled": payload.enabled,
+        },
+        user["id"],
+    )
+    return stored or {}
+
+
+@api.get("/api/notifications/preferences", tags=["notifications"])
+def list_notification_preferences(request: Request, companyId: str | None = None) -> list[dict]:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Notification preferences require admin access")
+    if companyId:
+        _company(companyId)
+    return REPOSITORY.list_notification_preferences(companyId)
+
+
+@api.put("/api/notifications/preferences", tags=["notifications"])
+def update_notification_preference(
+    payload: NotificationPreferenceRequest, request: Request
+) -> dict:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Notification preferences require admin access")
+    _company(payload.companyId)
+    if bool(payload.contactId) == bool(payload.userId):
+        raise HTTPException(400, "Choose either one contact or one portal user")
+    if payload.contactId:
+        contact = REPOSITORY.get_contact(payload.contactId)
+        if not contact or contact.get("companyId") != payload.companyId:
+            raise HTTPException(400, "Contact does not belong to this customer")
+    if payload.userId and not any(
+        item["id"] == payload.userId for item in REPOSITORY.list_users(include_inactive=True)
+    ):
+        raise HTTPException(400, "Portal user not found")
+    event_types = list(dict.fromkeys(payload.eventTypes or ["*"]))
+    if set(event_types) - ({"*"} | NOTIFICATION_EVENT_TYPES):
+        raise HTTPException(400, "Notification preference contains an unknown event type")
+    if payload.digestMode != "instant":
+        raise HTTPException(400, "Digest delivery is reserved but not enabled in this release")
+    return REPOSITORY.upsert_notification_preference(
+        {
+            "companyId": payload.companyId,
+            "contactId": payload.contactId,
+            "userId": payload.userId,
+            "emailEnabled": payload.emailEnabled,
+            "eventTypes": event_types,
+            "digestMode": payload.digestMode,
+        },
+        user["id"],
+    )
+
+
+@api.get("/api/notifications/events", tags=["notifications"])
+def list_notification_events(
+    request: Request, companyId: str | None = None, limit: int = 200
+) -> list[dict]:
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Notification evidence requires admin access")
+    if companyId:
+        _company(companyId)
+    return REPOSITORY.list_notification_events(companyId, limit)
+
+
+@api.post("/api/notifications/run", tags=["notifications"])
+def run_notifications(request: Request, companyId: str | None = None) -> dict:
+    """Evaluate every enabled rule now; this queues but does not send email."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Notification execution requires admin access")
+    if companyId:
+        _company(companyId)
+    return _run_notification_scan(user["id"], companyId, force=True)
+
+
+@api.post("/api/notifications/process", tags=["notifications"])
+def process_notifications(request: Request, limit: int = 20) -> dict:
+    """Explicitly send a bounded batch of due outbox messages."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Notification delivery requires admin access")
+    return _process_notification_outbox(limit)
 
 
 @api.get("/api/email/exchange-rbac-script", tags=["email"])
@@ -2579,6 +3413,33 @@ def get_exchange_rbac_script(request: Request) -> Response:
         script,
         media_type="text/plain",
         headers={"Content-Disposition": "attachment; filename=configure-cmdb-exchange-rbac.ps1"},
+    )
+
+
+@api.post("/api/email/setup-script", tags=["email"])
+def generate_email_setup_script(payload: EmailSetupScriptRequest, request: Request) -> Response:
+    """Return a tailored, secret-free Microsoft 365 administrator script."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Email setup requires platform admin access")
+    sender = payload.senderAddress.strip().lower()
+    if not valid_email_address(sender):
+        raise HTTPException(400, "Enter a valid sender mailbox")
+    script = exchange_rbac_script(
+        {
+            "authMode": payload.authMode,
+            "tenantId": payload.tenantId.strip(),
+            "clientId": payload.clientId.strip(),
+            "servicePrincipalObjectId": payload.servicePrincipalObjectId.strip(),
+            "senderAddress": sender,
+            "senderName": payload.senderName.strip() or "IPT CMDB",
+        },
+        create_shared_mailbox=payload.createSharedMailbox,
+    )
+    return Response(
+        script,
+        media_type="text/plain",
+        headers={"Content-Disposition": "attachment; filename=setup-ipt-cmdb-email.ps1"},
     )
 
 
