@@ -1,7 +1,9 @@
+import asyncio
 import base64
 import json
 import os
 import unittest
+from datetime import date, timedelta
 from unittest.mock import patch
 
 import pyotp
@@ -9,7 +11,7 @@ from fastapi.testclient import TestClient
 
 import app as core
 import backend.main as backend_main
-from src.cmdb.email_delivery import DeliveryResult
+from src.cmdb.email_delivery import DeliveryResult, EmailDeliveryError
 from src.cmdb.repository import StateRepository
 
 api = backend_main.api
@@ -116,6 +118,28 @@ class FastApiMigrationTests(unittest.TestCase):
     def _headers(self, email: str, password: str = "ChangeMe!") -> dict[str, str]:
         return {"Authorization": f"Bearer {self._login(email, password)}"}
 
+    def test_notification_worker_finishes_cleanup_during_shutdown(self):
+        events: list[str] = []
+
+        async def worker() -> None:
+            events.append("started")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("stopped")
+
+        async def exercise_lifespan() -> None:
+            with (
+                patch.dict(os.environ, {"NOTIFICATION_WORKER_ENABLED": "true"}),
+                patch.object(backend_main, "_notification_worker_loop", worker),
+            ):
+                async with backend_main.application_lifespan(api):
+                    await asyncio.sleep(0)
+                    self.assertEqual(events, ["started"])
+            self.assertEqual(events, ["started", "stopped"])
+
+        asyncio.run(exercise_lifespan())
+
     def test_authorization_matrix_enforces_customer_read_scope(self):
         routes = [
             "/api/dashboard?companyId={company}",
@@ -174,6 +198,7 @@ class FastApiMigrationTests(unittest.TestCase):
                     "authMode": "client_secret",
                     "tenantId": "00000000-0000-0000-0000-000000000001",
                     "clientId": "00000000-0000-0000-0000-000000000002",
+                    "servicePrincipalObjectId": "00000000-0000-0000-0000-000000000003",
                     "senderAddress": "cmdb@example.com",
                     "senderName": "CMDB Hub",
                     "clientSecret": "write-only-secret",
@@ -182,6 +207,10 @@ class FastApiMigrationTests(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertTrue(response.json()["hasClientSecret"])
+            self.assertEqual(
+                response.json()["servicePrincipalObjectId"],
+                "00000000-0000-0000-0000-000000000003",
+            )
             self.assertNotIn("clientSecretEncrypted", response.json())
             self.assertNotIn("write-only-secret", json.dumps(core.DB))
             self.assertEqual(
@@ -205,6 +234,265 @@ class FastApiMigrationTests(unittest.TestCase):
             self.assertEqual(history.status_code, 200)
             self.assertEqual(history.json()[0]["status"], "accepted")
             self.assertNotIn("bodyHtml", history.json()[0])
+
+            setup = self.client.post(
+                "/api/email/setup-script",
+                headers=admin_headers,
+                json={
+                    "authMode": "client_secret",
+                    "tenantId": "00000000-0000-0000-0000-000000000001",
+                    "clientId": "00000000-0000-0000-0000-000000000002",
+                    "servicePrincipalObjectId": "00000000-0000-0000-0000-000000000003",
+                    "senderAddress": "cmdb@example.com",
+                    "senderName": "CMDB Hub",
+                    "createSharedMailbox": True,
+                },
+            )
+            self.assertEqual(setup.status_code, 200, setup.text)
+            self.assertIn("$CreateSharedMailbox = $true", setup.text)
+            self.assertIn("00000000-0000-0000-0000-000000000003", setup.text)
+            self.assertNotIn("write-only-secret", setup.text)
+
+            with patch.object(
+                backend_main.EMAIL_SENDER,
+                "send",
+                side_effect=EmailDeliveryError("Microsoft identity is unreachable"),
+            ):
+                failed = self.client.post(
+                    "/api/email/test",
+                    headers=admin_headers,
+                    json={"recipient": "tech@example.com"},
+                )
+            self.assertEqual(failed.status_code, 502, failed.text)
+            self.assertEqual(failed.json()["detail"], "Microsoft identity is unreachable")
+            history = self.client.get("/api/email/outbox", headers=admin_headers).json()
+            self.assertEqual(history[0]["status"], "failed")
+            failed_delivery_event = next(
+                event for event in core.DB["auditEvents"] if event["action"] == "delivery_failed"
+            )
+            self.assertEqual(failed_delivery_event["outcome"], "failed")
+
+    def test_local_password_recovery_is_generic_single_use_and_revokes_credentials(self):
+        backend_main.REPOSITORY.update_email_connection(
+            {
+                "enabled": True,
+                "authMode": "managed_identity",
+                "senderAddress": "cmdb@example.com",
+                "senderName": "CMDB Hub",
+                "status": "verified",
+            },
+            None,
+        )
+        old_session = self._login("admin@example.com")
+        backend_main.REPOSITORY.create_api_token(
+            {
+                "id": "00000000-0000-0000-0000-000000000099",
+                "userId": "admin",
+                "name": "Recovery test",
+                "tokenPrefix": "cmdb_pat_test",
+                "tokenHash": "f" * 64,
+                "scopes": ["cmdb:read"],
+                "companyIds": [],
+                "expiresAt": "2099-01-01T00:00:00Z",
+            },
+            "admin",
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"AUTH_MODE": "local", "PUBLIC_BASE_URL": "http://localhost:3000"},
+                clear=False,
+            ),
+            patch.object(
+                backend_main.EMAIL_SENDER,
+                "send",
+                return_value=DeliveryResult(202, "graph-reset-request"),
+            ) as send_mock,
+        ):
+            known = self.client.post(
+                "/api/password-reset/request",
+                json={"email": "admin@example.com"},
+            )
+            unknown = self.client.post(
+                "/api/password-reset/request",
+                json={"email": "missing@example.com"},
+            )
+            self.assertEqual(known.status_code, 202, known.text)
+            self.assertEqual(known.json(), unknown.json())
+            self.assertTrue(self.client.get("/api/auth/config").json()["passwordResetAvailable"])
+
+            reset_message = send_mock.call_args_list[0].args[1]
+            raw_token = reset_message["bodyText"].split("resetToken=", 1)[1].splitlines()[0]
+            self.assertTrue(raw_token.startswith("cmdb_reset_"))
+            self.assertNotIn(raw_token, json.dumps(core.DB["passwordResets"]))
+            self.assertNotIn(raw_token, json.dumps(core.DB.get("emailOutbox", [])))
+            self.assertTrue(
+                self.client.get("/api/password-reset/validate", params={"token": raw_token}).json()[
+                    "valid"
+                ]
+            )
+
+            completed = self.client.post(
+                "/api/password-reset/complete",
+                json={
+                    "token": raw_token,
+                    "newPassword": "Recovered-Local-Password-2026!",
+                    "revokeApiTokens": True,
+                },
+            )
+            self.assertEqual(completed.status_code, 200, completed.text)
+            self.assertGreaterEqual(completed.json()["revokedSessions"], 1)
+            self.assertEqual(completed.json()["revokedApiTokens"], 1)
+
+        self.assertEqual(
+            self.client.get(
+                "/api/assets", headers={"Authorization": f"Bearer {old_session}"}
+            ).status_code,
+            401,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/login",
+                json={"email": "admin@example.com", "password": "ChangeMe!"},
+            ).status_code,
+            401,
+        )
+        self._login("admin@example.com", "Recovered-Local-Password-2026!")
+        self.assertFalse(
+            self.client.get("/api/password-reset/validate", params={"token": raw_token}).json()[
+                "valid"
+            ]
+        )
+        reused = self.client.post(
+            "/api/password-reset/complete",
+            json={"token": raw_token, "newPassword": "Another-Local-Password-2026!"},
+        )
+        self.assertEqual(reused.status_code, 400)
+        self.assertTrue(
+            any(item["action"] == "password_reset_completed" for item in core.DB["auditEvents"])
+        )
+
+    def test_local_password_recovery_rate_limits_by_identifier(self):
+        backend_main.REPOSITORY.update_email_connection(
+            {
+                "enabled": True,
+                "authMode": "managed_identity",
+                "senderAddress": "cmdb@example.com",
+                "status": "verified",
+            },
+            None,
+        )
+        with (
+            patch.dict(os.environ, {"PUBLIC_BASE_URL": "http://localhost:3000"}, clear=False),
+            patch.object(
+                backend_main.EMAIL_SENDER,
+                "send",
+                return_value=DeliveryResult(202, "graph-rate-limit"),
+            ) as send_mock,
+        ):
+            responses = [
+                self.client.post("/api/password-reset/request", json={"email": "admin@example.com"})
+                for _index in range(4)
+            ]
+        self.assertTrue(all(item.status_code == 202 for item in responses))
+        self.assertTrue(all(item.json() == responses[0].json() for item in responses))
+        self.assertEqual(len(core.DB["passwordResets"]), 3)
+        self.assertEqual(send_mock.call_count, 3)
+        self.assertFalse(
+            any(
+                item.get("templateKey") == "local_password_reset" for item in core.DB["emailOutbox"]
+            )
+        )
+
+    def test_local_password_recovery_requires_a_trusted_public_origin(self):
+        backend_main.REPOSITORY.update_email_connection(
+            {
+                "enabled": True,
+                "authMode": "managed_identity",
+                "senderAddress": "cmdb@example.com",
+                "status": "verified",
+            },
+            None,
+        )
+        for public_url in ("http://cmdb.example.com", "https://cmdb.example.com/subpath"):
+            with (
+                self.subTest(public_url=public_url),
+                patch.dict(os.environ, {"PUBLIC_BASE_URL": public_url}, clear=False),
+            ):
+                self.assertFalse(
+                    self.client.get("/api/auth/config").json()["passwordResetAvailable"]
+                )
+
+    def test_authenticated_local_password_change_revokes_the_current_session(self):
+        session = self._login("client@acme.example")
+        headers = {"Authorization": f"Bearer {session}"}
+        changed = self.client.put(
+            "/api/me/password",
+            headers=headers,
+            json={
+                "currentPassword": "ChangeMe!",
+                "newPassword": "Self-Service-Password-2026!",
+                "revokeApiTokens": False,
+            },
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
+        self.assertGreaterEqual(changed.json()["revokedSessions"], 1)
+        self.assertEqual(self.client.get("/api/me", headers=headers).status_code, 401)
+        self.assertEqual(
+            self.client.post(
+                "/api/login",
+                json={"email": "client@acme.example", "password": "ChangeMe!"},
+            ).status_code,
+            401,
+        )
+        self._login("client@acme.example", "Self-Service-Password-2026!")
+        self.assertTrue(
+            any(item["action"] == "password_changed_by_user" for item in core.DB["auditEvents"])
+        )
+
+    def test_notification_rules_queue_owner_events_without_sending(self):
+        admin_headers = self._headers("admin@example.com")
+        operator_headers = self._headers("operator@example.com")
+        core.DB["assets"][0]["metadata"] = {
+            "renewalDate": (date.today() + timedelta(days=10)).isoformat()
+        }
+        rules_response = self.client.get("/api/notifications/rules", headers=admin_headers)
+        self.assertEqual(rules_response.status_code, 200, rules_response.text)
+        renewal_rule = next(
+            item for item in rules_response.json() if item["eventType"] == "asset_renewal"
+        )
+        updated = self.client.patch(
+            f"/api/notifications/rules/{renewal_rule['id']}",
+            headers=admin_headers,
+            json={
+                "name": renewal_rule["name"],
+                "enabled": True,
+                "leadDays": 30,
+                "cadence": "daily",
+                "recipientRoles": renewal_rule["recipientRoles"],
+                "fallbackAddresses": ["fallback@example.com"],
+                "templateKey": renewal_rule["templateKey"],
+                "maxAttempts": 4,
+                "expectedRevision": renewal_rule["revision"],
+            },
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        evaluated = self.client.post("/api/notifications/run?companyId=acme", headers=admin_headers)
+        self.assertEqual(evaluated.status_code, 200, evaluated.text)
+        self.assertGreaterEqual(evaluated.json()["queued"], 1)
+        evidence = self.client.get(
+            "/api/notifications/events?companyId=acme", headers=admin_headers
+        )
+        self.assertEqual(evidence.status_code, 200)
+        renewal_event = next(
+            item for item in evidence.json() if item["eventType"] == "asset_renewal"
+        )
+        self.assertEqual(renewal_event["status"], "queued")
+        self.assertEqual(renewal_event["recipients"], ["fallback@example.com"])
+        self.assertEqual(
+            self.client.get("/api/notifications/rules", headers=operator_headers).status_code,
+            403,
+        )
 
     def test_authorization_matrix_enforces_customer_write_scope(self):
         cases = [

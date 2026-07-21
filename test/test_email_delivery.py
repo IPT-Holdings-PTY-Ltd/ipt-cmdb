@@ -4,6 +4,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from src.cmdb.email_delivery import (
+    EmailDeliveryError,
     GraphEmailSender,
     exchange_rbac_script,
     graph_message_payload,
@@ -15,6 +16,11 @@ from src.cmdb.email_delivery import (
 class FakeCredential:
     def get_token(self, _scope):
         return type("Token", (), {"token": "access-token"})()
+
+
+class UnreachableCredential:
+    def get_token(self, _scope):
+        raise RuntimeError("Failed to establish a new connection: Network unreachable")
 
 
 class FakeResponse:
@@ -39,6 +45,7 @@ class EmailDeliveryTests(unittest.TestCase):
             "authMode": "client_secret",
             "tenantId": "tenant",
             "clientId": "client",
+            "servicePrincipalObjectId": "object-id",
             "senderAddress": "cmdb@example.com",
             "replyTo": "helpdesk@example.com",
         }
@@ -109,11 +116,43 @@ class EmailDeliveryTests(unittest.TestCase):
         self.assertEqual(sleeps, [2.0])
         self.assertEqual(len(calls), 2)
 
+    @patch(
+        "src.cmdb.email_delivery.build_credential",
+        return_value=UnreachableCredential(),
+    )
+    def test_authentication_network_failure_is_actionable_and_sanitized(self, _credential):
+        with self.assertRaisesRegex(
+            EmailDeliveryError,
+            "container cannot reach Microsoft identity over HTTPS",
+        ):
+            GraphEmailSender().send(
+                self.connection,
+                self.message,
+                client_secret="secret",
+            )
+
     def test_exchange_script_contains_scope_but_no_secret(self):
         script = exchange_rbac_script(self.connection)
         self.assertIn("Application Mail.Send", script)
         self.assertIn("cmdb@example.com", script)
-        self.assertNotIn("client_secret", script)
+        self.assertIn("object-id", script)
+        self.assertIn("Get-ManagementScope", script)
+        self.assertIn("ipt-cmdb-email-setup-result.json", script)
+        self.assertIn("Unblock-File -LiteralPath", script)
+        self.assertIn("Do not use the Object ID from App registrations", script)
+        self.assertIn("-ErrorAction Stop", script)
+        self.assertIn("PrincipalAttempt -le 4", script)
+        self.assertNotIn("clientSecret", script)
+
+    def test_exchange_script_can_create_shared_mailbox_and_escapes_literals(self):
+        script = exchange_rbac_script(
+            {**self.connection, "senderName": "Contoso's CMDB"},
+            create_shared_mailbox=True,
+        )
+        self.assertIn("$CreateSharedMailbox = $true", script)
+        self.assertIn("New-Mailbox -Shared", script)
+        self.assertIn("MailboxAttempt -le 12", script)
+        self.assertIn("Contoso''s CMDB", script)
 
 
 if __name__ == "__main__":

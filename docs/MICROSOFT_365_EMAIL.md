@@ -2,9 +2,9 @@
 
 IPT CMDB sends platform mail through Microsoft Graph. Feature code writes a
 provider-neutral message to the durable PostgreSQL outbox first; the delivery
-adapter then submits it with Graph application permissions. The initial release
-sends explicit administrator test messages. Renewal reminders and change-control
-notifications can use the same outbox in later releases.
+adapter then submits it with Graph application permissions. Administrator tests,
+lifecycle reminders, ownership gaps, change-approval notifications, and local
+account recovery share the same durable delivery path.
 
 ## Security model
 
@@ -16,7 +16,8 @@ notifications can use the same outbox in later releases.
 - Portable exports omit email credentials, email bodies and the outbox.
 - Use Exchange Online Application RBAC to grant `Application Mail.Send` only for
   the configured sender mailbox. Do not also grant an unscoped Entra `Mail.Send`
-  application permission, because permission grants are additive.
+  application permission. The Exchange role assignment is sufficient for Graph
+  `sendMail`, and permission grants are additive.
 - Graph `202 Accepted` means Microsoft accepted the request for processing. It is
   not proof of final mailbox delivery.
 
@@ -28,22 +29,53 @@ notifications can use the same outbox in later releases.
 | Customer Docker instance | App registration with certificate | Portable and stronger than a long-lived client secret |
 | Development / initial evaluation | App registration with client secret | Fastest setup; use a short expiry and rotate it |
 
-## Microsoft 365 administrator setup
+## Guided Microsoft 365 setup
 
-1. Create or identify the Entra enterprise application or Azure managed identity.
-2. Record its application/client ID and enterprise application object ID. These are
-   different identifiers.
-3. In IPT CMDB, open **MSP / Root level > Email delivery**, choose the authentication
-   method, set the sender mailbox, and save.
-4. Download the generated **Exchange RBAC script**.
-5. Review the script, replace `<ENTERPRISE_APP_OBJECT_ID>`, and run it in Exchange
-   Online PowerShell as an Exchange administrator.
-6. Allow directory/Exchange changes time to propagate, then send a test email from
-   IPT CMDB. The outbox records acceptance or a sanitized failure.
+Open **MSP workspace > Platform > Email delivery**. The six-step wizard guides a
+platform administrator through the supported setup without asking the CMDB for
+broad Microsoft 365 administrative permissions:
 
-The generated script creates an Exchange recipient management scope for exactly
-one mailbox, registers the service principal in Exchange, grants `Application
-Mail.Send` for that scope, and runs `Test-ServicePrincipalAuthorization`.
+1. Choose Azure managed identity, an application certificate, or a client secret.
+2. Choose an existing sender mailbox or ask the setup package to create a dedicated
+   shared mailbox.
+3. Enter the Entra tenant ID, application/client ID, and **enterprise application
+   object ID**. For the Exchange values, open **Entra ID > Enterprise applications**,
+   search using the Application ID, and copy that result's Application ID and Object
+   ID. Do not use the Object ID from **App registrations**; that is a different
+   directory object and Exchange rejects it.
+4. Review and save the runtime configuration. Client secrets are write-only and
+   certificate private keys stay outside the browser.
+5. Download the tailored PowerShell package and run it with PowerShell 7.2 or later
+   as an Exchange administrator.
+6. Confirm that the mailbox is in scope, then send an explicit verification email.
+
+The generated script is safe to re-run. It creates or reuses the mailbox, updates
+the Exchange recipient management scope for exactly that mailbox, creates or reuses
+the Exchange service principal and `Application Mail.Send` role assignment, runs
+`Test-ServicePrincipalAuthorization`, and writes a non-sensitive
+`ipt-cmdb-email-setup-result.json` result file. The script never includes client
+secrets, private keys, or certificate passwords.
+
+On Windows, review and unblock only the downloaded file. Do not change the
+machine-wide execution policy to `Unrestricted`:
+
+```powershell
+cd $HOME\Downloads
+Get-Content .\setup-ipt-cmdb-email.ps1
+Unblock-File -LiteralPath .\setup-ipt-cmdb-email.ps1
+.\setup-ipt-cmdb-email.ps1
+```
+
+The script allows for normal Exchange mailbox and Entra service-principal
+replication delays. If it ultimately reports `AADServicePrincipalNotFound`, return
+to the wizard's identity step and correct the Object ID from **Enterprise
+applications**. The script stops at that failure and does not attempt the role
+assignment with a null application reference.
+
+The setup script finishing with `GrantedPermissions = Mail.Send` and
+`InScope = True` is the expected authorization confirmation. It does not mean
+`Mail.Send` should also appear under the app registration's **API permissions**
+blade.
 
 ## Azure managed identity
 
@@ -86,8 +118,31 @@ authentication or Graph failures in the outbox and audit ledger.
 
 Each send has an idempotency key, status, attempt count, provider request ID and
 timestamps. Explicit retries are allowed only for queued or failed messages and stop
-at the message retry limit. The Graph adapter observes `Retry-After` for HTTP 429 and
-uses a bounded retry before recording a failure.
+at the message retry limit. The Graph adapter observes `Retry-After` for HTTP 429.
+The notification worker adds exponential retry scheduling, safe multi-replica
+claims, stale-claim recovery and a dead-letter state. See [Notification rules and
+delivery](NOTIFICATIONS.md).
 
-Scheduled background delivery, dead-letter handling and templated change/renewal
-notifications are intentionally separated from this initial control-plane feature.
+Local password recovery is shown on the login page only after this connection is
+enabled and has a sender mailbox. Set the trusted `PUBLIC_BASE_URL` as described in
+[Local account password recovery](LOCAL_ACCOUNT_RECOVERY.md); do not expose recovery
+until a test message has succeeded. Reset-link emails bypass the durable outbox so
+the raw recovery token is never stored; accepted or failed delivery is recorded as a
+sanitized audit event instead.
+
+## Container connectivity troubleshooting
+
+The application container needs outbound HTTPS to `login.microsoftonline.com`
+and `graph.microsoft.com`. On Docker Desktop, keep **Settings > Resources >
+Network > DNS resolution behavior** on **Auto**, or filter IPv6 records when the
+Docker network is IPv4-only. The development Compose network is dual stack so
+Microsoft endpoints that resolve to IPv6 remain reachable.
+
+Verify identity discovery from the running application container:
+
+```powershell
+docker compose exec -T cmdb python -c "import urllib.request; print(urllib.request.urlopen('https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration', timeout=10).status)"
+```
+
+An HTTP `200` confirms that Microsoft identity discovery is reachable. Corporate
+proxy deployments must configure Docker or container HTTPS proxy settings too.

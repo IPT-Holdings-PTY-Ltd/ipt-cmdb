@@ -221,6 +221,22 @@ class RepositoryTests(unittest.TestCase):
         self.assertNotIn("emailConnection", exported)
         self.assertNotIn("emailOutbox", exported)
 
+        failed_message = self.repository.create_email_outbox(
+            {
+                "idempotencyKey": "test:failed",
+                "to": ["tech@example.com"],
+                "subject": "Failed test",
+            },
+            "admin",
+        )
+        failed = self.repository.update_email_outbox(
+            failed_message["id"],
+            {"status": "failed", "attempts": 1, "lastError": "Provider unavailable"},
+            "admin",
+        )
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(self.state["auditEvents"][0]["outcome"], "failed")
+
     def test_customer_branding_is_scoped_persisted_and_audited(self):
         self.assertEqual(self.repository.get_company_branding("acme")["name"], "Acme")
         stored = self.repository.update_company_branding(

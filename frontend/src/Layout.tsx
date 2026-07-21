@@ -13,6 +13,7 @@ import HistoryOutlined from '@mui/icons-material/HistoryOutlined';
 import FactCheckOutlined from '@mui/icons-material/FactCheckOutlined';
 import ContactsOutlined from '@mui/icons-material/ContactsOutlined';
 import EmailOutlined from '@mui/icons-material/EmailOutlined';
+import NotificationsActiveOutlined from '@mui/icons-material/NotificationsActiveOutlined';
 import { Box, FormControl, MenuItem, Select, Stack, Typography } from '@mui/material';
 import { AppBar, Layout, Menu, useRefresh, type LayoutProps } from 'react-admin';
 import { useWorkspace } from './workspace';
@@ -93,6 +94,7 @@ function WorkspaceMenu() {
       {section('Operations')}
       <Menu.Item to="/admin/integrations" primaryText="Integrations" leftIcon={<CloudSyncOutlined />} />
       {platformAdmin && <Menu.Item to="/admin/email" primaryText="Email delivery" leftIcon={<EmailOutlined />} />}
+      {platformAdmin && <Menu.Item to="/admin/notifications" primaryText="Notifications" leftIcon={<NotificationsActiveOutlined />} />}
       {section('Governance')}
       <Menu.Item to="/governance/audit" primaryText="Audit activity" leftIcon={<HistoryOutlined />} />
       <Menu.Item to="/governance/data-quality" primaryText="Data quality" leftIcon={<FactCheckOutlined />} />

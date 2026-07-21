@@ -17,7 +17,7 @@ IPT CMDB combines a tenant-aware asset inventory, business-system modelling, int
 |---|---|
 | Multi-tenancy | MSP/root workspace, isolated customer workspaces and server-enforced company scope |
 | Access | Governed user lifecycle, platform/MSP/customer roles, customer groups, effective-access views and restricted personal API tokens |
-| Authentication | Microsoft Entra ID or local accounts with encrypted TOTP MFA, one-use recovery codes, PostgreSQL sessions and revocation on sensitive identity changes |
+| Authentication | Microsoft Entra ID or local accounts with encrypted TOTP MFA, one-use recovery codes, email password recovery, PostgreSQL sessions and revocation on sensitive identity changes |
 | Assets | ITIL-aligned lifecycle, owners, criticality, environment, site, renewal, EOL and integration identity metadata |
 | Business systems | Business-facing services with owners, RTO/RPO, sign-off context and supporting CI stacks |
 | Relationships | Drag-and-drop React Flow maps with full-stack, network, storage, virtualization and business-impact perspectives |
@@ -131,6 +131,7 @@ flowchart LR
     NC[N-central] --> WORKERS
     PP[Passportal metadata] --> WORKERS
     API -->|Application Mail.Send| GRAPH[Microsoft Graph / Exchange Online]
+    NOTIFY[Notification evaluator and outbox worker] --> API
     WORKERS --> MAP[Mapping and reconciliation]
     MAP --> PG
 ```
@@ -148,6 +149,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime, tenancy, identity and re
 - [Data quality and reconciliation](docs/DATA_QUALITY.md)
 - [Integration design and provider boundaries](docs/INTEGRATIONS.md)
 - [Microsoft 365 email delivery](docs/MICROSOFT_365_EMAIL.md)
+- [Local account password recovery](docs/LOCAL_ACCOUNT_RECOVERY.md)
+- [Notification rules, ownership routing and delivery](docs/NOTIFICATIONS.md)
 - [Deployment selector and production contract](docs/DEPLOYMENT.md)
 - [Self-hosted container deployment](docs/deployment/SELF_HOSTED.md)
 - [Compact Docker appliance](docs/deployment/APPLIANCE.md)
@@ -164,7 +167,7 @@ Interactive API documentation is available at `/docs` while the API is running.
 
 1. Read-only ConnectWise company and configuration ingestion using the reconciliation and authority workbench.
 2. Bulk ownership, relationship-layer and lifecycle correction actions from data-quality findings.
-3. Scheduled worker execution, retry, locking and richer integration diagnostics.
+3. Expand notification policies with customer overrides, digest aggregation and provider delivery receipts where available.
 4. N-central device/customer ingestion and Passportal metadata association.
 5. Explicitly approved ConnectWise change-ticket publishing with PDF attachment and idempotency.
 

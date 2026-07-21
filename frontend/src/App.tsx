@@ -29,7 +29,8 @@ const CustomerGroupsPage = lazy(() => import('./RootAdmin').then(module => ({ de
 const UsersPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.UsersPage })));
 const RbacPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.RbacPage })));
 const IntegrationsPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.IntegrationsPage })));
-const EmailPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.EmailPage })));
+const EmailPage = lazy(() => import('./EmailSetup').then(module => ({ default: module.EmailPage })));
+const NotificationsPage = lazy(() => import('./Notifications').then(module => ({ default: module.NotificationsPage })));
 const BrandingPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.BrandingPage })));
 const DatabasePage = lazy(() => import('./RootAdmin').then(module => ({ default: module.DatabasePage })));
 const SecurityPage = lazy(() => import('./SecurityPage').then(module => ({ default: module.SecurityPage })));
@@ -72,6 +73,7 @@ function BrandedApplication() {
           <Route path="/admin/rbac" element={<RbacPage />} />
           <Route path="/admin/integrations" element={<IntegrationsPage />} />
           <Route path="/admin/email" element={<EmailPage />} />
+          <Route path="/admin/notifications" element={<NotificationsPage />} />
           <Route path="/admin/branding" element={<BrandingPage />} />
           <Route path="/admin/database" element={<DatabasePage />} />
           <Route path="/profile/security" element={<SecurityPage />} />

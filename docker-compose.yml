@@ -9,10 +9,13 @@ services:
       DATABASE_URL: postgresql://cmdb:${POSTGRES_PASSWORD:-cmdb}@postgres:5432/cmdb
       DATABASE_SEED_MODE: demo
       AUTH_MODE: ${AUTH_MODE:-local}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
       ALLOW_LOCAL_DEVELOPMENT: "false"
       # Local demo key only. Set MFA_ENCRYPTION_KEY from Key Vault/container secrets in production.
       MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-Y21kYi1sb2NhbC1tZmEtZGV2ZWxvcG1lbnQta2V5ISE=}
       LOCAL_MFA_POLICY: ${LOCAL_MFA_POLICY:-optional}
+      NOTIFICATION_WORKER_ENABLED: ${NOTIFICATION_WORKER_ENABLED:-false}
+      NOTIFICATION_WORKER_INTERVAL_SECONDS: ${NOTIFICATION_WORKER_INTERVAL_SECONDS:-60}
     depends_on:
       postgres:
         condition: service_healthy
@@ -43,3 +46,9 @@ services:
 
 volumes:
   cmdb-postgres:
+
+# Docker Desktop can otherwise return Microsoft IPv6 addresses to an IPv4-only
+# container. A dual-stack project network keeps Entra and Graph reachable.
+networks:
+  default:
+    enable_ipv6: true

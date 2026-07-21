@@ -42,6 +42,7 @@ and mounts only a small runtime volume and temporary filesystem.
 | `DATABASE_URL` or `DATABASE_URL_FILE` | PostgreSQL URL with TLS, normally `sslmode=require` |
 | `DATABASE_SEED_MODE` | `empty` |
 | `AUTH_MODE` | `easy_auth` behind a trusted identity boundary |
+| `PUBLIC_BASE_URL` | Exact external HTTPS origin used in local-account recovery links |
 | `MFA_ENCRYPTION_KEY` or `MFA_ENCRYPTION_KEY_FILE` | Stable URL-safe base64 encoding of 32 random bytes |
 | `ALLOW_UI_DATABASE_CONFIG` | `false` |
 | `ALLOW_LOCAL_DEVELOPMENT` | `false` |

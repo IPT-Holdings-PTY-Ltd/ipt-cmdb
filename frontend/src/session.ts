@@ -43,9 +43,16 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
   return payload as T;
 }
 
-export async function apiDownload(path: string): Promise<{ blob: Blob; filename: string }> {
+export async function apiDownload(path: string, init: RequestInit = {}): Promise<{ blob: Blob; filename: string }> {
   const session = getSession();
-  const response = await fetch(path, { headers: session ? { Authorization: `Bearer ${session.token}` } : {} });
+  const response = await fetch(path, {
+    ...init,
+    headers: {
+      ...(init.body ? { 'content-type': 'application/json' } : {}),
+      ...(session ? { Authorization: `Bearer ${session.token}` } : {}),
+      ...init.headers,
+    },
+  });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     if (response.status === 401) setSession(null);
