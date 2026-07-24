@@ -125,12 +125,21 @@ class RepositoryTests(unittest.TestCase):
             "number": self.repository.next_change_number(2026),
             "companyId": "acme",
             "title": "Patch database",
-            "impactSnapshot": [],
+            "scopeAssetIds": ["database-1"],
+            "impactSnapshot": [
+                {"assetId": "database-1", "name": "SQL01", "role": "Scope"},
+                {"assetId": "application-1", "name": "Sage 200", "role": "Direct impact"},
+            ],
         }
         stored = self.repository.create_change(change, "admin")
         self.assertEqual(stored["number"], "CHG-2026-0001")
         self.assertEqual(self.repository.get_change("change-1")["title"], "Patch database")
         self.assertEqual(self.repository.list_changes(), [change])
+        self.assertEqual(self.repository.list_changes(company_id="acme"), [change])
+        self.assertEqual(self.repository.list_changes(asset_id="database-1"), [change])
+        self.assertEqual(self.repository.list_changes(asset_id="application-1"), [change])
+        self.assertEqual(self.repository.list_changes(asset_id="unrelated"), [])
+        self.assertEqual(self.repository.list_changes(company_id="northwind"), [])
         self.assertEqual(self.state["auditEvents"][0]["entityType"], "change_request")
 
     def test_change_revision_update_is_persisted_and_audited(self):

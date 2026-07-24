@@ -1446,6 +1446,25 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(created.json()["number"], "CHG-2026-0001")
         listed = self.client.get("/api/changes?companyId=acme", headers=headers)
         self.assertEqual([item["id"] for item in listed.json()], [created.json()["id"]])
+        asset_history = self.client.get("/api/changes?assetId=asset-1", headers=headers)
+        self.assertEqual(asset_history.status_code, 200)
+        self.assertEqual(
+            [item["id"] for item in asset_history.json()],
+            [created.json()["id"]],
+        )
+        unrelated_history = self.client.get("/api/changes?assetId=asset-2", headers=headers)
+        self.assertEqual(unrelated_history.status_code, 200)
+        self.assertEqual(unrelated_history.json(), [])
+        denied_history = self.client.get(
+            "/api/changes?assetId=asset-2",
+            headers={"Authorization": f"Bearer {client_token}"},
+        )
+        self.assertEqual(denied_history.status_code, 403)
+        mismatched_customer = self.client.get(
+            "/api/changes?companyId=northwind&assetId=asset-1",
+            headers=headers,
+        )
+        self.assertEqual(mismatched_customer.status_code, 400)
 
         updated = self.client.patch(
             f"/api/changes/{created.json()['id']}",
@@ -1478,6 +1497,267 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(current["status"], "declined")
         self.assertEqual(current["approvals"][-1]["decision"], "declined")
         self.assertTrue(any(item["toStatus"] == "declined" for item in current["statusHistory"]))
+
+    def test_change_templates_are_scoped_versioned_and_pinned_to_changes(self):
+        admin_headers = self._headers("admin@example.com")
+        operator_headers = self._headers("operator@example.com")
+        client_headers = self._headers("client@acme.example")
+
+        standards = self.client.get(
+            "/api/change-templates?companyId=acme",
+            headers=client_headers,
+        )
+        self.assertEqual(standards.status_code, 200, standards.text)
+        self.assertGreaterEqual(len(standards.json()), 6)
+        self.assertTrue(all(item["status"] == "published" for item in standards.json()))
+
+        root_blocked = self.client.get(
+            "/api/change-templates?includeDraft=true",
+            headers=client_headers,
+        )
+        self.assertEqual(root_blocked.status_code, 403)
+
+        content = standards.json()[0]["content"]
+        customer_template = self.client.post(
+            "/api/change-templates",
+            headers=operator_headers,
+            json={
+                "companyId": "acme",
+                "key": "acme_patch_procedure",
+                "name": "Acme patch procedure",
+                "description": "Customer-specific approved patch procedure.",
+                "tags": ["patching", "acme"],
+                "status": "draft",
+                "content": content,
+            },
+        )
+        self.assertEqual(customer_template.status_code, 201, customer_template.text)
+        template = customer_template.json()
+        self.assertEqual(template["version"], 1)
+
+        client_drafts = self.client.get(
+            "/api/change-templates?companyId=acme&includeDraft=true",
+            headers=client_headers,
+        )
+        self.assertNotIn(template["id"], {item["id"] for item in client_drafts.json()})
+
+        published = self.client.put(
+            f"/api/change-templates/{template['id']}",
+            headers=operator_headers,
+            json={
+                "expectedVersion": 1,
+                "name": template["name"],
+                "description": template["description"],
+                "tags": template["tags"],
+                "status": "published",
+                "content": template["content"],
+            },
+        )
+        self.assertEqual(published.status_code, 200, published.text)
+        template = published.json()
+        self.assertEqual(template["version"], 2)
+        stale = self.client.put(
+            f"/api/change-templates/{template['id']}",
+            headers=operator_headers,
+            json={
+                "expectedVersion": 1,
+                "name": template["name"],
+                "description": template["description"],
+                "tags": template["tags"],
+                "status": "published",
+                "content": template["content"],
+            },
+        )
+        self.assertEqual(stale.status_code, 409)
+
+        parameter_values = {
+            parameter["key"]: (
+                False
+                if parameter["type"] == "boolean"
+                else 10
+                if parameter["type"] == "number"
+                else parameter["options"][0]
+                if parameter["type"] == "select"
+                else "Verified input"
+            )
+            for parameter in template["content"]["parameters"]
+        }
+        change = self.client.post(
+            "/api/changes",
+            headers=admin_headers,
+            json={
+                "companyId": "acme",
+                "scopeAssetIds": ["asset-1"],
+                "title": "Patch ACME-DC01",
+                "reason": "Approved maintenance",
+                "implementationPlan": "Install approved updates",
+                "validationPlan": "Validate directory health",
+                "rollbackPlan": "Restore the approved backup",
+                "templateId": template["id"],
+                "templateVersion": template["version"],
+                "templateParameters": parameter_values,
+            },
+        )
+        self.assertEqual(change.status_code, 201, change.text)
+        self.assertEqual(change.json()["templateId"], template["id"])
+        self.assertEqual(change.json()["templateVersion"], 2)
+        self.assertEqual(change.json()["templateSnapshot"]["name"], template["name"])
+        self.assertEqual(change.json()["templateParameters"], parameter_values)
+
+        missing_parameters = self.client.post(
+            "/api/changes",
+            headers=admin_headers,
+            json={
+                "companyId": "acme",
+                "scopeAssetIds": ["asset-1"],
+                "title": "Invalid template use",
+                "reason": "Missing inputs",
+                "implementationPlan": "Not applicable",
+                "validationPlan": "Not applicable",
+                "rollbackPlan": "Not applicable",
+                "templateId": template["id"],
+                "templateVersion": template["version"],
+            },
+        )
+        self.assertEqual(missing_parameters.status_code, 400)
+
+        audit = self.client.get(
+            "/api/audit-events?companyId=acme",
+            headers=admin_headers,
+        )
+        self.assertEqual(audit.status_code, 200)
+        self.assertIn(
+            "change_template",
+            {item["entityType"] for item in audit.json()},
+        )
+
+    def test_change_reassignment_is_scoped_audited_concurrent_and_notified(self):
+        headers = self._headers("admin@example.com")
+        created = self.client.post(
+            "/api/changes",
+            headers=headers,
+            json={
+                "companyId": "acme",
+                "scopeAssetIds": ["asset-1"],
+                "title": "Patch domain controller",
+                "reason": "Apply security updates",
+                "implementationPlan": "Validate backup and install updates",
+                "validationPlan": "Check directory health",
+                "rollbackPlan": "Restore the VM snapshot",
+            },
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        change = created.json()
+        self.assertEqual(change["assignedUserId"], "admin")
+        self.assertEqual(change["assignmentHistory"][0]["assignedUserId"], "admin")
+
+        assignees = self.client.get(
+            "/api/change-assignees?companyId=acme",
+            headers=headers,
+        )
+        self.assertEqual(assignees.status_code, 200)
+        self.assertEqual(
+            {item["email"] for item in assignees.json()},
+            {"admin@example.com", "operator@example.com"},
+        )
+
+        forbidden = self.client.post(
+            f"/api/changes/{change['id']}/assignment",
+            headers=self._headers("client@acme.example"),
+            json={
+                "expectedRevision": change["revision"],
+                "assignedUserId": "operator",
+                "reason": "Customer readers cannot reassign changes",
+            },
+        )
+        self.assertEqual(forbidden.status_code, 403)
+
+        backend_main.REPOSITORY.update_email_connection(
+            {
+                "enabled": True,
+                "authMode": "managed_identity",
+                "senderAddress": "cmdb@example.com",
+                "status": "verified",
+            },
+            None,
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"PUBLIC_BASE_URL": "http://localhost:3000"},
+                clear=False,
+            ),
+            patch.object(
+                backend_main.EMAIL_SENDER,
+                "send",
+                return_value=DeliveryResult(202, "graph-change-assignment"),
+            ) as send_mock,
+        ):
+            reassigned = self.client.post(
+                f"/api/changes/{change['id']}/assignment",
+                headers=headers,
+                json={
+                    "expectedRevision": change["revision"],
+                    "assignedUserId": "operator",
+                    "reason": "Move this work to the on-call technician",
+                    "notify": True,
+                },
+            )
+        self.assertEqual(reassigned.status_code, 200, reassigned.text)
+        updated = reassigned.json()
+        self.assertEqual(updated["assignedUserId"], "operator")
+        self.assertEqual(updated["assignedTechnician"], "operator")
+        self.assertEqual(updated["revision"], 2)
+        self.assertTrue(updated["assignmentNotification"]["queued"])
+        self.assertEqual(updated["assignmentHistory"][-1]["previousUserId"], "admin")
+        self.assertEqual(updated["assignmentHistory"][-1]["assignedUserId"], "operator")
+        self.assertIn(change["number"], send_mock.call_args.args[1]["subject"])
+        self.assertIn(
+            f"/#/changes?changeId={change['id']}",
+            send_mock.call_args.args[1]["bodyText"],
+        )
+
+        stale = self.client.post(
+            f"/api/changes/{change['id']}/assignment",
+            headers=headers,
+            json={
+                "expectedRevision": 1,
+                "assignedUserId": None,
+                "reason": "Attempt to overwrite a newer assignment",
+            },
+        )
+        self.assertEqual(stale.status_code, 409)
+        bypass = self.client.patch(
+            f"/api/changes/{change['id']}",
+            headers=headers,
+            json={
+                "expectedRevision": updated["revision"],
+                "assignedTechnician": "free-text@example.com",
+            },
+        )
+        self.assertEqual(bypass.status_code, 400)
+
+        unassigned = self.client.post(
+            f"/api/changes/{change['id']}/assignment",
+            headers=headers,
+            json={
+                "expectedRevision": updated["revision"],
+                "assignedUserId": None,
+                "reason": "Return this change to the dispatch queue",
+                "notify": False,
+            },
+        )
+        self.assertEqual(unassigned.status_code, 200, unassigned.text)
+        self.assertIsNone(unassigned.json()["assignedUserId"])
+        self.assertEqual(unassigned.json()["assignedTechnician"], "")
+        self.assertEqual(
+            [
+                event["action"]
+                for event in core.DB["auditEvents"]
+                if event["entityId"] == change["id"]
+            ],
+            ["unassigned", "reassigned", "created"],
+        )
 
     def test_change_approval_links_are_scoped_hashed_single_use_and_audited(self):
         headers = self._headers("admin@example.com")

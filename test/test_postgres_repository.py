@@ -201,6 +201,43 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         self.assertEqual(authenticated["role"], "platform_admin")
         actor_id = authenticated["id"]
 
+        standards = repository.list_change_templates("acme")
+        self.assertGreaterEqual(len(standards), 6)
+        customer_template = repository.create_change_template(
+            {
+                "companyId": "acme",
+                "key": "acme_contract_maintenance",
+                "name": "Acme contract maintenance",
+                "description": "PostgreSQL contract template",
+                "tags": ["contract", "maintenance"],
+                "status": "draft",
+                "ownerUserId": actor_id,
+                "reviewDueDate": "2027-07-24",
+                "content": standards[0]["content"],
+            },
+            actor_id,
+        )
+        self.assertEqual(customer_template["version"], 1)
+        customer_template = repository.update_change_template(
+            customer_template["id"],
+            {
+                "name": customer_template["name"],
+                "description": customer_template["description"],
+                "tags": customer_template["tags"],
+                "status": "published",
+                "ownerUserId": actor_id,
+                "reviewDueDate": customer_template["reviewDueDate"],
+                "content": customer_template["content"],
+            },
+            1,
+            actor_id,
+        )
+        self.assertEqual(customer_template["version"], 2)
+        self.assertEqual(
+            repository.get_change_template(customer_template["id"], 1)["status"],
+            "published",
+        )
+
         connection = repository.get_integration_connection("connectwise")
         self.assertIsNotNone(connection)
         configured = repository.update_integration_connection(
@@ -327,7 +364,63 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         self.assertEqual(
             repository.get_change(repository.list_changes()[0]["id"])["number"], "CHG-2026-0001"
         )
+        self.assertEqual(
+            [item["number"] for item in repository.list_changes(company_id="acme")],
+            ["CHG-2026-0001"],
+        )
+        self.assertEqual(
+            [item["number"] for item in repository.list_changes(asset_id=sql01["id"])],
+            ["CHG-2026-0001"],
+        )
+        self.assertEqual(repository.list_changes(asset_id=str(uuid.uuid4())), [])
         change_id = repository.list_changes()[0]["id"]
+        assigned_change = repository.get_change(change_id)
+        assigned_change.update(
+            {
+                "assignedUserId": actor_id,
+                "assignedTechnician": "Admin",
+                "assignmentHistory": [
+                    {
+                        "id": str(uuid.uuid4()),
+                        "previousUserId": None,
+                        "previousDisplayName": "",
+                        "assignedUserId": actor_id,
+                        "assignedDisplayName": "Admin",
+                        "reason": "Assign for PostgreSQL contract verification",
+                        "actorId": actor_id,
+                        "actorEmail": "admin@example.com",
+                        "createdAt": "2026-07-24T12:00:00Z",
+                    }
+                ],
+                "templateId": customer_template["id"],
+                "templateVersion": customer_template["version"],
+                "templateSnapshot": {
+                    "id": customer_template["id"],
+                    "key": customer_template["key"],
+                    "name": customer_template["name"],
+                    "companyId": "acme",
+                    "version": customer_template["version"],
+                    "content": customer_template["content"],
+                },
+                "templateParameters": {"contract_reference": "PSQL-1"},
+                "revision": 2,
+            }
+        )
+        persisted_assignment = repository.update_change(
+            change_id,
+            assigned_change,
+            actor_id,
+            action="reassigned",
+            reason="Assign for PostgreSQL contract verification",
+        )
+        self.assertEqual(persisted_assignment["assignedUserId"], actor_id)
+        self.assertEqual(
+            persisted_assignment["assignmentHistory"][0]["assignedDisplayName"], "Admin"
+        )
+        self.assertEqual(
+            persisted_assignment["templateSnapshot"]["name"],
+            "Acme contract maintenance",
+        )
         approval = repository.create_change_approval_request(
             {
                 "id": str(uuid.uuid4()),
@@ -395,6 +488,14 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         self.assertEqual(repository.list_notification_preferences("acme"), [])
         self.assertEqual(repository.list_notification_events(), [])
         self.assertEqual(repository.list_notification_events("acme"), [])
+        portable_templates = repository.export_state()["changeTemplates"]
+        exported_customer_template = next(
+            item for item in portable_templates if item["id"] == customer_template["id"]
+        )
+        self.assertEqual(
+            [item["version"] for item in exported_customer_template["versions"]],
+            [1, 2],
+        )
 
         updated = repository.update_asset(
             sql01["id"], {"name": "SQL-PROD", "metadata": sql01["metadata"]}, actor_id

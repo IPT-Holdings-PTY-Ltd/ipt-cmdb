@@ -37,10 +37,17 @@ from src.cmdb.change_control import (
     create_change_record,
     derive_change_approvers,
     preview_change_impact,
+    reassign_change_record,
     record_external_approval,
     render_change_pdf,
     transition_change_record,
     update_change_record,
+)
+from src.cmdb.change_templates import (
+    TEMPLATE_STATUSES,
+    normalize_template_content,
+    template_public_snapshot,
+    validate_template_parameters,
 )
 from src.cmdb.connectwise import (
     ConnectWiseClient,
@@ -960,9 +967,40 @@ class ChangeCreateRequest(ChangeImpactRequest):
     rollbackPlan: str = Field(min_length=1, max_length=8000)
     communicationStatus: str = "required"
     communicationPlan: str = ""
+    assignedUserId: str | None = None
     assignedTechnician: str = ""
     approver: str = ""
     notes: str = ""
+    templateId: str | None = None
+    templateVersion: int | None = Field(default=None, ge=1)
+    templateParameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChangeTemplateCreateRequest(BaseModel):
+    """Validate a new global or customer-scoped change procedure."""
+
+    companyId: str | None = None
+    key: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    name: str = Field(min_length=2, max_length=160)
+    description: str = Field(default="", max_length=1000)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    status: str = Field(default="draft", pattern="^(draft|published)$")
+    ownerUserId: str | None = None
+    reviewDueDate: str | None = None
+    content: dict[str, Any]
+
+
+class ChangeTemplateUpdateRequest(BaseModel):
+    """Validate a new immutable version of an existing procedure."""
+
+    expectedVersion: int = Field(ge=1)
+    name: str = Field(min_length=2, max_length=160)
+    description: str = Field(default="", max_length=1000)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    status: str = Field(pattern="^(draft|published|retired)$")
+    ownerUserId: str | None = None
+    reviewDueDate: str | None = None
+    content: dict[str, Any]
 
 
 class ChangeUpdateRequest(BaseModel):
@@ -985,6 +1023,7 @@ class ChangeUpdateRequest(BaseModel):
     rollbackPlan: str | None = Field(default=None, max_length=8000)
     communicationStatus: str | None = None
     communicationPlan: str | None = Field(default=None, max_length=8000)
+    assignedUserId: str | None = None
     assignedTechnician: str | None = Field(default=None, max_length=240)
     approver: str | None = Field(default=None, max_length=240)
     notes: str | None = Field(default=None, max_length=8000)
@@ -1002,6 +1041,16 @@ class ChangeTransitionRequest(BaseModel):
     validationResult: str = Field(default="", max_length=8000)
     rollbackResult: str = Field(default="", max_length=8000)
     closureNotes: str = Field(default="", max_length=8000)
+    closureAssessment: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChangeAssignmentRequest(BaseModel):
+    """Validate an optimistic, auditable change reassignment."""
+
+    expectedRevision: int = Field(ge=1)
+    assignedUserId: str | None = None
+    reason: str = Field(min_length=4, max_length=1000)
+    notify: bool = True
 
 
 class ChangeApprovalCreateRequest(BaseModel):
@@ -5519,6 +5568,155 @@ def _change_for_user(change_id: str, user: dict) -> dict:
     return change
 
 
+def _eligible_change_assignees(company_id: str) -> list[dict]:
+    """Return active MSP technicians whose effective scope includes the customer."""
+
+    return sorted(
+        [
+            item
+            for item in REPOSITORY.list_users()
+            if item.get("status", "active") == "active"
+            and item.get("role") in {"platform_admin", "msp_operator"}
+            and core.allowed(item, company_id)
+        ],
+        key=lambda item: (
+            str(item.get("displayName") or item.get("email") or "").casefold(),
+            str(item.get("email") or "").casefold(),
+        ),
+    )
+
+
+def _change_assignee(company_id: str, user_id: str | None) -> dict | None:
+    """Resolve one eligible technician, or reject an out-of-scope identity."""
+
+    if not user_id:
+        return None
+    assignee = next(
+        (item for item in _eligible_change_assignees(company_id) if item["id"] == user_id),
+        None,
+    )
+    if not assignee:
+        raise HTTPException(
+            400,
+            "Choose an active MSP technician who has access to this customer",
+        )
+    return assignee
+
+
+def _validate_template_review_date(value: str | None) -> str | None:
+    """Normalize an optional ISO review date before it reaches PostgreSQL."""
+
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+    except ValueError as error:
+        raise HTTPException(400, "Review date must use YYYY-MM-DD") from error
+
+
+def _change_template_manager(template: dict, user: dict) -> None:
+    """Require authority to manage one global or customer template."""
+
+    if template.get("companyId"):
+        _company_for_change(template["companyId"], user, require_manage=True)
+        return
+    _require_role(user, {"platform_admin"}, "Global templates require platform admin role")
+
+
+def _template_owner(user_id: str | None, company_id: str | None) -> str | None:
+    """Validate an accountable active MSP owner for a change template."""
+
+    if not user_id:
+        return None
+    owner = next(
+        (
+            item
+            for item in REPOSITORY.list_users()
+            if item["id"] == user_id
+            and item.get("status", "active") == "active"
+            and item.get("role") in {"platform_admin", "msp_operator"}
+            and (not company_id or core.allowed(item, company_id))
+        ),
+        None,
+    )
+    if not owner:
+        raise HTTPException(400, "Choose an active MSP owner with access to this scope")
+    return owner["id"]
+
+
+def _operational_email_available() -> bool:
+    """Return whether Microsoft 365 delivery can accept operational notices."""
+
+    connection = REPOSITORY.get_email_connection()
+    return bool(
+        connection.get("enabled")
+        and connection.get("senderAddress")
+        and connection.get("status") in {"configured", "verified"}
+    )
+
+
+def _change_assignment_message(
+    change: dict,
+    assignee: dict,
+    actor: dict,
+    reason: str,
+) -> dict:
+    """Build a branded, idempotent notification for a newly assigned technician."""
+
+    brand = REPOSITORY.get_msp_branding()
+    raw_brand_name = str(brand.get("name") or "CMDB Hub")
+    base_url = _public_base_url()
+    change_url = (
+        f"{base_url}/#/changes?changeId={quote(str(change['id']), safe='')}" if base_url else ""
+    )
+    safe_url = html.escape(change_url, quote=True)
+    accent = html.escape(str(brand.get("accent") or "#50d5b9"), quote=True)
+    assignee_name = html.escape(
+        str(assignee.get("displayName") or assignee.get("email") or "Technician")
+    )
+    change_number = html.escape(str(change.get("number") or "Change"))
+    title = html.escape(str(change.get("title") or ""))
+    company = html.escape(str(change.get("companyName") or change.get("companyId") or ""))
+    reason_html = html.escape(reason)
+    actor_name = html.escape(
+        str(actor.get("displayName") or actor.get("email") or "An administrator")
+    )
+    link_html = (
+        f'<p><a href="{safe_url}" style="display:inline-block;padding:12px 18px;'
+        f"background:{accent};color:#07111f;text-decoration:none;border-radius:6px;"
+        '">Open change</a></p>'
+        if safe_url
+        else ""
+    )
+    link_text = f"\n\nOpen change: {change_url}" if change_url else ""
+    return {
+        "companyId": change.get("companyId"),
+        "idempotencyKey": (
+            f"change-assignment:{change['id']}:{change.get('revision', 1)}:{assignee['id']}"
+        ),
+        "to": [assignee["email"]],
+        "subject": f"Assigned: {change.get('number')} - {change.get('title')}",
+        "bodyHtml": (
+            f'<div style="font-family:Arial,sans-serif;color:#172033;max-width:640px">'
+            f"<h2>{html.escape(raw_brand_name)} change assignment</h2>"
+            f"<p>Hello {assignee_name},</p>"
+            f"<p>{actor_name} assigned you to <strong>{change_number} - {title}</strong> "
+            f"for {company}.</p><p><strong>Reason:</strong> {reason_html}</p>"
+            f"{link_html}</div>"
+        ),
+        "bodyText": (
+            f"Hello {assignee.get('displayName') or assignee.get('email')},\n\n"
+            f"{actor.get('displayName') or actor.get('email')} assigned you to "
+            f"{change.get('number')} - {change.get('title')} for "
+            f"{change.get('companyName') or change.get('companyId')}.\n"
+            f"Reason: {reason}{link_text}"
+        ),
+        "templateKey": "change_assignment",
+        "templateVersion": 1,
+        "maxAttempts": 5,
+    }
+
+
 def _approval_email_message(change: dict, approver: dict, raw_token: str, expires_at: str) -> dict:
     """Build a branded approval invitation without persisting its bearer token."""
 
@@ -5638,6 +5836,122 @@ def _approval_request_for_token(raw_token: str) -> tuple[dict, dict]:
     return record, change
 
 
+@api.get("/api/change-templates", tags=["change control"])
+def list_change_templates(
+    request: Request,
+    companyId: str | None = None,
+    includeDraft: bool = False,
+) -> list[dict]:
+    """List templates visible in a customer wizard or root management library."""
+
+    user = current_user(request)
+    if companyId:
+        _company_for_change(companyId, user)
+    else:
+        _require_role(
+            user,
+            {"platform_admin", "msp_operator"},
+            "Template management requires MSP access",
+        )
+    records = REPOSITORY.list_change_templates(companyId)
+    visible = []
+    for template in records:
+        scope = template.get("companyId")
+        if scope and not core.allowed(user, scope):
+            continue
+        manager = (
+            user.get("role") == "platform_admin" if not scope else core.can_manage(user, scope)
+        )
+        if template.get("status") == "published" or (includeDraft and manager):
+            visible.append(template)
+    return visible
+
+
+@api.post("/api/change-templates", status_code=201, tags=["change control"])
+def create_change_template(
+    payload: ChangeTemplateCreateRequest,
+    request: Request,
+) -> dict:
+    """Create a governed global or customer template at immutable version one."""
+
+    user = current_user(request)
+    if payload.companyId:
+        _company_for_change(payload.companyId, user, require_manage=True)
+    else:
+        _require_role(
+            user,
+            {"platform_admin"},
+            "Global templates require platform admin role",
+        )
+    try:
+        content = normalize_template_content(payload.content)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    record = {
+        **payload.model_dump(exclude={"content"}),
+        "key": payload.key.casefold(),
+        "name": payload.name.strip(),
+        "description": payload.description.strip(),
+        "tags": list(
+            dict.fromkeys(
+                str(item).strip().casefold()[:80] for item in payload.tags if str(item).strip()
+            )
+        ),
+        "status": payload.status if payload.status in TEMPLATE_STATUSES else "draft",
+        "ownerUserId": _template_owner(payload.ownerUserId, payload.companyId),
+        "reviewDueDate": _validate_template_review_date(payload.reviewDueDate),
+        "content": content,
+    }
+    try:
+        with core.LOCK:
+            return REPOSITORY.create_change_template(record, user["id"])
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@api.put("/api/change-templates/{template_id}", tags=["change control"])
+def update_change_template(
+    template_id: str,
+    payload: ChangeTemplateUpdateRequest,
+    request: Request,
+) -> dict:
+    """Create a new immutable version and update template lifecycle metadata."""
+
+    user = current_user(request)
+    current = REPOSITORY.get_change_template(template_id)
+    if not current:
+        raise HTTPException(404, "Change template not found")
+    _change_template_manager(current, user)
+    try:
+        content = normalize_template_content(payload.content)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    changes = {
+        **payload.model_dump(exclude={"expectedVersion", "content"}),
+        "name": payload.name.strip(),
+        "description": payload.description.strip(),
+        "tags": list(
+            dict.fromkeys(
+                str(item).strip().casefold()[:80] for item in payload.tags if str(item).strip()
+            )
+        ),
+        "ownerUserId": _template_owner(payload.ownerUserId, current.get("companyId")),
+        "reviewDueDate": _validate_template_review_date(payload.reviewDueDate),
+        "content": content,
+    }
+    try:
+        with core.LOCK:
+            return REPOSITORY.update_change_template(
+                template_id,
+                changes,
+                payload.expectedVersion,
+                user["id"],
+            )
+    except ValueError as error:
+        detail = str(error)
+        raise HTTPException(409 if "changed" in detail else 400, detail) from error
+
+
 @api.post("/api/changes/impact-preview", tags=["change control"])
 def change_impact_preview(payload: ChangeImpactRequest, request: Request) -> dict:
     user = current_user(request)
@@ -5654,16 +5968,33 @@ def change_impact_preview(payload: ChangeImpactRequest, request: Request) -> dic
         raise HTTPException(400, str(error)) from error
 
 
+@api.get("/api/change-assignees", tags=["change control"])
+def list_change_assignees(companyId: str, request: Request) -> list[dict]:
+    """List active MSP technicians eligible to own changes for one customer."""
+
+    user = current_user(request)
+    _company_for_change(companyId, user, require_manage=True)
+    return [core.visible_user(item) for item in _eligible_change_assignees(companyId)]
+
+
 @api.get("/api/changes", tags=["change control"])
-def list_changes(request: Request, companyId: str | None = None) -> list[dict]:
+def list_changes(
+    request: Request,
+    companyId: str | None = None,
+    assetId: str | None = None,
+) -> list[dict]:
     user = current_user(request)
     if companyId:
         _company_for_change(companyId, user)
+    if assetId:
+        asset = _asset_for_user(assetId, user)
+        if companyId and asset["companyId"] != companyId:
+            raise HTTPException(400, "Asset does not belong to the selected customer")
+        companyId = companyId or asset["companyId"]
     changes = [
         item
-        for item in REPOSITORY.list_changes()
-        if (not companyId or item["companyId"] == companyId)
-        and core.allowed(user, item["companyId"])
+        for item in REPOSITORY.list_changes(company_id=companyId, asset_id=assetId)
+        if core.allowed(user, item["companyId"])
     ]
     return sorted(changes, key=lambda item: item.get("createdAt", ""), reverse=True)
 
@@ -5672,12 +6003,46 @@ def list_changes(request: Request, companyId: str | None = None) -> list[dict]:
 def create_change(payload: ChangeCreateRequest, request: Request) -> dict:
     user = current_user(request)
     company = _company_for_change(payload.companyId, user, require_manage=True)
+    assignee = _change_assignee(payload.companyId, payload.assignedUserId or user["id"])
+    values = payload.model_dump()
+    if payload.templateId:
+        template = REPOSITORY.get_change_template(payload.templateId, payload.templateVersion)
+        if (
+            not template
+            or template.get("status") != "published"
+            or template.get("companyId") not in {None, payload.companyId}
+        ):
+            raise HTTPException(
+                400,
+                "Choose a published template available to this customer",
+            )
+        try:
+            values["templateParameters"] = validate_template_parameters(
+                template["content"],
+                payload.templateParameters,
+            )
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        values["templateId"] = template["id"]
+        values["templateVersion"] = template["version"]
+        values["templateSnapshot"] = template_public_snapshot(template)
+    elif payload.templateVersion or payload.templateParameters:
+        raise HTTPException(400, "Template parameters require a selected template")
+    else:
+        values["templateId"] = None
+        values["templateVersion"] = None
+        values["templateSnapshot"] = None
+        values["templateParameters"] = {}
+    values["assignedUserId"] = assignee["id"] if assignee else None
+    values["assignedTechnician"] = (
+        str(assignee.get("displayName") or assignee.get("email") or "") if assignee else ""
+    )
     with core.LOCK:
         year = datetime.now(UTC).year
         number = REPOSITORY.next_change_number(year)
         try:
             change = create_change_record(
-                payload.model_dump(),
+                values,
                 number,
                 str(uuid.uuid4()),
                 company,
@@ -5716,6 +6081,59 @@ def update_change(change_id: str, payload: ChangeUpdateRequest, request: Request
     if not stored:
         raise HTTPException(404, "Change package not found")
     return stored
+
+
+@api.post("/api/changes/{change_id}/assignment", tags=["change control"])
+def reassign_change(
+    change_id: str,
+    payload: ChangeAssignmentRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """Reassign or unassign an active change with scope checks and immutable evidence."""
+
+    actor = current_user(request)
+    current = _change_for_user(change_id, actor)
+    _company_for_change(current["companyId"], actor, require_manage=True)
+    if int(current.get("revision") or 1) != payload.expectedRevision:
+        raise HTTPException(
+            409, "This change was updated by another user. Reload it before reassigning."
+        )
+    assignee = _change_assignee(current["companyId"], payload.assignedUserId)
+    try:
+        updated = reassign_change_record(current, assignee, payload.reason, actor)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    action = "reassigned" if assignee else "unassigned"
+    with core.LOCK:
+        stored = REPOSITORY.update_change(
+            change_id,
+            updated,
+            actor["id"],
+            action=action,
+            reason=payload.reason.strip(),
+        )
+    if not stored:
+        raise HTTPException(404, "Change package not found")
+
+    notification = {
+        "requested": bool(payload.notify and assignee),
+        "queued": False,
+        "recipient": assignee.get("email") if assignee else None,
+    }
+    if (
+        payload.notify
+        and assignee
+        and valid_email_address(str(assignee.get("email") or ""))
+        and _operational_email_available()
+    ):
+        queued = REPOSITORY.create_email_outbox(
+            _change_assignment_message(stored, assignee, actor, payload.reason.strip()),
+            actor["id"],
+        )
+        background_tasks.add_task(_deliver_security_email_quietly, queued["id"])
+        notification["queued"] = True
+    return {**stored, "assignmentNotification": notification}
 
 
 @api.get("/api/changes/{change_id}/approval-requests", tags=["change control"])

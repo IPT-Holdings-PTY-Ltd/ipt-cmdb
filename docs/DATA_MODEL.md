@@ -77,6 +77,20 @@ Impact direction is normalized by relationship type. For example, `A depends_on 
 
 `change_requests` holds the change record. Scope, calculated impact, revisions and external links are normalized into related tables. Impact snapshots intentionally duplicate selected CI attributes so a historical change document does not mutate when live inventory changes.
 
+Asset change activity is resolved in reverse through `change_impact_snapshots.ci_id`; change identifiers are not copied into configuration-item metadata. The asset lookup therefore includes explicit scope, direct impact and downstream impact while retaining the CI name and owner frozen with each change revision. PostgreSQL indexes active snapshot membership by CI and change for bounded asset-history reads.
+
+### Change templates
+
+`change_templates` is the stable procedure identity and scope. A null `company_id` denotes an MSP-wide standard; a company ID denotes a customer-only procedure. The identity carries its lifecycle, owner, review date and current version.
+
+`change_template_versions` holds immutable procedure content and typed parameter definitions. Updating metadata, content or lifecycle creates a new version under optimistic concurrency. `change_requests.template_id` and `template_version` identify the source procedure, while `template_snapshot` and `template_parameters` retain self-contained evidence for reports, recovery and audit. Portable exports include every stored version.
+
+### Change ownership
+
+The current technician is stored as `assigned_user_id`, a foreign key to the immutable platform-user ID. `assigned_technician` is a display snapshot for reports and historical readability; it is not used as the identity key. `assignment_history` is an append-only JSON record of each assignment or unassignment, including the previous and new user IDs and display names, reason, actor and timestamp.
+
+Assignment is changed only through the dedicated reassignment action. Eligible technicians must be active MSP/root users with access to the change's customer. The action uses the change revision for optimistic concurrency, records an attributable audit event and can queue a Microsoft 365 notification. Closed or cancelled changes cannot be reassigned.
+
 ## Integration and audit records
 
 `integration_connections` stores provider type, scope, public configuration and installation-bound encrypted credential material. API responses, audit values and portable exports remove that material. `provider_company_observations` retains the least-data ConnectWise discovery snapshot, while `external_object_mappings` holds the durable provider-company-to-canonical-customer decision. `sync_runs` records execution outcomes and `audit_events` captures security- and data-relevant mutations. Passportal credential content does not belong in any of these records.

@@ -37,6 +37,7 @@ const BrandingPage = lazy(() => import('./RootAdmin').then(module => ({ default:
 const DatabasePage = lazy(() => import('./RootAdmin').then(module => ({ default: module.DatabasePage })));
 const SecurityPage = lazy(() => import('./SecurityPage').then(module => ({ default: module.SecurityPage })));
 const ChangeApprovalPage = lazy(() => import('./ChangeApprovalPage').then(module => ({ default: module.ChangeApprovalPage })));
+const ChangeTemplatesPage = lazy(() => import('./ChangeTemplates').then(module => ({ default: module.ChangeTemplatesPage })));
 
 function RouteLoadingFallback() {
   return <Box sx={{ display: 'grid', minHeight: '45vh', placeItems: 'center' }}><CircularProgress aria-label="Loading workspace" /></Box>;
@@ -79,6 +80,7 @@ function BrandedApplication() {
           <Route path="/admin/reconciliation" element={<ReconciliationPage />} />
           <Route path="/admin/email" element={<EmailPage />} />
           <Route path="/admin/notifications" element={<NotificationsPage />} />
+          <Route path="/admin/change-templates" element={<ChangeTemplatesPage />} />
           <Route path="/admin/branding" element={<BrandingPage />} />
           <Route path="/admin/database" element={<DatabasePage />} />
           <Route path="/profile/security" element={<SecurityPage />} />

@@ -1,5 +1,6 @@
 import AccountTreeOutlined from '@mui/icons-material/AccountTreeOutlined';
 import AddOutlined from '@mui/icons-material/AddOutlined';
+import AssignmentOutlined from '@mui/icons-material/AssignmentOutlined';
 import EditOutlined from '@mui/icons-material/EditOutlined';
 import FileDownloadOutlined from '@mui/icons-material/FileDownloadOutlined';
 import Inventory2Outlined from '@mui/icons-material/Inventory2Outlined';
@@ -27,7 +28,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiFetch, getSession } from './session';
 import { businessApplicationMemberships, displayLayer, displayLayerColors, displayLayerLabels, displayLayerOrder, type DisplayLayer } from './topology';
-import type { Asset, Contact, Relationship } from './types';
+import type { Asset, ChangePackage, Contact, Relationship } from './types';
 import { useWorkspace } from './workspace';
 import { AuditTimeline } from './Governance';
 import { canonicalAssetTypes } from './assetCatalog';
@@ -81,6 +82,20 @@ function isStale(asset: Asset) {
   if (asset.source === 'manual' || !asset.lastSeen) return false;
   const seen = Date.parse(asset.lastSeen);
   return Number.isFinite(seen) && Date.now() - seen > 7 * 86_400_000;
+}
+
+const inactiveChangeStatuses = new Set(['closed', 'cancelled']);
+
+function changeImpactForAsset(change: ChangePackage, assetId: string) {
+  return change.impactSnapshot.find(item => item.assetId === assetId);
+}
+
+function changeStatusColor(status: string) {
+  if (['completed', 'closed', 'approved'].includes(status)) return 'success';
+  if (['failed', 'declined'].includes(status)) return 'error';
+  if (['scheduled', 'implementing', 'awaiting_approval'].includes(status)) return 'warning';
+  if (['impact_review', 'post_implementation_review'].includes(status)) return 'info';
+  return 'default';
 }
 
 function attentionReasons(asset: Asset, relationshipCount: number) {
@@ -397,23 +412,51 @@ function AssetShowContent() {
   const canEdit = !workspace.isRoot && ['platform_admin', 'msp_operator'].includes(getSession()?.user.role || '');
   const [applications, setApplications] = useState<Asset[]>([]);
   const [directRelationships, setDirectRelationships] = useState(0);
+  const [changes, setChanges] = useState<ChangePackage[]>([]);
+  const [changesLoading, setChangesLoading] = useState(false);
+  const [changesError, setChangesError] = useState('');
   useEffect(() => {
     if (!asset) return;
     let active = true;
     const loadContext = async () => {
+      setChangesLoading(true);
+      setChangesError('');
       try {
         const suffix = workspace.isRoot ? '' : `?companyId=${encodeURIComponent(workspace.companyId)}`;
-        const [assets, relationships] = await Promise.all([apiFetch<Asset[]>(`/api/assets${suffix}`), apiFetch<Relationship[]>(`/api/relationships${suffix}`)]);
+        const [assets, relationships, relatedChanges] = await Promise.all([
+          apiFetch<Asset[]>(`/api/assets${suffix}`),
+          apiFetch<Relationship[]>(`/api/relationships${suffix}`),
+          apiFetch<ChangePackage[]>(`/api/changes?assetId=${encodeURIComponent(asset.id)}`),
+        ]);
         if (!active) return;
         setApplications(businessApplicationMemberships(assets, relationships).get(asset.id) || []);
         setDirectRelationships(relationships.filter(item => item.fromId === asset.id || item.toId === asset.id).length);
-      } catch { if (active) { setApplications([]); setDirectRelationships(0); } }
+        setChanges(relatedChanges);
+      } catch (error) {
+        if (active) {
+          setApplications([]);
+          setDirectRelationships(0);
+          setChanges([]);
+          setChangesError(error instanceof Error ? error.message : 'Change activity could not be loaded.');
+        }
+      } finally {
+        if (active) setChangesLoading(false);
+      }
     };
     void loadContext();
     return () => { active = false; };
   }, [asset?.id, workspace.companyId, workspace.isRoot]);
   if (!asset) return null;
   const layer = displayLayer(asset); const health = asset.metadata?.operationalStatus || 'unknown'; const owner = primaryOwner(asset);
+  const orderedChanges = [...changes].sort((left, right) => {
+    const leftInactive = inactiveChangeStatuses.has(left.status) ? 1 : 0;
+    const rightInactive = inactiveChangeStatuses.has(right.status) ? 1 : 0;
+    return leftInactive - rightInactive || (right.plannedStart || right.createdAt).localeCompare(left.plannedStart || left.createdAt);
+  });
+  const openChanges = (query: string) => {
+    workspace.setCompanyId(asset.companyId);
+    navigate(`/changes?${query}`);
+  };
   return (
     <Box className="asset-detail">
       <Stack
@@ -434,7 +477,7 @@ function AssetShowContent() {
             flexWrap: "wrap",
             mt: 1.5
           }}><Chip size="small" color={health === 'healthy' ? 'success' : ['critical', 'offline'].includes(health) ? 'error' : 'warning'} label={health} /><Chip size="small" variant="outlined" label={`${asset.metadata?.criticality || 'medium'} criticality`} /><Chip size="small" variant="outlined" label={(asset.metadata?.lifecycle || 'unknown').replaceAll('_', ' ')} />{applications.map(system => <Chip key={system.id} size="small" clickable label={system.name} onClick={() => navigate(`/relationships?view=stack&businessAppId=${encodeURIComponent(system.id)}`)} />)}</Stack></Box>
-        <Stack direction="row" spacing={1}><Button variant="outlined" startIcon={<AccountTreeOutlined />} onClick={() => navigate(`/relationships?view=technical&assetId=${encodeURIComponent(asset.id)}`)}>Relationships ({directRelationships})</Button><Button variant="outlined" onClick={() => navigate(`/changes?assetId=${encodeURIComponent(asset.id)}`)}>Create change</Button>{canEdit && <Button variant="contained" startIcon={<EditOutlined />} onClick={() => navigate(`/assets/${asset.id}`)}>Edit</Button>}</Stack>
+        <Stack direction="row" spacing={1}><Button variant="outlined" startIcon={<AccountTreeOutlined />} onClick={() => navigate(`/relationships?view=technical&assetId=${encodeURIComponent(asset.id)}`)}>Relationships ({directRelationships})</Button><Button variant="outlined" startIcon={<AssignmentOutlined />} onClick={() => openChanges(`assetId=${encodeURIComponent(asset.id)}`)}>Create change</Button>{canEdit && <Button variant="contained" startIcon={<EditOutlined />} onClick={() => navigate(`/assets/${asset.id}`)}>Edit</Button>}</Stack>
       </Stack>
       <Grid container spacing={2}>
         <Grid size={{ xs: 12, md: 6, lg: 3 }}><Paper className="asset-detail-card"><Typography variant="overline" color="primary">Ownership</Typography><Typography variant="h6">{owner || 'Unassigned'}</Typography><Typography variant="body2" sx={{
@@ -498,6 +541,19 @@ function AssetShowContent() {
             mt: 1
           }}>Last seen</Typography><Typography variant="body2" color={isStale(asset) ? 'warning.main' : 'text.primary'}>{freshness(asset)}</Typography></Paper></Grid>
       </Grid>
+      <Paper variant="outlined" sx={{ mt: 2, p: 2.5 }}>
+        <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} sx={{ justifyContent: 'space-between', alignItems: { md: 'center' }, mb: 2 }}>
+          <Box><Typography variant="overline" color="primary">Change enablement</Typography><Typography variant="h5">Change activity</Typography><Typography variant="body2" color="text.secondary">Planned and historical changes where this asset was explicitly selected or calculated as affected.</Typography></Box>
+          <Stack direction="row" spacing={1}><Button variant="outlined" onClick={() => openChanges(`affectedAssetId=${encodeURIComponent(asset.id)}`)}>View all history</Button><Button variant="contained" startIcon={<AssignmentOutlined />} onClick={() => openChanges(`assetId=${encodeURIComponent(asset.id)}`)}>Create change</Button></Stack>
+        </Stack>
+        {changesLoading ? <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}><CircularProgress size={22} /><Typography color="text.secondary">Loading change activity…</Typography></Stack>
+          : changesError ? <Alert severity="error">{changesError}</Alert>
+            : !orderedChanges.length ? <Alert severity="info">No changes are currently linked to this asset.</Alert>
+              : <TableContainer><Table size="small"><TableHead><TableRow><TableCell>Change</TableCell><TableCell>Status</TableCell><TableCell>Schedule</TableCell><TableCell>Asset involvement</TableCell><TableCell>Impact</TableCell><TableCell align="right">Action</TableCell></TableRow></TableHead><TableBody>{orderedChanges.slice(0, 8).map(change => {
+                const impact = changeImpactForAsset(change, asset.id);
+                return <TableRow key={change.id} hover><TableCell><Typography sx={{ fontWeight: 800 }}>{change.number}</Typography><Typography variant="body2">{change.title}</Typography></TableCell><TableCell><Chip size="small" color={changeStatusColor(change.status)} label={change.status.replaceAll('_', ' ')} /></TableCell><TableCell>{change.plannedStart ? new Date(change.plannedStart).toLocaleString() : 'Not scheduled'}</TableCell><TableCell><Chip size="small" variant={impact?.role === 'Scope' ? 'filled' : 'outlined'} label={impact?.role || (change.scopeAssetIds.includes(asset.id) ? 'Scope' : 'Affected')} /></TableCell><TableCell><Chip size="small" color={impact?.impactSeverity === 'outage' ? 'error' : impact?.impactSeverity === 'degraded' ? 'warning' : impact?.impactSeverity === 'protected' ? 'success' : 'default'} label={(impact?.impactSeverity || 'scope').replaceAll('_', ' ')} /></TableCell><TableCell align="right"><Button size="small" startIcon={<VisibilityOutlined />} onClick={() => openChanges(`changeId=${encodeURIComponent(change.id)}`)}>Open change</Button></TableCell></TableRow>;
+              })}</TableBody></Table></TableContainer>}
+      </Paper>
       <AuditTimeline entityType="configuration_item" entityId={asset.id} companyId={asset.companyId} />
     </Box>
   );

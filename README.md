@@ -23,7 +23,7 @@ IPT CMDB combines a tenant-aware asset inventory, business-system modelling, int
 | Business systems | Business-facing services with owners, RTO/RPO, sign-off context and supporting CI stacks |
 | Relationships | Drag-and-drop React Flow maps with full-stack, network, storage, virtualization and business-impact perspectives |
 | Impact analysis | Upstream/downstream traversal, shared dependencies, HA evidence and protected/degraded/outage decisions |
-| Change control | Guided change form, frozen impact snapshot, suggested risk, branded PDF and email-based owner sign-off with expiring single-use links |
+| Change control | Governed global/customer procedure templates, guided change form, scoped technician assignment and reassignment history, frozen named-asset impact snapshot, per-asset change history, suggested risk, branded PDF and email-based owner sign-off with expiring single-use links |
 | Dashboards | MSP customer-risk queue and customer business-system/action dashboards |
 | PostgreSQL | Canonical repository, forward-only checksum migrations, blank-database bootstrap and upgrade verification |
 | Recovery | Portable checksum-protected export/import plus operational guidance for PostgreSQL PITR or `pg_dump` |
@@ -154,6 +154,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime, tenancy, identity and re
 - [Local account password recovery](docs/LOCAL_ACCOUNT_RECOVERY.md)
 - [Notification rules, ownership routing and delivery](docs/NOTIFICATIONS.md)
 - [Change approval and business-owner sign-off](docs/CHANGE_APPROVALS.md)
+- [Change-template governance and authoring](docs/CHANGE_TEMPLATES.md)
 - [Deployment selector and production contract](docs/DEPLOYMENT.md)
 - [Self-hosted container deployment](docs/deployment/SELF_HOSTED.md)
 - [Compact Docker appliance](docs/deployment/APPLIANCE.md)
