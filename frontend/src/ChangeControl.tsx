@@ -144,6 +144,11 @@ function parameterHasValue(parameter: ChangeTemplateParameter, value: string | n
   return value !== undefined && value !== null && String(value).trim() !== '';
 }
 
+function isBusinessSystemType(value: string) {
+  const normalized = value.trim().toLowerCase().replace(/[_-]+/g, ' ');
+  return ['business system', 'business application', 'business service'].includes(normalized);
+}
+
 function closureRequiresPir(change: ChangePackage, assessment: ChangeClosureAssessment) {
   return change.changeType === 'emergency'
     || ['high', 'critical'].includes(change.riskLevel)
@@ -162,7 +167,7 @@ function closureDraft(change: ChangePackage): ChangeClosureAssessment {
   }
   const scope = sortedImpactItems(change);
   const primary = scope.find(item => item.role === 'Scope') || scope[0];
-  const businessSystem = scope.find(item => ['business system', 'business application', 'business service'].includes(item.type.toLowerCase()));
+  const businessSystem = scope.find(item => isBusinessSystemType(item.type));
   const context = {
     company_name: change.companyName,
     asset_name: primary?.name || '',
@@ -384,7 +389,7 @@ export function ChangeControlPage() {
 
   const templateContext = (parameters = templateParameters) => {
     const primaryAsset = scopeAssets[0];
-    const businessSystem = scopeAssets.find(asset => ['business_system', 'business application', 'business service'].includes(asset.type.toLowerCase()));
+    const businessSystem = scopeAssets.find(asset => isBusinessSystemType(asset.type));
     return {
       company_name: workspace.companyName,
       asset_name: primaryAsset?.name || '',
