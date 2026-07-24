@@ -748,13 +748,13 @@ export function ConnectWiseIntegrationPage() {
           expectedRevision: connectWise.revision,
         }),
       });
-      setConnectWise(stored); setPublicKey(''); setPrivateKey(''); setDiscoveryOptions(null); setPreview(null); setPreviewStale(false);
+      setConnectWise(stored); setPublicKey(''); setPrivateKey(''); setTestResult(null); setDiscoveryOptions(null); setPreview(null); setPreviewStale(false);
       setNotice({ severity: 'success', message: 'ConnectWise settings saved with write-only encrypted credentials. Test the connection before discovery.' });
       await load();
     } catch (value) { setError(value); } finally { setBusy(''); }
   }
   async function testConnectWise() {
-    setBusy('test-cw'); setNotice({ severity: 'info', message: 'Testing authentication and company-read permission…' }); setError(null);
+    setBusy('test-cw'); setTestResult(null); setNotice({ severity: 'info', message: 'Testing authentication and company-read permission…' }); setError(null);
     try {
       const result = await apiFetch<IntegrationTestResult>('/api/integrations/connectwise/test', { method: 'POST' });
       setTestResult(result); setNotice({ severity: 'success', message: result.message }); await load();

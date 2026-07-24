@@ -111,17 +111,18 @@ def normalize_configuration(record: dict[str, Any]) -> dict[str, Any]:
     provider_type_name = reference("type")
     provider_status_id = reference_id("status")
     provider_status_name = reference("status")
+    model = text("modelNumber", 240)
+    operating_system = text("osInfo", 500) or text("osType", 240)
     fields = {
         "serialNumber": serial_number,
-        "modelNumber": text("modelNumber", 240),
+        "model": model,
         "tagNumber": text("tagNumber", 160),
         "deviceIdentifier": device_identifier,
         "mobileGuid": mobile_guid,
         "ipAddress": text("ipAddress", 160),
         "macAddress": text("macAddress", 160),
         "defaultGateway": text("defaultGateway", 160),
-        "osType": text("osType", 240),
-        "osInfo": text("osInfo", 500),
+        "operatingSystem": operating_system,
         "ram": text("ram", 160),
         "cpuSpeed": text("cpuSpeed", 160),
         "localHardDrives": text("localHardDrives", 500),
@@ -152,7 +153,7 @@ def normalize_configuration(record: dict[str, Any]) -> dict[str, Any]:
             "operationalStatus": "unknown",
             "site": fields["site"],
             "ipAddress": fields["ipAddress"],
-            "model": fields["modelNumber"],
+            "model": model,
             "serialNumber": serial_number,
             "sourceSystem": "ConnectWise",
         },

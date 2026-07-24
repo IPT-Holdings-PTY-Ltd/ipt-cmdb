@@ -213,6 +213,8 @@ class ConnectWiseClientTests(unittest.TestCase):
                         "site": {"name": "Head office"},
                         "serialNumber": "SN-41",
                         "modelNumber": "PowerEdge",
+                        "osType": "Microsoft Windows",
+                        "osInfo": "Windows Server 2022 Standard",
                         "ipAddress": "10.0.0.41",
                         "vendorNotes": "not retained",
                         "questions": [{"answer": "not retained"}],
@@ -228,6 +230,11 @@ class ConnectWiseClientTests(unittest.TestCase):
         self.assertEqual(query["pageSize"], ["1000"])
         self.assertEqual(items[0]["identifiers"]["serial_number"], "SN-41")
         self.assertEqual(items[0]["metadata"]["site"], "Head office")
+        self.assertEqual(items[0]["fields"]["model"], "PowerEdge")
+        self.assertEqual(items[0]["fields"]["operatingSystem"], "Windows Server 2022 Standard")
+        self.assertNotIn("modelNumber", items[0]["fields"])
+        self.assertNotIn("osType", items[0]["fields"])
+        self.assertNotIn("osInfo", items[0]["fields"])
         self.assertEqual(items[0]["providerTypeId"], "11")
         self.assertEqual(items[0]["providerTypeName"], "Server")
         self.assertEqual(items[0]["providerStatusId"], "3")
