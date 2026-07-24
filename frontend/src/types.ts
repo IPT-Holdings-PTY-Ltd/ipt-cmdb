@@ -206,6 +206,316 @@ export type Integration = {
   lastSync: string | null;
   status: string;
   scope: 'msp' | 'customer';
+  connectionStatus?: string;
+  lastTestAt?: string | null;
+  lastError?: string;
+  revision?: number;
+  hasCredentials?: boolean;
+  lifecycleStatus: 'active' | 'paused' | 'disabled' | 'removed';
+  lifecycleReason?: string;
+  lifecycleChangedAt?: string | null;
+  lifecycleChangedBy?: string | null;
+};
+
+export type ConnectWiseConnection = {
+  id: string;
+  enabled: boolean;
+  baseUrl: string;
+  companyId: string;
+  clientId: string;
+  pageSize: number;
+  configured: boolean;
+  hasCredentials: boolean;
+  credentialSource: 'environment' | 'encrypted_database' | 'not_configured';
+  managedByEnvironment: boolean;
+  connectionStatus: 'not_configured' | 'configured' | 'verified' | 'error';
+  lastTestAt?: string | null;
+  lastError?: string;
+  revision: number;
+  lifecycleStatus: 'active' | 'paused' | 'disabled' | 'removed';
+  lifecycleReason?: string;
+  lifecycleChangedAt?: string | null;
+  lifecycleChangedBy?: string | null;
+  discoveryPolicy: ConnectWiseDiscoveryPolicy;
+};
+
+export type IntegrationLifecycleImpact = {
+  provider: Integration['type'];
+  lifecycleStatus: Integration['lifecycleStatus'];
+  customerMappings: number;
+  companyObservations: number;
+  ciPolicies: number;
+  enabledPolicies: number;
+  pendingReviews: number;
+  ciMappings: number;
+  importedCis: number;
+  syncRuns: number;
+  managedByEnvironment: boolean;
+  credentialSource: string;
+};
+
+export type ConnectWiseDiscoveryPolicy = {
+  includedStatuses: string[];
+  includedTypes: string[];
+  includedSites: string[];
+  includeDeleted: boolean;
+  excludedExternalIds: string[];
+};
+
+export type IntegrationProviderManifest = {
+  key: string;
+  name: string;
+  vendor: string;
+  version: string;
+  description: string;
+  scopes: Array<'msp' | 'customer'>;
+  authentication_modes: string[];
+  prerequisites: string[];
+  operations: Array<{
+    key: string;
+    label: string;
+    direction: 'input' | 'output' | 'bidirectional' | 'trigger' | 'action';
+    entity_type: string;
+    status: 'available' | 'planned' | 'disabled';
+    description: string;
+    requires_approval: boolean;
+    writes_provider: boolean;
+  }>;
+  filters: Array<{ key: string; label: string; kind: string; description: string }>;
+  documentation_path: string;
+};
+
+export type IntegrationTestResult = {
+  reachable: boolean;
+  message: string;
+  credentialSource: string;
+  writesAttempted: boolean;
+  stages: Array<{ key: string; label: string; status: 'passed' | 'failed' | 'skipped'; message: string }>;
+};
+
+export type DiscoveryPreview = {
+  readOnly: boolean;
+  writesAttempted: boolean;
+  appliedPolicy: ConnectWiseDiscoveryPolicy;
+  discovered: number;
+  included: number;
+  excluded: number;
+  truncated: boolean;
+  exclusionReasons: Record<string, number>;
+  availableStatuses: string[];
+  availableTypes: string[];
+  availableSites: string[];
+  sampleIncluded: ProviderCompany[];
+  sampleExcluded: Array<{ externalId: string; name: string; reason: string }>;
+  message: string;
+};
+
+export type ConnectWiseDiscoveryOptions = {
+  readOnly: boolean;
+  writesAttempted: boolean;
+  sampled: number;
+  truncated: boolean;
+  availableStatuses: string[];
+  availableTypes: string[];
+  availableSites: string[];
+  credentialSource: string;
+};
+
+export type ConfigurationReconciliationItem = {
+  externalId: string;
+  name: string;
+  type: string;
+  status: string;
+  action: 'create' | 'update' | 'link' | 'unchanged' | 'conflict';
+  reason: string;
+  confidence: number;
+  assetId?: string | null;
+  assetName: string;
+  changedFields: string[];
+  record: {
+    externalId: string;
+    name: string;
+    type: string;
+    status: string;
+    providerTypeId: string;
+    providerTypeName: string;
+    providerStatusId: string;
+    providerStatusName: string;
+    fields: Record<string, unknown>;
+    metadata: Record<string, unknown>;
+  };
+};
+
+export type ConfigurationReconciliationPreview = {
+  companyId: string;
+  companyName: string;
+  providerCompanyId: string;
+  providerCompanyName: string;
+  credentialSource: string;
+  readOnly: boolean;
+  writesAttempted: boolean;
+  discovered: number;
+  included: number;
+  excluded: number;
+  exclusionReasons: Record<string, number>;
+  availableTypes: ProviderFilterOption[];
+  availableStatuses: ProviderFilterOption[];
+  typeMappingSummary: {
+    mapped: number;
+    unmapped: number;
+    blocked: number;
+    unmappedTypes: ProviderFilterOption[];
+  };
+  appliedPolicy: ConnectWiseCiPolicy;
+  counts: Record<'create' | 'update' | 'link' | 'unchanged' | 'conflict', number>;
+  items: ConfigurationReconciliationItem[];
+  message: string;
+  syncRunId?: string;
+  queueSummary?: { pending: number; created: number; updated: number; resolved: number };
+};
+
+export type ProviderFilterOption = { id: string; name: string; count: number };
+
+export type ConnectWiseCiPolicy = {
+  id: string;
+  provider: string;
+  companyId: string;
+  providerParentId: string;
+  typeMode: 'all' | 'selected';
+  includedTypeIds: string[];
+  typeMappings: Record<string, string>;
+  blockUnmappedTypes: boolean;
+  statusMode: 'all' | 'selected';
+  includedStatusIds: string[];
+  excludedExternalIds: string[];
+  syncMode: 'manual' | 'continuous_preview';
+  intervalMinutes: number;
+  enabled: boolean;
+  revision: number;
+  updatedAt?: string | null;
+  nextRunAt?: string | null;
+  lastRunAt?: string | null;
+  lastSuccessAt?: string | null;
+  lastError?: string;
+  consecutiveFailures?: number;
+  companyName?: string;
+  leaseOwner?: string | null;
+  leaseUntil?: string | null;
+};
+
+export type IntegrationPreviewStatus = {
+  workerEnabled: boolean;
+  workerIntervalSeconds: number;
+  enabledPolicies: number;
+  pendingReviews: number;
+  policies: ConnectWiseCiPolicy[];
+};
+
+export type CiReviewItem = {
+  id: string;
+  provider: string;
+  policyId: string;
+  companyId: string;
+  companyName?: string;
+  providerParentId: string;
+  externalId: string;
+  externalName: string;
+  action: 'create' | 'update' | 'link' | 'conflict';
+  assetId?: string | null;
+  assetName?: string;
+  reason: string;
+  providerTypeName: string;
+  providerStatusName: string;
+  changedFields: string[];
+  blockedFields?: string[];
+  fieldDecisions?: Array<{
+    field: string;
+    provider: string;
+    currentProvider: string;
+    incomingPriority?: number;
+    currentPriority?: number | null;
+    allowed: boolean;
+    reason: string;
+  }>;
+  providerRecord?: Record<string, unknown>;
+  evidence?: Record<string, unknown>;
+  state: 'pending' | 'dismissed' | 'resolved';
+  firstSeenAt: string;
+  lastSeenAt: string;
+  reviewedAt?: string | null;
+  reviewNotes?: string;
+};
+
+export type CiReviewQueue = {
+  items: CiReviewItem[];
+  total: number;
+};
+
+export type IntegrationReconciliationQueue = CiReviewQueue & {
+  summary: Record<'create' | 'update' | 'link' | 'conflict', number>;
+};
+
+export type IntegrationObjectSuppression = {
+  id: string;
+  provider: string;
+  policyId: string;
+  companyId: string;
+  companyName?: string;
+  providerParentId: string;
+  externalObjectType: string;
+  externalId: string;
+  externalName: string;
+  providerRecord?: Record<string, unknown>;
+  reason: string;
+  active: boolean;
+  ignoredBy?: string | null;
+  ignoredByName?: string;
+  ignoredAt: string;
+  restoredBy?: string | null;
+  restoredByName?: string;
+  restoredAt?: string | null;
+  restoreReason?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type IntegrationObjectSuppressionQueue = {
+  items: IntegrationObjectSuppression[];
+  total: number;
+};
+
+export type ConnectWiseCiOptions = {
+  companyId: string;
+  providerCompanyId: string;
+  providerCompanyName: string;
+  credentialSource: string;
+  readOnly: boolean;
+  writesAttempted: boolean;
+  discovered: number;
+  availableTypes: ProviderFilterOption[];
+  availableStatuses: ProviderFilterOption[];
+  policy: ConnectWiseCiPolicy;
+};
+
+export type ProviderCompany = {
+  id: string;
+  provider: string;
+  externalId: string;
+  identifier: string;
+  name: string;
+  status: string;
+  type: string;
+  site: string;
+  deleted: boolean;
+  active: boolean;
+  lastUpdated?: string;
+  lastSeenAt?: string;
+  mappingId?: string | null;
+  mappedCompanyId?: string | null;
+  mappedCompanyName: string;
+  suggestedCompanyId?: string | null;
+  suggestedCompanyName: string;
+  suggestionReason: string;
 };
 
 export type SyncRun = {
@@ -397,6 +707,12 @@ export type ReconciliationCandidate = {
   conflictDetails: Record<string, unknown>;
 };
 export type FieldAuthorityRule = { companyId: string; ciType: string; fieldName: string; provider: string; priority: number };
+export type FieldAuthorityCatalogue = {
+  fields: Array<{ key: string; label: string; group: string }>;
+  providers: Array<{ key: string; name: string }>;
+  ciTypes: string[];
+  presets: Array<{ key: string; name: string; description: string }>;
+};
 export type DataQualitySnapshot = {
   summary: { score: number; assetCount: number; findingCount: number; highCount: number; exceptionCount: number; staleDays: number; pendingReconciliationCount: number; byCategory: Record<string, number> };
   customers: DataQualityCustomer[]; findings: DataQualityFinding[]; candidates: ReconciliationCandidate[];

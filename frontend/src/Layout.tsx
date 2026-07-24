@@ -14,6 +14,7 @@ import FactCheckOutlined from '@mui/icons-material/FactCheckOutlined';
 import ContactsOutlined from '@mui/icons-material/ContactsOutlined';
 import EmailOutlined from '@mui/icons-material/EmailOutlined';
 import NotificationsActiveOutlined from '@mui/icons-material/NotificationsActiveOutlined';
+import CompareArrowsOutlined from '@mui/icons-material/CompareArrowsOutlined';
 import { Box, FormControl, MenuItem, Select, Stack, Typography } from '@mui/material';
 import { AppBar, Layout, Menu, useRefresh, type LayoutProps } from 'react-admin';
 import { useWorkspace } from './workspace';
@@ -93,6 +94,7 @@ function WorkspaceMenu() {
       {platformAdmin && <Menu.Item to="/admin/rbac" primaryText="Access control" leftIcon={<SecurityOutlined />} />}
       {section('Operations')}
       <Menu.Item to="/admin/integrations" primaryText="Integrations" leftIcon={<CloudSyncOutlined />} />
+      <Menu.Item to="/admin/reconciliation" primaryText="Reconciliation" leftIcon={<CompareArrowsOutlined />} />
       {platformAdmin && <Menu.Item to="/admin/email" primaryText="Email delivery" leftIcon={<EmailOutlined />} />}
       {platformAdmin && <Menu.Item to="/admin/notifications" primaryText="Notifications" leftIcon={<NotificationsActiveOutlined />} />}
       {section('Governance')}

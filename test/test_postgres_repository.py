@@ -201,6 +201,123 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         self.assertEqual(authenticated["role"], "platform_admin")
         actor_id = authenticated["id"]
 
+        connection = repository.get_integration_connection("connectwise")
+        self.assertIsNotNone(connection)
+        configured = repository.update_integration_connection(
+            "connectwise",
+            {
+                "configuration": {
+                    "baseUrl": "https://api.example.com/v4_6_release/apis/3.0",
+                    "companyId": "ipt",
+                    "clientId": "client-id",
+                    "pageSize": 100,
+                },
+                "credentialsEncrypted": "ciphertext",
+                "credentialsNonce": "nonce",
+                "enabled": True,
+                "connectionStatus": "configured",
+                "expectedRevision": connection["revision"],
+            },
+            actor_id,
+        )
+        self.assertEqual(configured["connectionStatus"], "configured")
+        impact = repository.integration_lifecycle_impact("connectwise")
+        self.assertEqual(impact["syncRuns"], 1)
+        paused = repository.change_integration_lifecycle(
+            "connectwise",
+            "paused",
+            "Database maintenance",
+            actor_id,
+            configured["revision"],
+        )
+        self.assertFalse(paused["enabled"])
+        self.assertEqual(paused["lifecycleStatus"], "paused")
+        resumed = repository.change_integration_lifecycle(
+            "connectwise",
+            "active",
+            "Database maintenance completed",
+            actor_id,
+            paused["revision"],
+        )
+        self.assertTrue(resumed["enabled"])
+        repository.record_company_discovery(
+            "connectwise",
+            {
+                "id": "connectwise-discovery-contract",
+                "type": "connectwise",
+                "status": "review_required",
+                "startedAt": "2026-07-21T10:00:00Z",
+                "finishedAt": "2026-07-21T10:00:01Z",
+                "discovered": 1,
+                "imported": 0,
+                "review": 1,
+                "message": "One company requires review",
+            },
+            [
+                {
+                    "externalId": "42",
+                    "identifier": "ACME",
+                    "name": "Acme Manufacturing",
+                    "status": "Active",
+                    "type": "Customer",
+                    "site": "Head office",
+                    "deleted": False,
+                    "lastUpdated": "2026-07-21T09:00:00Z",
+                }
+            ],
+            actor_id,
+        )
+        observed = repository.list_provider_companies("connectwise")[0]
+        self.assertIsNone(observed["mappedCompanyId"])
+        mapped = repository.map_provider_company("connectwise", "42", "acme", actor_id)
+        self.assertEqual(mapped["mappedCompanyId"], "acme")
+        ci_policy = repository.update_ci_sync_policy(
+            "connectwise",
+            "acme",
+            "42",
+            {"syncMode": "continuous_preview", "enabled": True},
+            expected_revision=0,
+            actor_id=actor_id,
+        )
+        repository.replace_ci_review_items(
+            ci_policy["id"],
+            "acme",
+            repository.list_sync_runs()[0]["id"],
+            [
+                {
+                    "externalId": "501",
+                    "name": "ACME-UNMANAGED-01",
+                    "action": "create",
+                    "reason": "No canonical identity was found",
+                    "record": {
+                        "externalId": "501",
+                        "name": "ACME-UNMANAGED-01",
+                        "type": "Laptop",
+                        "status": "Active",
+                    },
+                }
+            ],
+            actor_id,
+        )
+        review_item = repository.list_ci_review_items("connectwise", "acme")[0]
+        suppression = repository.ignore_ci_review_items(
+            [review_item["id"]], "Outside managed scope", actor_id
+        )[0]
+        self.assertEqual(
+            repository.get_ci_sync_policy("connectwise", "acme", "42")["excludedExternalIds"],
+            ["501"],
+        )
+        self.assertEqual(
+            repository.query_integration_object_suppressions(company_id="acme")["total"],
+            1,
+        )
+        self.assertFalse(
+            repository.restore_integration_object_suppression(
+                suppression["id"], "Now managed", actor_id
+            )["active"]
+        )
+        self.assertTrue(repository.unmap_provider_company("connectwise", "42", actor_id))
+
         assets = repository.list_assets()
         sage = next(item for item in assets if item["name"] == "Sage 200")
         sql01 = next(item for item in assets if item["name"] == "SQL01")
@@ -271,7 +388,9 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         self.assertEqual(repository.next_change_number(2026), "CHG-2026-0002")
         self.assertEqual(repository.get_msp_branding()["name"], "IPT CMDB")
         self.assertEqual(repository.get_company_branding("acme")["name"], "Acme CMDB")
-        self.assertEqual(repository.list_sync_runs()[0]["status"], "success")
+        sync_statuses = {item["status"] for item in repository.list_sync_runs()}
+        self.assertIn("success", sync_statuses)
+        self.assertIn("review_required", sync_statuses)
         self.assertEqual(repository.list_notification_preferences(), [])
         self.assertEqual(repository.list_notification_preferences("acme"), [])
         self.assertEqual(repository.list_notification_events(), [])

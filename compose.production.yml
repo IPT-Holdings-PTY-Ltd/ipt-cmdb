@@ -22,6 +22,8 @@ services:
       LOCAL_MFA_POLICY: ${LOCAL_MFA_POLICY:-admins}
       ALLOW_UI_DATABASE_CONFIG: "false"
       ALLOW_LOCAL_DEVELOPMENT: "false"
+      INTEGRATION_WORKER_ENABLED: ${INTEGRATION_WORKER_ENABLED:-false}
+      INTEGRATION_WORKER_INTERVAL_SECONDS: ${INTEGRATION_WORKER_INTERVAL_SECONDS:-60}
     secrets:
       - database_url
       - bootstrap_admin_password

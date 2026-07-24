@@ -23,12 +23,14 @@ const ContactsPage = lazy(() => import('./Contacts').then(module => ({ default: 
 const AuditCenterPage = lazy(() => import('./Governance').then(module => ({ default: module.AuditCenterPage })));
 const ReportsPage = lazy(() => import('./Governance').then(module => ({ default: module.ReportsPage })));
 const DataQualityPage = lazy(() => import('./DataQuality').then(module => ({ default: module.DataQualityPage })));
+const ReconciliationPage = lazy(() => import('./Reconciliation').then(module => ({ default: module.ReconciliationPage })));
 const CustomerUsersPage = lazy(() => import('./CustomerUsers').then(module => ({ default: module.CustomerUsersPage })));
 const CustomersPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.CustomersPage })));
 const CustomerGroupsPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.CustomerGroupsPage })));
 const UsersPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.UsersPage })));
 const RbacPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.RbacPage })));
-const IntegrationsPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.IntegrationsPage })));
+const IntegrationsPage = lazy(() => import('./Integrations').then(module => ({ default: module.IntegrationsPage })));
+const ConnectWiseIntegrationPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.ConnectWiseIntegrationPage })));
 const EmailPage = lazy(() => import('./EmailSetup').then(module => ({ default: module.EmailPage })));
 const NotificationsPage = lazy(() => import('./Notifications').then(module => ({ default: module.NotificationsPage })));
 const BrandingPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.BrandingPage })));
@@ -73,6 +75,8 @@ function BrandedApplication() {
           <Route path="/admin/users" element={<UsersPage />} />
           <Route path="/admin/rbac" element={<RbacPage />} />
           <Route path="/admin/integrations" element={<IntegrationsPage />} />
+          <Route path="/admin/integrations/connectwise" element={<ConnectWiseIntegrationPage />} />
+          <Route path="/admin/reconciliation" element={<ReconciliationPage />} />
           <Route path="/admin/email" element={<EmailPage />} />
           <Route path="/admin/notifications" element={<NotificationsPage />} />
           <Route path="/admin/branding" element={<BrandingPage />} />

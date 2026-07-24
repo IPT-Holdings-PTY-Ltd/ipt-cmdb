@@ -13,7 +13,7 @@ import hmac
 import json
 import secrets
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -27,6 +27,7 @@ from src.cmdb.audit import (
     field_changes,
     sanitize_audit_value,
 )
+from src.cmdb.integration_reconciliation import normalize_ci_policy
 from src.cmdb.notifications import DEFAULT_NOTIFICATION_RULES, DEFAULT_NOTIFICATION_TEMPLATES
 
 CMDB_NAMESPACE = uuid.UUID("a12d44c4-64a7-4d6f-b829-3a8b691f0fa4")
@@ -117,6 +118,15 @@ def email_connection_audit_value(connection: dict) -> dict:
     return value
 
 
+def integration_connection_audit_value(connection: dict) -> dict:
+    """Return integration metadata without installation-bound credential material."""
+
+    hidden = {"credentialsEncrypted", "credentialsNonce"}
+    value = {key: deepcopy(item) for key, item in connection.items() if key not in hidden}
+    value["hasCredentials"] = bool(connection.get("credentialsEncrypted"))
+    return value
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
@@ -180,6 +190,7 @@ class StateRepository:
         self.state.setdefault("dataQualityExceptions", [])
         self.state.setdefault("reconciliationCandidates", [])
         self.state.setdefault("fieldAuthority", [])
+        self.state.setdefault("integrationObjectSuppressions", [])
         self.state.setdefault("contacts", [])
         self.state.setdefault("contactResponsibilities", [])
         self.state.setdefault("apiTokens", [])
@@ -221,6 +232,8 @@ class StateRepository:
         self.state.setdefault("notificationPreferences", [])
         self.state.setdefault("notificationEvents", [])
         self.state.setdefault("changeApprovalRequests", [])
+        self.state.setdefault("providerCompanyObservations", [])
+        self.state.setdefault("providerCompanyMappings", [])
 
     def list_companies(self) -> list[dict]:
         return deepcopy(self.state["companies"])
@@ -2503,7 +2516,1197 @@ class StateRepository:
         return count
 
     def list_integrations(self) -> list[dict]:
-        return deepcopy(self.state.get("integrations", []))
+        return [
+            integration_connection_audit_value(item)
+            for item in deepcopy(self.state.get("integrations", []))
+        ]
+
+    def get_integration_connection(self, kind: str) -> dict | None:
+        """Return one root integration, including encrypted material for server-side use."""
+
+        record = next(
+            (item for item in self.state.get("integrations", []) if item.get("type") == kind),
+            None,
+        )
+        if not record:
+            return None
+        return {
+            "configuration": {},
+            "credentialsEncrypted": "",
+            "credentialsNonce": "",
+            "revision": 1,
+            "lifecycleStatus": "active",
+            "lifecycleReason": "",
+            "lifecycleChangedAt": None,
+            "lifecycleChangedBy": None,
+            "connectionStatus": "not_configured",
+            "lastTestAt": None,
+            "lastError": "",
+            **deepcopy(record),
+        }
+
+    def update_integration_connection(
+        self, kind: str, changes: dict, actor_id: str | None = None
+    ) -> dict:
+        """Persist encrypted connection settings while exposing only audit-safe metadata."""
+
+        record = next(
+            (item for item in self.state.get("integrations", []) if item.get("type") == kind),
+            None,
+        )
+        if not record:
+            raise ValueError("Integration connection not found")
+        before = self.get_integration_connection(kind) or {}
+        expected_revision = changes.get("expectedRevision")
+        if expected_revision is not None and int(expected_revision) != int(before["revision"]):
+            raise ValueError("Integration settings changed; reload before saving")
+        stored_changes = deepcopy(changes)
+        if "configuration" in stored_changes:
+            stored_changes["configuration"] = {
+                **(before.get("configuration") or {}),
+                **(stored_changes.get("configuration") or {}),
+            }
+        record.update(stored_changes)
+        record.pop("expectedRevision", None)
+        if record.get("lifecycleStatus", "active") != "active":
+            record["enabled"] = False
+        record.update(
+            mode="configured_in_application",
+            revision=int(before.get("revision") or 0) + 1,
+            updatedAt=utc_now(),
+        )
+        after = self.get_integration_connection(kind) or {}
+        self._audit(
+            None,
+            actor_id,
+            "integration_connection",
+            record["id"],
+            "configuration_updated",
+            integration_connection_audit_value(before),
+            integration_connection_audit_value(after),
+        )
+        self.save_state(self.state)
+        return after
+
+    def integration_lifecycle_impact(self, kind: str) -> dict:
+        """Summarize retained provider evidence before disabling or removal."""
+
+        connection = self.get_integration_connection(kind)
+        if not connection:
+            raise ValueError("Integration connection not found")
+        companies = self.list_companies()
+        provider_companies = self.list_provider_companies(kind)
+        ci_mappings = [
+            mapping
+            for company in companies
+            for mapping in self.list_provider_ci_mappings(kind, company["id"])
+        ]
+        policies = self.list_ci_sync_policies(kind)
+        return {
+            "provider": kind,
+            "lifecycleStatus": connection.get("lifecycleStatus", "active"),
+            "customerMappings": sum(
+                bool(item.get("mappedCompanyId")) for item in provider_companies
+            ),
+            "companyObservations": len(provider_companies),
+            "ciPolicies": len(policies),
+            "enabledPolicies": sum(bool(item.get("enabled")) for item in policies),
+            "pendingReviews": self.count_ci_review_items(kind, state="pending"),
+            "ciMappings": len(ci_mappings),
+            "importedCis": len(
+                {item.get("assetId") for item in ci_mappings if item.get("assetId")}
+            ),
+            "syncRuns": sum(item.get("type") == kind for item in self.list_sync_runs()),
+        }
+
+    def change_integration_lifecycle(
+        self,
+        kind: str,
+        lifecycle_status: str,
+        reason: str,
+        actor_id: str,
+        expected_revision: int | None = None,
+        *,
+        remove_configuration: bool = False,
+    ) -> dict:
+        """Change the master provider lifecycle and optionally erase usable secrets."""
+
+        record = next(
+            (item for item in self.state.get("integrations", []) if item.get("type") == kind),
+            None,
+        )
+        if not record:
+            raise ValueError("Integration connection not found")
+        before = self.get_integration_connection(kind) or {}
+        if expected_revision is not None and int(expected_revision) != int(before["revision"]):
+            raise ValueError("Integration settings changed; reload before continuing")
+        changed_at = utc_now()
+        record.update(
+            lifecycleStatus=lifecycle_status,
+            lifecycleReason=reason[:1000],
+            lifecycleChangedAt=changed_at,
+            lifecycleChangedBy=actor_id,
+            enabled=lifecycle_status == "active",
+            revision=int(before.get("revision") or 0) + 1,
+            updatedAt=changed_at,
+        )
+        if remove_configuration:
+            record.update(
+                configuration={"scope": "msp", "mode": "removed"},
+                credentialsEncrypted="",
+                credentialsNonce="",
+                mode="removed",
+                connectionStatus="not_configured",
+                lastError="",
+                status="Removed",
+            )
+        elif lifecycle_status == "paused":
+            record["status"] = "Paused"
+        elif lifecycle_status == "disabled":
+            record["status"] = "Disabled"
+        elif lifecycle_status == "active":
+            record["status"] = (
+                "Healthy" if record.get("connectionStatus") == "verified" else "Ready"
+            )
+        after = self.get_integration_connection(kind) or {}
+        self._audit(
+            None,
+            actor_id,
+            "integration_connection",
+            record["id"],
+            f"integration_{lifecycle_status}",
+            integration_connection_audit_value(before),
+            integration_connection_audit_value(after),
+            reason=reason,
+        )
+        self.save_state(self.state)
+        return after
+
+    def mark_integration_test(
+        self, kind: str, status: str, message: str, actor_id: str | None = None
+    ) -> dict:
+        """Record a credential test without incrementing the editable revision."""
+
+        record = next(
+            (item for item in self.state.get("integrations", []) if item.get("type") == kind),
+            None,
+        )
+        if not record:
+            raise ValueError("Integration connection not found")
+        before = integration_connection_audit_value(self.get_integration_connection(kind) or {})
+        record.update(
+            connectionStatus=status,
+            status="Ready" if status == "verified" else "error",
+            lastTestAt=utc_now(),
+            lastError="" if status == "verified" else message[:1000],
+        )
+        after = integration_connection_audit_value(self.get_integration_connection(kind) or {})
+        self._audit(
+            None,
+            actor_id,
+            "integration_connection",
+            record["id"],
+            "connection_tested",
+            before,
+            after,
+            outcome="success" if status == "verified" else "failure",
+            reason=message,
+        )
+        self.save_state(self.state)
+        return self.get_integration_connection(kind) or {}
+
+    def record_company_discovery(
+        self,
+        kind: str,
+        run: dict,
+        companies: list[dict],
+        actor_id: str | None = None,
+    ) -> dict:
+        """Persist a bounded discovery snapshot and its governed sync run."""
+
+        stored_run = self.record_sync_run(kind, run, True, actor_id)
+        current_ids = {item["externalId"] for item in companies}
+        records = self.state.setdefault("providerCompanyObservations", [])
+        for record in records:
+            if record.get("provider") == kind and record.get("externalId") not in current_ids:
+                record["active"] = False
+        for company in companies:
+            existing = next(
+                (
+                    item
+                    for item in records
+                    if item.get("provider") == kind
+                    and item.get("externalId") == company["externalId"]
+                ),
+                None,
+            )
+            payload_hash = hashlib.sha256(
+                json.dumps(company, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if existing:
+                existing.update(
+                    deepcopy(company),
+                    payloadHash=payload_hash,
+                    active=True,
+                    lastSeenAt=utc_now(),
+                    lastSyncRunId=stored_run["id"],
+                )
+            else:
+                records.append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "provider": kind,
+                        **deepcopy(company),
+                        "payloadHash": payload_hash,
+                        "active": True,
+                        "firstSeenAt": utc_now(),
+                        "lastSeenAt": utc_now(),
+                        "lastSyncRunId": stored_run["id"],
+                    }
+                )
+        self.save_state(self.state)
+        return stored_run
+
+    def list_provider_companies(self, kind: str) -> list[dict]:
+        """List sanitized provider companies with any explicit canonical mapping."""
+
+        mappings = {
+            item["externalId"]: item
+            for item in self.state.get("providerCompanyMappings", [])
+            if item.get("provider") == kind and item.get("active", True)
+        }
+        companies = {item["id"]: item for item in self.state.get("companies", [])}
+        records = []
+        for item in self.state.get("providerCompanyObservations", []):
+            if item.get("provider") != kind:
+                continue
+            mapping = mappings.get(item["externalId"])
+            mapped_company = companies.get(mapping.get("companyId")) if mapping else None
+            records.append(
+                {
+                    **deepcopy(item),
+                    "mappedCompanyId": mapping.get("companyId") if mapping else None,
+                    "mappedCompanyName": mapped_company.get("name") if mapped_company else "",
+                    "mappingId": mapping.get("id") if mapping else None,
+                }
+            )
+        return sorted(records, key=lambda item: (not item.get("active", True), item["name"]))
+
+    def map_provider_company(
+        self, kind: str, external_id: str, company_id: str, actor_id: str | None = None
+    ) -> dict:
+        """Create or replace an explicit provider-company to CMDB-customer mapping."""
+
+        observation = next(
+            (
+                item
+                for item in self.state.get("providerCompanyObservations", [])
+                if item.get("provider") == kind and item.get("externalId") == external_id
+            ),
+            None,
+        )
+        company = next(
+            (item for item in self.state.get("companies", []) if item.get("id") == company_id),
+            None,
+        )
+        if not observation or not company:
+            raise ValueError("Provider company or CMDB customer not found")
+        mapping = next(
+            (
+                item
+                for item in self.state.setdefault("providerCompanyMappings", [])
+                if item.get("provider") == kind and item.get("externalId") == external_id
+            ),
+            None,
+        )
+        before = deepcopy(mapping) if mapping else None
+        if mapping:
+            mapping.update(companyId=company_id, externalName=observation["name"], active=True)
+        else:
+            mapping = {
+                "id": str(uuid.uuid4()),
+                "provider": kind,
+                "externalId": external_id,
+                "externalName": observation["name"],
+                "companyId": company_id,
+                "active": True,
+            }
+            self.state["providerCompanyMappings"].append(mapping)
+        self._audit(
+            company_id,
+            actor_id,
+            "external_company_mapping",
+            mapping["id"],
+            "mapped",
+            before,
+            mapping,
+        )
+        self.save_state(self.state)
+        return next(
+            item for item in self.list_provider_companies(kind) if item["externalId"] == external_id
+        )
+
+    def unmap_provider_company(
+        self, kind: str, external_id: str, actor_id: str | None = None
+    ) -> bool:
+        """Deactivate a provider-company mapping without deleting its history."""
+
+        mapping = next(
+            (
+                item
+                for item in self.state.get("providerCompanyMappings", [])
+                if item.get("provider") == kind
+                and item.get("externalId") == external_id
+                and item.get("active", True)
+            ),
+            None,
+        )
+        if not mapping:
+            return False
+        before = deepcopy(mapping)
+        mapping["active"] = False
+        self._audit(
+            mapping.get("companyId"),
+            actor_id,
+            "external_company_mapping",
+            mapping["id"],
+            "unmapped",
+            before,
+            mapping,
+        )
+        self.save_state(self.state)
+        return True
+
+    def list_provider_ci_mappings(self, kind: str, company_id: str) -> list[dict]:
+        """Return active immutable provider-ID mappings for one customer."""
+
+        return [
+            deepcopy(item)
+            for item in self.state.get("providerCiMappings", [])
+            if item.get("provider") == kind
+            and item.get("companyId") == company_id
+            and item.get("active", True)
+        ]
+
+    def get_ci_sync_policy(self, kind: str, company_id: str, provider_parent_id: str) -> dict:
+        """Return one saved provider/customer CI policy or explicit safe defaults."""
+
+        record = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("provider") == kind
+                and item.get("companyId") == company_id
+                and item.get("providerParentId") == provider_parent_id
+            ),
+            None,
+        )
+        if record:
+            return {**deepcopy(record), **normalize_ci_policy(record)}
+        return {
+            "id": "",
+            "provider": kind,
+            "companyId": company_id,
+            "providerParentId": provider_parent_id,
+            **normalize_ci_policy(None),
+            "revision": 0,
+            "updatedAt": None,
+            "nextRunAt": None,
+            "lastRunAt": None,
+            "lastSuccessAt": None,
+            "lastError": "",
+            "consecutiveFailures": 0,
+        }
+
+    def update_ci_sync_policy(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        policy: dict,
+        expected_revision: int | None = None,
+        actor_id: str | None = None,
+    ) -> dict:
+        """Persist an audited CI filter/schedule policy with optimistic concurrency."""
+
+        policies = self.state.setdefault("integrationCiPolicies", [])
+        record = next(
+            (
+                item
+                for item in policies
+                if item.get("provider") == kind
+                and item.get("companyId") == company_id
+                and item.get("providerParentId") == provider_parent_id
+            ),
+            None,
+        )
+        before = deepcopy(record) if record else None
+        revision = int(record.get("revision") or 0) if record else 0
+        if expected_revision is not None and expected_revision != revision:
+            raise ValueError("CI policy changed; reload before saving")
+        normalized = normalize_ci_policy(policy)
+        if not record:
+            record = {
+                "id": str(uuid.uuid4()),
+                "provider": kind,
+                "companyId": company_id,
+                "providerParentId": provider_parent_id,
+            }
+            policies.append(record)
+        record.update(
+            normalized,
+            revision=revision + 1,
+            updatedAt=utc_now(),
+            nextRunAt=(
+                utc_now()
+                if normalized["enabled"] and normalized["syncMode"] == "continuous_preview"
+                else None
+            ),
+            leaseOwner=None,
+            leaseUntil=None,
+        )
+        self._audit(
+            company_id,
+            actor_id,
+            "integration_ci_policy",
+            record["id"],
+            "updated" if before else "created",
+            before,
+            record,
+            metadata={"provider": kind, "providerParentId": provider_parent_id},
+        )
+        self.save_state(self.state)
+        return deepcopy(record)
+
+    def list_ci_sync_policies(self, kind: str | None = None) -> list[dict]:
+        """Return saved CI policies with their worker scheduling state."""
+
+        policies = [
+            deepcopy(item)
+            for item in self.state.get("integrationCiPolicies", [])
+            if kind is None or item.get("provider") == kind
+        ]
+        return sorted(policies, key=lambda item: (item.get("companyId", ""), item.get("id", "")))
+
+    def claim_due_ci_sync_policy(
+        self, kind: str, worker_id: str, lease_seconds: int = 300
+    ) -> dict | None:
+        """Claim one due continuous-preview policy in the local repository."""
+
+        connection = self.get_integration_connection(kind)
+        if (
+            not connection
+            or not connection.get("enabled")
+            or connection.get("lifecycleStatus", "active") != "active"
+        ):
+            return None
+        now = datetime.now(UTC)
+        due = []
+        for policy in self.state.get("integrationCiPolicies", []):
+            if policy.get("provider") != kind:
+                continue
+            if not policy.get("enabled") or policy.get("syncMode") != "continuous_preview":
+                continue
+            next_run = parse_timestamp(policy.get("nextRunAt"))
+            lease_until = parse_timestamp(policy.get("leaseUntil"))
+            if next_run and next_run > now:
+                continue
+            if lease_until and lease_until > now:
+                continue
+            due.append(policy)
+        if not due:
+            return None
+        policy = min(due, key=lambda item: parse_timestamp(item.get("nextRunAt")) or now)
+        policy["leaseOwner"] = worker_id[:120]
+        policy["leaseUntil"] = (
+            (now + timedelta(seconds=max(30, lease_seconds))).isoformat().replace("+00:00", "Z")
+        )
+        self.save_state(self.state)
+        return deepcopy(policy)
+
+    def complete_ci_sync_policy_run(
+        self, policy_id: str, *, success: bool, error: str = ""
+    ) -> dict | None:
+        """Release a policy lease and calculate its next bounded execution."""
+
+        policy = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("id") == policy_id
+            ),
+            None,
+        )
+        if not policy:
+            return None
+        now = datetime.now(UTC)
+        failures = 0 if success else int(policy.get("consecutiveFailures") or 0) + 1
+        interval = max(15, min(int(policy.get("intervalMinutes") or 360), 10080))
+        policy.update(
+            lastRunAt=now.isoformat().replace("+00:00", "Z"),
+            lastSuccessAt=(
+                now.isoformat().replace("+00:00", "Z") if success else policy.get("lastSuccessAt")
+            ),
+            lastError="" if success else str(error)[:1000],
+            consecutiveFailures=failures,
+            nextRunAt=(now + timedelta(minutes=interval)).isoformat().replace("+00:00", "Z"),
+            leaseOwner=None,
+            leaseUntil=None,
+        )
+        self.save_state(self.state)
+        return deepcopy(policy)
+
+    def replace_ci_review_items(
+        self,
+        policy_id: str,
+        company_id: str,
+        run_id: str,
+        items: list[dict],
+        actor_id: str | None = None,
+    ) -> dict[str, int]:
+        """Refresh the current review queue while preserving unchanged dismissals."""
+
+        queue = self.state.setdefault("integrationCiReviewItems", [])
+        reviewable = [
+            deepcopy(item)
+            for item in items
+            if item.get("action") in {"create", "update", "link", "conflict"}
+        ]
+        seen = {str(item["externalId"]) for item in reviewable}
+        resolved = 0
+        for queued in queue:
+            if (
+                queued.get("policyId") == policy_id
+                and queued.get("state") == "pending"
+                and queued.get("externalId") not in seen
+            ):
+                queued["state"] = "resolved"
+                queued["reviewedAt"] = utc_now()
+                resolved += 1
+        created = 0
+        updated = 0
+        now = utc_now()
+        for item in reviewable:
+            content = {
+                "action": item.get("action"),
+                "assetId": item.get("assetId"),
+                "reason": item.get("reason", ""),
+                "changes": item.get("changes") or {},
+                "blockedFields": item.get("blockedFields") or [],
+                "fieldDecisions": item.get("fieldDecisions") or [],
+                "record": item.get("record") or {},
+            }
+            content_hash = hashlib.sha256(
+                json.dumps(content, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            queued = next(
+                (
+                    row
+                    for row in queue
+                    if row.get("policyId") == policy_id
+                    and row.get("externalId") == item.get("externalId")
+                ),
+                None,
+            )
+            if not queued:
+                queued = {
+                    "id": str(uuid.uuid4()),
+                    "policyId": policy_id,
+                    "companyId": company_id,
+                    "externalId": str(item["externalId"]),
+                    "firstSeenAt": now,
+                    "state": "pending",
+                }
+                queue.append(queued)
+                created += 1
+            else:
+                if queued.get("contentHash") != content_hash or queued.get("state") == "resolved":
+                    queued.update(state="pending", reviewedBy=None, reviewedAt=None, reviewNotes="")
+                updated += 1
+            record = item.get("record") or {}
+            queued.update(
+                externalName=item.get("name") or record.get("name") or item["externalId"],
+                action=item["action"],
+                assetId=item.get("assetId"),
+                assetName=item.get("assetName") or "",
+                reason=item.get("reason") or "",
+                providerTypeName=record.get("providerTypeName") or record.get("type") or "",
+                providerStatusName=record.get("providerStatusName") or record.get("status") or "",
+                providerRecord=deepcopy(record),
+                evidence={
+                    "changedFields": deepcopy(item.get("changedFields") or []),
+                    "blockedFields": deepcopy(item.get("blockedFields") or []),
+                    "fieldDecisions": deepcopy(item.get("fieldDecisions") or []),
+                    "changes": deepcopy(item.get("changes") or {}),
+                },
+                contentHash=content_hash,
+                lastRunId=run_id,
+                lastSeenAt=now,
+            )
+        self._audit(
+            company_id,
+            actor_id,
+            "integration_ci_policy",
+            policy_id,
+            "review_queue_refreshed",
+            None,
+            {
+                "pending": len(reviewable),
+                "created": created,
+                "updated": updated,
+                "resolved": resolved,
+            },
+            metadata={"syncRunId": run_id},
+            actor_type="system" if actor_id is None else "user",
+            source_system="integration_worker" if actor_id is None else "web",
+        )
+        self.save_state(self.state)
+        return {
+            "pending": len(reviewable),
+            "created": created,
+            "updated": updated,
+            "resolved": resolved,
+        }
+
+    def list_ci_review_items(
+        self,
+        kind: str | None = None,
+        company_id: str | None = None,
+        state: str | None = "pending",
+        limit: int = 250,
+    ) -> list[dict]:
+        """Return the current provider-neutral CI review queue."""
+
+        policies = {item["id"]: item for item in self.list_ci_sync_policies(kind)}
+        records = []
+        for item in self.state.get("integrationCiReviewItems", []):
+            policy = policies.get(item.get("policyId"))
+            if not policy:
+                continue
+            if company_id and item.get("companyId") != company_id:
+                continue
+            if state and item.get("state") != state:
+                continue
+            evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+            records.append(
+                {
+                    **deepcopy(item),
+                    "provider": policy.get("provider"),
+                    "providerParentId": policy.get("providerParentId"),
+                    "changedFields": deepcopy(evidence.get("changedFields") or []),
+                    "blockedFields": deepcopy(evidence.get("blockedFields") or []),
+                    "fieldDecisions": deepcopy(evidence.get("fieldDecisions") or []),
+                }
+            )
+        return sorted(records, key=lambda item: item.get("lastSeenAt", ""), reverse=True)[
+            : max(1, min(limit, 1000))
+        ]
+
+    def count_ci_review_items(
+        self,
+        kind: str | None = None,
+        company_id: str | None = None,
+        state: str | None = "pending",
+    ) -> int:
+        """Count current CI review observations without a page-size cap."""
+
+        policies = {item["id"]: item for item in self.list_ci_sync_policies(kind)}
+        return sum(
+            1
+            for item in self.state.get("integrationCiReviewItems", [])
+            if item.get("policyId") in policies
+            and (not company_id or item.get("companyId") == company_id)
+            and (not state or item.get("state") == state)
+        )
+
+    def query_ci_review_items(
+        self,
+        *,
+        kind: str | None = None,
+        company_id: str | None = None,
+        company_ids: Iterable[str] | None = None,
+        state: str | None = "pending",
+        action: str | None = None,
+        search: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Return a filtered, paged provider-neutral review workbench."""
+
+        policies = {item["id"]: item for item in self.list_ci_sync_policies(kind)}
+        permitted_companies = set(company_ids) if company_ids is not None else None
+        needle = search.strip().casefold()
+        records: list[dict] = []
+        for raw in self.state.get("integrationCiReviewItems", []):
+            policy = policies.get(raw.get("policyId"))
+            if not policy:
+                continue
+            evidence = raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {}
+            item = {
+                **deepcopy(raw),
+                "provider": policy.get("provider"),
+                "providerParentId": policy.get("providerParentId"),
+                "changedFields": deepcopy(evidence.get("changedFields") or []),
+                "blockedFields": deepcopy(evidence.get("blockedFields") or []),
+                "fieldDecisions": deepcopy(evidence.get("fieldDecisions") or []),
+            }
+            if company_id and item.get("companyId") != company_id:
+                continue
+            if permitted_companies is not None and item.get("companyId") not in permitted_companies:
+                continue
+            if state and item.get("state") != state:
+                continue
+            haystack = " ".join(
+                str(item.get(key) or "")
+                for key in ("externalName", "externalId", "assetName", "reason")
+            ).casefold()
+            if needle and needle not in haystack:
+                continue
+            records.append(item)
+        summary = {
+            decision: sum(item.get("action") == decision for item in records)
+            for decision in ("create", "update", "link", "conflict")
+        }
+        filtered = [item for item in records if not action or item.get("action") == action]
+        filtered.sort(key=lambda item: item.get("lastSeenAt", ""), reverse=True)
+        page_limit = max(1, min(limit, 250))
+        page_offset = max(0, offset)
+        return {
+            "items": filtered[page_offset : page_offset + page_limit],
+            "total": len(filtered),
+            "summary": summary,
+        }
+
+    def get_ci_review_item(self, item_id: str) -> dict | None:
+        """Return one review item by immutable queue identifier."""
+
+        raw = next(
+            (
+                item
+                for item in self.state.get("integrationCiReviewItems", [])
+                if item.get("id") == item_id
+            ),
+            None,
+        )
+        if not raw:
+            return None
+        policy = next(
+            (
+                item
+                for item in self.list_ci_sync_policies()
+                if item.get("id") == raw.get("policyId")
+            ),
+            None,
+        )
+        if not policy:
+            return None
+        evidence = raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {}
+        return {
+            **deepcopy(raw),
+            "provider": policy.get("provider"),
+            "providerParentId": policy.get("providerParentId"),
+            "changedFields": deepcopy(evidence.get("changedFields") or []),
+            "blockedFields": deepcopy(evidence.get("blockedFields") or []),
+            "fieldDecisions": deepcopy(evidence.get("fieldDecisions") or []),
+        }
+
+    def dismiss_ci_review_item(self, item_id: str, notes: str, actor_id: str) -> dict | None:
+        """Dismiss one unchanged review observation with audited notes."""
+
+        item = next(
+            (
+                row
+                for row in self.state.get("integrationCiReviewItems", [])
+                if row.get("id") == item_id
+            ),
+            None,
+        )
+        if not item:
+            return None
+        before = deepcopy(item)
+        item.update(state="dismissed", reviewedBy=actor_id, reviewedAt=utc_now(), reviewNotes=notes)
+        self._audit(
+            item.get("companyId"),
+            actor_id,
+            "integration_ci_review_item",
+            item_id,
+            "dismissed",
+            before,
+            item,
+        )
+        self.save_state(self.state)
+        return deepcopy(item)
+
+    def ignore_ci_review_items(self, item_ids: list[str], notes: str, actor_id: str) -> list[dict]:
+        """Persist durable immutable-ID suppressions for one governed CI policy."""
+
+        selected_ids = set(item_ids)
+        items = [
+            item
+            for item in self.state.get("integrationCiReviewItems", [])
+            if item.get("id") in selected_ids
+        ]
+        if len(items) != len(selected_ids):
+            raise ValueError("One or more review items no longer exist")
+        policy_ids = {str(item.get("policyId") or "") for item in items}
+        if len(policy_ids) != 1:
+            raise ValueError("Ignored configurations must belong to one customer policy")
+        policy_id = next(iter(policy_ids))
+        policy = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("id") == policy_id
+            ),
+            None,
+        )
+        if not policy:
+            raise ValueError("CI policy not found")
+
+        now = utc_now()
+        suppressions = self.state.setdefault("integrationObjectSuppressions", [])
+        stored: list[dict] = []
+        excluded_ids = set(normalize_ci_policy(policy)["excludedExternalIds"])
+        for item in items:
+            external_id = str(item.get("externalId") or "")
+            suppression = next(
+                (
+                    row
+                    for row in suppressions
+                    if row.get("policyId") == policy_id
+                    and row.get("externalObjectType") == "configuration"
+                    and row.get("externalId") == external_id
+                ),
+                None,
+            )
+            before = deepcopy(suppression) if suppression else None
+            if not suppression:
+                suppression = {
+                    "id": str(uuid.uuid4()),
+                    "policyId": policy_id,
+                    "companyId": item.get("companyId"),
+                    "externalObjectType": "configuration",
+                    "externalId": external_id,
+                    "createdAt": now,
+                }
+                suppressions.append(suppression)
+            suppression.update(
+                externalName=item.get("externalName") or external_id,
+                providerRecord=deepcopy(item.get("providerRecord") or {}),
+                reason=notes,
+                active=True,
+                ignoredBy=actor_id,
+                ignoredAt=now,
+                restoredBy=None,
+                restoredAt=None,
+                restoreReason="",
+                updatedAt=now,
+            )
+            item.update(
+                state="resolved",
+                reviewedBy=actor_id,
+                reviewedAt=now,
+                reviewNotes=notes,
+            )
+            excluded_ids.add(external_id)
+            self._audit(
+                item.get("companyId"),
+                actor_id,
+                "integration_object_suppression",
+                suppression["id"],
+                "ignored" if before is None else "reignored",
+                before,
+                suppression,
+                metadata={
+                    "provider": policy.get("provider"),
+                    "policyId": policy_id,
+                    "externalId": external_id,
+                },
+            )
+            stored.append(deepcopy(suppression))
+
+        policy_before = deepcopy(policy)
+        policy.update(
+            excludedExternalIds=sorted(excluded_ids),
+            revision=int(policy.get("revision") or 0) + 1,
+            updatedAt=now,
+        )
+        self._audit(
+            policy.get("companyId"),
+            actor_id,
+            "integration_ci_policy",
+            policy_id,
+            "suppression_updated",
+            policy_before,
+            policy,
+            metadata={"ignoredExternalIds": sorted(excluded_ids)},
+        )
+        self.save_state(self.state)
+        return stored
+
+    def query_integration_object_suppressions(
+        self,
+        *,
+        kind: str | None = None,
+        company_id: str | None = None,
+        company_ids: Iterable[str] | None = None,
+        active: bool | None = True,
+        search: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Return filtered, tenant-safe provider object suppressions."""
+
+        policies = {item["id"]: item for item in self.list_ci_sync_policies(kind)}
+        companies = {
+            item.get("id"): item.get("name", item.get("id", ""))
+            for item in self.state.get("companies", [])
+        }
+        users = {
+            item.get("id"): item.get("email", item.get("id", ""))
+            for item in self.state.get("users", [])
+        }
+        permitted_companies = set(company_ids) if company_ids is not None else None
+        needle = search.strip().casefold()
+        records: list[dict] = []
+        for raw in self.state.get("integrationObjectSuppressions", []):
+            policy = policies.get(raw.get("policyId"))
+            if not policy:
+                continue
+            item = {
+                **deepcopy(raw),
+                "provider": policy.get("provider"),
+                "providerParentId": policy.get("providerParentId"),
+                "companyName": companies.get(raw.get("companyId"), raw.get("companyId", "")),
+                "ignoredByName": users.get(raw.get("ignoredBy"), raw.get("ignoredBy", "")),
+                "restoredByName": users.get(raw.get("restoredBy"), raw.get("restoredBy", "")),
+            }
+            if company_id and item.get("companyId") != company_id:
+                continue
+            if permitted_companies is not None and item.get("companyId") not in permitted_companies:
+                continue
+            if active is not None and bool(item.get("active")) is not active:
+                continue
+            haystack = " ".join(
+                str(item.get(key) or "")
+                for key in ("externalName", "externalId", "reason", "restoreReason")
+            ).casefold()
+            if needle and needle not in haystack:
+                continue
+            records.append(item)
+        records.sort(key=lambda item: item.get("updatedAt", ""), reverse=True)
+        page_limit = max(1, min(limit, 250))
+        page_offset = max(0, offset)
+        return {
+            "items": records[page_offset : page_offset + page_limit],
+            "total": len(records),
+        }
+
+    def get_integration_object_suppression(self, suppression_id: str) -> dict | None:
+        """Return one provider-object suppression by its governed identifier."""
+
+        raw = next(
+            (
+                item
+                for item in self.state.get("integrationObjectSuppressions", [])
+                if item.get("id") == suppression_id
+            ),
+            None,
+        )
+        if not raw:
+            return None
+        policy = next(
+            (
+                item
+                for item in self.list_ci_sync_policies()
+                if item.get("id") == raw.get("policyId")
+            ),
+            None,
+        )
+        if not policy:
+            return None
+        companies = {
+            item.get("id"): item.get("name", item.get("id", ""))
+            for item in self.state.get("companies", [])
+        }
+        users = {
+            item.get("id"): item.get("email", item.get("id", ""))
+            for item in self.state.get("users", [])
+        }
+        return {
+            **deepcopy(raw),
+            "provider": policy.get("provider"),
+            "providerParentId": policy.get("providerParentId"),
+            "companyName": companies.get(raw.get("companyId"), raw.get("companyId", "")),
+            "ignoredByName": users.get(raw.get("ignoredBy"), raw.get("ignoredBy", "")),
+            "restoredByName": users.get(raw.get("restoredBy"), raw.get("restoredBy", "")),
+        }
+
+    def restore_integration_object_suppression(
+        self, suppression_id: str, notes: str, actor_id: str
+    ) -> dict | None:
+        """Restore one ignored provider object without changing its canonical CI."""
+
+        suppression = next(
+            (
+                item
+                for item in self.state.get("integrationObjectSuppressions", [])
+                if item.get("id") == suppression_id
+            ),
+            None,
+        )
+        if not suppression or not suppression.get("active"):
+            return None
+        policy = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("id") == suppression.get("policyId")
+            ),
+            None,
+        )
+        if not policy:
+            raise ValueError("CI policy not found")
+        before = deepcopy(suppression)
+        policy_before = deepcopy(policy)
+        now = utc_now()
+        suppression.update(
+            active=False,
+            restoredBy=actor_id,
+            restoredAt=now,
+            restoreReason=notes,
+            updatedAt=now,
+        )
+        external_id = str(suppression.get("externalId") or "")
+        policy.update(
+            excludedExternalIds=[
+                value
+                for value in normalize_ci_policy(policy)["excludedExternalIds"]
+                if value != external_id
+            ],
+            revision=int(policy.get("revision") or 0) + 1,
+            updatedAt=now,
+        )
+        for item in self.state.get("integrationCiReviewItems", []):
+            if item.get("policyId") == policy["id"] and item.get("externalId") == external_id:
+                item.update(
+                    state="pending",
+                    reviewedBy=None,
+                    reviewedAt=None,
+                    reviewNotes="",
+                )
+        self._audit(
+            suppression.get("companyId"),
+            actor_id,
+            "integration_object_suppression",
+            suppression_id,
+            "restored",
+            before,
+            suppression,
+            metadata={
+                "provider": policy.get("provider"),
+                "policyId": policy.get("id"),
+                "externalId": external_id,
+            },
+        )
+        self._audit(
+            policy.get("companyId"),
+            actor_id,
+            "integration_ci_policy",
+            policy["id"],
+            "suppression_updated",
+            policy_before,
+            policy,
+            metadata={"restoredExternalId": external_id},
+        )
+        self.save_state(self.state)
+        return deepcopy(suppression)
+
+    def resolve_ci_review_items(
+        self, policy_id: str, external_ids: list[str], actor_id: str | None = None
+    ) -> int:
+        """Resolve queue entries after an explicit import or immutable-ID link."""
+
+        selected = set(external_ids)
+        resolved = 0
+        for item in self.state.get("integrationCiReviewItems", []):
+            if item.get("policyId") == policy_id and item.get("externalId") in selected:
+                item.update(state="resolved", reviewedBy=actor_id, reviewedAt=utc_now())
+                resolved += 1
+        if resolved:
+            self.save_state(self.state)
+        return resolved
+
+    def record_provider_ci_mapping(
+        self,
+        kind: str,
+        company_id: str,
+        record: dict,
+        asset_id: str,
+        actor_id: str | None = None,
+    ) -> dict:
+        """Upsert provider identity and retain a deduplicated source observation."""
+
+        mappings = self.state.setdefault("providerCiMappings", [])
+        mapping = next(
+            (
+                item
+                for item in mappings
+                if item.get("provider") == kind and item.get("externalId") == record["externalId"]
+            ),
+            None,
+        )
+        before = deepcopy(mapping) if mapping else None
+        if not mapping:
+            mapping = {
+                "id": str(uuid.uuid4()),
+                "provider": kind,
+                "companyId": company_id,
+                "externalId": record["externalId"],
+                "firstSeenAt": utc_now(),
+            }
+            mappings.append(mapping)
+        mapping.update(
+            assetId=asset_id,
+            externalName=record.get("name", ""),
+            externalVersion=record.get("providerVersion", ""),
+            active=True,
+            lastSeenAt=utc_now(),
+            lastSyncedAt=utc_now(),
+        )
+        payload_hash = hashlib.sha256(
+            json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        observations = self.state.setdefault("providerCiObservations", [])
+        if not any(
+            item.get("mappingId") == mapping["id"] and item.get("payloadHash") == payload_hash
+            for item in observations
+        ):
+            observations.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "mappingId": mapping["id"],
+                    "assetId": asset_id,
+                    "payloadHash": payload_hash,
+                    "fields": deepcopy(record),
+                    "observedAt": utc_now(),
+                }
+            )
+        self._audit(
+            company_id,
+            actor_id,
+            "external_ci_mapping",
+            mapping["id"],
+            (
+                "remapped"
+                if before and before.get("assetId") != asset_id
+                else ("source_observed" if before else "mapped")
+            ),
+            before,
+            mapping,
+        )
+        self.save_state(self.state)
+        return deepcopy(mapping)
 
     def list_sync_runs(self) -> list[dict]:
         return deepcopy(self.state.get("syncRuns", []))
@@ -3115,6 +4318,10 @@ class StateRepository:
         state.pop("notificationEvents", None)
         state.pop("passwordResets", None)
         state.pop("changeApprovalRequests", None)
+        state.pop("providerCompanyObservations", None)
+        for integration in state.get("integrations", []):
+            integration.pop("credentialsEncrypted", None)
+            integration.pop("credentialsNonce", None)
         return state
 
     def import_state(self, state: dict, actor_id: str | None = None) -> dict[str, int]:
@@ -3123,6 +4330,7 @@ class StateRepository:
         self.state.setdefault("auditEvents", [])
         self.state.setdefault("contacts", [])
         self.state.setdefault("contactResponsibilities", [])
+        self.state.setdefault("integrationObjectSuppressions", [])
         self.state.setdefault("emailConnection", deepcopy(DEFAULT_EMAIL_CONNECTION))
         self.state.setdefault("emailOutbox", [])
         self.state.setdefault(
@@ -3157,6 +4365,8 @@ class StateRepository:
         self.state.setdefault("notificationEvents", [])
         self.state.setdefault("changeApprovalRequests", [])
         self.state.setdefault("passwordResets", [])
+        self.state.setdefault("providerCompanyObservations", [])
+        self.state.setdefault("providerCompanyMappings", [])
         self.state["apiTokens"] = []
         self.save_state(self.state)
         return {
@@ -6160,7 +7370,10 @@ class PostgresCmdbRepository(StateRepository):
             cursor.execute(
                 """
                 SELECT ic.id, ic.slug, c.slug, ic.provider, ic.name, ic.configuration,
-                       ic.enabled, latest.status, latest.finished_at
+                       ic.enabled, latest.status, latest.finished_at,
+                       ic.connection_status, ic.last_test_at, ic.last_error, ic.revision,
+                       (ic.credentials_encrypted IS NOT NULL), ic.lifecycle_status,
+                       ic.lifecycle_reason, ic.lifecycle_changed_at, ic.lifecycle_changed_by
                 FROM integration_connections ic
                 LEFT JOIN companies c ON c.id = ic.company_id
                 LEFT JOIN LATERAL (
@@ -6182,6 +7395,11 @@ class PostgresCmdbRepository(StateRepository):
                 "queued": "Queued",
                 "running": "Running",
             }
+            lifecycle_labels = {
+                "paused": "Paused",
+                "disabled": "Disabled",
+                "removed": "Removed",
+            }
             for (
                 _item_id,
                 slug,
@@ -6192,6 +7410,15 @@ class PostgresCmdbRepository(StateRepository):
                 enabled,
                 latest_status,
                 finished_at,
+                connection_status,
+                last_test_at,
+                last_error,
+                revision,
+                has_credentials,
+                lifecycle_status,
+                lifecycle_reason,
+                lifecycle_changed_at,
+                lifecycle_changed_by,
             ) in cursor.fetchall():
                 configuration = configuration or {}
                 records.append(
@@ -6202,14 +7429,1983 @@ class PostgresCmdbRepository(StateRepository):
                         "enabled": bool(enabled),
                         "mode": configuration.get("mode", "configured_by_environment"),
                         "lastSync": self._timestamp(finished_at) or None,
-                        "status": status_labels.get(
+                        "status": lifecycle_labels.get(lifecycle_status)
+                        or status_labels.get(
                             latest_status, "Ready" if enabled else "Not configured"
                         ),
                         "scope": configuration.get("scope", "customer" if company_slug else "msp"),
                         "companyId": company_slug,
+                        "connectionStatus": connection_status,
+                        "lastTestAt": self._timestamp(last_test_at) or None,
+                        "lastError": last_error or "",
+                        "revision": revision,
+                        "hasCredentials": bool(has_credentials),
+                        "lifecycleStatus": lifecycle_status,
+                        "lifecycleReason": lifecycle_reason or "",
+                        "lifecycleChangedAt": self._timestamp(lifecycle_changed_at) or None,
+                        "lifecycleChangedBy": (
+                            str(lifecycle_changed_by) if lifecycle_changed_by else None
+                        ),
                     }
                 )
             return records
+
+    def get_integration_connection(self, kind: str) -> dict | None:
+        """Load one root integration including encrypted server-side material."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT ic.id, ic.slug, ic.provider, ic.name, ic.configuration, ic.enabled,
+                       ic.credentials_encrypted, ic.credentials_nonce,
+                       ic.connection_status, ic.last_test_at, ic.last_error, ic.revision,
+                       ic.created_at, ic.updated_at, ic.lifecycle_status,
+                       ic.lifecycle_reason, ic.lifecycle_changed_at, ic.lifecycle_changed_by
+                FROM integration_connections ic
+                WHERE ic.provider = %s AND ic.company_id IS NULL
+                ORDER BY ic.created_at LIMIT 1
+                """,
+                (PROVIDER_TO_DB.get(kind, kind),),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "uuid": str(row[0]),
+            "id": row[1],
+            "type": PROVIDER_FROM_DB.get(row[2], row[2]),
+            "name": row[3],
+            "configuration": row[4] or {},
+            "enabled": bool(row[5]),
+            "credentialsEncrypted": row[6] or "",
+            "credentialsNonce": row[7] or "",
+            "connectionStatus": row[8],
+            "lastTestAt": self._timestamp(row[9]) or None,
+            "lastError": row[10] or "",
+            "revision": int(row[11]),
+            "createdAt": self._timestamp(row[12]),
+            "updatedAt": self._timestamp(row[13]),
+            "lifecycleStatus": row[14],
+            "lifecycleReason": row[15] or "",
+            "lifecycleChangedAt": self._timestamp(row[16]) or None,
+            "lifecycleChangedBy": str(row[17]) if row[17] else None,
+        }
+
+    def update_integration_connection(
+        self, kind: str, changes: dict, actor_id: str | None = None
+    ) -> dict:
+        """Update encrypted root connection settings with optimistic concurrency."""
+
+        before = self.get_integration_connection(kind)
+        if not before:
+            raise ValueError("Integration connection not found")
+        expected_revision = changes.get("expectedRevision")
+        if expected_revision is not None and int(expected_revision) != int(before["revision"]):
+            raise ValueError("Integration settings changed; reload before saving")
+        stored_configuration = {
+            **(before.get("configuration") or {}),
+            **deepcopy(changes.get("configuration") or {}),
+            "mode": "configured_in_application",
+            "scope": "msp",
+        }
+        lifecycle_status = changes.get("lifecycleStatus", before.get("lifecycleStatus", "active"))
+        lifecycle_changed = lifecycle_status != before.get("lifecycleStatus", "active")
+        enabled = bool(changes.get("enabled", before.get("enabled"))) and (
+            lifecycle_status == "active"
+        )
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_connections SET
+                    configuration = %s::jsonb,
+                    credentials_encrypted = %s,
+                    credentials_nonce = %s,
+                    credential_reference = 'encrypted://integration/connectwise',
+                    enabled = %s,
+                    lifecycle_status = %s,
+                    lifecycle_reason = CASE WHEN %s THEN %s ELSE lifecycle_reason END,
+                    lifecycle_changed_at = CASE WHEN %s THEN now() ELSE lifecycle_changed_at END,
+                    lifecycle_changed_by = CASE WHEN %s THEN %s::uuid
+                        ELSE lifecycle_changed_by END,
+                    connection_status = %s,
+                    last_error = %s,
+                    revision = revision + 1,
+                    updated_at = now()
+                WHERE id = %s::uuid AND revision = %s
+                """,
+                (
+                    json.dumps(stored_configuration),
+                    changes.get("credentialsEncrypted")
+                    or before.get("credentialsEncrypted")
+                    or None,
+                    changes.get("credentialsNonce") or before.get("credentialsNonce") or None,
+                    enabled,
+                    lifecycle_status,
+                    lifecycle_changed,
+                    changes.get("lifecycleReason") or "",
+                    lifecycle_changed,
+                    lifecycle_changed,
+                    actor_id,
+                    changes.get("connectionStatus", "configured"),
+                    changes.get("lastError") or None,
+                    before["uuid"],
+                    before["revision"],
+                ),
+            )
+            if not cursor.rowcount:
+                raise ValueError("Integration settings changed; reload before saving")
+            after = {
+                **before,
+                "configuration": stored_configuration,
+                "credentialsEncrypted": changes.get("credentialsEncrypted")
+                or before.get("credentialsEncrypted"),
+                "credentialsNonce": changes.get("credentialsNonce")
+                or before.get("credentialsNonce"),
+                "enabled": enabled,
+                "lifecycleStatus": lifecycle_status,
+                "lifecycleReason": (
+                    changes.get("lifecycleReason") or ""
+                    if lifecycle_changed
+                    else before.get("lifecycleReason", "")
+                ),
+                "connectionStatus": changes.get("connectionStatus", "configured"),
+                "lastError": changes.get("lastError") or "",
+                "revision": int(before["revision"]) + 1,
+            }
+            self._insert_audit(
+                cursor,
+                None,
+                actor_id,
+                "integration_connection",
+                before["uuid"],
+                "configuration_updated",
+                integration_connection_audit_value(before),
+                integration_connection_audit_value(after),
+            )
+        return self.get_integration_connection(kind) or after
+
+    def integration_lifecycle_impact(self, kind: str) -> dict:
+        """Return exact retained-data counts for an integration lifecycle decision."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        connection_record = self.get_integration_connection(kind)
+        if not connection_record:
+            raise ValueError("Integration connection not found")
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    (SELECT count(*) FROM provider_company_observations observation
+                     WHERE observation.integration_connection_id = integration.id),
+                    (SELECT count(*) FROM external_object_mappings mapping
+                     WHERE mapping.integration_connection_id = integration.id
+                       AND mapping.external_object_type = 'company'
+                       AND mapping.active = true),
+                    (SELECT count(*) FROM integration_ci_policies policy
+                     WHERE policy.integration_connection_id = integration.id),
+                    (SELECT count(*) FROM integration_ci_policies policy
+                     WHERE policy.integration_connection_id = integration.id
+                       AND policy.enabled = true),
+                    (SELECT count(*) FROM integration_ci_review_items item
+                     JOIN integration_ci_policies policy ON policy.id = item.policy_id
+                     WHERE policy.integration_connection_id = integration.id
+                       AND item.state = 'pending'),
+                    (SELECT count(*) FROM external_object_mappings mapping
+                     WHERE mapping.integration_connection_id = integration.id
+                       AND mapping.external_object_type = 'configuration'
+                       AND mapping.active = true),
+                    (SELECT count(DISTINCT mapping.canonical_entity_id)
+                     FROM external_object_mappings mapping
+                     WHERE mapping.integration_connection_id = integration.id
+                       AND mapping.external_object_type = 'configuration'
+                       AND mapping.canonical_entity_type = 'configuration_item'
+                       AND mapping.active = true),
+                    (SELECT count(*) FROM sync_runs run
+                     WHERE run.integration_connection_id = integration.id)
+                FROM integration_connections integration
+                WHERE integration.provider = %s AND integration.company_id IS NULL
+                ORDER BY integration.created_at
+                LIMIT 1
+                """,
+                (provider,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            raise ValueError("Integration connection not found")
+        return {
+            "provider": kind,
+            "lifecycleStatus": connection_record.get("lifecycleStatus", "active"),
+            "companyObservations": int(row[0]),
+            "customerMappings": int(row[1]),
+            "ciPolicies": int(row[2]),
+            "enabledPolicies": int(row[3]),
+            "pendingReviews": int(row[4]),
+            "ciMappings": int(row[5]),
+            "importedCis": int(row[6]),
+            "syncRuns": int(row[7]),
+        }
+
+    def change_integration_lifecycle(
+        self,
+        kind: str,
+        lifecycle_status: str,
+        reason: str,
+        actor_id: str,
+        expected_revision: int | None = None,
+        *,
+        remove_configuration: bool = False,
+    ) -> dict:
+        """Apply an audited lifecycle transition and optionally destroy stored secrets."""
+
+        before = self.get_integration_connection(kind)
+        if not before:
+            raise ValueError("Integration connection not found")
+        if expected_revision is not None and int(expected_revision) != int(before["revision"]):
+            raise ValueError("Integration settings changed; reload before continuing")
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_connections
+                SET lifecycle_status = %s,
+                    lifecycle_reason = %s,
+                    lifecycle_changed_at = now(),
+                    lifecycle_changed_by = %s::uuid,
+                    enabled = %s,
+                    configuration = CASE WHEN %s
+                        THEN jsonb_build_object('scope', 'msp', 'mode', 'removed')
+                        ELSE configuration END,
+                    credentials_encrypted = CASE WHEN %s THEN NULL
+                        ELSE credentials_encrypted END,
+                    credentials_nonce = CASE WHEN %s THEN NULL ELSE credentials_nonce END,
+                    credential_reference = CASE WHEN %s
+                        THEN 'removed://integration/' || slug ELSE credential_reference END,
+                    connection_status = CASE WHEN %s THEN 'not_configured'
+                        ELSE connection_status END,
+                    last_error = CASE WHEN %s THEN NULL ELSE last_error END,
+                    revision = revision + 1,
+                    updated_at = now()
+                WHERE id = %s::uuid AND revision = %s
+                """,
+                (
+                    lifecycle_status,
+                    reason[:1000],
+                    actor_id,
+                    lifecycle_status == "active",
+                    remove_configuration,
+                    remove_configuration,
+                    remove_configuration,
+                    remove_configuration,
+                    remove_configuration,
+                    remove_configuration,
+                    before["uuid"],
+                    before["revision"],
+                ),
+            )
+            if not cursor.rowcount:
+                raise ValueError("Integration settings changed; reload before continuing")
+            after = {
+                **before,
+                "enabled": lifecycle_status == "active",
+                "lifecycleStatus": lifecycle_status,
+                "lifecycleReason": reason[:1000],
+                "lifecycleChangedAt": utc_now(),
+                "lifecycleChangedBy": actor_id,
+                "revision": int(before["revision"]) + 1,
+            }
+            if remove_configuration:
+                after.update(
+                    configuration={"scope": "msp", "mode": "removed"},
+                    credentialsEncrypted="",
+                    credentialsNonce="",
+                    connectionStatus="not_configured",
+                    lastError="",
+                )
+            self._insert_audit(
+                cursor,
+                None,
+                actor_id,
+                "integration_connection",
+                before["uuid"],
+                f"integration_{lifecycle_status}",
+                integration_connection_audit_value(before),
+                integration_connection_audit_value(after),
+                reason=reason,
+            )
+        return self.get_integration_connection(kind) or after
+
+    def mark_integration_test(
+        self, kind: str, status: str, message: str, actor_id: str | None = None
+    ) -> dict:
+        """Record a connection test and its audit outcome without revision churn."""
+
+        before = self.get_integration_connection(kind)
+        if not before:
+            raise ValueError("Integration connection not found")
+        tested_at = utc_now()
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_connections SET connection_status = %s,
+                    last_test_at = %s::timestamptz, last_error = %s, updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (
+                    status,
+                    tested_at,
+                    None if status == "verified" else message[:1000],
+                    before["uuid"],
+                ),
+            )
+            after = {
+                **before,
+                "connectionStatus": status,
+                "lastTestAt": tested_at,
+                "lastError": "" if status == "verified" else message[:1000],
+            }
+            self._insert_audit(
+                cursor,
+                None,
+                actor_id,
+                "integration_connection",
+                before["uuid"],
+                "connection_tested",
+                integration_connection_audit_value(before),
+                integration_connection_audit_value(after),
+                outcome="success" if status == "verified" else "failure",
+                reason=message,
+            )
+        return self.get_integration_connection(kind) or after
+
+    def record_company_discovery(
+        self,
+        kind: str,
+        run: dict,
+        companies: list[dict],
+        actor_id: str | None = None,
+    ) -> dict:
+        """Atomically store a company snapshot, sync run and audit evidence."""
+
+        connection_record = self.get_integration_connection(kind)
+        if not connection_record:
+            raise ValueError("Integration connection not found")
+        run_uuid = canonical_uuid("sync_run", run["id"])
+        status_to_db = {"success": "succeeded", "review_required": "review_required"}
+        database_status = status_to_db.get(str(run.get("status")), "failed")
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO sync_runs (
+                    id, integration_connection_id, status, started_at, finished_at,
+                    discovered_count, created_count, updated_count, review_count,
+                    error_summary, message, attributes
+                ) VALUES (
+                    %s::uuid, %s::uuid, %s, %s::timestamptz, %s::timestamptz,
+                    %s, 0, 0, %s, NULL, %s, %s::jsonb
+                )
+                """,
+                (
+                    run_uuid,
+                    connection_record["uuid"],
+                    database_status,
+                    run.get("startedAt"),
+                    run.get("finishedAt"),
+                    len(companies),
+                    int(run.get("review") or 0),
+                    run.get("message") or "",
+                    json.dumps({"operation": "company_discovery", "readOnly": True}),
+                ),
+            )
+            for company in companies:
+                payload_hash = hashlib.sha256(
+                    json.dumps(company, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                observation_id = canonical_uuid(
+                    "provider_company_observation",
+                    f"{connection_record['uuid']}:{company['externalId']}",
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO provider_company_observations (
+                        id, integration_connection_id, last_sync_run_id, external_id,
+                        identifier, display_name, status_name, type_name, site_name,
+                        deleted, provider_updated_at, observed_fields, payload_hash,
+                        active, first_seen_at, last_seen_at
+                    ) VALUES (
+                        %s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s::jsonb, %s, true, now(), now()
+                    )
+                    ON CONFLICT (integration_connection_id, external_id) DO UPDATE SET
+                        last_sync_run_id = EXCLUDED.last_sync_run_id,
+                        identifier = EXCLUDED.identifier,
+                        display_name = EXCLUDED.display_name,
+                        status_name = EXCLUDED.status_name,
+                        type_name = EXCLUDED.type_name,
+                        site_name = EXCLUDED.site_name,
+                        deleted = EXCLUDED.deleted,
+                        provider_updated_at = EXCLUDED.provider_updated_at,
+                        observed_fields = EXCLUDED.observed_fields,
+                        payload_hash = EXCLUDED.payload_hash,
+                        active = true,
+                        last_seen_at = now()
+                    """,
+                    (
+                        observation_id,
+                        connection_record["uuid"],
+                        run_uuid,
+                        company["externalId"],
+                        company.get("identifier") or None,
+                        company["name"],
+                        company.get("status") or None,
+                        company.get("type") or None,
+                        company.get("site") or None,
+                        bool(company.get("deleted")),
+                        company.get("lastUpdated") or None,
+                        json.dumps(company),
+                        payload_hash,
+                    ),
+                )
+            cursor.execute(
+                """
+                UPDATE provider_company_observations SET active = false
+                WHERE integration_connection_id = %s::uuid
+                  AND last_sync_run_id IS DISTINCT FROM %s::uuid
+                """,
+                (connection_record["uuid"], run_uuid),
+            )
+            cursor.execute(
+                """
+                UPDATE integration_connections SET enabled = true,
+                    connection_status = 'verified', last_test_at = now(),
+                    last_error = NULL, updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (connection_record["uuid"],),
+            )
+            stored = {**deepcopy(run), "id": run_uuid, "discovered": len(companies)}
+            self._insert_audit(
+                cursor,
+                None,
+                actor_id,
+                "integration_connection",
+                connection_record["uuid"],
+                "company_discovery_completed",
+                None,
+                stored,
+                metadata={"readOnly": True, "reviewCount": int(run.get("review") or 0)},
+            )
+        return next(item for item in self.list_sync_runs() if item["id"] == run_uuid)
+
+    def list_provider_companies(self, kind: str) -> list[dict]:
+        """Load sanitized company observations and active explicit mappings."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT observation.id, observation.external_id, observation.identifier,
+                       observation.display_name, observation.status_name,
+                       observation.type_name, observation.site_name, observation.deleted,
+                       observation.provider_updated_at, observation.active,
+                       observation.first_seen_at, observation.last_seen_at,
+                       mapping.id, company.slug, company.name
+                FROM provider_company_observations observation
+                JOIN integration_connections integration
+                  ON integration.id = observation.integration_connection_id
+                LEFT JOIN external_object_mappings mapping
+                  ON mapping.integration_connection_id = integration.id
+                 AND mapping.external_object_type = 'company'
+                 AND mapping.external_id = observation.external_id
+                 AND mapping.active = true
+                LEFT JOIN companies company
+                  ON company.id = mapping.canonical_entity_id
+                 AND mapping.canonical_entity_type = 'company'
+                WHERE integration.provider = %s AND integration.company_id IS NULL
+                ORDER BY observation.active DESC, observation.display_name, observation.external_id
+                """,
+                (PROVIDER_TO_DB.get(kind, kind),),
+            )
+            return [
+                {
+                    "id": str(row[0]),
+                    "provider": kind,
+                    "externalId": row[1],
+                    "identifier": row[2] or "",
+                    "name": row[3],
+                    "status": row[4] or "",
+                    "type": row[5] or "",
+                    "site": row[6] or "",
+                    "deleted": bool(row[7]),
+                    "lastUpdated": row[8] or "",
+                    "active": bool(row[9]),
+                    "firstSeenAt": self._timestamp(row[10]),
+                    "lastSeenAt": self._timestamp(row[11]),
+                    "mappingId": str(row[12]) if row[12] else None,
+                    "mappedCompanyId": row[13],
+                    "mappedCompanyName": row[14] or "",
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def map_provider_company(
+        self, kind: str, external_id: str, company_id: str, actor_id: str | None = None
+    ) -> dict:
+        """Persist an explicit provider-company mapping without name-based auto-merge."""
+
+        before = next(
+            (
+                item
+                for item in self.list_provider_companies(kind)
+                if item["externalId"] == external_id
+            ),
+            None,
+        )
+        if not before:
+            raise ValueError("Provider company not found")
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM companies WHERE slug = %s AND status <> 'inactive'",
+                (company_id,),
+            )
+            company_row = cursor.fetchone()
+            if not company_row:
+                raise ValueError("CMDB customer not found")
+            cursor.execute(
+                """
+                SELECT id FROM integration_connections
+                WHERE provider = %s AND company_id IS NULL ORDER BY created_at LIMIT 1
+                """,
+                (PROVIDER_TO_DB.get(kind, kind),),
+            )
+            connection_uuid = str(cursor.fetchone()[0])
+            mapping_uuid = canonical_uuid(
+                "external_company_mapping", f"{connection_uuid}:{external_id}"
+            )
+            cursor.execute(
+                """
+                INSERT INTO external_object_mappings (
+                    id, integration_connection_id, external_object_type, external_id,
+                    canonical_entity_type, canonical_entity_id, external_name,
+                    active, first_seen_at, last_seen_at, last_synced_at
+                ) VALUES (
+                    %s::uuid, %s::uuid, 'company', %s, 'company', %s::uuid, %s,
+                    true, now(), now(), now()
+                )
+                ON CONFLICT (integration_connection_id, external_object_type, external_id)
+                DO UPDATE SET canonical_entity_type = 'company',
+                    canonical_entity_id = EXCLUDED.canonical_entity_id,
+                    external_name = EXCLUDED.external_name,
+                    active = true, last_seen_at = now(), last_synced_at = now()
+                """,
+                (mapping_uuid, connection_uuid, external_id, str(company_row[0]), before["name"]),
+            )
+            after = {
+                **before,
+                "mappingId": mapping_uuid,
+                "mappedCompanyId": company_id,
+            }
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "external_company_mapping",
+                mapping_uuid,
+                "mapped",
+                before if before.get("mappingId") else None,
+                after,
+            )
+        return next(
+            item for item in self.list_provider_companies(kind) if item["externalId"] == external_id
+        )
+
+    def unmap_provider_company(
+        self, kind: str, external_id: str, actor_id: str | None = None
+    ) -> bool:
+        """Deactivate an explicit mapping while retaining its audit history."""
+
+        before = next(
+            (
+                item
+                for item in self.list_provider_companies(kind)
+                if item["externalId"] == external_id and item.get("mappingId")
+            ),
+            None,
+        )
+        if not before:
+            return False
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE external_object_mappings SET active = false, last_synced_at = now() WHERE id = %s::uuid AND active = true",
+                (before["mappingId"],),
+            )
+            if not cursor.rowcount:
+                return False
+            after = {**before, "mappingId": None, "mappedCompanyId": None, "mappedCompanyName": ""}
+            self._insert_audit(
+                cursor,
+                before.get("mappedCompanyId"),
+                actor_id,
+                "external_company_mapping",
+                before["mappingId"],
+                "unmapped",
+                before,
+                after,
+            )
+        return True
+
+    def list_provider_ci_mappings(self, kind: str, company_id: str) -> list[dict]:
+        """Return active provider mappings joined to their canonical customer."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT mapping.id, mapping.external_id, mapping.external_name,
+                       mapping.external_version, mapping.canonical_entity_id,
+                       mapping.first_seen_at, mapping.last_seen_at, mapping.last_synced_at
+                FROM external_object_mappings mapping
+                JOIN integration_connections integration
+                  ON integration.id = mapping.integration_connection_id
+                JOIN configuration_items ci
+                  ON ci.id = mapping.canonical_entity_id
+                 AND mapping.canonical_entity_type = 'configuration_item'
+                JOIN companies company ON company.id = ci.company_id
+                WHERE integration.provider = %s
+                  AND integration.company_id IS NULL
+                  AND mapping.external_object_type = 'configuration'
+                  AND mapping.active = true
+                  AND company.slug = %s
+                ORDER BY mapping.external_name, mapping.external_id
+                """,
+                (PROVIDER_TO_DB.get(kind, kind), company_id),
+            )
+            return [
+                {
+                    "id": str(row[0]),
+                    "provider": kind,
+                    "companyId": company_id,
+                    "externalId": row[1],
+                    "externalName": row[2] or "",
+                    "externalVersion": row[3] or "",
+                    "assetId": str(row[4]),
+                    "firstSeenAt": self._timestamp(row[5]),
+                    "lastSeenAt": self._timestamp(row[6]),
+                    "lastSyncedAt": self._timestamp(row[7]) or None,
+                    "active": True,
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def get_ci_sync_policy(self, kind: str, company_id: str, provider_parent_id: str) -> dict:
+        """Return one provider/customer CI policy from canonical PostgreSQL."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT policy.id, policy.filter_policy, policy.sync_mode,
+                       policy.interval_minutes, policy.enabled, policy.revision,
+                       policy.updated_at, policy.next_run_at, policy.last_run_at,
+                       policy.last_success_at, policy.last_error,
+                       policy.consecutive_failures
+                FROM integration_ci_policies policy
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = policy.company_id
+                WHERE integration.provider = %s
+                  AND integration.company_id IS NULL
+                  AND company.slug = %s
+                  AND policy.external_parent_id = %s
+                  AND policy.external_object_type = 'configuration'
+                """,
+                (PROVIDER_TO_DB.get(kind, kind), company_id, provider_parent_id),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return {
+                "id": "",
+                "provider": kind,
+                "companyId": company_id,
+                "providerParentId": provider_parent_id,
+                **normalize_ci_policy(None),
+                "revision": 0,
+                "updatedAt": None,
+                "nextRunAt": None,
+                "lastRunAt": None,
+                "lastSuccessAt": None,
+                "lastError": "",
+                "consecutiveFailures": 0,
+            }
+        normalized = normalize_ci_policy(
+            {
+                **(row[1] or {}),
+                "syncMode": row[2],
+                "intervalMinutes": row[3],
+                "enabled": row[4],
+            }
+        )
+        return {
+            "id": str(row[0]),
+            "provider": kind,
+            "companyId": company_id,
+            "providerParentId": provider_parent_id,
+            **normalized,
+            "revision": int(row[5]),
+            "updatedAt": self._timestamp(row[6]),
+            "nextRunAt": self._timestamp(row[7]) or None,
+            "lastRunAt": self._timestamp(row[8]) or None,
+            "lastSuccessAt": self._timestamp(row[9]) or None,
+            "lastError": row[10] or "",
+            "consecutiveFailures": int(row[11] or 0),
+        }
+
+    def update_ci_sync_policy(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        policy: dict,
+        expected_revision: int | None = None,
+        actor_id: str | None = None,
+    ) -> dict:
+        """Persist an audited CI filter/schedule policy with optimistic concurrency."""
+
+        before = self.get_ci_sync_policy(kind, company_id, provider_parent_id)
+        current_revision = int(before.get("revision") or 0)
+        if expected_revision is not None and expected_revision != current_revision:
+            raise ValueError("CI policy changed; reload before saving")
+        normalized = normalize_ci_policy(policy)
+        filter_policy = {
+            key: normalized[key]
+            for key in (
+                "typeMode",
+                "includedTypeIds",
+                "typeMappings",
+                "blockUnmappedTypes",
+                "statusMode",
+                "includedStatusIds",
+                "excludedExternalIds",
+            )
+        }
+        policy_uuid = canonical_uuid(
+            "integration_ci_policy",
+            f"{kind}:{company_id}:{provider_parent_id}:configuration",
+        )
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM integration_connections WHERE provider = %s AND company_id IS NULL ORDER BY created_at LIMIT 1",
+                (PROVIDER_TO_DB.get(kind, kind),),
+            )
+            connection_row = cursor.fetchone()
+            cursor.execute("SELECT id FROM companies WHERE slug = %s", (company_id,))
+            company_row = cursor.fetchone()
+            if not connection_row or not company_row:
+                raise ValueError("Integration connection or customer not found")
+            cursor.execute(
+                """
+                INSERT INTO integration_ci_policies (
+                    id, integration_connection_id, company_id, external_parent_id,
+                    external_object_type, filter_policy, sync_mode,
+                    interval_minutes, enabled, revision, updated_at, next_run_at,
+                    lease_owner, lease_until
+                ) VALUES (
+                    %s::uuid, %s::uuid, %s::uuid, %s, 'configuration', %s::jsonb,
+                    %s, %s, %s, 1, now(), CASE WHEN %s THEN now() ELSE NULL END,
+                    NULL, NULL
+                )
+                ON CONFLICT (
+                    integration_connection_id, company_id, external_parent_id, external_object_type
+                ) DO UPDATE SET filter_policy = EXCLUDED.filter_policy,
+                    sync_mode = EXCLUDED.sync_mode,
+                    interval_minutes = EXCLUDED.interval_minutes,
+                    enabled = EXCLUDED.enabled,
+                    revision = integration_ci_policies.revision + 1,
+                    updated_at = now(),
+                    next_run_at = CASE WHEN EXCLUDED.enabled
+                                           AND EXCLUDED.sync_mode = 'continuous_preview'
+                                       THEN now() ELSE NULL END,
+                    lease_owner = NULL,
+                    lease_until = NULL
+                RETURNING id
+                """,
+                (
+                    policy_uuid,
+                    connection_row[0],
+                    company_row[0],
+                    provider_parent_id,
+                    json.dumps(filter_policy),
+                    normalized["syncMode"],
+                    normalized["intervalMinutes"],
+                    normalized["enabled"],
+                    normalized["enabled"] and normalized["syncMode"] == "continuous_preview",
+                ),
+            )
+            stored_id = str(cursor.fetchone()[0])
+            after = {
+                "id": stored_id,
+                "provider": kind,
+                "companyId": company_id,
+                "providerParentId": provider_parent_id,
+                **normalized,
+                "revision": current_revision + 1,
+            }
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "integration_ci_policy",
+                stored_id,
+                "updated" if current_revision else "created",
+                before if current_revision else None,
+                after,
+                metadata={"provider": kind, "providerParentId": provider_parent_id},
+            )
+        return self.get_ci_sync_policy(kind, company_id, provider_parent_id)
+
+    def list_ci_sync_policies(self, kind: str | None = None) -> list[dict]:
+        """Return canonical CI policies and worker scheduling health."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind) if kind else None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT policy.id, integration.provider, company.slug, company.name,
+                       policy.external_parent_id, policy.filter_policy, policy.sync_mode,
+                       policy.interval_minutes, policy.enabled, policy.revision,
+                       policy.updated_at, policy.next_run_at, policy.last_run_at,
+                       policy.last_success_at, policy.last_error,
+                       policy.consecutive_failures, policy.lease_owner, policy.lease_until
+                FROM integration_ci_policies policy
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = policy.company_id
+                WHERE (%s::text IS NULL OR integration.provider = %s)
+                ORDER BY company.name, policy.external_parent_id
+                """,
+                (provider, provider),
+            )
+            rows = cursor.fetchall()
+        policies = []
+        for row in rows:
+            normalized = normalize_ci_policy(
+                {
+                    **(row[5] or {}),
+                    "syncMode": row[6],
+                    "intervalMinutes": row[7],
+                    "enabled": row[8],
+                }
+            )
+            policies.append(
+                {
+                    "id": str(row[0]),
+                    "provider": PROVIDER_FROM_DB.get(row[1], row[1]),
+                    "companyId": row[2],
+                    "companyName": row[3],
+                    "providerParentId": row[4],
+                    **normalized,
+                    "revision": int(row[9]),
+                    "updatedAt": self._timestamp(row[10]),
+                    "nextRunAt": self._timestamp(row[11]) or None,
+                    "lastRunAt": self._timestamp(row[12]) or None,
+                    "lastSuccessAt": self._timestamp(row[13]) or None,
+                    "lastError": row[14] or "",
+                    "consecutiveFailures": int(row[15] or 0),
+                    "leaseOwner": row[16] or None,
+                    "leaseUntil": self._timestamp(row[17]) or None,
+                }
+            )
+        return policies
+
+    def claim_due_ci_sync_policy(
+        self, kind: str, worker_id: str, lease_seconds: int = 300
+    ) -> dict | None:
+        """Atomically lease one due policy so multiple replicas cannot duplicate work."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH due AS (
+                    SELECT policy.id, integration.provider, company.slug AS company_slug,
+                           company.name AS company_name
+                    FROM integration_ci_policies policy
+                    JOIN integration_connections integration
+                      ON integration.id = policy.integration_connection_id
+                    JOIN companies company ON company.id = policy.company_id
+                    WHERE integration.provider = %s
+                      AND integration.enabled = true
+                      AND integration.lifecycle_status = 'active'
+                      AND policy.enabled = true
+                      AND policy.sync_mode = 'continuous_preview'
+                      AND (policy.next_run_at IS NULL OR policy.next_run_at <= now())
+                      AND (policy.lease_until IS NULL OR policy.lease_until < now())
+                    ORDER BY policy.next_run_at NULLS FIRST, policy.updated_at
+                    FOR UPDATE OF policy SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE integration_ci_policies policy
+                SET lease_owner = %s,
+                    lease_until = now() + (%s * interval '1 second')
+                FROM due
+                WHERE policy.id = due.id
+                RETURNING policy.id, due.provider, due.company_slug, due.company_name,
+                          policy.external_parent_id, policy.filter_policy, policy.sync_mode,
+                          policy.interval_minutes, policy.enabled, policy.revision,
+                          policy.updated_at, policy.next_run_at, policy.last_run_at,
+                          policy.last_success_at, policy.last_error,
+                          policy.consecutive_failures, policy.lease_owner, policy.lease_until
+                """,
+                (provider, worker_id[:120], max(30, min(lease_seconds, 3600))),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        normalized = normalize_ci_policy(
+            {
+                **(row[5] or {}),
+                "syncMode": row[6],
+                "intervalMinutes": row[7],
+                "enabled": row[8],
+            }
+        )
+        return {
+            "id": str(row[0]),
+            "provider": PROVIDER_FROM_DB.get(row[1], row[1]),
+            "companyId": row[2],
+            "companyName": row[3],
+            "providerParentId": row[4],
+            **normalized,
+            "revision": int(row[9]),
+            "updatedAt": self._timestamp(row[10]),
+            "nextRunAt": self._timestamp(row[11]) or None,
+            "lastRunAt": self._timestamp(row[12]) or None,
+            "lastSuccessAt": self._timestamp(row[13]) or None,
+            "lastError": row[14] or "",
+            "consecutiveFailures": int(row[15] or 0),
+            "leaseOwner": row[16] or None,
+            "leaseUntil": self._timestamp(row[17]) or None,
+        }
+
+    def complete_ci_sync_policy_run(
+        self, policy_id: str, *, success: bool, error: str = ""
+    ) -> dict | None:
+        """Release a policy lease and schedule its next execution."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_ci_policies
+                SET last_run_at = now(),
+                    last_success_at = CASE WHEN %s THEN now() ELSE last_success_at END,
+                    last_error = CASE WHEN %s THEN NULL ELSE %s END,
+                    consecutive_failures = CASE WHEN %s THEN 0 ELSE consecutive_failures + 1 END,
+                    next_run_at = CASE WHEN enabled AND sync_mode = 'continuous_preview'
+                        THEN now() + (interval_minutes * interval '1 minute') ELSE NULL END,
+                    lease_owner = NULL,
+                    lease_until = NULL
+                WHERE id = %s::uuid
+                RETURNING id
+                """,
+                (success, success, str(error)[:1000], success, policy_id),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return next(
+            (item for item in self.list_ci_sync_policies() if item["id"] == policy_id),
+            None,
+        )
+
+    def replace_ci_review_items(
+        self,
+        policy_id: str,
+        company_id: str,
+        run_id: str,
+        items: list[dict],
+        actor_id: str | None = None,
+    ) -> dict[str, int]:
+        """Upsert current review observations and resolve items absent from the new snapshot."""
+
+        reviewable = [
+            deepcopy(item)
+            for item in items
+            if item.get("action") in {"create", "update", "link", "conflict"}
+        ]
+        seen = [str(item["externalId"]) for item in reviewable]
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM companies WHERE slug = %s",
+                (company_id,),
+            )
+            company_row = cursor.fetchone()
+            if not company_row:
+                raise ValueError("Customer not found")
+            company_uuid = str(company_row[0])
+            cursor.execute(
+                """
+                SELECT external_id FROM integration_ci_review_items
+                WHERE policy_id = %s::uuid
+                """,
+                (policy_id,),
+            )
+            existing = {str(row[0]) for row in cursor.fetchall()}
+            cursor.execute(
+                """
+                UPDATE integration_ci_review_items
+                SET state = 'resolved', reviewed_at = now()
+                WHERE policy_id = %s::uuid
+                  AND state = 'pending'
+                  AND NOT (external_id = ANY(%s::text[]))
+                """,
+                (policy_id, seen),
+            )
+            resolved = cursor.rowcount
+            for item in reviewable:
+                record = deepcopy(item.get("record") or {})
+                content = {
+                    "action": item.get("action"),
+                    "assetId": item.get("assetId"),
+                    "reason": item.get("reason", ""),
+                    "changes": item.get("changes") or {},
+                    "blockedFields": item.get("blockedFields") or [],
+                    "fieldDecisions": item.get("fieldDecisions") or [],
+                    "record": record,
+                }
+                content_hash = hashlib.sha256(
+                    json.dumps(content, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                item_uuid = canonical_uuid(
+                    "integration_ci_review_item", f"{policy_id}:{item['externalId']}"
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO integration_ci_review_items AS current (
+                        id, policy_id, company_id, last_sync_run_id, external_id,
+                        external_name, decision, candidate_ci_id, reason,
+                        provider_record, evidence, content_hash, state,
+                        first_seen_at, last_seen_at
+                    ) VALUES (
+                        %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, %s, %s,
+                        %s::uuid, %s, %s::jsonb, %s::jsonb, %s, 'pending', now(), now()
+                    )
+                    ON CONFLICT (policy_id, external_id) DO UPDATE SET
+                        company_id = EXCLUDED.company_id,
+                        last_sync_run_id = EXCLUDED.last_sync_run_id,
+                        external_name = EXCLUDED.external_name,
+                        decision = EXCLUDED.decision,
+                        candidate_ci_id = EXCLUDED.candidate_ci_id,
+                        reason = EXCLUDED.reason,
+                        provider_record = EXCLUDED.provider_record,
+                        evidence = EXCLUDED.evidence,
+                        content_hash = EXCLUDED.content_hash,
+                        state = CASE
+                            WHEN current.content_hash <> EXCLUDED.content_hash
+                              OR current.state = 'resolved' THEN 'pending'
+                            ELSE current.state END,
+                        reviewed_by = CASE
+                            WHEN current.content_hash <> EXCLUDED.content_hash
+                              OR current.state = 'resolved' THEN NULL
+                            ELSE current.reviewed_by END,
+                        reviewed_at = CASE
+                            WHEN current.content_hash <> EXCLUDED.content_hash
+                              OR current.state = 'resolved' THEN NULL
+                            ELSE current.reviewed_at END,
+                        review_notes = CASE
+                            WHEN current.content_hash <> EXCLUDED.content_hash
+                              OR current.state = 'resolved' THEN NULL
+                            ELSE current.review_notes END,
+                        last_seen_at = now()
+                    """,
+                    (
+                        item_uuid,
+                        policy_id,
+                        company_uuid,
+                        run_id,
+                        str(item["externalId"]),
+                        item.get("name") or record.get("name") or str(item["externalId"]),
+                        item["action"],
+                        item.get("assetId"),
+                        item.get("reason") or "",
+                        json.dumps(record),
+                        json.dumps(
+                            {
+                                "assetName": item.get("assetName") or "",
+                                "changedFields": item.get("changedFields") or [],
+                                "blockedFields": item.get("blockedFields") or [],
+                                "fieldDecisions": item.get("fieldDecisions") or [],
+                                "changes": item.get("changes") or {},
+                            }
+                        ),
+                        content_hash,
+                    ),
+                )
+            summary = {
+                "pending": len(reviewable),
+                "created": sum(external_id not in existing for external_id in seen),
+                "updated": sum(external_id in existing for external_id in seen),
+                "resolved": resolved,
+            }
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "integration_ci_policy",
+                policy_id,
+                "review_queue_refreshed",
+                None,
+                summary,
+                metadata={"syncRunId": run_id},
+                actor_type="system" if actor_id is None else "user",
+                source_system="integration_worker" if actor_id is None else "web",
+            )
+        return summary
+
+    def list_ci_review_items(
+        self,
+        kind: str | None = None,
+        company_id: str | None = None,
+        state: str | None = "pending",
+        limit: int = 250,
+    ) -> list[dict]:
+        """Return sanitized current review observations for MSP operators."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind) if kind else None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT item.id, integration.provider, policy.id, company.slug, company.name,
+                       policy.external_parent_id, item.external_id, item.external_name,
+                       item.decision, item.candidate_ci_id, ci.display_name, item.reason,
+                       item.provider_record, item.evidence, item.state,
+                       item.first_seen_at, item.last_seen_at, item.reviewed_at,
+                       item.review_notes
+                FROM integration_ci_review_items item
+                JOIN integration_ci_policies policy ON policy.id = item.policy_id
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = item.company_id
+                LEFT JOIN configuration_items ci ON ci.id = item.candidate_ci_id
+                WHERE (%s::text IS NULL OR integration.provider = %s)
+                  AND (%s::text IS NULL OR company.slug = %s)
+                  AND (%s::text IS NULL OR item.state = %s)
+                ORDER BY item.last_seen_at DESC, item.external_name
+                LIMIT %s
+                """,
+                (
+                    provider,
+                    provider,
+                    company_id,
+                    company_id,
+                    state,
+                    state,
+                    max(1, min(limit, 1000)),
+                ),
+            )
+            rows = cursor.fetchall()
+        return [self._ci_review_from_row(row) for row in rows]
+
+    def _ci_review_from_row(self, row: tuple) -> dict:
+        """Normalize one PostgreSQL review-queue row for API consumers."""
+
+        record = row[12] or {}
+        evidence = row[13] or {}
+        return {
+            "id": str(row[0]),
+            "provider": PROVIDER_FROM_DB.get(row[1], row[1]),
+            "policyId": str(row[2]),
+            "companyId": row[3],
+            "companyName": row[4],
+            "providerParentId": row[5],
+            "externalId": row[6],
+            "externalName": row[7],
+            "action": row[8],
+            "assetId": str(row[9]) if row[9] else None,
+            "assetName": row[10] or evidence.get("assetName", ""),
+            "reason": row[11] or "",
+            "providerTypeName": record.get("providerTypeName") or record.get("type", ""),
+            "providerStatusName": record.get("providerStatusName") or record.get("status", ""),
+            "providerRecord": record,
+            "evidence": evidence,
+            "changedFields": evidence.get("changedFields", []),
+            "blockedFields": evidence.get("blockedFields", []),
+            "fieldDecisions": evidence.get("fieldDecisions", []),
+            "state": row[14],
+            "firstSeenAt": self._timestamp(row[15]),
+            "lastSeenAt": self._timestamp(row[16]),
+            "reviewedAt": self._timestamp(row[17]) or None,
+            "reviewNotes": row[18] or "",
+        }
+
+    def query_ci_review_items(
+        self,
+        *,
+        kind: str | None = None,
+        company_id: str | None = None,
+        company_ids: Iterable[str] | None = None,
+        state: str | None = "pending",
+        action: str | None = None,
+        search: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Return an exact, server-paged provider-neutral review workbench."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind) if kind else None
+        needle = search.strip()
+        restrict_companies = company_ids is not None
+        permitted_companies = sorted(set(company_ids or []))
+        filters = (
+            provider,
+            provider,
+            company_id,
+            company_id,
+            restrict_companies,
+            permitted_companies,
+            state,
+            state,
+            needle,
+            needle,
+        )
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT item.decision, count(*)
+                FROM integration_ci_review_items item
+                JOIN integration_ci_policies policy ON policy.id = item.policy_id
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = item.company_id
+                LEFT JOIN configuration_items ci ON ci.id = item.candidate_ci_id
+                WHERE (%s::text IS NULL OR integration.provider = %s)
+                  AND (%s::text IS NULL OR company.slug = %s)
+                  AND (%s = false OR company.slug = ANY(%s::text[]))
+                  AND (%s::text IS NULL OR item.state = %s)
+                  AND (%s = '' OR strpos(lower(concat_ws(' ', item.external_name,
+                      item.external_id, ci.display_name, item.reason)), lower(%s)) > 0)
+                GROUP BY item.decision
+                """,
+                filters,
+            )
+            summary = {decision: 0 for decision in ("create", "update", "link", "conflict")}
+            for decision, count in cursor.fetchall():
+                if decision in summary:
+                    summary[decision] = int(count)
+            cursor.execute(
+                """
+                SELECT item.id, integration.provider, policy.id, company.slug, company.name,
+                       policy.external_parent_id, item.external_id, item.external_name,
+                       item.decision, item.candidate_ci_id, ci.display_name, item.reason,
+                       item.provider_record, item.evidence, item.state,
+                       item.first_seen_at, item.last_seen_at, item.reviewed_at,
+                       item.review_notes, count(*) OVER()
+                FROM integration_ci_review_items item
+                JOIN integration_ci_policies policy ON policy.id = item.policy_id
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = item.company_id
+                LEFT JOIN configuration_items ci ON ci.id = item.candidate_ci_id
+                WHERE (%s::text IS NULL OR integration.provider = %s)
+                  AND (%s::text IS NULL OR company.slug = %s)
+                  AND (%s = false OR company.slug = ANY(%s::text[]))
+                  AND (%s::text IS NULL OR item.state = %s)
+                  AND (%s = '' OR strpos(lower(concat_ws(' ', item.external_name,
+                      item.external_id, ci.display_name, item.reason)), lower(%s)) > 0)
+                  AND (%s::text IS NULL OR item.decision = %s)
+                ORDER BY item.last_seen_at DESC, item.external_name
+                LIMIT %s OFFSET %s
+                """,
+                (
+                    *filters,
+                    action,
+                    action,
+                    max(1, min(limit, 250)),
+                    max(0, offset),
+                ),
+            )
+            rows = cursor.fetchall()
+        return {
+            "items": [self._ci_review_from_row(row) for row in rows],
+            "total": int(rows[0][19]) if rows else 0,
+            "summary": summary,
+        }
+
+    def get_ci_review_item(self, item_id: str) -> dict | None:
+        """Return one review item without depending on queue pagination."""
+
+        try:
+            parsed_id = str(uuid.UUID(item_id))
+        except (TypeError, ValueError):
+            return None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT item.id, integration.provider, policy.id, company.slug, company.name,
+                       policy.external_parent_id, item.external_id, item.external_name,
+                       item.decision, item.candidate_ci_id, ci.display_name, item.reason,
+                       item.provider_record, item.evidence, item.state,
+                       item.first_seen_at, item.last_seen_at, item.reviewed_at,
+                       item.review_notes
+                FROM integration_ci_review_items item
+                JOIN integration_ci_policies policy ON policy.id = item.policy_id
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = item.company_id
+                LEFT JOIN configuration_items ci ON ci.id = item.candidate_ci_id
+                WHERE item.id = %s::uuid
+                """,
+                (parsed_id,),
+            )
+            row = cursor.fetchone()
+        return self._ci_review_from_row(row) if row else None
+
+    def count_ci_review_items(
+        self,
+        kind: str | None = None,
+        company_id: str | None = None,
+        state: str | None = "pending",
+    ) -> int:
+        """Count current CI review observations without loading queue payloads."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind) if kind else None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT count(*)
+                FROM integration_ci_review_items item
+                JOIN integration_ci_policies policy ON policy.id = item.policy_id
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = item.company_id
+                WHERE (%s::text IS NULL OR integration.provider = %s)
+                  AND (%s::text IS NULL OR company.slug = %s)
+                  AND (%s::text IS NULL OR item.state = %s)
+                """,
+                (provider, provider, company_id, company_id, state, state),
+            )
+            row = cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    def dismiss_ci_review_item(self, item_id: str, notes: str, actor_id: str) -> dict | None:
+        """Dismiss one queue item; changed provider evidence reopens it later."""
+
+        before = self.get_ci_review_item(item_id)
+        if not before:
+            return None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_ci_review_items
+                SET state = 'dismissed', reviewed_by = %s::uuid,
+                    reviewed_at = now(), review_notes = %s
+                WHERE id = %s::uuid
+                """,
+                (actor_id, notes, item_id),
+            )
+            self._insert_audit(
+                cursor,
+                before["companyId"],
+                actor_id,
+                "integration_ci_review_item",
+                item_id,
+                "dismissed",
+                before,
+                {**before, "state": "dismissed", "reviewNotes": notes},
+                reason=notes,
+            )
+        return self.get_ci_review_item(item_id)
+
+    def ignore_ci_review_items(self, item_ids: list[str], notes: str, actor_id: str) -> list[dict]:
+        """Atomically suppress selected immutable provider IDs for one CI policy."""
+
+        items = [self.get_ci_review_item(item_id) for item_id in item_ids]
+        if any(item is None for item in items):
+            raise ValueError("One or more review items no longer exist")
+        current = [item for item in items if item is not None]
+        policy_ids = {item["policyId"] for item in current}
+        if len(policy_ids) != 1:
+            raise ValueError("Ignored configurations must belong to one customer policy")
+        policy_id = next(iter(policy_ids))
+        provider = current[0]["provider"]
+        company_id = current[0]["companyId"]
+        provider_parent_id = current[0]["providerParentId"]
+        before_policy = self.get_ci_sync_policy(provider, company_id, provider_parent_id)
+        stored: list[dict] = []
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT filter_policy, revision
+                FROM integration_ci_policies
+                WHERE id = %s::uuid
+                FOR UPDATE
+                """,
+                (policy_id,),
+            )
+            policy_row = cursor.fetchone()
+            if not policy_row:
+                raise ValueError("CI policy not found")
+            before_policy = {
+                **before_policy,
+                **normalize_ci_policy(policy_row[0] or {}),
+                "revision": int(policy_row[1]),
+            }
+            excluded_ids = set(before_policy["excludedExternalIds"])
+            excluded_ids.update(item["externalId"] for item in current)
+            filter_policy = {
+                key: before_policy[key]
+                for key in (
+                    "typeMode",
+                    "includedTypeIds",
+                    "typeMappings",
+                    "blockUnmappedTypes",
+                    "statusMode",
+                    "includedStatusIds",
+                )
+            }
+            filter_policy["excludedExternalIds"] = sorted(excluded_ids)
+            for item in current:
+                cursor.execute(
+                    """
+                    SELECT id, active, reason, ignored_at
+                    FROM integration_object_suppressions
+                    WHERE policy_id = %s::uuid
+                      AND external_object_type = 'configuration'
+                      AND external_id = %s
+                    """,
+                    (policy_id, item["externalId"]),
+                )
+                previous = cursor.fetchone()
+                suppression_id = (
+                    str(previous[0])
+                    if previous
+                    else canonical_uuid(
+                        "integration_object_suppression",
+                        f"{policy_id}:configuration:{item['externalId']}",
+                    )
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO integration_object_suppressions AS suppression (
+                        id, policy_id, company_id, external_object_type, external_id,
+                        external_name, provider_record, reason, active, ignored_by,
+                        ignored_at, restored_by, restored_at, restore_reason,
+                        created_at, updated_at
+                    ) VALUES (
+                        %s::uuid, %s::uuid,
+                        (SELECT id FROM companies WHERE slug = %s),
+                        'configuration', %s, %s, %s::jsonb, %s, true, %s::uuid,
+                        now(), NULL, NULL, NULL, now(), now()
+                    )
+                    ON CONFLICT (policy_id, external_object_type, external_id)
+                    DO UPDATE SET
+                        external_name = EXCLUDED.external_name,
+                        provider_record = EXCLUDED.provider_record,
+                        reason = EXCLUDED.reason,
+                        active = true,
+                        ignored_by = EXCLUDED.ignored_by,
+                        ignored_at = now(),
+                        restored_by = NULL,
+                        restored_at = NULL,
+                        restore_reason = NULL,
+                        updated_at = now()
+                    RETURNING id, ignored_at, updated_at
+                    """,
+                    (
+                        suppression_id,
+                        policy_id,
+                        company_id,
+                        item["externalId"],
+                        item["externalName"],
+                        json.dumps(item.get("providerRecord") or {}),
+                        notes,
+                        actor_id,
+                    ),
+                )
+                stored_row = cursor.fetchone()
+                stored_item = {
+                    "id": str(stored_row[0]),
+                    "policyId": policy_id,
+                    "companyId": company_id,
+                    "provider": provider,
+                    "providerParentId": provider_parent_id,
+                    "externalObjectType": "configuration",
+                    "externalId": item["externalId"],
+                    "externalName": item["externalName"],
+                    "providerRecord": item.get("providerRecord") or {},
+                    "reason": notes,
+                    "active": True,
+                    "ignoredBy": actor_id,
+                    "ignoredAt": self._timestamp(stored_row[1]),
+                    "restoredBy": None,
+                    "restoredAt": None,
+                    "restoreReason": "",
+                    "updatedAt": self._timestamp(stored_row[2]),
+                }
+                self._insert_audit(
+                    cursor,
+                    company_id,
+                    actor_id,
+                    "integration_object_suppression",
+                    stored_item["id"],
+                    "reignored" if previous else "ignored",
+                    (
+                        {
+                            "id": str(previous[0]),
+                            "active": bool(previous[1]),
+                            "reason": previous[2],
+                            "ignoredAt": self._timestamp(previous[3]),
+                        }
+                        if previous
+                        else None
+                    ),
+                    stored_item,
+                    reason=notes,
+                    metadata={
+                        "provider": provider,
+                        "policyId": policy_id,
+                        "externalId": item["externalId"],
+                    },
+                )
+                stored.append(stored_item)
+            cursor.execute(
+                """
+                UPDATE integration_ci_policies
+                SET filter_policy = %s::jsonb,
+                    revision = revision + 1,
+                    updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (json.dumps(filter_policy), policy_id),
+            )
+            cursor.execute(
+                """
+                UPDATE integration_ci_review_items
+                SET state = 'resolved', reviewed_by = %s::uuid,
+                    reviewed_at = now(), review_notes = %s
+                WHERE id = ANY(%s::uuid[])
+                """,
+                (actor_id, notes, item_ids),
+            )
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "integration_ci_policy",
+                policy_id,
+                "suppression_updated",
+                before_policy,
+                {
+                    **before_policy,
+                    "excludedExternalIds": sorted(excluded_ids),
+                    "revision": int(before_policy.get("revision") or 0) + 1,
+                },
+                reason=notes,
+                metadata={"ignoredExternalIds": sorted(excluded_ids)},
+            )
+        return stored
+
+    def _integration_object_suppression_from_row(self, row: tuple) -> dict:
+        """Normalize one provider-object suppression query row."""
+
+        return {
+            "id": str(row[0]),
+            "provider": PROVIDER_FROM_DB.get(row[1], row[1]),
+            "policyId": str(row[2]),
+            "companyId": row[3],
+            "companyName": row[4],
+            "providerParentId": row[5],
+            "externalObjectType": row[6],
+            "externalId": row[7],
+            "externalName": row[8],
+            "providerRecord": row[9] or {},
+            "reason": row[10],
+            "active": bool(row[11]),
+            "ignoredBy": str(row[12]) if row[12] else None,
+            "ignoredByName": row[13] or "",
+            "ignoredAt": self._timestamp(row[14]),
+            "restoredBy": str(row[15]) if row[15] else None,
+            "restoredByName": row[16] or "",
+            "restoredAt": self._timestamp(row[17]) or None,
+            "restoreReason": row[18] or "",
+            "createdAt": self._timestamp(row[19]),
+            "updatedAt": self._timestamp(row[20]),
+        }
+
+    def query_integration_object_suppressions(
+        self,
+        *,
+        kind: str | None = None,
+        company_id: str | None = None,
+        company_ids: Iterable[str] | None = None,
+        active: bool | None = True,
+        search: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Return exact, server-paged provider-object suppression history."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind) if kind else None
+        restrict_companies = company_ids is not None
+        permitted_companies = sorted(set(company_ids or []))
+        needle = search.strip()
+        filters = (
+            provider,
+            provider,
+            company_id,
+            company_id,
+            restrict_companies,
+            permitted_companies,
+            active,
+            active,
+            needle,
+            needle,
+        )
+        joins = """
+            FROM integration_object_suppressions suppression
+            JOIN integration_ci_policies policy ON policy.id = suppression.policy_id
+            JOIN integration_connections integration
+              ON integration.id = policy.integration_connection_id
+            JOIN companies company ON company.id = suppression.company_id
+            LEFT JOIN users ignored_user ON ignored_user.id = suppression.ignored_by
+            LEFT JOIN users restored_user ON restored_user.id = suppression.restored_by
+        """
+        where = """
+            WHERE (%s::text IS NULL OR integration.provider = %s)
+              AND (%s::text IS NULL OR company.slug = %s)
+              AND (%s = false OR company.slug = ANY(%s::text[]))
+              AND (%s::boolean IS NULL OR suppression.active = %s)
+              AND (%s = '' OR strpos(lower(concat_ws(' ', suppression.external_name,
+                  suppression.external_id, suppression.reason,
+                  suppression.restore_reason)), lower(%s)) > 0)
+        """
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT count(*) {joins} {where}", filters)  # nosec B608
+            count_row = cursor.fetchone()
+            cursor.execute(
+                f"""
+                SELECT suppression.id, integration.provider, policy.id, company.slug,
+                       company.name, policy.external_parent_id,
+                       suppression.external_object_type, suppression.external_id,
+                       suppression.external_name, suppression.provider_record,
+                       suppression.reason, suppression.active, suppression.ignored_by,
+                       ignored_user.email, suppression.ignored_at,
+                       suppression.restored_by, restored_user.email,
+                       suppression.restored_at, suppression.restore_reason,
+                       suppression.created_at, suppression.updated_at
+                {joins}
+                {where}
+                ORDER BY suppression.updated_at DESC, suppression.external_name
+                LIMIT %s OFFSET %s
+                """,  # nosec B608
+                (*filters, max(1, min(limit, 250)), max(0, offset)),
+            )
+            rows = cursor.fetchall()
+        return {
+            "items": [self._integration_object_suppression_from_row(row) for row in rows],
+            "total": int(count_row[0]) if count_row else 0,
+        }
+
+    def get_integration_object_suppression(self, suppression_id: str) -> dict | None:
+        """Return one exact provider-object suppression for authorization checks."""
+
+        try:
+            parsed_id = str(uuid.UUID(suppression_id))
+        except (TypeError, ValueError):
+            return None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT suppression.id, integration.provider, policy.id, company.slug,
+                       company.name, policy.external_parent_id,
+                       suppression.external_object_type, suppression.external_id,
+                       suppression.external_name, suppression.provider_record,
+                       suppression.reason, suppression.active, suppression.ignored_by,
+                       ignored_user.email, suppression.ignored_at,
+                       suppression.restored_by, restored_user.email,
+                       suppression.restored_at, suppression.restore_reason,
+                       suppression.created_at, suppression.updated_at
+                FROM integration_object_suppressions suppression
+                JOIN integration_ci_policies policy ON policy.id = suppression.policy_id
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = suppression.company_id
+                LEFT JOIN users ignored_user ON ignored_user.id = suppression.ignored_by
+                LEFT JOIN users restored_user ON restored_user.id = suppression.restored_by
+                WHERE suppression.id = %s::uuid
+                """,
+                (parsed_id,),
+            )
+            row = cursor.fetchone()
+        return self._integration_object_suppression_from_row(row) if row else None
+
+    def restore_integration_object_suppression(
+        self, suppression_id: str, notes: str, actor_id: str
+    ) -> dict | None:
+        """Deactivate one durable exclusion and schedule a fresh preview."""
+
+        try:
+            parsed_id = str(uuid.UUID(suppression_id))
+        except (TypeError, ValueError):
+            return None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT suppression.id, integration.provider, policy.id, company.slug,
+                       company.name, policy.external_parent_id,
+                       suppression.external_object_type, suppression.external_id,
+                       suppression.external_name, suppression.provider_record,
+                       suppression.reason, suppression.active, suppression.ignored_by,
+                       ignored_user.email, suppression.ignored_at,
+                       suppression.restored_by, restored_user.email,
+                       suppression.restored_at, suppression.restore_reason,
+                       suppression.created_at, suppression.updated_at,
+                       policy.filter_policy, policy.revision
+                FROM integration_object_suppressions suppression
+                JOIN integration_ci_policies policy ON policy.id = suppression.policy_id
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = suppression.company_id
+                LEFT JOIN users ignored_user ON ignored_user.id = suppression.ignored_by
+                LEFT JOIN users restored_user ON restored_user.id = suppression.restored_by
+                WHERE suppression.id = %s::uuid
+                FOR UPDATE OF suppression, policy
+                """,
+                (parsed_id,),
+            )
+            row = cursor.fetchone()
+            if not row or not row[11]:
+                return None
+            before = self._integration_object_suppression_from_row(row[:21])
+            filter_policy = row[21] or {}
+            filter_policy["excludedExternalIds"] = [
+                value
+                for value in normalize_ci_policy(filter_policy)["excludedExternalIds"]
+                if value != before["externalId"]
+            ]
+            cursor.execute(
+                """
+                UPDATE integration_object_suppressions
+                SET active = false, restored_by = %s::uuid, restored_at = now(),
+                    restore_reason = %s, updated_at = now()
+                WHERE id = %s::uuid
+                RETURNING restored_at, updated_at
+                """,
+                (actor_id, notes, parsed_id),
+            )
+            restored_at, updated_at = cursor.fetchone()
+            cursor.execute(
+                """
+                UPDATE integration_ci_policies
+                SET filter_policy = %s::jsonb,
+                    revision = revision + 1,
+                    updated_at = now(),
+                    next_run_at = CASE
+                        WHEN enabled AND sync_mode = 'continuous_preview' THEN now()
+                        ELSE next_run_at END
+                WHERE id = %s::uuid
+                """,
+                (json.dumps(filter_policy), before["policyId"]),
+            )
+            cursor.execute(
+                """
+                UPDATE integration_ci_review_items
+                SET state = 'pending', reviewed_by = NULL,
+                    reviewed_at = NULL, review_notes = NULL
+                WHERE policy_id = %s::uuid
+                  AND external_id = %s
+                """,
+                (before["policyId"], before["externalId"]),
+            )
+            after = {
+                **before,
+                "active": False,
+                "restoredBy": actor_id,
+                "restoredAt": self._timestamp(restored_at),
+                "restoreReason": notes,
+                "updatedAt": self._timestamp(updated_at),
+            }
+            self._insert_audit(
+                cursor,
+                before["companyId"],
+                actor_id,
+                "integration_object_suppression",
+                parsed_id,
+                "restored",
+                before,
+                after,
+                reason=notes,
+                metadata={
+                    "provider": before["provider"],
+                    "policyId": before["policyId"],
+                    "externalId": before["externalId"],
+                },
+            )
+            self._insert_audit(
+                cursor,
+                before["companyId"],
+                actor_id,
+                "integration_ci_policy",
+                before["policyId"],
+                "suppression_updated",
+                {"revision": int(row[22]), "excludedExternalIds": [before["externalId"]]},
+                {
+                    "revision": int(row[22]) + 1,
+                    "excludedExternalIds": filter_policy["excludedExternalIds"],
+                },
+                reason=notes,
+                metadata={"restoredExternalId": before["externalId"]},
+            )
+        return after
+
+    def resolve_ci_review_items(
+        self, policy_id: str, external_ids: list[str], actor_id: str | None = None
+    ) -> int:
+        """Resolve reviewed items after an explicit canonical import or link."""
+
+        if not external_ids:
+            return 0
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_ci_review_items
+                SET state = 'resolved', reviewed_by = %s::uuid, reviewed_at = now()
+                WHERE policy_id = %s::uuid
+                  AND external_id = ANY(%s::text[])
+                  AND state <> 'resolved'
+                """,
+                (actor_id, policy_id, external_ids),
+            )
+            return cursor.rowcount
+
+    def record_provider_ci_mapping(
+        self,
+        kind: str,
+        company_id: str,
+        record: dict,
+        asset_id: str,
+        actor_id: str | None = None,
+    ) -> dict:
+        """Upsert provider identity and append a content-addressed observation."""
+
+        connection_record = self.get_integration_connection(kind)
+        if not connection_record:
+            raise ValueError("Integration connection not found")
+        before = next(
+            (
+                item
+                for item in self.list_provider_ci_mappings(kind, company_id)
+                if item["externalId"] == record["externalId"]
+            ),
+            None,
+        )
+        mapping_uuid = canonical_uuid(
+            "external_ci_mapping",
+            f"{connection_record['uuid']}:{record['externalId']}",
+        )
+        payload_hash = hashlib.sha256(
+            json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        observation_uuid = canonical_uuid("ci_source_observation", f"{mapping_uuid}:{payload_hash}")
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT ci.id FROM configuration_items ci
+                JOIN companies company ON company.id = ci.company_id
+                WHERE ci.id = %s::uuid AND company.slug = %s AND ci.retired_at IS NULL
+                """,
+                (asset_id, company_id),
+            )
+            if not cursor.fetchone():
+                raise ValueError("Configuration item is unavailable in this customer")
+            cursor.execute(
+                """
+                INSERT INTO external_object_mappings (
+                    id, integration_connection_id, external_object_type, external_id,
+                    canonical_entity_type, canonical_entity_id, external_name,
+                    external_version, active, first_seen_at, last_seen_at, last_synced_at
+                ) VALUES (
+                    %s::uuid, %s::uuid, 'configuration', %s,
+                    'configuration_item', %s::uuid, %s, %s, true, now(), now(), now()
+                )
+                ON CONFLICT (integration_connection_id, external_object_type, external_id)
+                DO UPDATE SET canonical_entity_type = 'configuration_item',
+                    canonical_entity_id = EXCLUDED.canonical_entity_id,
+                    external_name = EXCLUDED.external_name,
+                    external_version = EXCLUDED.external_version,
+                    active = true, last_seen_at = now(), last_synced_at = now()
+                """,
+                (
+                    mapping_uuid,
+                    connection_record["uuid"],
+                    record["externalId"],
+                    asset_id,
+                    record.get("name") or None,
+                    record.get("providerVersion") or None,
+                ),
+            )
+            cursor.execute(
+                """
+                DELETE FROM ci_identifiers
+                WHERE source_mapping_id = %s::uuid AND ci_id <> %s::uuid
+                """,
+                (mapping_uuid, asset_id),
+            )
+            cursor.execute(
+                """
+                INSERT INTO ci_identifiers (
+                    id, ci_id, company_id, ci_type, identifier_type,
+                    identifier_value, verified_at, source_mapping_id
+                )
+                SELECT %s::uuid, ci.id, ci.company_id, ci.ci_type,
+                       'provider_native', %s, now(), %s::uuid
+                FROM configuration_items ci WHERE ci.id = %s::uuid
+                ON CONFLICT (ci_id, identifier_type, identifier_value)
+                DO UPDATE SET verified_at = now(), source_mapping_id = EXCLUDED.source_mapping_id
+                """,
+                (
+                    canonical_uuid(
+                        "ci_identifier", f"{asset_id}:provider_native:{record['externalId']}"
+                    ),
+                    record["externalId"],
+                    mapping_uuid,
+                    asset_id,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO ci_source_observations (
+                    id, ci_id, mapping_id, observed_at, payload_hash, fields
+                ) VALUES (%s::uuid, %s::uuid, %s::uuid, now(), %s, %s::jsonb)
+                ON CONFLICT (mapping_id, payload_hash)
+                DO UPDATE SET observed_at = now()
+                """,
+                (observation_uuid, asset_id, mapping_uuid, payload_hash, json.dumps(record)),
+            )
+            after = {
+                "id": mapping_uuid,
+                "provider": kind,
+                "companyId": company_id,
+                "externalId": record["externalId"],
+                "externalName": record.get("name", ""),
+                "externalVersion": record.get("providerVersion", ""),
+                "assetId": asset_id,
+                "active": True,
+            }
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "external_ci_mapping",
+                mapping_uuid,
+                (
+                    "remapped"
+                    if before and before.get("assetId") != asset_id
+                    else ("source_observed" if before else "mapped")
+                ),
+                before,
+                after,
+                metadata={"provider": kind, "payloadHash": payload_hash},
+            )
+        return next(
+            item
+            for item in self.list_provider_ci_mappings(kind, company_id)
+            if item["externalId"] == record["externalId"]
+        )
 
     def get_msp_branding(self) -> dict:
         with self.connection_factory() as connection, connection.cursor() as cursor:
@@ -7292,7 +10488,12 @@ class PostgresCmdbRepository(StateRepository):
                     int(run.get("review") or 0),
                     run.get("message") if database_status == "failed" else None,
                     run.get("message") or "",
-                    json.dumps({"apiStatus": run.get("status")}),
+                    json.dumps(
+                        {
+                            "apiStatus": run.get("status"),
+                            **deepcopy(run.get("attributes") or {}),
+                        }
+                    ),
                 ),
             )
             cursor.execute(

@@ -140,6 +140,28 @@ class FastApiMigrationTests(unittest.TestCase):
 
         asyncio.run(exercise_lifespan())
 
+    def test_integration_worker_finishes_cleanup_during_shutdown(self):
+        events: list[str] = []
+
+        async def worker() -> None:
+            events.append("started")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("stopped")
+
+        async def exercise_lifespan() -> None:
+            with (
+                patch.dict(os.environ, {"INTEGRATION_WORKER_ENABLED": "true"}),
+                patch.object(backend_main, "_integration_worker_loop", worker),
+            ):
+                async with backend_main.application_lifespan(api):
+                    await asyncio.sleep(0)
+                    self.assertEqual(events, ["started"])
+            self.assertEqual(events, ["started", "stopped"])
+
+        asyncio.run(exercise_lifespan())
+
     def test_authorization_matrix_enforces_customer_read_scope(self):
         routes = [
             "/api/dashboard?companyId={company}",
@@ -184,6 +206,134 @@ class FastApiMigrationTests(unittest.TestCase):
                 response = self.client.get("/api/assets", headers=self._headers(email))
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual({item["id"] for item in response.json()}, expected_ids)
+
+    def test_root_reconciliation_workbench_is_tenant_safe_and_governed(self):
+        """Root operators see only permitted tenants while admins can govern decisions."""
+
+        queued_ids: dict[str, str] = {}
+        for company_id, parent_id, external_id in (
+            ("acme", "42", "501"),
+            ("northwind", "84", "601"),
+        ):
+            policy = backend_main.REPOSITORY.update_ci_sync_policy(
+                "connectwise",
+                company_id,
+                parent_id,
+                {"syncMode": "continuous_preview", "enabled": True},
+                expected_revision=0,
+                actor_id="admin",
+            )
+            backend_main.REPOSITORY.replace_ci_review_items(
+                policy["id"],
+                company_id,
+                f"run-{external_id}",
+                [
+                    {
+                        "externalId": external_id,
+                        "name": f"{company_id.upper()}-APP-01",
+                        "action": "create",
+                        "reason": "New immutable provider identity",
+                        "record": {
+                            "externalId": external_id,
+                            "name": f"{company_id.upper()}-APP-01",
+                            "type": "Server",
+                            "status": "Active",
+                        },
+                    }
+                ],
+            )
+            queued_ids[company_id] = backend_main.REPOSITORY.list_ci_review_items(
+                "connectwise", company_id
+            )[0]["id"]
+
+        admin_headers = self._headers("admin@example.com")
+        operator_headers = self._headers("operator@example.com")
+        client_headers = self._headers("client@acme.example")
+        admin_queue = self.client.get("/api/integration-reconciliation", headers=admin_headers)
+        self.assertEqual(admin_queue.status_code, 200, admin_queue.text)
+        self.assertEqual(admin_queue.json()["total"], 2)
+        operator_queue = self.client.get(
+            "/api/integration-reconciliation", headers=operator_headers
+        )
+        self.assertEqual(operator_queue.status_code, 200, operator_queue.text)
+        self.assertEqual(operator_queue.json()["total"], 1)
+        self.assertEqual(operator_queue.json()["items"][0]["companyId"], "acme")
+        self.assertEqual(
+            self.client.get("/api/integration-reconciliation", headers=client_headers).status_code,
+            403,
+        )
+
+        catalogue = self.client.get("/api/field-authority/catalogue", headers=admin_headers)
+        self.assertEqual(catalogue.status_code, 200, catalogue.text)
+        self.assertIn("cmdb", {item["key"] for item in catalogue.json()["providers"]})
+        preset = self.client.post(
+            "/api/field-authority/presets",
+            headers=admin_headers,
+            json={"companyId": "acme", "presetKey": "balanced_msp"},
+        )
+        self.assertEqual(preset.status_code, 200, preset.text)
+        self.assertGreater(preset.json()["applied"], 0)
+        self.assertEqual(
+            self.client.post(
+                "/api/field-authority/presets",
+                headers=operator_headers,
+                json={"companyId": "acme", "presetKey": "balanced_msp"},
+            ).status_code,
+            403,
+        )
+
+        dismissed = self.client.post(
+            "/api/integration-reconciliation/dismiss",
+            headers=admin_headers,
+            json={"itemIds": [queued_ids["acme"]], "notes": "Confirmed duplicate source record"},
+        )
+        self.assertEqual(dismissed.status_code, 200, dismissed.text)
+        self.assertEqual(dismissed.json()["dismissed"], 1)
+        self.assertEqual(
+            backend_main.REPOSITORY.get_ci_review_item(queued_ids["acme"])["state"],
+            "dismissed",
+        )
+
+        ignored = self.client.post(
+            "/api/integration-reconciliation/ignore",
+            headers=admin_headers,
+            json={
+                "itemIds": [queued_ids["northwind"]],
+                "notes": "Outside the managed configuration scope",
+            },
+        )
+        self.assertEqual(ignored.status_code, 200, ignored.text)
+        self.assertEqual(ignored.json()["ignored"], 1)
+        ignored_list = self.client.get(
+            "/api/integration-reconciliation/ignored", headers=admin_headers
+        )
+        self.assertEqual(ignored_list.status_code, 200, ignored_list.text)
+        self.assertEqual(ignored_list.json()["total"], 1)
+        self.assertEqual(
+            self.client.post(
+                "/api/integration-reconciliation/ignore",
+                headers=operator_headers,
+                json={
+                    "itemIds": [queued_ids["acme"]],
+                    "notes": "Operator cannot persist exclusions",
+                },
+            ).status_code,
+            403,
+        )
+        restored = self.client.post(
+            (
+                "/api/integration-reconciliation/ignored/"
+                f"{ignored.json()['suppressionIds'][0]}/restore"
+            ),
+            headers=admin_headers,
+            json={"notes": "Configuration is now managed"},
+        )
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertFalse(restored.json()["active"])
+        self.assertEqual(
+            backend_main.REPOSITORY.get_ci_review_item(queued_ids["northwind"])["state"],
+            "pending",
+        )
 
     def test_root_email_configuration_is_write_only_and_test_delivery_is_audited(self):
         admin_headers = self._headers("admin@example.com")
@@ -1451,7 +1601,7 @@ class FastApiMigrationTests(unittest.TestCase):
             any(event["action"] == "external_approved" for event in core.DB["auditEvents"])
         )
 
-    def test_integration_check_is_root_scoped_and_persisted_by_repository(self):
+    def test_connectwise_company_discovery_is_root_scoped_review_gated_and_secret_safe(self):
         client_token = self._login("client@acme.example")
         forbidden = self.client.get(
             "/api/integrations",
@@ -1461,11 +1611,449 @@ class FastApiMigrationTests(unittest.TestCase):
 
         admin_token = self._login("admin@example.com")
         headers = {"Authorization": f"Bearer {admin_token}"}
-        result = self.client.post("/api/integrations/connectwise/sync", headers=headers)
-        self.assertEqual(result.status_code, 200)
-        self.assertEqual(result.json()["status"], "blocked")
+        encryption_key = base64.urlsafe_b64encode(b"c" * 32).decode("ascii")
+
+        class FakeConnectWiseClient:
+            def __init__(self, configuration):
+                self.configuration = configuration
+
+            def test_connection(self):
+                return {
+                    "reachable": True,
+                    "sampleCompany": {"externalId": "42", "name": "Acme Manufacturing"},
+                }
+
+            def discover_companies(self):
+                return [
+                    {
+                        "externalId": "42",
+                        "identifier": "ACME",
+                        "name": "Acme Manufacturing",
+                        "status": "Active",
+                        "type": "Customer",
+                        "site": "Head office",
+                        "deleted": False,
+                        "lastUpdated": "2026-07-21T09:00:00Z",
+                    },
+                    {
+                        "externalId": "84",
+                        "identifier": "NEW",
+                        "name": "Unmapped Customer",
+                        "status": "Active",
+                        "type": "Customer",
+                        "site": "",
+                        "deleted": False,
+                        "lastUpdated": "",
+                    },
+                ]
+
+            def discover_configurations(self, company_external_id):
+                self.requested_company_id = company_external_id
+                return [
+                    {
+                        "externalId": "501",
+                        "name": "ACME-DC01",
+                        "type": "Server",
+                        "status": "Active",
+                        "providerTypeId": "11",
+                        "providerTypeName": "Server",
+                        "providerStatusId": "3",
+                        "providerStatusName": "Managed",
+                        "fields": {"ipAddress": "10.0.0.51"},
+                        "metadata": {"lifecycle": "in_service"},
+                        "identifiers": {},
+                        "providerVersion": "2026-07-21T10:00:00Z",
+                    },
+                    {
+                        "externalId": "502",
+                        "name": "CW-SRV-502",
+                        "type": "Server",
+                        "status": "Active",
+                        "providerTypeId": "11",
+                        "providerTypeName": "Server",
+                        "providerStatusId": "3",
+                        "providerStatusName": "Managed",
+                        "fields": {
+                            "serialNumber": "CW-SN-502",
+                            "ipAddress": "10.0.0.52",
+                        },
+                        "metadata": {
+                            "lifecycle": "in_service",
+                            "operationalStatus": "unknown",
+                            "serialNumber": "CW-SN-502",
+                        },
+                        "identifiers": {"serial_number": "CW-SN-502"},
+                        "providerVersion": "2026-07-21T10:00:00Z",
+                    },
+                    {
+                        "externalId": "503",
+                        "name": "CW-ROUTER-503",
+                        "type": "Router",
+                        "status": "Inactive",
+                        "providerTypeId": "12",
+                        "providerTypeName": "Router",
+                        "providerStatusId": "4",
+                        "providerStatusName": "Retired",
+                        "fields": {},
+                        "metadata": {"lifecycle": "retired"},
+                        "identifiers": {},
+                        "providerVersion": "2026-07-21T10:00:00Z",
+                    },
+                ]
+
+        environment = {
+            "MFA_ENCRYPTION_KEY": encryption_key,
+            "CW_BASE_URL": "",
+            "CW_COMPANY_ID": "",
+            "CW_PUBLIC_KEY": "",
+            "CW_PRIVATE_KEY": "",
+            "CW_CLIENT_ID": "",
+            "CW_PAGE_SIZE": "",
+        }
+        with (
+            patch.dict(os.environ, environment),
+            patch.object(backend_main, "ConnectWiseClient", FakeConnectWiseClient),
+        ):
+            configured = self.client.put(
+                "/api/integrations/connectwise/config",
+                headers=headers,
+                json={
+                    "enabled": True,
+                    "baseUrl": "https://api.example.com/v4_6_release/apis/3.0",
+                    "companyId": "ipt",
+                    "clientId": "client-id",
+                    "publicKey": "public-key",
+                    "privateKey": "private-key",
+                    "pageSize": 100,
+                    "expectedRevision": 1,
+                },
+            )
+            self.assertEqual(configured.status_code, 200, configured.text)
+            self.assertTrue(configured.json()["hasCredentials"])
+            self.assertNotIn("publicKey", configured.json())
+            self.assertNotIn("privateKey", configured.json())
+
+            catalogue = self.client.get("/api/integration-providers", headers=headers)
+            self.assertEqual(catalogue.status_code, 200, catalogue.text)
+            manifest = next(item for item in catalogue.json() if item["key"] == "connectwise")
+            self.assertEqual(manifest["name"], "ConnectWise PSA")
+            self.assertTrue(
+                any(
+                    operation["key"] == "change_ticket.create"
+                    and operation["status"] == "disabled"
+                    and operation["writes_provider"]
+                    for operation in manifest["operations"]
+                )
+            )
+
+            tested = self.client.post("/api/integrations/connectwise/test", headers=headers)
+            self.assertEqual(tested.status_code, 200, tested.text)
+            self.assertEqual(tested.json()["credentialSource"], "encrypted_database")
+            self.assertEqual(
+                [stage["status"] for stage in tested.json()["stages"]],
+                ["passed", "passed", "passed"],
+            )
+            self.assertFalse(tested.json()["writesAttempted"])
+
+            options = self.client.get(
+                "/api/integrations/connectwise/discovery-options", headers=headers
+            )
+            self.assertEqual(options.status_code, 200, options.text)
+            self.assertEqual(options.json()["availableStatuses"], ["Active"])
+            self.assertEqual(options.json()["availableTypes"], ["Customer"])
+            self.assertEqual(options.json()["sampled"], 2)
+            self.assertFalse(options.json()["writesAttempted"])
+
+            policy = self.client.put(
+                "/api/integrations/connectwise/policy",
+                headers=headers,
+                json={
+                    "includedStatuses": ["Active"],
+                    "includedTypes": ["Customer"],
+                    "includedSites": [],
+                    "includeDeleted": False,
+                    "excludedExternalIds": ["84"],
+                    "expectedRevision": configured.json()["revision"],
+                },
+            )
+            self.assertEqual(policy.status_code, 200, policy.text)
+            self.assertEqual(policy.json()["discoveryPolicy"]["excludedExternalIds"], ["84"])
+            preview = self.client.post(
+                "/api/integrations/connectwise/discovery-preview", headers=headers
+            )
+            self.assertEqual(preview.status_code, 200, preview.text)
+            self.assertEqual(preview.json()["discovered"], 2)
+            self.assertEqual(preview.json()["included"], 1)
+            self.assertEqual(preview.json()["excluded"], 1)
+            self.assertTrue(preview.json()["readOnly"])
+            self.assertFalse(preview.json()["writesAttempted"])
+            self.assertFalse(preview.json()["truncated"])
+            result = self.client.post("/api/integrations/connectwise/sync", headers=headers)
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json()["status"], "review_required")
+            self.assertEqual(result.json()["discovered"], 1)
+
+            mapped_for_import = self.client.put(
+                "/api/integrations/connectwise/companies/42/mapping",
+                headers=headers,
+                json={"companyId": "acme"},
+            )
+            self.assertEqual(mapped_for_import.status_code, 200, mapped_for_import.text)
+            ci_options = self.client.post(
+                "/api/integrations/connectwise/configurations/options",
+                headers=headers,
+                json={"companyId": "acme", "providerCompanyId": "42"},
+            )
+            self.assertEqual(ci_options.status_code, 200, ci_options.text)
+            self.assertEqual(ci_options.json()["discovered"], 3)
+            self.assertEqual(
+                [(item["id"], item["count"]) for item in ci_options.json()["availableTypes"]],
+                [("12", 1), ("11", 2)],
+            )
+            default_ci_policy = self.client.get(
+                "/api/integrations/connectwise/configurations/policy?companyId=acme&providerCompanyId=42",
+                headers=headers,
+            )
+            self.assertEqual(default_ci_policy.status_code, 200, default_ci_policy.text)
+            saved_ci_policy = self.client.put(
+                "/api/integrations/connectwise/configurations/policy",
+                headers=headers,
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "42",
+                    "typeMode": "selected",
+                    "includedTypeIds": ["11"],
+                    "typeMappings": {"11": "Server"},
+                    "blockUnmappedTypes": True,
+                    "statusMode": "selected",
+                    "includedStatusIds": ["3"],
+                    "excludedExternalIds": [],
+                    "syncMode": "continuous_preview",
+                    "intervalMinutes": 120,
+                    "enabled": True,
+                    "expectedRevision": default_ci_policy.json()["revision"],
+                },
+            )
+            self.assertEqual(saved_ci_policy.status_code, 200, saved_ci_policy.text)
+            self.assertEqual(saved_ci_policy.json()["includedTypeIds"], ["11"])
+            self.assertEqual(saved_ci_policy.json()["typeMappings"], {"11": "Server"})
+            self.assertTrue(saved_ci_policy.json()["blockUnmappedTypes"])
+            ci_preview = self.client.post(
+                "/api/integrations/connectwise/configurations/preview",
+                headers=headers,
+                json={"companyId": "acme", "providerCompanyId": "42"},
+            )
+            self.assertEqual(ci_preview.status_code, 200, ci_preview.text)
+            self.assertEqual(ci_preview.json()["counts"]["create"], 1)
+            self.assertEqual(ci_preview.json()["counts"]["conflict"], 1)
+            self.assertEqual(ci_preview.json()["discovered"], 3)
+            self.assertEqual(ci_preview.json()["included"], 2)
+            self.assertEqual(ci_preview.json()["excluded"], 1)
+            self.assertTrue(ci_preview.json()["readOnly"])
+            self.assertEqual(ci_preview.json()["queueSummary"]["pending"], 2)
+            review_queue = self.client.get(
+                "/api/integrations/connectwise/configurations/review-queue?companyId=acme",
+                headers=headers,
+            )
+            self.assertEqual(review_queue.status_code, 200, review_queue.text)
+            self.assertEqual(review_queue.json()["total"], 2)
+            self.assertEqual(
+                {item["externalId"] for item in review_queue.json()["items"]},
+                {"501", "502"},
+            )
+            worker_status = self.client.get(
+                "/api/integrations/continuous-preview/status", headers=headers
+            )
+            self.assertEqual(worker_status.status_code, 200, worker_status.text)
+            self.assertEqual(worker_status.json()["enabledPolicies"], 1)
+            self.assertEqual(worker_status.json()["pendingReviews"], 2)
+            linked = self.client.post(
+                "/api/integrations/connectwise/configurations/link",
+                headers=headers,
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "42",
+                    "externalId": "501",
+                    "assetId": "asset-1",
+                },
+            )
+            self.assertEqual(linked.status_code, 200, linked.text)
+            self.assertEqual(linked.json()["assetName"], "ACME-DC01")
+            ci_import = self.client.post(
+                "/api/integrations/connectwise/configurations/import",
+                headers=headers,
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "42",
+                    "externalIds": ["502"],
+                },
+            )
+            self.assertEqual(ci_import.status_code, 200, ci_import.text)
+            self.assertEqual(ci_import.json()["created"], 1)
+            imported_asset = next(
+                item
+                for item in backend_main.REPOSITORY.list_assets()
+                if item["name"] == "CW-SRV-502"
+            )
+            self.assertEqual(imported_asset["source"], "connectwise")
+            self.assertEqual(imported_asset["externalId"], "502")
+            cleared_queue = self.client.get(
+                "/api/integrations/connectwise/configurations/review-queue?companyId=acme",
+                headers=headers,
+            )
+            self.assertEqual(cleared_queue.status_code, 200, cleared_queue.text)
+            self.assertEqual(cleared_queue.json(), {"items": [], "total": 0})
+
+        companies = self.client.get("/api/integrations/connectwise/companies", headers=headers)
+        self.assertEqual(companies.status_code, 200, companies.text)
+        exact_match = next(item for item in companies.json() if item["externalId"] == "42")
+        self.assertEqual(exact_match["mappedCompanyId"], "acme")
+        self.assertIsNone(exact_match["suggestedCompanyId"])
+
+        operator_headers = self._headers("operator@example.com")
+        forbidden_mapping = self.client.put(
+            "/api/integrations/connectwise/companies/42/mapping",
+            headers=operator_headers,
+            json={"companyId": "acme"},
+        )
+        self.assertEqual(forbidden_mapping.status_code, 403)
+        mapped = self.client.put(
+            "/api/integrations/connectwise/companies/42/mapping",
+            headers=headers,
+            json={"companyId": "acme"},
+        )
+        self.assertEqual(mapped.status_code, 200, mapped.text)
+        self.assertEqual(mapped.json()["mappedCompanyId"], "acme")
+        unmapped = self.client.delete(
+            "/api/integrations/connectwise/companies/42/mapping", headers=headers
+        )
+        self.assertEqual(unmapped.status_code, 200, unmapped.text)
+
         history = self.client.get("/api/sync-runs", headers=headers)
         self.assertEqual(history.json()[0]["type"], "connectwise")
+        serialized = json.dumps(core.DB)
+        self.assertNotIn("public-key", serialized)
+        self.assertNotIn("private-key", serialized)
+
+    def test_connectwise_failures_return_and_store_only_stable_public_messages(self):
+        headers = self._headers("admin@example.com")
+        environment_marker = "environment-secret-stack-marker"
+        with patch.object(
+            backend_main,
+            "_connectwise_environment_configuration",
+            side_effect=backend_main.ConnectWiseConfigurationError(environment_marker),
+        ):
+            configuration = self.client.get("/api/integrations/connectwise/config", headers=headers)
+        self.assertEqual(configuration.status_code, 200, configuration.text)
+        self.assertEqual(
+            configuration.json()["lastError"],
+            "ConnectWise environment configuration is invalid. "
+            "Review the container environment settings.",
+        )
+        self.assertNotIn(environment_marker, configuration.text)
+
+        request_marker = "provider-secret-stack-marker"
+        with patch.object(
+            backend_main,
+            "_connectwise_effective_configuration",
+            side_effect=backend_main.ConnectWiseRequestError(request_marker),
+        ):
+            tested = self.client.post("/api/integrations/connectwise/test", headers=headers)
+        self.assertEqual(tested.status_code, 502, tested.text)
+        self.assertEqual(
+            tested.json()["detail"],
+            "ConnectWise could not complete the requested read operation. "
+            "Verify connectivity, credentials and API permissions.",
+        )
+        self.assertNotIn(request_marker, tested.text)
+        self.assertNotIn(request_marker, json.dumps(core.DB))
+
+    def test_integration_lifecycle_blocks_provider_calls_and_removes_credentials(self):
+        headers = self._headers("admin@example.com")
+        operator_headers = self._headers("operator@example.com")
+        configured = backend_main.REPOSITORY.update_integration_connection(
+            "connectwise",
+            {
+                "configuration": {
+                    "baseUrl": "https://api.example.com/v4_6_release/apis/3.0",
+                    "companyId": "ipt",
+                    "clientId": "client-id",
+                },
+                "credentialsEncrypted": "ciphertext",
+                "credentialsNonce": "nonce",
+                "enabled": True,
+                "connectionStatus": "verified",
+                "expectedRevision": 1,
+            },
+            "admin",
+        )
+        impact = self.client.get(
+            "/api/integrations/connectwise/lifecycle-impact", headers=operator_headers
+        )
+        self.assertEqual(impact.status_code, 200, impact.text)
+        self.assertEqual(impact.json()["lifecycleStatus"], "active")
+        forbidden = self.client.post(
+            "/api/integrations/connectwise/lifecycle",
+            headers=operator_headers,
+            json={
+                "action": "pause",
+                "reason": "Maintenance window",
+                "expectedRevision": configured["revision"],
+            },
+        )
+        self.assertEqual(forbidden.status_code, 403)
+
+        paused = self.client.post(
+            "/api/integrations/connectwise/lifecycle",
+            headers=headers,
+            json={
+                "action": "pause",
+                "reason": "Maintenance window",
+                "expectedRevision": configured["revision"],
+            },
+        )
+        self.assertEqual(paused.status_code, 200, paused.text)
+        self.assertEqual(paused.json()["lifecycleStatus"], "paused")
+        blocked_sync = self.client.post("/api/integrations/connectwise/sync", headers=headers)
+        self.assertEqual(blocked_sync.status_code, 409, blocked_sync.text)
+
+        resumed = self.client.post(
+            "/api/integrations/connectwise/lifecycle",
+            headers=headers,
+            json={
+                "action": "resume",
+                "reason": "Maintenance completed",
+                "expectedRevision": paused.json()["revision"],
+            },
+        )
+        self.assertEqual(resumed.status_code, 200, resumed.text)
+        rejected = self.client.post(
+            "/api/integrations/connectwise/remove",
+            headers=headers,
+            json={
+                "confirmation": "ConnectWise",
+                "reason": "Provider retired",
+                "expectedRevision": resumed.json()["revision"],
+            },
+        )
+        self.assertEqual(rejected.status_code, 400)
+        removed = self.client.post(
+            "/api/integrations/connectwise/remove",
+            headers=headers,
+            json={
+                "confirmation": "ConnectWise Manage",
+                "reason": "Provider retired",
+                "expectedRevision": resumed.json()["revision"],
+            },
+        )
+        self.assertEqual(removed.status_code, 200, removed.text)
+        self.assertEqual(removed.json()["integration"]["lifecycleStatus"], "removed")
+        stored = backend_main.REPOSITORY.get_integration_connection("connectwise")
+        self.assertFalse(stored["credentialsEncrypted"])
+        self.assertEqual(stored["configuration"]["mode"], "removed")
+        listed = self.client.get("/api/integrations", headers=headers).json()[0]
+        self.assertEqual(listed["lifecycleStatus"], "removed")
+        self.assertFalse(listed["enabled"])
 
     def test_user_profile_password_and_status_lifecycle_revokes_sessions(self):
         admin_headers = self._headers("admin@example.com")

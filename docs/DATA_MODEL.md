@@ -79,4 +79,4 @@ Impact direction is normalized by relationship type. For example, `A depends_on 
 
 ## Integration and audit records
 
-`integration_connections` stores provider type, scope and credential-reference metadata. `sync_runs` records execution outcomes. `audit_events` captures security- and data-relevant mutations. Secrets and Passportal credential content do not belong in any of these records.
+`integration_connections` stores provider type, scope, public configuration and installation-bound encrypted credential material. API responses, audit values and portable exports remove that material. `provider_company_observations` retains the least-data ConnectWise discovery snapshot, while `external_object_mappings` holds the durable provider-company-to-canonical-customer decision. `sync_runs` records execution outcomes and `audit_events` captures security- and data-relevant mutations. Passportal credential content does not belong in any of these records.

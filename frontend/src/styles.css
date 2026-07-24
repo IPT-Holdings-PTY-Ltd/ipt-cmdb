@@ -95,6 +95,8 @@ body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradie
 .quality-workbench > .MuiTabs-root { padding: 5px 10px 0; border-bottom: 1px solid #263956; background: #101a2d; }
 .quality-filter { display: grid; grid-template-columns: minmax(240px, 1fr) 190px; gap: 10px; padding: 12px; border-bottom: 1px solid #263956; }
 .quality-asset-link { min-width: 170px; padding: 0 !important; justify-content: flex-start !important; }
+.reconciliation-filter { display: grid; grid-template-columns: minmax(260px, 1.5fr) repeat(3, minmax(165px, 1fr)) auto auto auto; gap: 10px; align-items: center; padding: 12px; border-top: 1px solid #263956; border-bottom: 1px solid #263956; background: #101a2d; }
+.reconciliation-filter + .MuiTableContainer-root .MuiTable-root { min-width: 1320px; }
 @media (max-width: 1250px) { .asset-filter-toolbar { grid-template-columns: repeat(3, minmax(180px, 1fr)); } }
-@media (max-width: 1100px) { .governance-filter { grid-template-columns: repeat(3, minmax(170px, 1fr)); } }
-@media (max-width: 900px) { .relationship-canvas { height: 680px; } .relationship-toolbar .MuiTextField-root { flex-basis: 100%; } .asset-filter-toolbar,.governance-filter,.quality-filter { grid-template-columns: 1fr; } .report-catalog { position: static; } }
+@media (max-width: 1100px) { .governance-filter,.reconciliation-filter { grid-template-columns: repeat(3, minmax(170px, 1fr)); } }
+@media (max-width: 900px) { .relationship-canvas { height: 680px; } .relationship-toolbar .MuiTextField-root { flex-basis: 100%; } .asset-filter-toolbar,.governance-filter,.quality-filter,.reconciliation-filter { grid-template-columns: 1fr; } .report-catalog { position: static; } }
