@@ -71,7 +71,7 @@ The API continues to enforce tenant and role authorization after external authen
 
 ## PostgreSQL and migrations
 
-PostgreSQL is the production source of truth. The repository stores customers, users, access groups, CIs, identifiers, relationships, integration connections, mappings, observations, provider-object suppressions, changes, branding, sync runs, reconciliation candidates, data-quality exceptions, field-authority rules and audit events in normalized tables.
+PostgreSQL is the production source of truth. The repository stores customers, users, access groups, CIs, identifiers, relationships, integration connections, mappings, observations, provider-object suppressions, changes, versioned change templates, branding, sync runs, reconciliation candidates, data-quality exceptions, field-authority rules and audit events in normalized tables.
 
 Audit rows are append-only and contain sanitised before/after values, field changes, actor attribution, source, outcome and correlation context. Tenant-aware reporting is assembled through controlled report templates rather than allowing arbitrary SQL from the web tier.
 
@@ -128,6 +128,8 @@ Virtualization impact uses recorded HA, cluster membership, host health, minimum
 ## Change-control snapshots
 
 Change packages reference live scope CIs during preparation. When saved, the package freezes impacted CI names, paths, ownership, business systems, risk factors and technical plans. Later CI edits therefore do not rewrite historical evidence.
+
+Published change templates can supply reusable procedure text and typed technician prompts. Global templates are visible to every customer; customer templates remain tenant-scoped. Each edit creates an immutable version. A change pins the template ID, exact version, non-secret content snapshot and validated parameter values, so later template revisions cannot rewrite the historical plan. Templates are deliberately unable to set customer scope, planned timing, calculated impact/risk, technician identities or approvers.
 
 The provider-neutral external-link envelope reserves future ConnectWise ticket state. Publishing must be explicit and idempotent; the current application does not create ConnectWise tickets.
 

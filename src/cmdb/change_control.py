@@ -15,8 +15,21 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from html import escape
 from io import BytesIO
+from typing import Any
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+TEMPLATE_TOKEN = re.compile(r"{{\s*([a-z][a-z0-9_]*)\s*}}", re.IGNORECASE)
+CLOSURE_RESULTS = {
+    "successful",
+    "successful_with_issues",
+    "partially_implemented",
+    "failed",
+    "backed_out",
+}
+CLOSURE_SERVICE_STATES = {"restored", "degraded", "unavailable"}
+CLOSURE_TEST_RESULTS = {"pending", "passed", "failed", "not_run"}
+CLOSURE_FOLLOW_UP_STATES = {"open", "completed"}
+CLOSURE_CONFIRMATION_STATES = {"not_required", "confirmed"}
 
 CHANGE_TYPES = {"standard", "normal", "emergency"}
 CHANGE_CATEGORIES = {
@@ -66,11 +79,11 @@ SCHEDULE_EDIT_STATUSES = {"approved", "scheduled"}
 SCHEDULE_EDIT_FIELDS = {
     "plannedStart",
     "plannedEnd",
-    "assignedTechnician",
     "communicationStatus",
     "communicationPlan",
     "notes",
 }
+ASSIGNABLE_CHANGE_STATUSES = CHANGE_STATUSES - {"cancelled", "closed"}
 REASON_REQUIRED_TRANSITIONS = {
     "declined",
     "cancelled",
@@ -724,11 +737,11 @@ def normalise_change_payload(payload: dict) -> dict:
         "communicationStatus": (COMMUNICATION_STATES, "required"),
     }
     for field, (allowed, default) in enum_fields.items():
-        value = str(result.get(field) or default).lower()
+        value = str(result.get(field) or default).strip().casefold()
         if value not in allowed:
             raise ValueError(f"Choose a valid {field}")
         result[field] = value
-    risk_level = str(result.get("riskLevel") or "").lower()
+    risk_level = str(result.get("riskLevel") or "").strip().casefold()
     if risk_level and risk_level not in RISK_LEVELS:
         raise ValueError("Choose a valid risk level")
     result["riskLevel"] = risk_level
@@ -744,6 +757,21 @@ def normalise_change_payload(payload: dict) -> dict:
         "notes",
     ):
         result[field] = str(result.get(field) or "").strip()[:8000]
+    result["assignedUserId"] = str(result.get("assignedUserId") or "").strip() or None
+    result["templateId"] = str(result.get("templateId") or "").strip() or None
+    result["templateVersion"] = (
+        int(result.get("templateVersion") or 0) if result["templateId"] else None
+    )
+    result["templateSnapshot"] = (
+        deepcopy(result.get("templateSnapshot"))
+        if isinstance(result.get("templateSnapshot"), dict)
+        else None
+    )
+    result["templateParameters"] = (
+        deepcopy(result.get("templateParameters"))
+        if isinstance(result.get("templateParameters"), dict)
+        else {}
+    )
     if (
         result["plannedStart"]
         and result["plannedEnd"]
@@ -751,6 +779,278 @@ def normalise_change_payload(payload: dict) -> dict:
     ):
         raise ValueError("Planned end must be after planned start")
     return result
+
+
+def _render_closure_template(template: str, values: dict[str, Any]) -> str:
+    """Render a safe closure-test string from a pinned template context."""
+
+    def replacement(match: re.Match[str]) -> str:
+        value = values.get(match.group(1).casefold())
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        return "" if value is None else str(value)
+
+    return TEMPLATE_TOKEN.sub(replacement, str(template or "")).strip()
+
+
+def initial_closure_assessment(change: dict) -> dict:
+    """Build the structured closure draft frozen to one change revision."""
+
+    impact = list(change.get("impactSnapshot") or [])
+    primary = next(
+        (item for item in impact if item.get("role") == "Scope"),
+        impact[0] if impact else {},
+    )
+    business_system: dict[str, Any] = next(
+        (
+            item
+            for item in impact
+            if str(item.get("type") or "").strip().casefold()
+            in {"business system", "business application", "business service"}
+        ),
+        {},
+    )
+    context: dict[str, Any] = {
+        "company_name": change.get("companyName", ""),
+        "asset_name": primary.get("name", ""),
+        "business_system_name": business_system.get("name", ""),
+        **(change.get("templateParameters") or {}),
+    }
+    snapshot = change.get("templateSnapshot") or {}
+    content = snapshot.get("content") or {}
+    definitions = content.get("closureTests") or []
+    tests = []
+    for definition in definitions:
+        if not isinstance(definition, dict):
+            continue
+        key = str(definition.get("key") or "").strip().lower()
+        if not key:
+            continue
+        tests.append(
+            {
+                "key": key,
+                "label": _render_closure_template(definition.get("label", ""), context)
+                or key.replace("_", " ").title(),
+                "expectedResult": _render_closure_template(
+                    definition.get("expectedResultTemplate", ""),
+                    context,
+                ),
+                "required": bool(definition.get("required", True)),
+                "evidenceRequired": bool(definition.get("evidenceRequired", False)),
+                "result": "pending",
+                "actualResult": "",
+                "evidence": "",
+                "testedBy": "",
+                "testedAt": "",
+            }
+        )
+    if not tests:
+        tests.append(
+            {
+                "key": "validation_plan",
+                "label": "Validation plan",
+                "expectedResult": str(change.get("validationPlan") or "").strip(),
+                "required": True,
+                "evidenceRequired": False,
+                "result": "pending",
+                "actualResult": "",
+                "evidence": "",
+                "testedBy": "",
+                "testedAt": "",
+            }
+        )
+    outcome = str(change.get("outcome") or "pending")
+    implementation_result = outcome if outcome in CLOSURE_RESULTS else "successful"
+    assessment = {
+        "implementationResult": implementation_result,
+        "serviceStatus": "restored",
+        "deviations": "",
+        "unexpectedImpact": "",
+        "tests": tests,
+        "pirRequired": False,
+        "pirCompleted": False,
+        "lessonsLearned": "",
+        "followUpActions": [],
+        "stakeholderConfirmation": "not_required",
+        "closureSummary": "",
+        "closedBy": "",
+        "closedAt": "",
+    }
+    assessment["pirRequired"] = _closure_requires_pir(change, assessment)
+    return assessment
+
+
+def _closure_requires_pir(change: dict, assessment: dict) -> bool:
+    """Return whether governance rules require a completed PIR."""
+
+    return any(
+        (
+            str(change.get("changeType") or "") == "emergency",
+            str(change.get("riskLevel") or "") in {"high", "critical"},
+            bool(change.get("rollbackExecuted")),
+            assessment.get("implementationResult") != "successful",
+            assessment.get("serviceStatus") != "restored",
+            bool(str(assessment.get("unexpectedImpact") or "").strip()),
+            any(
+                test.get("result") == "failed"
+                for test in assessment.get("tests") or []
+                if isinstance(test, dict)
+            ),
+        )
+    )
+
+
+def normalize_closure_assessment(change: dict, payload: object, actor: dict) -> dict:
+    """Validate closure evidence and enforce final-review readiness gates."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("Complete the post-change review before closing this change")
+    draft = initial_closure_assessment(change)
+    implementation_result = str(
+        payload.get("implementationResult") or draft["implementationResult"]
+    ).strip()
+    if implementation_result not in CLOSURE_RESULTS:
+        raise ValueError("Choose a valid implementation result")
+    service_status = str(payload.get("serviceStatus") or "").strip()
+    if service_status not in CLOSURE_SERVICE_STATES:
+        raise ValueError("Choose the current service status")
+
+    supplied_tests = payload.get("tests")
+    if not isinstance(supplied_tests, list) or not supplied_tests or len(supplied_tests) > 30:
+        raise ValueError("Record between 1 and 30 post-change tests")
+    definitions = {item["key"]: item for item in draft["tests"]}
+    tests: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    timestamp = utc_now()
+    for raw in supplied_tests:
+        if not isinstance(raw, dict):
+            raise ValueError("Each post-change test must be an object")
+        key = str(raw.get("key") or "").strip().lower()
+        if not re.fullmatch(r"[a-z][a-z0-9_]{1,63}", key) or key in seen:
+            raise ValueError("Post-change test keys must be unique stable identifiers")
+        seen.add(key)
+        definition = definitions.get(key)
+        label = str((definition or {}).get("label") or raw.get("label") or "").strip()[:160]
+        expected = str(
+            (definition or {}).get("expectedResult") or raw.get("expectedResult") or ""
+        ).strip()[:2000]
+        if not label or not expected:
+            raise ValueError(f"Complete the name and expected result for test {key}")
+        required = bool((definition or {}).get("required", raw.get("required", True)))
+        evidence_required = bool(
+            (definition or {}).get(
+                "evidenceRequired",
+                raw.get("evidenceRequired", False),
+            )
+        )
+        result = str(raw.get("result") or "pending").strip()
+        if result not in CLOSURE_TEST_RESULTS:
+            raise ValueError(f"Choose a valid result for {label}")
+        actual_result = str(raw.get("actualResult") or "").strip()[:4000]
+        evidence = str(raw.get("evidence") or "").strip()[:4000]
+        if required and result in {"pending", "not_run"}:
+            raise ValueError(f"Complete the required test: {label}")
+        if result in {"passed", "failed"} and len(actual_result) < 4:
+            raise ValueError(f"Record the actual result for {label}")
+        if evidence_required and result in {"passed", "failed"} and len(evidence) < 3:
+            raise ValueError(f"Record evidence for {label}")
+        tests.append(
+            {
+                "key": key,
+                "label": label,
+                "expectedResult": expected,
+                "required": required,
+                "evidenceRequired": evidence_required,
+                "result": result,
+                "actualResult": actual_result,
+                "evidence": evidence,
+                "testedBy": actor.get("email", ""),
+                "testedAt": timestamp if result in {"passed", "failed", "not_run"} else "",
+            }
+        )
+    missing_required = [
+        item["label"]
+        for key, item in definitions.items()
+        if item.get("required") and key not in seen
+    ]
+    if missing_required:
+        raise ValueError(f"Required tests are missing: {', '.join(missing_required)}")
+
+    deviations = str(payload.get("deviations") or "").strip()[:8000]
+    unexpected_impact = str(payload.get("unexpectedImpact") or "").strip()[:8000]
+    closure_summary = str(payload.get("closureSummary") or "").strip()[:8000]
+    if len(closure_summary) < 4:
+        raise ValueError("Enter a concise closure summary")
+    if implementation_result == "successful" and any(
+        test["required"] and test["result"] != "passed" for test in tests
+    ):
+        raise ValueError("A successful change requires every required test to pass")
+    if implementation_result in {"successful", "successful_with_issues"} and (
+        service_status != "restored"
+    ):
+        raise ValueError("A successful result requires service to be restored")
+    if service_status != "restored" and len(unexpected_impact) < 4:
+        raise ValueError("Describe the remaining degraded or unavailable service impact")
+
+    raw_actions = payload.get("followUpActions") or []
+    if not isinstance(raw_actions, list) or len(raw_actions) > 30:
+        raise ValueError("A closure may contain up to 30 follow-up actions")
+    follow_up_actions = []
+    for raw in raw_actions:
+        if not isinstance(raw, dict):
+            raise ValueError("Each follow-up action must be an object")
+        description = str(raw.get("description") or "").strip()[:1000]
+        if not description:
+            continue
+        status = str(raw.get("status") or "open").strip()
+        if status not in CLOSURE_FOLLOW_UP_STATES:
+            raise ValueError("Choose a valid follow-up action status")
+        owner = str(raw.get("owner") or "").strip()[:240]
+        due_date = str(raw.get("dueDate") or "").strip()[:10]
+        if status == "open" and (not owner or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", due_date)):
+            raise ValueError("Every open follow-up action needs an owner and due date")
+        follow_up_actions.append(
+            {
+                "id": str(raw.get("id") or uuid.uuid4()),
+                "description": description,
+                "owner": owner,
+                "dueDate": due_date,
+                "status": status,
+            }
+        )
+
+    assessment = {
+        "implementationResult": implementation_result,
+        "serviceStatus": service_status,
+        "deviations": deviations,
+        "unexpectedImpact": unexpected_impact,
+        "tests": tests,
+        "pirRequired": False,
+        "pirCompleted": bool(payload.get("pirCompleted")),
+        "lessonsLearned": str(payload.get("lessonsLearned") or "").strip()[:8000],
+        "followUpActions": follow_up_actions,
+        "stakeholderConfirmation": str(
+            payload.get("stakeholderConfirmation") or "not_required"
+        ).strip(),
+        "closureSummary": closure_summary,
+        "closedBy": actor.get("email", ""),
+        "closedAt": timestamp,
+    }
+    assessment["pirRequired"] = _closure_requires_pir(change, assessment)
+    if assessment["pirRequired"] and not assessment["pirCompleted"]:
+        raise ValueError("Complete the required post-implementation review")
+    if assessment["pirRequired"] and len(assessment["lessonsLearned"]) < 4:
+        raise ValueError("Record lessons learned for the required post-implementation review")
+    if assessment["stakeholderConfirmation"] not in CLOSURE_CONFIRMATION_STATES:
+        raise ValueError("Choose a valid stakeholder confirmation state")
+    business_systems = int((change.get("impactSummary") or {}).get("businessSystemCount") or 0)
+    if (
+        business_systems
+        and str(change.get("riskLevel") or "") in {"high", "critical"}
+        and assessment["stakeholderConfirmation"] != "confirmed"
+    ):
+        raise ValueError("Confirm stakeholder acceptance for this high-risk business impact")
+    return assessment
 
 
 def create_change_record(
@@ -774,7 +1074,9 @@ def create_change_record(
     )
     suggested_risk = preview["summary"]["suggestedRisk"]
     timestamp = utc_now()
-    return {
+    assigned_user_id = values.get("assignedUserId")
+    assigned_technician = values["assignedTechnician"] or actor.get("email", "")
+    record = {
         "id": change_id,
         "number": number,
         "companyId": company["id"],
@@ -797,7 +1099,8 @@ def create_change_record(
         "rollbackPlan": values["rollbackPlan"],
         "communicationStatus": values["communicationStatus"],
         "communicationPlan": values["communicationPlan"],
-        "assignedTechnician": values["assignedTechnician"] or actor.get("email", ""),
+        "assignedUserId": assigned_user_id,
+        "assignedTechnician": assigned_technician,
         "approver": values["approver"],
         "notes": values["notes"],
         "scopeAssetIds": values["scopeAssetIds"],
@@ -816,7 +1119,27 @@ def create_change_record(
         "rollbackExecuted": False,
         "rollbackResult": "",
         "closureNotes": "",
+        "closureAssessment": {},
         "approvals": [],
+        "assignmentHistory": [
+            {
+                "id": str(uuid.uuid4()),
+                "previousUserId": None,
+                "previousDisplayName": "",
+                "assignedUserId": assigned_user_id,
+                "assignedDisplayName": assigned_technician,
+                "reason": "Assigned when change was created",
+                "actorId": actor.get("id"),
+                "actorEmail": actor.get("email", ""),
+                "createdAt": timestamp,
+            }
+        ]
+        if assigned_technician
+        else [],
+        "templateId": values["templateId"],
+        "templateVersion": values["templateVersion"],
+        "templateSnapshot": values["templateSnapshot"],
+        "templateParameters": values["templateParameters"],
         "statusHistory": [
             {
                 "id": str(uuid.uuid4()),
@@ -839,6 +1162,8 @@ def create_change_record(
             }
         },
     }
+    record["closureAssessment"] = initial_closure_assessment(record)
+    return record
 
 
 def update_change_record(
@@ -853,6 +1178,8 @@ def update_change_record(
     provided_fields = {
         key for key, value in payload.items() if value is not None and key != "expectedRevision"
     }
+    if provided_fields & {"assignedTechnician", "assignedUserId"}:
+        raise ValueError("Use the dedicated reassignment action to change the technician")
     if current_status in SCHEDULE_EDIT_STATUSES:
         unsupported = provided_fields - SCHEDULE_EDIT_FIELDS
         if unsupported:
@@ -862,7 +1189,12 @@ def update_change_record(
         updated = dict(change)
         for field in SCHEDULE_EDIT_FIELDS:
             if field in payload and payload[field] is not None:
-                updated[field] = str(payload[field]).strip()[:8000]
+                value = str(payload[field]).strip()
+                if field == "communicationStatus":
+                    value = value.casefold()
+                    if value not in COMMUNICATION_STATES:
+                        raise ValueError("Choose a valid communicationStatus")
+                updated[field] = value[:8000]
         if (
             updated.get("plannedStart")
             and updated.get("plannedEnd")
@@ -898,7 +1230,6 @@ def update_change_record(
             "rollbackPlan",
             "communicationStatus",
             "communicationPlan",
-            "assignedTechnician",
             "approver",
             "notes",
             "scopeAssetIds",
@@ -914,6 +1245,59 @@ def update_change_record(
         raise ValueError(f"A change in {current_status.replace('_', ' ')} status cannot be edited")
     updated["revision"] = int(change.get("revision") or 1) + 1
     updated["updatedAt"] = utc_now()
+    updated["lastUpdatedBy"] = {"id": actor.get("id"), "email": actor.get("email", "")}
+    return updated
+
+
+def reassign_change_record(
+    change: dict,
+    assignee: dict | None,
+    reason: str,
+    actor: dict,
+) -> dict:
+    """Create an auditable revision that changes only the technical assignee."""
+
+    current_status = str(change.get("status") or "draft")
+    if current_status not in ASSIGNABLE_CHANGE_STATUSES:
+        raise ValueError(
+            f"A change in {current_status.replace('_', ' ')} status cannot be reassigned"
+        )
+    normalized_reason = str(reason or "").strip()
+    if len(normalized_reason) < 4:
+        raise ValueError("Enter a reason for the reassignment")
+
+    previous_user_id = change.get("assignedUserId") or None
+    previous_display_name = str(change.get("assignedTechnician") or "")
+    assigned_user_id = assignee.get("id") if assignee else None
+    assigned_display_name = (
+        str(assignee.get("displayName") or assignee.get("email") or "") if assignee else ""
+    )
+    if previous_user_id == assigned_user_id and (
+        assigned_user_id is not None or not previous_display_name
+    ):
+        raise ValueError("Choose a different technician")
+
+    timestamp = utc_now()
+    updated = deepcopy(change)
+    updated["assignedUserId"] = assigned_user_id
+    updated["assignedTechnician"] = assigned_display_name
+    history = list(updated.get("assignmentHistory") or [])
+    history.append(
+        {
+            "id": str(uuid.uuid4()),
+            "previousUserId": previous_user_id,
+            "previousDisplayName": previous_display_name,
+            "assignedUserId": assigned_user_id,
+            "assignedDisplayName": assigned_display_name,
+            "reason": normalized_reason,
+            "actorId": actor.get("id"),
+            "actorEmail": actor.get("email", ""),
+            "createdAt": timestamp,
+        }
+    )
+    updated["assignmentHistory"] = history
+    updated["revision"] = int(change.get("revision") or 1) + 1
+    updated["updatedAt"] = timestamp
     updated["lastUpdatedBy"] = {"id": actor.get("id"), "email": actor.get("email", "")}
     return updated
 
@@ -982,8 +1366,18 @@ def transition_change_record(change: dict, target_status: str, payload: dict, ac
         updated["rollbackResult"] = str(payload.get("rollbackResult") or reason).strip()[:8000]
     elif target == "cancelled":
         updated["outcome"] = "cancelled"
+    elif target == "post_implementation_review":
+        if not updated.get("closureAssessment"):
+            updated["closureAssessment"] = initial_closure_assessment(updated)
     elif target == "closed":
-        updated["closureNotes"] = str(payload.get("closureNotes") or reason).strip()[:8000]
+        assessment = normalize_closure_assessment(
+            updated,
+            payload.get("closureAssessment"),
+            actor,
+        )
+        updated["closureAssessment"] = assessment
+        updated["outcome"] = assessment["implementationResult"]
+        updated["closureNotes"] = assessment["closureSummary"]
     return updated
 
 
@@ -1620,6 +2014,143 @@ def render_change_pdf(change: dict, company: dict, branding: dict) -> bytes:
             )
         )
         story.append(outcome_table)
+
+    closure = change.get("closureAssessment") or {}
+    closure_tests = [item for item in closure.get("tests") or [] if isinstance(item, dict)]
+    if closure_tests:
+        story.append(Paragraph("Post-change review and closure", styles["Section"]))
+        closure_rows = [
+            ["Implementation result", _label(closure.get("implementationResult"))],
+            ["Service status", _label(closure.get("serviceStatus"))],
+            [
+                "PIR",
+                (
+                    "Completed"
+                    if closure.get("pirCompleted")
+                    else "Required"
+                    if closure.get("pirRequired")
+                    else "Not required"
+                ),
+            ],
+            [
+                "Stakeholder acceptance",
+                _label(closure.get("stakeholderConfirmation") or "not_required"),
+            ],
+            ["Deviations", closure.get("deviations") or "None recorded"],
+            ["Unexpected impact", closure.get("unexpectedImpact") or "None recorded"],
+            ["Lessons learned", closure.get("lessonsLearned") or "None recorded"],
+            ["Closure summary", closure.get("closureSummary") or "Not yet closed"],
+            ["Closed by", closure.get("closedBy") or "Not yet closed"],
+            ["Closed at", closure.get("closedAt") or "Not yet closed"],
+        ]
+        closure_table = Table(
+            [
+                [
+                    Paragraph(f"<b>{_safe(label)}</b>", styles["Cell"]),
+                    Paragraph(_safe(value).replace("\n", "<br/>"), styles["Cell"]),
+                ]
+                for label, value in closure_rows
+            ],
+            colWidths=[48 * mm, 130 * mm],
+        )
+        closure_table.setStyle(
+            TableStyle(
+                [
+                    ("GRID", (0, 0), (-1, -1), 0.4, line),
+                    ("BACKGROUND", (0, 0), (0, -1), pale),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 3 * mm),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3 * mm),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2.3 * mm),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2.3 * mm),
+                ]
+            )
+        )
+        story.append(closure_table)
+        story.append(Paragraph("Validation evidence", styles["Section"]))
+        validation_rows: list[list[object]] = [
+            [
+                Paragraph("<b>Test</b>", styles["Cell"]),
+                Paragraph("<b>Result</b>", styles["Cell"]),
+                Paragraph("<b>Actual result and evidence</b>", styles["Cell"]),
+            ]
+        ]
+        for test in closure_tests:
+            details = test.get("actualResult") or "Not recorded"
+            if test.get("evidence"):
+                details = f"{details}\nEvidence: {test['evidence']}"
+            if test.get("testedBy"):
+                details = f"{details}\nTested by {test['testedBy']}" + (
+                    f" at {test['testedAt']}" if test.get("testedAt") else ""
+                )
+            validation_rows.append(
+                [
+                    Paragraph(
+                        f"<b>{_safe(test.get('label'))}</b><br/>"
+                        f"<font color='#5e6b80'>{_safe(test.get('expectedResult'))}</font>",
+                        styles["Cell"],
+                    ),
+                    Paragraph(_safe(_label(test.get("result"))), styles["Cell"]),
+                    Paragraph(_safe(details).replace("\n", "<br/>"), styles["Cell"]),
+                ]
+            )
+        validation_table = Table(
+            validation_rows,
+            colWidths=[62 * mm, 28 * mm, 88 * mm],
+            repeatRows=1,
+        )
+        validation_table.setStyle(
+            TableStyle(
+                [
+                    ("GRID", (0, 0), (-1, -1), 0.4, line),
+                    ("BACKGROUND", (0, 0), (-1, 0), navy),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 2.3 * mm),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 2.3 * mm),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2 * mm),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2 * mm),
+                ]
+            )
+        )
+        story.append(validation_table)
+        follow_ups = [
+            item
+            for item in closure.get("followUpActions") or []
+            if isinstance(item, dict) and item.get("description")
+        ]
+        if follow_ups:
+            story.append(Paragraph("Follow-up actions", styles["Section"]))
+            follow_up_rows: list[list[object]] = [
+                ["Action", "Owner", "Due", "Status"],
+                *[
+                    [
+                        item.get("description"),
+                        item.get("owner") or "Not assigned",
+                        item.get("dueDate") or "Not set",
+                        _label(item.get("status")),
+                    ]
+                    for item in follow_ups
+                ],
+            ]
+            follow_up_table = Table(
+                [
+                    [Paragraph(_safe(value), styles["Cell"]) for value in row]
+                    for row in follow_up_rows
+                ],
+                colWidths=[88 * mm, 44 * mm, 24 * mm, 22 * mm],
+                repeatRows=1,
+            )
+            follow_up_table.setStyle(
+                TableStyle(
+                    [
+                        ("GRID", (0, 0), (-1, -1), 0.4, line),
+                        ("BACKGROUND", (0, 0), (-1, 0), pale),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ]
+                )
+            )
+            story.append(follow_up_table)
 
     story.append(Paragraph("Record and integration details", styles["Section"]))
     cw_state = change.get("integrationState", {}).get("connectwise", {})

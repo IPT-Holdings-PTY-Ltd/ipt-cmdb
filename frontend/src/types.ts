@@ -589,6 +589,97 @@ export type ChangeImpactPreview = {
   };
 };
 
+export type ChangeTemplateParameter = {
+  key: string;
+  label: string;
+  type: 'text' | 'multiline' | 'number' | 'select' | 'boolean';
+  required: boolean;
+  source: string;
+  helpText: string;
+  options: string[];
+};
+
+export type ChangeTemplateClosureTest = {
+  key: string;
+  label: string;
+  expectedResultTemplate: string;
+  required: boolean;
+  evidenceRequired: boolean;
+};
+
+export type ChangeTemplateContent = {
+  titleTemplate: string;
+  changeType: string;
+  category: string;
+  priority: string;
+  outageExpected: boolean;
+  expectedDurationMinutes: number;
+  reasonTemplate: string;
+  businessImpactTemplate: string;
+  implementationPlanTemplate: string;
+  validationPlanTemplate: string;
+  rollbackPlanTemplate: string;
+  communicationStatus: string;
+  communicationPlanTemplate: string;
+  suggestedApproverRole: string;
+  closureTests: ChangeTemplateClosureTest[];
+  parameters: ChangeTemplateParameter[];
+};
+
+export type ChangeClosureTest = {
+  key: string;
+  label: string;
+  expectedResult: string;
+  required: boolean;
+  evidenceRequired: boolean;
+  result: 'pending' | 'passed' | 'failed' | 'not_run';
+  actualResult: string;
+  evidence: string;
+  testedBy: string;
+  testedAt: string;
+};
+
+export type ChangeClosureFollowUp = {
+  id: string;
+  description: string;
+  owner: string;
+  dueDate: string;
+  status: 'open' | 'completed';
+};
+
+export type ChangeClosureAssessment = {
+  implementationResult: 'successful' | 'successful_with_issues' | 'partially_implemented' | 'failed' | 'backed_out';
+  serviceStatus: 'restored' | 'degraded' | 'unavailable';
+  deviations: string;
+  unexpectedImpact: string;
+  tests: ChangeClosureTest[];
+  pirRequired: boolean;
+  pirCompleted: boolean;
+  lessonsLearned: string;
+  followUpActions: ChangeClosureFollowUp[];
+  stakeholderConfirmation: 'not_required' | 'confirmed';
+  closureSummary: string;
+  closedBy: string;
+  closedAt: string;
+};
+
+export type ChangeTemplate = {
+  id: string;
+  companyId?: string | null;
+  key: string;
+  name: string;
+  description: string;
+  tags: string[];
+  status: 'draft' | 'published' | 'retired';
+  system: boolean;
+  version: number;
+  ownerUserId?: string | null;
+  reviewDueDate?: string | null;
+  content: ChangeTemplateContent;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type ChangePackage = {
   id: string;
   number: string;
@@ -612,6 +703,7 @@ export type ChangePackage = {
   rollbackPlan: string;
   communicationStatus: string;
   communicationPlan: string;
+  assignedUserId?: string | null;
   assignedTechnician: string;
   approver: string;
   notes: string;
@@ -621,13 +713,20 @@ export type ChangePackage = {
   actualStart: string;
   actualEnd: string;
   actualOutageMinutes: number;
-  outcome: 'pending' | 'successful' | 'failed' | 'backed_out' | 'cancelled';
+  outcome: 'pending' | 'successful' | 'successful_with_issues' | 'partially_implemented' | 'failed' | 'backed_out' | 'cancelled';
   failureReason: string;
   validationResult: string;
   rollbackExecuted: boolean;
   rollbackResult: string;
   closureNotes: string;
+  closureAssessment?: ChangeClosureAssessment;
   approvals: Array<{ id: string; decision: 'approved' | 'declined'; comments: string; actorId?: string | null; actorEmail: string; approverName?: string; responsibilityRole?: string; scope?: Array<{ type: string; id?: string; name?: string }>; createdAt: string }>;
+  assignmentHistory?: Array<{ id: string; previousUserId?: string | null; previousDisplayName: string; assignedUserId?: string | null; assignedDisplayName: string; reason: string; actorId?: string | null; actorEmail: string; createdAt: string }>;
+  assignmentNotification?: { requested: boolean; queued: boolean; recipient?: string | null };
+  templateId?: string | null;
+  templateVersion?: number | null;
+  templateSnapshot?: { id: string; key: string; name: string; companyId?: string | null; version: number; content: ChangeTemplateContent } | null;
+  templateParameters?: Record<string, string | number | boolean>;
   statusHistory: Array<{ id: string; fromStatus?: string | null; toStatus: string; reason: string; actorId?: string | null; actorEmail: string; createdAt: string }>;
   createdBy: { id?: string | null; email: string };
   createdAt: string;

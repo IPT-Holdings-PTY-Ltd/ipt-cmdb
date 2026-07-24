@@ -19,6 +19,11 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Enforced customer field authority during ConnectWise preview and canonical import, including protected-field evidence, source provenance and audited baseline presets.
 - Change approval batches derived from structured business-system ownership, with Microsoft 365 invitations, expiring single-use public review links, multi-approver completion, decline handling and immutable decision evidence.
 - Technician-facing approval delivery/status controls and a branded, login-free external sign-off page scoped to each approver's affected business systems.
+- Asset-linked change history with tenant-safe reverse lookup, named affected-CI summaries and scope/direct/downstream impact context on both change and asset views.
+- Governed change reassignment and unassignment with customer-scoped technician selection, optimistic concurrency, immutable assignment history, audit evidence, optional Microsoft 365 notification and assignment-aware register filters.
+- Governed global and customer change-template library with six seeded procedures, typed technician prompts, ownership, review dates, draft/publish/retire lifecycle and immutable versions.
+- Template-first change authoring with safe token rendering, pinned procedure provenance and parameter evidence while retaining CMDB-derived scope, impact, risk, identities and approvals.
+- Guided post-change review and closure with template-governed validation tests, evidence capture, outcome and service-state rules, risk-based PIR and stakeholder acceptance gates, accountable follow-up actions, immutable audit evidence and expanded change PDFs.
 - Governance navigation with MSP- and customer-scoped Audit Center and Reports Center.
 - Append-only audit v2 schema with actor attribution, source, outcome, severity, sanitised field changes and request correlation.
 - Authentication, authorization-denial, portable-export, recovery and report-download audit coverage.
@@ -32,7 +37,7 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Self-service **My security** controls plus per-user and environment-level MFA enforcement policy.
 - Platform-admin-only MFA reset with local administrator step-up verification, typed target confirmation, optional ticket evidence, discoverable disabled states, detailed audit metadata and immediate target-session revocation.
 - Replaced root user-management customer checkboxes with a scalable, search-driven scope selector, collapsed selections, filtered bulk management, group/direct/effective counts and assignment-source preview.
-- Blank-database and forward-upgrade coverage through schema `2026.07.24.2`.
+- Blank-database and forward-upgrade coverage through schema `2026.07.24.6`.
 - Guarded semantic-version release automation that reuses CI, publishes attested multi-architecture GHCR images and generates categorized GitHub releases.
 
 ### Planned

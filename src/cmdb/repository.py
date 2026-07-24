@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from psycopg import sql
+from psycopg.errors import UniqueViolation
 
 from src.cmdb.audit import (
     current_audit_context,
@@ -27,6 +28,7 @@ from src.cmdb.audit import (
     field_changes,
     sanitize_audit_value,
 )
+from src.cmdb.change_templates import DEFAULT_CHANGE_TEMPLATES, normalize_template_content
 from src.cmdb.integration_reconciliation import normalize_ci_policy
 from src.cmdb.notifications import DEFAULT_NOTIFICATION_RULES, DEFAULT_NOTIFICATION_TEMPLATES
 
@@ -151,6 +153,37 @@ def canonical_uuid(kind: str, current_id: str) -> str:
         return str(uuid.uuid5(CMDB_NAMESPACE, f"{kind}:{current_id}"))
 
 
+def change_template_version_uuid(template_id: str, version: int) -> str:
+    """Return the canonical identity for one immutable template version."""
+
+    return canonical_uuid("change_template_version", f"{template_id}:{int(version)}")
+
+
+def default_change_template_records() -> list[dict]:
+    """Return isolated state-repository copies of the standard catalogue."""
+
+    timestamp = utc_now()
+    return [
+        {
+            **deepcopy(template),
+            "id": canonical_uuid("change_template", str(template["key"])),
+            "version": 1,
+            "versions": [
+                {
+                    "version": 1,
+                    "content": normalize_template_content(template["content"]),
+                    "createdBy": None,
+                    "createdAt": timestamp,
+                }
+            ],
+            "content": normalize_template_content(template["content"]),
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
+        }
+        for template in DEFAULT_CHANGE_TEMPLATES
+    ]
+
+
 def normalized_name(value: str) -> str:
     return " ".join(value.casefold().split())
 
@@ -232,6 +265,7 @@ class StateRepository:
         self.state.setdefault("notificationPreferences", [])
         self.state.setdefault("notificationEvents", [])
         self.state.setdefault("changeApprovalRequests", [])
+        self.state.setdefault("changeTemplates", default_change_template_records())
         self.state.setdefault("providerCompanyObservations", [])
         self.state.setdefault("providerCompanyMappings", [])
 
@@ -1547,10 +1581,33 @@ class StateRepository:
         self.save_state(self.state)
         return True
 
-    def _postgres_list_changes(self) -> list[dict]:
+    def _postgres_list_changes(
+        self,
+        company_id: str | None = None,
+        asset_id: str | None = None,
+    ) -> list[dict]:
+        # canonical_uuid is intentionally idempotent for UUID input while retaining
+        # compatibility with legacy prototype IDs migrated deterministically to UUIDs.
+        asset_uuid = canonical_uuid("configuration_item", asset_id) if asset_id else None
         with self.connection_factory() as connection, connection.cursor() as cursor:  # type: ignore[attr-defined]  # Bound to PostgreSQL subclass below.
+            # The appended fragment is fixed; customer and CI values remain bound parameters.
             cursor.execute(
-                self._change_select_sql() + " ORDER BY cr.created_at DESC, cr.change_number DESC"
+                self._change_select_sql()
+                + """
+                  WHERE (%s::text IS NULL OR c.slug = %s)
+                    AND (
+                        %s::uuid IS NULL
+                        OR EXISTS (
+                            SELECT 1
+                            FROM change_impact_snapshots impact
+                            WHERE impact.change_id = cr.id
+                              AND impact.ci_id = %s::uuid
+                              AND impact.included = true
+                        )
+                    )
+                  ORDER BY cr.created_at DESC, cr.change_number DESC
+                """,  # nosec B608
+                (company_id, company_id, asset_uuid, asset_uuid),
             )
             return [self._change_from_row(cursor, row) for row in cursor.fetchall()]
 
@@ -1920,11 +1977,15 @@ class StateRepository:
                    cr.outage_expected, cr.planned_start, cr.planned_end, cr.reason,
                    cr.business_impact, cr.implementation_plan, cr.validation_plan,
                    cr.rollback_plan, cr.communication_status, cr.communication_plan,
-                   cr.assigned_technician, cr.approver, cr.notes, cr.impact_summary,
+                   cr.assigned_user_id, cr.assigned_technician, cr.assignment_history,
+                   cr.template_id, cr.template_version, cr.template_snapshot,
+                   cr.template_parameters,
+                   cr.approver, cr.notes, cr.impact_summary,
                    cr.risk_assessment, cr.revision, cr.actual_start, cr.actual_end,
                    cr.actual_outage_minutes, cr.outcome, cr.failure_reason,
                    cr.validation_result, cr.rollback_executed, cr.rollback_result,
-                   cr.closure_notes, cr.approvals, cr.status_history, u.id, u.email::text,
+                   cr.closure_notes, cr.closure_assessment,
+                   cr.approvals, cr.status_history, u.id, u.email::text,
                    cr.created_at, cr.updated_at
             FROM change_requests cr
             JOIN companies c ON c.id = cr.company_id
@@ -1954,7 +2015,13 @@ class StateRepository:
             rollback_plan,
             communication_status,
             communication_plan,
+            assigned_user_id,
             assigned_technician,
+            assignment_history,
+            template_id,
+            template_version,
+            template_snapshot,
+            template_parameters,
             approver,
             notes,
             impact_summary,
@@ -1969,6 +2036,7 @@ class StateRepository:
             rollback_executed,
             rollback_result,
             closure_notes,
+            closure_assessment,
             approvals,
             status_history,
             creator_id,
@@ -2085,7 +2153,13 @@ class StateRepository:
             "rollbackPlan": rollback_plan,
             "communicationStatus": communication_status,
             "communicationPlan": communication_plan or "",
+            "assignedUserId": str(assigned_user_id) if assigned_user_id else None,
             "assignedTechnician": assigned_technician or "",
+            "assignmentHistory": assignment_history or [],
+            "templateId": str(template_id) if template_id else None,
+            "templateVersion": int(template_version) if template_version else None,
+            "templateSnapshot": template_snapshot,
+            "templateParameters": template_parameters or {},
             "approver": approver or "",
             "notes": notes or "",
             "scopeAssetIds": [item for item in scope_asset_ids if item],
@@ -2107,6 +2181,7 @@ class StateRepository:
             "rollbackExecuted": bool(rollback_executed),
             "rollbackResult": rollback_result or "",
             "closureNotes": closure_notes or "",
+            "closureAssessment": closure_assessment or {},
             "approvals": approvals or [],
             "statusHistory": status_history or [],
             "externalReferences": external_references,
@@ -2131,24 +2206,37 @@ class StateRepository:
         revision_actor_uuid = (
             canonical_uuid("user", revision_actor_id) if revision_actor_id else creator_uuid
         )
+        assigned_user_uuid = (
+            canonical_uuid("user", change["assignedUserId"])
+            if change.get("assignedUserId")
+            else None
+        )
+        template_uuid = (
+            canonical_uuid("change_template", change["templateId"])
+            if change.get("templateId")
+            else None
+        )
         cursor.execute(
             """
             INSERT INTO change_requests (
                 id, company_id, change_number, title, status, change_type, category,
                 priority, risk_level, risk_source, outage_expected, planned_start,
                 planned_end, reason, business_impact, implementation_plan, validation_plan,
-                rollback_plan, communication_status, communication_plan, assigned_technician,
-                approver, notes, impact_summary, risk_assessment, revision,
+                rollback_plan, communication_status, communication_plan, assigned_user_id,
+                assigned_technician, assignment_history, template_id, template_version,
+                template_snapshot, template_parameters, approver, notes, impact_summary,
+                risk_assessment, revision,
                 actual_start, actual_end, actual_outage_minutes, outcome, failure_reason,
                 validation_result, rollback_executed, rollback_result, closure_notes,
-                approvals, status_history, created_by,
+                closure_assessment, approvals, status_history, created_by,
                 created_at, updated_at
             ) VALUES (
                 %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 %s::timestamp, %s::timestamp, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s::jsonb, %s::jsonb, %s,
+                %s::uuid, %s, %s::jsonb, %s::uuid, %s, %s::jsonb, %s::jsonb,
+                %s, %s, %s::jsonb, %s::jsonb, %s,
                 %s::timestamptz, %s::timestamptz, %s, %s, %s,
-                %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::uuid,
+                %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::uuid,
                 COALESCE(%s::timestamptz, now()), COALESCE(%s::timestamptz, now())
             )
             ON CONFLICT (id) DO UPDATE SET
@@ -2163,14 +2251,23 @@ class StateRepository:
                 validation_plan = EXCLUDED.validation_plan, rollback_plan = EXCLUDED.rollback_plan,
                 communication_status = EXCLUDED.communication_status,
                 communication_plan = EXCLUDED.communication_plan,
-                assigned_technician = EXCLUDED.assigned_technician, approver = EXCLUDED.approver,
+                assigned_user_id = EXCLUDED.assigned_user_id,
+                assigned_technician = EXCLUDED.assigned_technician,
+                assignment_history = EXCLUDED.assignment_history,
+                template_id = EXCLUDED.template_id,
+                template_version = EXCLUDED.template_version,
+                template_snapshot = EXCLUDED.template_snapshot,
+                template_parameters = EXCLUDED.template_parameters,
+                approver = EXCLUDED.approver,
                 notes = EXCLUDED.notes, impact_summary = EXCLUDED.impact_summary,
                 risk_assessment = EXCLUDED.risk_assessment, revision = EXCLUDED.revision,
                 actual_start = EXCLUDED.actual_start, actual_end = EXCLUDED.actual_end,
                 actual_outage_minutes = EXCLUDED.actual_outage_minutes, outcome = EXCLUDED.outcome,
                 failure_reason = EXCLUDED.failure_reason, validation_result = EXCLUDED.validation_result,
                 rollback_executed = EXCLUDED.rollback_executed, rollback_result = EXCLUDED.rollback_result,
-                closure_notes = EXCLUDED.closure_notes, approvals = EXCLUDED.approvals,
+                closure_notes = EXCLUDED.closure_notes,
+                closure_assessment = EXCLUDED.closure_assessment,
+                approvals = EXCLUDED.approvals,
                 status_history = EXCLUDED.status_history,
                 created_by = EXCLUDED.created_by, updated_at = EXCLUDED.updated_at
             """,
@@ -2195,7 +2292,15 @@ class StateRepository:
                 change.get("rollbackPlan", ""),
                 change.get("communicationStatus", "required"),
                 change.get("communicationPlan") or None,
+                assigned_user_uuid,
                 change.get("assignedTechnician") or None,
+                json.dumps(change.get("assignmentHistory") or []),
+                template_uuid,
+                int(change.get("templateVersion") or 0) or None,
+                json.dumps(change.get("templateSnapshot"))
+                if change.get("templateSnapshot")
+                else None,
+                json.dumps(change.get("templateParameters") or {}),
                 change.get("approver") or None,
                 change.get("notes") or None,
                 json.dumps(change.get("impactSummary") or {}),
@@ -2210,6 +2315,7 @@ class StateRepository:
                 bool(change.get("rollbackExecuted")),
                 change.get("rollbackResult") or None,
                 change.get("closureNotes") or None,
+                json.dumps(change.get("closureAssessment") or {}),
                 json.dumps(change.get("approvals") or []),
                 json.dumps(change.get("statusHistory") or []),
                 creator_uuid,
@@ -2308,8 +2414,25 @@ class StateRepository:
             return value.isoformat().replace("+00:00", "Z")
         return str(value)
 
-    def list_changes(self) -> list[dict]:
-        return deepcopy(self.state.get("changes", []))
+    def list_changes(
+        self,
+        company_id: str | None = None,
+        asset_id: str | None = None,
+    ) -> list[dict]:
+        changes = self.state.get("changes", [])
+        if company_id:
+            changes = [item for item in changes if item.get("companyId") == company_id]
+        if asset_id:
+            changes = [
+                item
+                for item in changes
+                if asset_id in (item.get("scopeAssetIds") or [])
+                or any(
+                    impact.get("assetId") == asset_id
+                    for impact in (item.get("impactSnapshot") or [])
+                )
+            ]
+        return deepcopy(changes)
 
     def get_change(self, change_id: str) -> dict | None:
         change = next(
@@ -2368,6 +2491,165 @@ class StateRepository:
         )
         self.save_state(self.state)
         return deepcopy(current)
+
+    @staticmethod
+    def _change_template_public(template: dict, version: int | None = None) -> dict:
+        """Return one template with the requested immutable content version."""
+
+        target_version = int(version or template.get("version") or 1)
+        version_record = next(
+            (
+                item
+                for item in template.get("versions", [])
+                if int(item.get("version") or 0) == target_version
+            ),
+            None,
+        )
+        if not version_record and target_version == int(template.get("version") or 1):
+            version_record = {"content": template.get("content") or {}}
+        if not version_record:
+            raise ValueError("Change template version not found")
+        return {
+            key: deepcopy(value)
+            for key, value in template.items()
+            if key not in {"versions", "content"}
+        } | {
+            "version": target_version,
+            "content": deepcopy(version_record["content"]),
+        }
+
+    def list_change_templates(self, company_id: str | None = None) -> list[dict]:
+        """List global and optionally customer-scoped change templates."""
+
+        records = [
+            item
+            for item in self.state.get("changeTemplates", [])
+            if company_id is None or item.get("companyId") in {None, company_id}
+        ]
+        return [
+            self._change_template_public(item)
+            for item in sorted(
+                records,
+                key=lambda item: (
+                    item.get("companyId") or "",
+                    str(item.get("name") or "").casefold(),
+                ),
+            )
+        ]
+
+    def get_change_template(self, template_id: str, version: int | None = None) -> dict | None:
+        """Load one template identity and pinned content version."""
+
+        template = next(
+            (item for item in self.state.get("changeTemplates", []) if item["id"] == template_id),
+            None,
+        )
+        if not template:
+            return None
+        try:
+            return self._change_template_public(template, version)
+        except ValueError:
+            return None
+
+    def create_change_template(self, template: dict, actor_id: str | None = None) -> dict:
+        """Create a template identity and immutable version one."""
+
+        key = str(template["key"]).casefold()
+        company_id = template.get("companyId")
+        if any(
+            item.get("companyId") == company_id and str(item.get("key") or "").casefold() == key
+            for item in self.state.get("changeTemplates", [])
+        ):
+            raise ValueError("A template with that key already exists in this scope")
+        timestamp = utc_now()
+        stored = {
+            **deepcopy(template),
+            "id": canonical_uuid("change_template", template.get("id") or str(uuid.uuid4())),
+            "content": normalize_template_content(template["content"]),
+            "version": 1,
+            "versions": [
+                {
+                    "version": 1,
+                    "content": normalize_template_content(template["content"]),
+                    "createdBy": actor_id,
+                    "createdAt": timestamp,
+                }
+            ],
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
+        }
+        self.state.setdefault("changeTemplates", []).append(stored)
+        public = self._change_template_public(stored)
+        self._audit(
+            company_id,
+            actor_id,
+            "change_template",
+            stored["id"],
+            "created",
+            None,
+            public,
+        )
+        self.save_state(self.state)
+        return public
+
+    def update_change_template(
+        self,
+        template_id: str,
+        changes: dict,
+        expected_version: int,
+        actor_id: str | None = None,
+    ) -> dict:
+        """Create a new immutable content version and update template metadata."""
+
+        template = next(
+            (item for item in self.state.get("changeTemplates", []) if item["id"] == template_id),
+            None,
+        )
+        if not template:
+            raise ValueError("Change template not found")
+        if int(template.get("version") or 1) != expected_version:
+            raise ValueError("Change template changed. Reload it before saving.")
+        before = self._change_template_public(template)
+        new_version = expected_version + 1
+        content = normalize_template_content(changes.get("content") or template["content"])
+        template.update(
+            {
+                key: deepcopy(value)
+                for key, value in changes.items()
+                if key
+                in {
+                    "name",
+                    "description",
+                    "tags",
+                    "status",
+                    "ownerUserId",
+                    "reviewDueDate",
+                }
+            }
+        )
+        template["content"] = content
+        template["version"] = new_version
+        template["updatedAt"] = utc_now()
+        template.setdefault("versions", []).append(
+            {
+                "version": new_version,
+                "content": content,
+                "createdBy": actor_id,
+                "createdAt": template["updatedAt"],
+            }
+        )
+        stored = self._change_template_public(template)
+        self._audit(
+            template.get("companyId"),
+            actor_id,
+            "change_template",
+            template_id,
+            "version_created",
+            before,
+            stored,
+        )
+        self.save_state(self.state)
+        return stored
 
     @staticmethod
     def _approval_public(record: dict) -> dict:
@@ -4364,6 +4646,7 @@ class StateRepository:
         self.state.setdefault("notificationPreferences", [])
         self.state.setdefault("notificationEvents", [])
         self.state.setdefault("changeApprovalRequests", [])
+        self.state.setdefault("changeTemplates", default_change_template_records())
         self.state.setdefault("passwordResets", [])
         self.state.setdefault("providerCompanyObservations", [])
         self.state.setdefault("providerCompanyMappings", [])
@@ -4463,6 +4746,344 @@ class PostgresCmdbRepository(StateRepository):
     ):
         super().__init__(state, save_state)
         self.connection_factory = connection_factory
+        self._ensure_default_change_templates()
+
+    @staticmethod
+    def _change_template_from_row(row: tuple) -> dict:
+        (
+            template_id,
+            company_slug,
+            key,
+            name,
+            description,
+            tags,
+            status,
+            system,
+            current_version,
+            owner_user_id,
+            review_due_date,
+            content,
+            created_at,
+            updated_at,
+        ) = row
+        return {
+            "id": str(template_id),
+            "companyId": company_slug,
+            "key": key,
+            "name": name,
+            "description": description or "",
+            "tags": list(tags or []),
+            "status": status,
+            "system": bool(system),
+            "version": int(current_version),
+            "ownerUserId": str(owner_user_id) if owner_user_id else None,
+            "reviewDueDate": review_due_date.isoformat() if review_due_date else None,
+            "content": content or {},
+            "createdAt": PostgresCmdbRepository._timestamp(created_at),
+            "updatedAt": PostgresCmdbRepository._timestamp(updated_at),
+        }
+
+    def _ensure_default_change_templates(self) -> None:
+        """Idempotently seed the maintained MSP standard-template catalogue."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            for template in DEFAULT_CHANGE_TEMPLATES:
+                template_id = canonical_uuid("change_template", template["key"])
+                content = normalize_template_content(template["content"])
+                cursor.execute(
+                    """
+                    INSERT INTO change_templates (
+                        id, company_id, template_key, name, description, tags,
+                        status, system, current_version
+                    ) VALUES (
+                        %s::uuid, NULL, %s, %s, %s, %s::jsonb,
+                        'published', true, 1
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    (
+                        template_id,
+                        template["key"],
+                        template["name"],
+                        template["description"],
+                        json.dumps(template["tags"]),
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO change_template_versions (
+                        id, template_id, version, content
+                    ) VALUES (%s::uuid, %s::uuid, 1, %s::jsonb)
+                    ON CONFLICT (template_id, version) DO NOTHING
+                    """,
+                    (
+                        change_template_version_uuid(template_id, 1),
+                        template_id,
+                        json.dumps(content),
+                    ),
+                )
+                cursor.execute(
+                    """
+                    SELECT template.current_version, version.content
+                    FROM change_templates template
+                    JOIN change_template_versions version
+                      ON version.template_id = template.id
+                     AND version.version = template.current_version
+                    WHERE template.id = %s::uuid AND template.system = true
+                    """,
+                    (template_id,),
+                )
+                current = cursor.fetchone()
+                if current and not (current[1] or {}).get("closureTests"):
+                    next_version = int(current[0]) + 1
+                    upgraded_content = normalize_template_content(
+                        {
+                            **(current[1] or {}),
+                            "closureTests": content["closureTests"],
+                        }
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO change_template_versions (
+                            id, template_id, version, content
+                        ) VALUES (%s::uuid, %s::uuid, %s, %s::jsonb)
+                        ON CONFLICT (template_id, version) DO NOTHING
+                        """,
+                        (
+                            change_template_version_uuid(template_id, next_version),
+                            template_id,
+                            next_version,
+                            json.dumps(upgraded_content),
+                        ),
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE change_templates
+                        SET current_version = %s, updated_at = now()
+                        WHERE id = %s::uuid AND current_version < %s
+                        """,
+                        (next_version, template_id, next_version),
+                    )
+
+    def list_change_templates(self, company_id: str | None = None) -> list[dict]:
+        """Load current global and customer template versions."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT template.id, company.slug, template.template_key::text,
+                       template.name, template.description, template.tags,
+                       template.status, template.system, template.current_version,
+                       template.owner_user_id, template.review_due_date,
+                       version.content, template.created_at, template.updated_at
+                FROM change_templates template
+                LEFT JOIN companies company ON company.id = template.company_id
+                JOIN change_template_versions version
+                  ON version.template_id = template.id
+                 AND version.version = template.current_version
+                WHERE %s::text IS NULL OR template.company_id IS NULL OR company.slug = %s
+                ORDER BY company.name NULLS FIRST, template.name
+                """,
+                (company_id, company_id),
+            )
+            return [self._change_template_from_row(row) for row in cursor.fetchall()]
+
+    def get_change_template(self, template_id: str, version: int | None = None) -> dict | None:
+        """Load one identity at its current or requested immutable version."""
+
+        try:
+            parsed_id = str(uuid.UUID(template_id))
+        except (ValueError, TypeError):
+            return None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT template.id, company.slug, template.template_key::text,
+                       template.name, template.description, template.tags,
+                       template.status, template.system, version.version,
+                       template.owner_user_id, template.review_due_date,
+                       version.content, template.created_at, template.updated_at
+                FROM change_templates template
+                LEFT JOIN companies company ON company.id = template.company_id
+                JOIN change_template_versions version
+                  ON version.template_id = template.id
+                 AND version.version = COALESCE(%s::integer, template.current_version)
+                WHERE template.id = %s::uuid
+                """,
+                (version, parsed_id),
+            )
+            row = cursor.fetchone()
+            return self._change_template_from_row(row) if row else None
+
+    def create_change_template(self, template: dict, actor_id: str | None = None) -> dict:
+        """Create a scoped template and immutable version one."""
+
+        template_id = canonical_uuid("change_template", template.get("id") or str(uuid.uuid4()))
+        actor_uuid = canonical_uuid("user", actor_id) if actor_id else None
+        company_uuid = None
+        content = normalize_template_content(template["content"])
+        try:
+            with self.connection_factory() as connection, connection.cursor() as cursor:
+                if template.get("companyId"):
+                    cursor.execute(
+                        "SELECT id FROM companies WHERE slug = %s",
+                        (template["companyId"],),
+                    )
+                    row = cursor.fetchone()
+                    if not row:
+                        raise ValueError("Customer not found")
+                    company_uuid = str(row[0])
+                cursor.execute(
+                    """
+                    INSERT INTO change_templates (
+                        id, company_id, template_key, name, description, tags,
+                        status, system, current_version, owner_user_id,
+                        review_due_date, created_by
+                    ) VALUES (
+                        %s::uuid, %s::uuid, %s, %s, %s, %s::jsonb,
+                        %s, false, 1, %s::uuid, %s::date, %s::uuid
+                    )
+                    """,
+                    (
+                        template_id,
+                        company_uuid,
+                        template["key"],
+                        template["name"],
+                        template.get("description", ""),
+                        json.dumps(template.get("tags") or []),
+                        template.get("status", "draft"),
+                        canonical_uuid("user", template["ownerUserId"])
+                        if template.get("ownerUserId")
+                        else None,
+                        template.get("reviewDueDate") or None,
+                        actor_uuid,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO change_template_versions (
+                        id, template_id, version, content, created_by
+                    ) VALUES (%s::uuid, %s::uuid, 1, %s::jsonb, %s::uuid)
+                    """,
+                    (
+                        change_template_version_uuid(template_id, 1),
+                        template_id,
+                        json.dumps(content),
+                        actor_uuid,
+                    ),
+                )
+                stored = {
+                    **deepcopy(template),
+                    "id": template_id,
+                    "version": 1,
+                    "system": False,
+                    "content": content,
+                }
+                self._insert_audit(
+                    cursor,
+                    template.get("companyId"),
+                    actor_id,
+                    "change_template",
+                    template_id,
+                    "created",
+                    None,
+                    stored,
+                )
+        except UniqueViolation as error:
+            raise ValueError("A template with that key already exists in this scope") from error
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        reloaded = self.get_change_template(template_id)
+        if not reloaded:
+            raise RuntimeError("Created change template could not be reloaded")
+        return reloaded
+
+    def update_change_template(
+        self,
+        template_id: str,
+        changes: dict,
+        expected_version: int,
+        actor_id: str | None = None,
+    ) -> dict:
+        """Write a new content version using optimistic concurrency."""
+
+        before = self.get_change_template(template_id)
+        if not before:
+            raise ValueError("Change template not found")
+        content = normalize_template_content(changes.get("content") or before["content"])
+        actor_uuid = canonical_uuid("user", actor_id) if actor_id else None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT current_version FROM change_templates
+                WHERE id = %s::uuid FOR UPDATE
+                """,
+                (template_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("Change template not found")
+            if int(row[0]) != expected_version:
+                raise ValueError("Change template changed. Reload it before saving.")
+            new_version = expected_version + 1
+            cursor.execute(
+                """
+                INSERT INTO change_template_versions (
+                    id, template_id, version, content, created_by
+                ) VALUES (%s::uuid, %s::uuid, %s, %s::jsonb, %s::uuid)
+                """,
+                (
+                    change_template_version_uuid(template_id, new_version),
+                    template_id,
+                    new_version,
+                    json.dumps(content),
+                    actor_uuid,
+                ),
+            )
+            cursor.execute(
+                """
+                UPDATE change_templates SET
+                    name = %s, description = %s, tags = %s::jsonb,
+                    status = %s, current_version = %s,
+                    owner_user_id = %s::uuid, review_due_date = %s::date,
+                    updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (
+                    changes.get("name", before["name"]),
+                    changes.get("description", before["description"]),
+                    json.dumps(changes.get("tags", before["tags"])),
+                    changes.get("status", before["status"]),
+                    new_version,
+                    canonical_uuid("user", changes["ownerUserId"])
+                    if changes.get("ownerUserId")
+                    else None,
+                    changes.get("reviewDueDate") or None,
+                    template_id,
+                ),
+            )
+            after = {
+                **before,
+                **{key: deepcopy(value) for key, value in changes.items() if key != "content"},
+                "version": new_version,
+                "content": content,
+            }
+            self._insert_audit(
+                cursor,
+                before.get("companyId"),
+                actor_id,
+                "change_template",
+                template_id,
+                "version_created",
+                before,
+                after,
+            )
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        stored = self.get_change_template(template_id)
+        if not stored:
+            raise RuntimeError("Updated change template could not be reloaded")
+        return stored
 
     def is_initialized(self) -> bool:
         with self.connection_factory() as connection, connection.cursor() as cursor:
@@ -4729,6 +5350,89 @@ class PostgresCmdbRepository(StateRepository):
                     cursor.execute(
                         "UPDATE access_groups SET owner_user_id = %s::uuid WHERE id = %s::uuid",
                         (owner_uuid, group_ids[group["id"]]),
+                    )
+
+            for template in self.state.get("changeTemplates", []):
+                template_id = canonical_uuid("change_template", template["id"])
+                template_company_uuid = company_ids.get(template.get("companyId"))
+                owner_id = template.get("ownerUserId")
+                owner_uuid = user_ids.get(owner_id) if owner_id else None
+                current_version = max(1, int(template.get("version") or 1))
+                cursor.execute(
+                    """
+                    INSERT INTO change_templates (
+                        id, company_id, template_key, name, description, tags,
+                        status, system, current_version, owner_user_id,
+                        review_due_date, created_by, created_at, updated_at
+                    ) VALUES (
+                        %s::uuid, %s::uuid, %s, %s, %s, %s::jsonb, %s, %s, %s,
+                        %s::uuid, %s::date, %s::uuid,
+                        COALESCE(%s::timestamptz, now()), COALESCE(%s::timestamptz, now())
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        company_id = EXCLUDED.company_id,
+                        template_key = EXCLUDED.template_key,
+                        name = EXCLUDED.name,
+                        description = EXCLUDED.description,
+                        tags = EXCLUDED.tags,
+                        status = EXCLUDED.status,
+                        system = EXCLUDED.system,
+                        current_version = EXCLUDED.current_version,
+                        owner_user_id = EXCLUDED.owner_user_id,
+                        review_due_date = EXCLUDED.review_due_date,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        template_id,
+                        template_company_uuid,
+                        template["key"],
+                        template["name"],
+                        template.get("description", ""),
+                        json.dumps(template.get("tags") or []),
+                        template.get("status", "draft"),
+                        bool(template.get("system")),
+                        current_version,
+                        owner_uuid,
+                        template.get("reviewDueDate") or None,
+                        user_ids.get(template.get("createdBy")),
+                        template.get("createdAt") or None,
+                        template.get("updatedAt") or None,
+                    ),
+                )
+                versions = template.get("versions") or [
+                    {
+                        "version": current_version,
+                        "content": template.get("content") or {},
+                        "createdBy": template.get("createdBy"),
+                        "createdAt": template.get("updatedAt") or template.get("createdAt"),
+                    }
+                ]
+                for version_record in versions:
+                    version_number = max(1, int(version_record.get("version") or 1))
+                    cursor.execute(
+                        """
+                        INSERT INTO change_template_versions (
+                            id, template_id, version, content, created_by, created_at
+                        ) VALUES (
+                            %s::uuid, %s::uuid, %s, %s::jsonb, %s::uuid,
+                            COALESCE(%s::timestamptz, now())
+                        )
+                        ON CONFLICT (template_id, version) DO UPDATE SET
+                            content = EXCLUDED.content,
+                            created_by = EXCLUDED.created_by
+                        """,
+                        (
+                            change_template_version_uuid(template_id, version_number),
+                            template_id,
+                            version_number,
+                            json.dumps(
+                                normalize_template_content(
+                                    version_record.get("content") or template["content"]
+                                )
+                            ),
+                            user_ids.get(version_record.get("createdBy")),
+                            version_record.get("createdAt") or None,
+                        ),
                     )
 
             contact_ids: dict[str, str] = {}
@@ -10379,6 +11083,33 @@ class PostgresCmdbRepository(StateRepository):
                 for row in cursor.fetchall()
             ]
 
+    def _export_change_templates(self) -> list[dict]:
+        """Export template identities with every immutable content version."""
+
+        templates = {item["id"]: {**item, "versions": []} for item in self.list_change_templates()}
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT version.template_id, version.version, version.content,
+                       version.created_by, version.created_at
+                FROM change_template_versions version
+                ORDER BY version.template_id, version.version
+                """
+            )
+            for template_id, version, content, created_by, created_at in cursor.fetchall():
+                template = templates.get(str(template_id))
+                if not template:
+                    continue
+                template["versions"].append(
+                    {
+                        "version": int(version),
+                        "content": content or {},
+                        "createdBy": str(created_by) if created_by else None,
+                        "createdAt": self._timestamp(created_at),
+                    }
+                )
+        return list(templates.values())
+
     def export_state(self) -> dict:
         """Assemble a portable document from canonical tables, never a JSON mirror."""
         return {
@@ -10388,6 +11119,7 @@ class PostgresCmdbRepository(StateRepository):
             "contactResponsibilities": self.list_contact_responsibilities(include_inactive=True),
             "notificationRules": self.list_notification_rules(),
             "notificationTemplates": self.list_notification_templates(),
+            "changeTemplates": self._export_change_templates(),
             "notificationPreferences": self.list_notification_preferences(),
             "accessGroups": self.list_access_groups(),
             "assets": self.list_assets(),
@@ -10577,6 +11309,7 @@ class PostgresCmdbRepository(StateRepository):
         self.state["assets"] = self.list_assets()
         self.state["relationships"] = self.list_relationships()
         self.state["changes"] = self.list_changes()
+        self.state["changeTemplates"] = self.list_change_templates()
         self.state["integrations"] = self.list_integrations()
         self.state["syncRuns"] = self.list_sync_runs()
         self.state["branding"] = self.list_company_branding()
