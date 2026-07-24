@@ -7,6 +7,7 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
 
 from src.cmdb.connectwise import (
+    COMPANY_DISCOVERY_FIELDS,
     ConnectWiseClient,
     ConnectWiseConfigurationError,
     ConnectWiseRequestError,
@@ -138,7 +139,9 @@ class ConnectWiseClientTests(unittest.TestCase):
 
         self.assertTrue(result["reachable"])
         self.assertEqual(result["sampleCompany"]["externalId"], "7")
-        self.assertEqual(parse_qs(urlparse(urls[0]).query)["pageSize"], ["1"])
+        query = parse_qs(urlparse(urls[0]).query)
+        self.assertEqual(query["pageSize"], ["1"])
+        self.assertEqual(query["fields"], ["id,name"])
 
     def test_preview_uses_one_bounded_page_and_accepts_company_territory(self):
         urls = []
@@ -169,7 +172,9 @@ class ConnectWiseClientTests(unittest.TestCase):
         self.assertEqual(companies[0]["typeValues"], ["Customer", "Managed service"])
         self.assertTrue(truncated)
         self.assertEqual(len(urls), 1)
-        self.assertEqual(parse_qs(urlparse(urls[0]).query)["pageSize"], ["50"])
+        query = parse_qs(urlparse(urls[0]).query)
+        self.assertEqual(query["pageSize"], ["50"])
+        self.assertEqual(query["fields"], [COMPANY_DISCOVERY_FIELDS])
 
     def test_territory_catalogue_uses_the_dedicated_read_only_collection(self):
         """Territory choices are complete rather than inferred from company sites."""

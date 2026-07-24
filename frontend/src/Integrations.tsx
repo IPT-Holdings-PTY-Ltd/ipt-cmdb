@@ -145,6 +145,7 @@ export function IntegrationsPage() {
   const installed = entries.filter(entry => entry.installed);
   const available = entries.filter(entry => !entry.installed);
   const attention = installed.filter(entry => statusPresentation(entry, connectWise).color !== 'success').length;
+  const removalConfirmationName = lifecycleEntry?.integration?.name || '';
 
   const openConfiguration = (entry: DirectoryEntry) => {
     if (entry.key === 'connectwise') navigate('/admin/integrations/connectwise');
@@ -364,8 +365,8 @@ export function IntegrationsPage() {
               <Paper variant="outlined" sx={{ p: 2, borderColor: 'error.main' }}>
                 <Stack spacing={1.5}>
                   <Box><Typography variant="h6" color="error.main">Danger zone</Typography><Typography variant="body2" color="text.secondary">Removal is credential-destructive. Canonical CIs, mappings, sync history and audit evidence are deliberately retained.</Typography></Box>
-                  <TextField label={`Type “${lifecycleEntry?.name || ''}” to confirm`} value={removalConfirmation} onChange={event => setRemovalConfirmation(event.target.value)} />
-                  <Button color="error" variant="contained" startIcon={<DeleteOutlineOutlined />} disabled={!lifecycleImpact || lifecycleReason.trim().length < 4 || removalConfirmation !== lifecycleEntry?.name || Boolean(lifecycleBusy)} onClick={() => void removeIntegration()} sx={{ alignSelf: 'flex-start' }}>{lifecycleBusy === 'remove' ? 'Removing…' : 'Remove integration'}</Button>
+                  <TextField label={`Type “${removalConfirmationName}” to confirm`} value={removalConfirmation} onChange={event => setRemovalConfirmation(event.target.value)} />
+                  <Button color="error" variant="contained" startIcon={<DeleteOutlineOutlined />} disabled={!lifecycleImpact || lifecycleReason.trim().length < 4 || removalConfirmation !== removalConfirmationName || Boolean(lifecycleBusy)} onClick={() => void removeIntegration()} sx={{ alignSelf: 'flex-start' }}>{lifecycleBusy === 'remove' ? 'Removing…' : 'Remove integration'}</Button>
                 </Stack>
               </Paper>
             </>}

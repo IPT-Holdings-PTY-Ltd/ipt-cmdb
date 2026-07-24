@@ -19,6 +19,9 @@ class ConnectWiseRequestError(RuntimeError):
     """Report a provider failure without exposing credentials or response bodies."""
 
 
+COMPANY_DISCOVERY_FIELDS = "id,identifier,name,status,types,territory,deletedFlag,lastUpdated"
+
+
 def normalize_base_url(value: str) -> str:
     """Return a safe HTTPS API root without query, fragment or embedded credentials."""
 
@@ -274,7 +277,7 @@ class ConnectWiseClient:
     def test_connection(self) -> dict[str, Any]:
         """Prove credentials and company-read permission using a one-record request."""
 
-        records = self._page(1, 1)
+        records = self._page(1, 1, fields="id,name")
         return {
             "reachable": True,
             "sampleCompany": normalize_company(records[0]) if records else None,
@@ -284,7 +287,7 @@ class ConnectWiseClient:
         """Return one bounded page for responsive filter choices and dry-run previews."""
 
         page_size = max(25, min(int(limit), 1000))
-        payload = self._page(1, page_size)
+        payload = self._page(1, page_size, fields=COMPANY_DISCOVERY_FIELDS)
         companies: list[dict[str, Any]] = []
         seen: set[str] = set()
         for raw in payload:
@@ -308,7 +311,7 @@ class ConnectWiseClient:
             payload = self._page(
                 page,
                 optimized_page_size,
-                fields="id,identifier,name,status,types,territory,deletedFlag,lastUpdated",
+                fields=COMPANY_DISCOVERY_FIELDS,
             )
             for raw in payload:
                 company = normalize_company(raw)
