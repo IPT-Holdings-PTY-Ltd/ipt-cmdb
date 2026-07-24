@@ -9,7 +9,7 @@ coverage[toml]>=7.15.2,<8
 pre-commit>=4.6.0,<5
 
 # Static analysis and maintained third-party type information.
-ruff>=0.15.22,<0.16
+ruff>=0.16.0,<0.17
 mypy>=2.3.0,<3
 types-openpyxl>=3.1.5.20260518,<3.2
 types-reportlab>=4.5.1.20260712,<5
