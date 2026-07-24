@@ -9,6 +9,7 @@ from src.cmdb.change_control import (
     create_change_record,
     derive_change_approvers,
     initial_closure_assessment,
+    normalise_change_payload,
     preview_change_impact,
     reassign_change_record,
     record_external_approval,
@@ -181,6 +182,41 @@ class ChangeControlTests(unittest.TestCase):
         self.assertEqual(updated["title"], "Database maintenance revised")
         self.assertEqual(updated["scopeAssetIds"], ["app"])
         self.assertEqual(updated["lastUpdatedBy"]["email"], "operator@example.com")
+
+    def test_change_enums_are_trimmed_and_schedule_communication_is_validated(self):
+        values = normalise_change_payload(
+            {
+                **self._change(),
+                "changeType": " Normal ",
+                "category": " Database ",
+                "priority": " High ",
+                "riskLevel": " Medium ",
+                "communicationStatus": " Required ",
+            }
+        )
+        self.assertEqual(values["changeType"], "normal")
+        self.assertEqual(values["category"], "database")
+        self.assertEqual(values["priority"], "high")
+        self.assertEqual(values["riskLevel"], "medium")
+        self.assertEqual(values["communicationStatus"], "required")
+
+        approved = {**self._change(), "status": "approved"}
+        updated = update_change_record(
+            approved,
+            {"expectedRevision": 1, "communicationStatus": " Completed "},
+            {"id": "operator", "email": "operator@example.com"},
+            ASSETS,
+            RELATIONSHIPS,
+        )
+        self.assertEqual(updated["communicationStatus"], "completed")
+        with self.assertRaisesRegex(ValueError, "valid communicationStatus"):
+            update_change_record(
+                approved,
+                {"expectedRevision": 1, "communicationStatus": "waiting"},
+                {"id": "operator", "email": "operator@example.com"},
+                ASSETS,
+                RELATIONSHIPS,
+            )
 
     def test_reassignment_creates_immutable_identity_history(self):
         change = self._change()

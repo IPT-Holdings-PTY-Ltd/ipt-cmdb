@@ -82,6 +82,41 @@ class ChangeTemplateDomainTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Complete template parameter"):
             validate_template_parameters(content, {"confirmed": True})
 
+    def test_enum_fields_and_parameter_keys_are_normalized(self) -> None:
+        content = deepcopy(self.standard["content"])
+        content["communicationStatus"] = " Required "
+        content["suggestedApproverRole"] = " Technical_Owner "
+        content["parameters"][0]["source"] = " Scope_Primary_Name "
+        normalized = normalize_template_content(content)
+        self.assertEqual(normalized["communicationStatus"], "required")
+        self.assertEqual(normalized["suggestedApproverRole"], "technical_owner")
+        self.assertEqual(normalized["parameters"][0]["source"], "scope_primary_name")
+
+    def test_optional_selects_allow_blank_and_parameter_keys_ignore_case(self) -> None:
+        content = deepcopy(self.standard["content"])
+        for parameter in content["parameters"]:
+            parameter["required"] = False
+        content["parameters"].append(
+            {
+                "key": "deployment_ring",
+                "label": "Deployment ring",
+                "type": "select",
+                "required": False,
+                "options": ["Pilot", "Broad"],
+            }
+        )
+        blank = validate_template_parameters(content, {})
+        self.assertEqual(blank["deployment_ring"], "")
+        selected = validate_template_parameters(content, {"Deployment_Ring": "Pilot"})
+        self.assertEqual(selected["deployment_ring"], "Pilot")
+        with self.assertRaisesRegex(ValueError, "Choose a valid value"):
+            validate_template_parameters(content, {"deployment_ring": "Unknown"})
+        with self.assertRaisesRegex(ValueError, "Duplicate template parameter"):
+            validate_template_parameters(
+                content,
+                {"deployment_ring": "Pilot", "Deployment_Ring": "Broad"},
+            )
+
     def test_closure_tests_are_templated_and_governed(self) -> None:
         content = deepcopy(self.standard["content"])
         content["closureTests"] = [

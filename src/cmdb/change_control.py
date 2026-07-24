@@ -737,11 +737,11 @@ def normalise_change_payload(payload: dict) -> dict:
         "communicationStatus": (COMMUNICATION_STATES, "required"),
     }
     for field, (allowed, default) in enum_fields.items():
-        value = str(result.get(field) or default).lower()
+        value = str(result.get(field) or default).strip().casefold()
         if value not in allowed:
             raise ValueError(f"Choose a valid {field}")
         result[field] = value
-    risk_level = str(result.get("riskLevel") or "").lower()
+    risk_level = str(result.get("riskLevel") or "").strip().casefold()
     if risk_level and risk_level not in RISK_LEVELS:
         raise ValueError("Choose a valid risk level")
     result["riskLevel"] = risk_level
@@ -1189,7 +1189,12 @@ def update_change_record(
         updated = dict(change)
         for field in SCHEDULE_EDIT_FIELDS:
             if field in payload and payload[field] is not None:
-                updated[field] = str(payload[field]).strip()[:8000]
+                value = str(payload[field]).strip()
+                if field == "communicationStatus":
+                    value = value.casefold()
+                    if value not in COMMUNICATION_STATES:
+                        raise ValueError("Choose a valid communicationStatus")
+                updated[field] = value[:8000]
         if (
             updated.get("plannedStart")
             and updated.get("plannedEnd")

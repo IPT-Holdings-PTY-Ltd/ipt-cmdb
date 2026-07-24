@@ -8,6 +8,16 @@ from typing import Any
 
 TEMPLATE_STATUSES = {"draft", "published", "retired"}
 TEMPLATE_PARAMETER_TYPES = {"text", "multiline", "number", "select", "boolean"}
+TEMPLATE_PARAMETER_SOURCES = {"", "scope_primary_name"}
+TEMPLATE_APPROVER_ROLES = {
+    "",
+    "change_approver",
+    "business_owner",
+    "service_owner",
+    "technical_owner",
+    "signoff_delegate",
+    "custodian",
+}
 TEMPLATE_TOKEN = re.compile(r"{{\s*([a-z][a-z0-9_]*)\s*}}", re.IGNORECASE)
 TEMPLATE_KEY = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 TEMPLATE_FIELDS = {
@@ -627,9 +637,11 @@ def normalize_template_content(content: dict[str, Any]) -> dict[str, Any]:
         "implementationPlanTemplate": str(content.get("implementationPlanTemplate") or "").strip(),
         "validationPlanTemplate": str(content.get("validationPlanTemplate") or "").strip(),
         "rollbackPlanTemplate": str(content.get("rollbackPlanTemplate") or "").strip(),
-        "communicationStatus": str(content.get("communicationStatus") or "required").strip(),
+        "communicationStatus": str(content.get("communicationStatus") or "required")
+        .strip()
+        .casefold(),
         "communicationPlanTemplate": str(content.get("communicationPlanTemplate") or "").strip(),
-        "suggestedApproverRole": str(content.get("suggestedApproverRole") or "").strip(),
+        "suggestedApproverRole": str(content.get("suggestedApproverRole") or "").strip().casefold(),
         "closureTests": [],
         "parameters": [],
     }
@@ -679,6 +691,8 @@ def normalize_template_content(content: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{field} is too long")
     if len(normalized["suggestedApproverRole"]) > 80:
         raise ValueError("Suggested approver role is too long")
+    if normalized["suggestedApproverRole"] not in TEMPLATE_APPROVER_ROLES:
+        raise ValueError("Choose a valid suggested approver responsibility")
 
     closure_test_keys: set[str] = set()
     closure_tests = content.get("closureTests") or []
@@ -733,8 +747,8 @@ def normalize_template_content(content: dict[str, Any]) -> dict[str, Any]:
         options = [str(item).strip()[:120] for item in raw_options if str(item).strip()]
         if parameter_type == "select" and not options:
             raise ValueError(f"Select parameter {key} requires options")
-        source = str(raw.get("source") or "").strip()[:80]
-        if source not in {"", "scope_primary_name"}:
+        source = str(raw.get("source") or "").strip().casefold()[:80]
+        if source not in TEMPLATE_PARAMETER_SOURCES:
             raise ValueError(f"Unsupported auto-fill source for {key}")
         normalized["parameters"].append(
             {
@@ -773,9 +787,15 @@ def validate_template_parameters(
     """Validate values supplied for one pinned template version."""
 
     normalized_content = normalize_template_content(content)
-    supplied = parameters or {}
-    if not isinstance(supplied, dict):
+    supplied_values = parameters or {}
+    if not isinstance(supplied_values, dict):
         raise ValueError("Template parameters must be an object")
+    supplied: dict[str, Any] = {}
+    for raw_key, raw_value in supplied_values.items():
+        key = str(raw_key).strip().casefold()
+        if key in supplied:
+            raise ValueError(f"Duplicate template parameter: {key}")
+        supplied[key] = raw_value
     definitions = {item["key"]: item for item in normalized_content["parameters"]}
     unknown = sorted(set(supplied) - set(definitions))
     if unknown:
@@ -811,7 +831,11 @@ def validate_template_parameters(
             key not in supplied or (definition["type"] != "boolean" and value in {"", None})
         ):
             raise ValueError(f"Complete template parameter: {definition['label']}")
-        if definition["type"] == "select" and value not in definition["options"]:
+        if (
+            definition["type"] == "select"
+            and value not in {"", None}
+            and value not in definition["options"]
+        ):
             raise ValueError(f"Choose a valid value for {definition['label']}")
         result[key] = value
     return result

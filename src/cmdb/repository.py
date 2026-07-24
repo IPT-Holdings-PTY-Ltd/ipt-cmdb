@@ -153,6 +153,12 @@ def canonical_uuid(kind: str, current_id: str) -> str:
         return str(uuid.uuid5(CMDB_NAMESPACE, f"{kind}:{current_id}"))
 
 
+def change_template_version_uuid(template_id: str, version: int) -> str:
+    """Return the canonical identity for one immutable template version."""
+
+    return canonical_uuid("change_template_version", f"{template_id}:{int(version)}")
+
+
 def default_change_template_records() -> list[dict]:
     """Return isolated state-repository copies of the standard catalogue."""
 
@@ -4811,7 +4817,7 @@ class PostgresCmdbRepository(StateRepository):
                     ON CONFLICT (template_id, version) DO NOTHING
                     """,
                     (
-                        canonical_uuid("change_template_version", f"{template['key']}:1"),
+                        change_template_version_uuid(template_id, 1),
                         template_id,
                         json.dumps(content),
                     ),
@@ -4844,10 +4850,7 @@ class PostgresCmdbRepository(StateRepository):
                         ON CONFLICT (template_id, version) DO NOTHING
                         """,
                         (
-                            canonical_uuid(
-                                "change_template_version",
-                                f"{template_id}:{next_version}",
-                            ),
+                            change_template_version_uuid(template_id, next_version),
                             template_id,
                             next_version,
                             json.dumps(upgraded_content),
@@ -4963,7 +4966,7 @@ class PostgresCmdbRepository(StateRepository):
                     ) VALUES (%s::uuid, %s::uuid, 1, %s::jsonb, %s::uuid)
                     """,
                     (
-                        canonical_uuid("change_template_version", f"{template_id}:1"),
+                        change_template_version_uuid(template_id, 1),
                         template_id,
                         json.dumps(content),
                         actor_uuid,
@@ -5030,7 +5033,7 @@ class PostgresCmdbRepository(StateRepository):
                 ) VALUES (%s::uuid, %s::uuid, %s, %s::jsonb, %s::uuid)
                 """,
                 (
-                    canonical_uuid("change_template_version", f"{template_id}:{new_version}"),
+                    change_template_version_uuid(template_id, new_version),
                     template_id,
                     new_version,
                     json.dumps(content),
@@ -5419,10 +5422,7 @@ class PostgresCmdbRepository(StateRepository):
                             created_by = EXCLUDED.created_by
                         """,
                         (
-                            canonical_uuid(
-                                "change_template_version",
-                                f"{template_id}:{version_number}",
-                            ),
+                            change_template_version_uuid(template_id, version_number),
                             template_id,
                             version_number,
                             json.dumps(

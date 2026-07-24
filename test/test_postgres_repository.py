@@ -8,7 +8,11 @@ import psycopg
 from psycopg import sql
 
 from src.cmdb.migrations import apply_migrations
-from src.cmdb.repository import PostgresCmdbRepository, hash_password
+from src.cmdb.repository import (
+    PostgresCmdbRepository,
+    change_template_version_uuid,
+    hash_password,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 ADMIN_URL = os.getenv("TEST_POSTGRES_ADMIN_URL", "")
@@ -203,6 +207,20 @@ class PostgresRepositoryContractTests(unittest.TestCase):
 
         standards = repository.list_change_templates("acme")
         self.assertGreaterEqual(len(standards), 6)
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT version.id, version.template_id, version.version
+                FROM change_template_versions version
+                JOIN change_templates template ON template.id = version.template_id
+                WHERE template.system = true
+                """
+            )
+            for version_id, template_id, version in cursor.fetchall():
+                self.assertEqual(
+                    str(version_id),
+                    change_template_version_uuid(str(template_id), int(version)),
+                )
         customer_template = repository.create_change_template(
             {
                 "companyId": "acme",
