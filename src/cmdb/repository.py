@@ -1580,6 +1580,8 @@ class StateRepository:
         company_id: str | None = None,
         asset_id: str | None = None,
     ) -> list[dict]:
+        # canonical_uuid is intentionally idempotent for UUID input while retaining
+        # compatibility with legacy prototype IDs migrated deterministically to UUIDs.
         asset_uuid = canonical_uuid("configuration_item", asset_id) if asset_id else None
         with self.connection_factory() as connection, connection.cursor() as cursor:  # type: ignore[attr-defined]  # Bound to PostgreSQL subclass below.
             # The appended fragment is fixed; customer and CI values remain bound parameters.

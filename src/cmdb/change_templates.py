@@ -8,7 +8,7 @@ from typing import Any
 
 TEMPLATE_STATUSES = {"draft", "published", "retired"}
 TEMPLATE_PARAMETER_TYPES = {"text", "multiline", "number", "select", "boolean"}
-TEMPLATE_TOKEN = re.compile(r"{{\s*([a-z][a-z0-9_]*)\s*}}")
+TEMPLATE_TOKEN = re.compile(r"{{\s*([a-z][a-z0-9_]*)\s*}}", re.IGNORECASE)
 TEMPLATE_KEY = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 TEMPLATE_FIELDS = {
     "titleTemplate",
@@ -747,13 +747,18 @@ def normalize_template_content(content: dict[str, Any]) -> dict[str, Any]:
                 "options": list(dict.fromkeys(options)),
             }
         )
-    referenced = set()
+    referenced: set[str] = set()
     for field, value in normalized.items():
         if field.endswith("Template") and isinstance(value, str):
-            referenced.update(TEMPLATE_TOKEN.findall(value))
+            referenced.update(token.casefold() for token in TEMPLATE_TOKEN.findall(value))
     for closure_test in normalized["closureTests"]:
-        referenced.update(TEMPLATE_TOKEN.findall(closure_test["label"]))
-        referenced.update(TEMPLATE_TOKEN.findall(closure_test["expectedResultTemplate"]))
+        referenced.update(
+            token.casefold() for token in TEMPLATE_TOKEN.findall(closure_test["label"])
+        )
+        referenced.update(
+            token.casefold()
+            for token in TEMPLATE_TOKEN.findall(closure_test["expectedResultTemplate"])
+        )
     implicit = {"company_name", "asset_name", "business_system_name"}
     undefined = sorted(referenced - keys - implicit)
     if undefined:

@@ -8,6 +8,7 @@ from src.cmdb.change_control import (
     build_impact_snapshot,
     create_change_record,
     derive_change_approvers,
+    initial_closure_assessment,
     preview_change_impact,
     reassign_change_record,
     record_external_approval,
@@ -349,6 +350,30 @@ class ChangeControlTests(unittest.TestCase):
             "operator@example.com",
         )
         self.assertEqual(closed["closureNotes"], assessment["closureSummary"])
+
+    def test_closure_template_tokens_are_case_insensitive(self):
+        change = self._change()
+        change["templateSnapshot"] = {
+            "content": {
+                "closureTests": [
+                    {
+                        "key": "service_check",
+                        "label": "{{Service_Test}}",
+                        "expectedResultTemplate": "{{Service_Test}} succeeds on {{Asset_Name}}",
+                        "required": True,
+                        "evidenceRequired": False,
+                    }
+                ]
+            }
+        }
+        change["templateParameters"] = {"service_test": "Portal login"}
+
+        assessment = initial_closure_assessment(change)
+        self.assertEqual(assessment["tests"][0]["label"], "Portal login")
+        self.assertEqual(
+            assessment["tests"][0]["expectedResult"],
+            "Portal login succeeds on DB01",
+        )
 
     def test_closed_change_pdf_includes_structured_validation_evidence(self):
         change = self._change()

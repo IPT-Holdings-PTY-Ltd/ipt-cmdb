@@ -133,7 +133,7 @@ function technicianLabel(user: User) {
 
 function renderTemplateText(template: string, values: Record<string, string | number | boolean>) {
   return template.replace(/\{\{\s*([a-z][a-z0-9_]*)\s*\}\}/gi, (_, key: string) => {
-    const value = values[key];
+    const value = values[key.toLowerCase()];
     if (typeof value === 'boolean') return value ? 'Yes' : 'No';
     return value === undefined || value === null ? '' : String(value);
   });

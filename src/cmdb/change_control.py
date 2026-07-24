@@ -785,7 +785,7 @@ def _render_closure_template(template: str, values: dict[str, Any]) -> str:
     """Render a safe closure-test string from a pinned template context."""
 
     def replacement(match: re.Match[str]) -> str:
-        value = values.get(match.group(1))
+        value = values.get(match.group(1).casefold())
         if isinstance(value, bool):
             return "Yes" if value else "No"
         return "" if value is None else str(value)

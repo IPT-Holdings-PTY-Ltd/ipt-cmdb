@@ -1,4 +1,6 @@
 import unittest
+import uuid
+from unittest.mock import MagicMock
 
 from src.cmdb.repository import (
     PostgresCmdbRepository,
@@ -48,6 +50,21 @@ class RepositoryTests(unittest.TestCase):
     def test_existing_uuid_is_preserved(self):
         current = "175925a0-73a4-5a44-aee0-af21152589d8"
         self.assertEqual(canonical_uuid("configuration_item", current), current)
+
+    def test_postgres_change_asset_filter_preserves_existing_uuid(self):
+        current = str(uuid.uuid4())
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connection_factory = MagicMock()
+        connection_factory.return_value.__enter__.return_value = connection
+        repository = PostgresCmdbRepository({}, lambda _state: None, connection_factory)
+
+        self.assertEqual(repository.list_changes(asset_id=current), [])
+
+        parameters = cursor.execute.call_args.args[1]
+        self.assertEqual(parameters[-2:], (current, current))
 
     def test_postgres_change_methods_do_not_fall_through_to_state(self):
         self.assertIs(PostgresCmdbRepository.list_changes, StateRepository._postgres_list_changes)

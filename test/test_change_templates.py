@@ -31,7 +31,7 @@ class ChangeTemplateDomainTests(unittest.TestCase):
 
     def test_undefined_variables_and_invalid_selects_are_rejected(self) -> None:
         content = deepcopy(self.standard["content"])
-        content["reasonTemplate"] += " {{not_defined}}"
+        content["reasonTemplate"] += " {{Not_Defined}}"
         with self.assertRaisesRegex(ValueError, "Undefined template variables"):
             normalize_template_content(content)
 
@@ -87,8 +87,8 @@ class ChangeTemplateDomainTests(unittest.TestCase):
         content["closureTests"] = [
             {
                 "key": "portal_login",
-                "label": "Portal login",
-                "expectedResultTemplate": "{{service_test}} succeeds on {{asset_name}}",
+                "label": "{{Service_Test}}",
+                "expectedResultTemplate": "{{Service_Test}} succeeds on {{Asset_Name}}",
                 "required": True,
                 "evidenceRequired": True,
             }
