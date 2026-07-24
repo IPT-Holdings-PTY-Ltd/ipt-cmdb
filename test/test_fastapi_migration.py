@@ -1935,6 +1935,39 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertNotIn("public-key", serialized)
         self.assertNotIn("private-key", serialized)
 
+    def test_connectwise_failures_return_and_store_only_stable_public_messages(self):
+        headers = self._headers("admin@example.com")
+        environment_marker = "environment-secret-stack-marker"
+        with patch.object(
+            backend_main,
+            "_connectwise_environment_configuration",
+            side_effect=backend_main.ConnectWiseConfigurationError(environment_marker),
+        ):
+            configuration = self.client.get("/api/integrations/connectwise/config", headers=headers)
+        self.assertEqual(configuration.status_code, 200, configuration.text)
+        self.assertEqual(
+            configuration.json()["lastError"],
+            "ConnectWise environment configuration is invalid. "
+            "Review the container environment settings.",
+        )
+        self.assertNotIn(environment_marker, configuration.text)
+
+        request_marker = "provider-secret-stack-marker"
+        with patch.object(
+            backend_main,
+            "_connectwise_effective_configuration",
+            side_effect=backend_main.ConnectWiseRequestError(request_marker),
+        ):
+            tested = self.client.post("/api/integrations/connectwise/test", headers=headers)
+        self.assertEqual(tested.status_code, 502, tested.text)
+        self.assertEqual(
+            tested.json()["detail"],
+            "ConnectWise could not complete the requested read operation. "
+            "Verify connectivity, credentials and API permissions.",
+        )
+        self.assertNotIn(request_marker, tested.text)
+        self.assertNotIn(request_marker, json.dumps(core.DB))
+
     def test_integration_lifecycle_blocks_provider_calls_and_removes_credentials(self):
         headers = self._headers("admin@example.com")
         operator_headers = self._headers("operator@example.com")

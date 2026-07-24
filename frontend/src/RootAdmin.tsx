@@ -756,8 +756,8 @@ export function ConnectWiseIntegrationPage() {
   async function testConnectWise() {
     setBusy('test-cw'); setNotice({ severity: 'info', message: 'Testing authentication and company-read permission…' }); setError(null);
     try {
-      const result = await apiFetch<{ message: string }>('/api/integrations/connectwise/test', { method: 'POST' });
-      setTestResult(result as IntegrationTestResult); setNotice({ severity: 'success', message: result.message }); await load();
+      const result = await apiFetch<IntegrationTestResult>('/api/integrations/connectwise/test', { method: 'POST' });
+      setTestResult(result); setNotice({ severity: 'success', message: result.message }); await load();
     } catch (value) { setError(value); setNotice(null); await load(); } finally { setBusy(''); }
   }
   async function savePolicy() {

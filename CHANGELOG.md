@@ -32,7 +32,7 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Self-service **My security** controls plus per-user and environment-level MFA enforcement policy.
 - Platform-admin-only MFA reset with local administrator step-up verification, typed target confirmation, optional ticket evidence, discoverable disabled states, detailed audit metadata and immediate target-session revocation.
 - Replaced root user-management customer checkboxes with a scalable, search-driven scope selector, collapsed selections, filtered bulk management, group/direct/effective counts and assignment-source preview.
-- Blank-database and forward-upgrade coverage through schema `2026.07.21.7`.
+- Blank-database and forward-upgrade coverage through schema `2026.07.24.2`.
 - Guarded semantic-version release automation that reuses CI, publishes attested multi-architecture GHCR images and generates categorized GitHub releases.
 
 ### Planned

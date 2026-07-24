@@ -4502,6 +4502,25 @@ def _connectwise_effective_configuration() -> tuple[dict, str]:
     return stored, "encrypted_database"
 
 
+def _connectwise_public_failure(error: Exception, operation: str) -> str:
+    """Log provider diagnostics while returning a stable, non-sensitive message."""
+
+    LOGGER.exception(
+        "ConnectWise %s failed (%s)",
+        operation,
+        type(error).__name__,
+    )
+    if isinstance(error, ConnectWiseConfigurationError):
+        return (
+            "ConnectWise configuration is invalid or incomplete. "
+            "Review the saved endpoint, company ID and credentials."
+        )
+    return (
+        "ConnectWise could not complete the requested read operation. "
+        "Verify connectivity, credentials and API permissions."
+    )
+
+
 def _connectwise_connection_public() -> dict:
     """Expose connection metadata without public or private API keys."""
 
@@ -4515,9 +4534,13 @@ def _connectwise_connection_public() -> dict:
     configuration = connection.get("configuration") or {}
     try:
         environment = _connectwise_environment_configuration()
-    except ConnectWiseConfigurationError as error:
+    except ConnectWiseConfigurationError:
+        LOGGER.exception("ConnectWise environment configuration is invalid")
         environment = None
-        environment_error = str(error)
+        environment_error = (
+            "ConnectWise environment configuration is invalid. "
+            "Review the container environment settings."
+        )
     else:
         environment_error = ""
     source = "environment" if environment else "encrypted_database"
@@ -4732,9 +4755,10 @@ def test_connectwise_connection(request: Request) -> dict:
         configuration, source = _connectwise_effective_configuration()
         result = _connectwise_adapter().test_connection(configuration)
     except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
+        detail = _connectwise_public_failure(error, "connection test")
         with core.LOCK:
-            REPOSITORY.mark_integration_test("connectwise", "error", str(error), user["id"])
-        raise HTTPException(502, str(error)) from error
+            REPOSITORY.mark_integration_test("connectwise", "error", detail, user["id"])
+        raise HTTPException(502, detail) from error
     with core.LOCK:
         REPOSITORY.mark_integration_test(
             "connectwise", "verified", "Company read permission verified", user["id"]
@@ -4783,7 +4807,9 @@ def preview_connectwise_discovery(request: Request) -> dict:
             configuration, _connectwise_connection_public()["discoveryPolicy"]
         )
     except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
-        raise HTTPException(502, str(error)) from error
+        raise HTTPException(
+            502, _connectwise_public_failure(error, "company discovery preview")
+        ) from error
     run = {
         "id": str(uuid.uuid4()),
         "type": "connectwise",
@@ -4816,7 +4842,9 @@ def list_connectwise_discovery_options(request: Request) -> dict:
         configuration, source = _connectwise_effective_configuration()
         options = _connectwise_adapter().discovery_options(configuration)
     except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
-        raise HTTPException(502, str(error)) from error
+        raise HTTPException(
+            502, _connectwise_public_failure(error, "company discovery options")
+        ) from error
     return {**options, "credentialSource": source}
 
 
@@ -5010,8 +5038,11 @@ def _execute_connectwise_ci_preview(
 def _record_connectwise_ci_preview_failure(policy: dict, error: Exception) -> None:
     """Persist a sanitized worker failure and release its policy lease."""
 
-    expected = isinstance(error, (ConnectWiseConfigurationError, ConnectWiseRequestError))
-    detail = str(error)[:1000] if expected else "Unexpected integration worker failure"
+    if isinstance(error, (ConnectWiseConfigurationError, ConnectWiseRequestError)):
+        detail = _connectwise_public_failure(error, "continuous configuration preview")
+    else:
+        LOGGER.exception("Unexpected continuous ConnectWise preview failure")
+        detail = "Unexpected integration worker failure"
     now = core.now()
     run = {
         "id": str(uuid.uuid4()),
@@ -5129,7 +5160,9 @@ def get_connectwise_ci_options(
             payload.companyId, payload.providerCompanyId
         )
     except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
-        raise HTTPException(502, str(error)) from error
+        raise HTTPException(
+            502, _connectwise_public_failure(error, "configuration options")
+        ) from error
     catalogue = configuration_catalogue(records)
     return {
         "companyId": payload.companyId,
@@ -5162,7 +5195,9 @@ def preview_connectwise_configurations(
             trigger="manual",
         )
     except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
-        raise HTTPException(502, str(error)) from error
+        raise HTTPException(
+            502, _connectwise_public_failure(error, "configuration preview")
+        ) from error
 
 
 @api.get("/api/integrations/continuous-preview/status", tags=["integrations"])
@@ -5249,7 +5284,9 @@ def import_connectwise_configurations(
     try:
         preview = _connectwise_configuration_preview(payload.companyId, payload.providerCompanyId)
     except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
-        raise HTTPException(502, str(error)) from error
+        raise HTTPException(
+            502, _connectwise_public_failure(error, "configuration import preview")
+        ) from error
     items_by_id = {item["externalId"]: item for item in preview["items"]}
     invalid = sorted(
         external_id
@@ -5387,7 +5424,9 @@ def link_connectwise_configuration(
     try:
         preview = _connectwise_configuration_preview(payload.companyId, payload.providerCompanyId)
     except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
-        raise HTTPException(502, str(error)) from error
+        raise HTTPException(
+            502, _connectwise_public_failure(error, "configuration link preview")
+        ) from error
     item = next(
         (row for row in preview["items"] if row["externalId"] == payload.externalId),
         None,
@@ -5441,7 +5480,9 @@ def run_integration_sync(kind: str, request: Request) -> dict:
         try:
             return _run_connectwise_company_discovery(user)
         except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
-            raise HTTPException(502, str(error)) from error
+            raise HTTPException(
+                502, _connectwise_public_failure(error, "company discovery")
+            ) from error
     run = core.execute_sync(kind)
     with core.LOCK:
         return REPOSITORY.record_sync_run(kind, run, core.configured(kind), user["id"])
