@@ -32,6 +32,7 @@ type TemplateEditor = {
 };
 
 const parameterTypes: ChangeTemplateParameter['type'][] = ['text', 'multiline', 'number', 'select', 'boolean'];
+const stableKeyPattern = /^[a-z][a-z0-9_]{1,63}$/;
 const contentFields: Array<{ key: keyof ChangeTemplateContent; label: string; rows: number; help: string }> = [
   { key: 'titleTemplate', label: 'Change title', rows: 1, help: 'Short, outcome-focused summary.' },
   { key: 'reasonTemplate', label: 'Reason', rows: 3, help: 'Why this work is necessary.' },
@@ -98,6 +99,24 @@ function sentence(value: string) {
 
 function ownerLabel(user: User) {
   return user.displayName && user.displayName !== user.email ? `${user.displayName} · ${user.email}` : user.email;
+}
+
+function normalizeStableKey(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '_')
+    .replace(/^[^a-z]+/, '')
+    .slice(0, 64);
+}
+
+function editorKeysAreValid(editor: TemplateEditor) {
+  const closureKeys = (editor.content.closureTests || []).map(test => test.key);
+  const parameterKeys = editor.content.parameters.map(parameter => parameter.key);
+  const keySetIsValid = (keys: string[]) =>
+    keys.every(key => stableKeyPattern.test(key)) && new Set(keys).size === keys.length;
+  return stableKeyPattern.test(editor.key)
+    && keySetIsValid(closureKeys)
+    && keySetIsValid(parameterKeys);
 }
 
 export function ChangeTemplatesPage() {
@@ -330,7 +349,7 @@ export function ChangeTemplatesPage() {
                   {platformAdmin && <MenuItem value="">Global · all customers</MenuItem>}
                   {companies.map(company => <MenuItem key={company.id} value={company.id}>{company.name}</MenuItem>)}
                 </Select></FormControl></Grid>
-                <Grid size={{ xs: 12, md: 4 }}><TextField fullWidth required disabled={Boolean(editor.id)} label="Stable key" value={editor.key} onChange={event => updateEditor('key', event.target.value.toLowerCase().replace(/[^a-z0-9_]/g, '_'))} helperText="Lowercase ID used by integrations and audit history." /></Grid>
+                <Grid size={{ xs: 12, md: 4 }}><TextField fullWidth required disabled={Boolean(editor.id)} label="Stable key" value={editor.key} error={Boolean(editor.key) && !stableKeyPattern.test(editor.key)} onChange={event => updateEditor('key', normalizeStableKey(event.target.value))} helperText={editor.key && !stableKeyPattern.test(editor.key) ? 'Use 2–64 characters, beginning with a letter.' : 'Lowercase ID used by integrations and audit history.'} /></Grid>
                 <Grid size={{ xs: 12, md: 4 }}><FormControl fullWidth><InputLabel>Status</InputLabel><Select label="Status" value={editor.status} onChange={event => updateEditor('status', event.target.value as ChangeTemplate['status'])}>
                   <MenuItem value="draft">Draft</MenuItem><MenuItem value="published">Published</MenuItem>{editor.id && <MenuItem value="retired">Retired</MenuItem>}
                 </Select></FormControl></Grid>
@@ -362,7 +381,7 @@ export function ChangeTemplatesPage() {
                 {!(editor.content.closureTests || []).length && <Grid size={{ xs: 12 }}><Alert severity="info">Without template tests, changes will use the free-form validation plan as one required closure check.</Alert></Grid>}
                 {(editor.content.closureTests || []).map((test, index) => <Grid key={`${test.key}-${index}`} size={{ xs: 12 }}>
                   <Paper variant="outlined" sx={{ p: 2 }}><Grid container spacing={1.5}>
-                    <Grid size={{ xs: 12, md: 3 }}><TextField fullWidth required label="Stable test key" value={test.key} onChange={event => updateClosureTest(index, { key: event.target.value.toLowerCase().replace(/[^a-z0-9_]/g, '_') })} /></Grid>
+                    <Grid size={{ xs: 12, md: 3 }}><TextField fullWidth required label="Stable test key" value={test.key} error={Boolean(test.key) && !stableKeyPattern.test(test.key)} onChange={event => updateClosureTest(index, { key: normalizeStableKey(event.target.value) })} helperText={test.key && !stableKeyPattern.test(test.key) ? 'Use 2–64 characters, beginning with a letter.' : 'Used in immutable closure evidence.'} /></Grid>
                     <Grid size={{ xs: 10, md: 4 }}><TextField fullWidth required label="Test name" value={test.label} onChange={event => updateClosureTest(index, { label: event.target.value })} helperText="Tokens are supported." /></Grid>
                     <Grid size={{ xs: 2, md: 1 }}><IconButton color="error" aria-label={`Remove ${test.label}`} onClick={() => removeClosureTest(index)}><DeleteOutlined /></IconButton></Grid>
                     <Grid size={{ xs: 12, md: 2 }}><FormControlLabel control={<Switch checked={test.required} onChange={event => updateClosureTest(index, { required: event.target.checked })} />} label="Required" /></Grid>
@@ -375,7 +394,7 @@ export function ChangeTemplatesPage() {
                 {!editor.content.parameters.length && <Grid size={{ xs: 12 }}><Alert severity="info">This template has no custom inputs. You can still use built-in <code>{'{{company_name}}'}</code>, <code>{'{{asset_name}}'}</code> and <code>{'{{business_system_name}}'}</code> tokens.</Alert></Grid>}
                 {editor.content.parameters.map((parameter, index) => <Grid key={`${parameter.key}-${index}`} size={{ xs: 12 }}>
                   <Paper variant="outlined" sx={{ p: 2 }}><Grid container spacing={1.5}>
-                    <Grid size={{ xs: 12, md: 3 }}><TextField fullWidth label="Input key" value={parameter.key} onChange={event => updateParameter(index, { key: event.target.value.toLowerCase().replace(/[^a-z0-9_]/g, '_') })} /></Grid>
+                    <Grid size={{ xs: 12, md: 3 }}><TextField fullWidth required label="Input key" value={parameter.key} error={Boolean(parameter.key) && !stableKeyPattern.test(parameter.key)} onChange={event => updateParameter(index, { key: normalizeStableKey(event.target.value) })} helperText={parameter.key && !stableKeyPattern.test(parameter.key) ? 'Use 2–64 characters, beginning with a letter.' : 'Use this key in template tokens.'} /></Grid>
                     <Grid size={{ xs: 12, md: 4 }}><TextField fullWidth label="Technician prompt" value={parameter.label} onChange={event => updateParameter(index, { label: event.target.value })} /></Grid>
                     <Grid size={{ xs: 10, md: 2 }}><FormControl fullWidth><InputLabel>Type</InputLabel><Select label="Type" value={parameter.type} onChange={event => updateParameter(index, { type: event.target.value as ChangeTemplateParameter['type'] })}>
                       {parameterTypes.map(value => <MenuItem key={value} value={value}>{sentence(value)}</MenuItem>)}
@@ -391,7 +410,7 @@ export function ChangeTemplatesPage() {
             </DialogContent>
             <DialogActions sx={{ justifyContent: 'space-between' }}>
               <Typography variant="caption" color="text.secondary">{selectedCompany?.name || 'Global scope'} · {editor.id ? `based on version ${editor.expectedVersion}` : 'new procedure'}</Typography>
-              <Stack direction="row" spacing={1}><Button onClick={() => setEditor(null)} disabled={saving}>Cancel</Button><Button variant="contained" disabled={saving || !editor.name.trim() || !editor.key.trim() || (!platformAdmin && !editor.companyId)} onClick={() => void save()}>{saving ? 'Saving…' : editor.id ? 'Save new version' : 'Create template'}</Button></Stack>
+              <Stack direction="row" spacing={1}><Button onClick={() => setEditor(null)} disabled={saving}>Cancel</Button><Button variant="contained" disabled={saving || !editor.name.trim() || !editorKeysAreValid(editor) || (!platformAdmin && !editor.companyId)} onClick={() => void save()}>{saving ? 'Saving…' : editor.id ? 'Save new version' : 'Create template'}</Button></Stack>
             </DialogActions>
           </>}
         </Dialog>
