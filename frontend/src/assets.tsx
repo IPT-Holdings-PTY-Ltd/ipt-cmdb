@@ -30,13 +30,9 @@ import { businessApplicationMemberships, displayLayer, displayLayerColors, displ
 import type { Asset, Contact, Relationship } from './types';
 import { useWorkspace } from './workspace';
 import { AuditTimeline } from './Governance';
+import { canonicalAssetTypes } from './assetCatalog';
 
-const types = [
-  'Business system', 'Device', 'Server', 'Virtual machine', 'Hypervisor host', 'Virtualization cluster',
-  'Datastore', 'Storage array', 'Virtual network', 'Virtualization manager', 'Workstation', 'Network device',
-  'Network service', 'Network zone', 'VPN tunnel',
-  'Software', 'Licence', 'Service', 'Credential owner',
-].map(id => ({ id, name: id }));
+const types = canonicalAssetTypes.map(id => ({ id, name: id }));
 const statuses = ['Active', 'Planned', 'Retired'].map(id => ({ id, name: id }));
 const lifecycle = ['planned', 'ordered', 'received', 'in_stock', 'in_service', 'maintenance', 'retired', 'disposed'].map(id => ({ id, name: id.replaceAll('_', ' ') }));
 const operational = ['unknown', 'healthy', 'warning', 'critical', 'offline'].map(id => ({ id, name: id }));

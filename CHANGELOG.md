@@ -6,6 +6,17 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ### Added
 
+- Root-managed ConnectWise PSA setup with AES-GCM encrypted API keys or environment-owned configuration, a least-data connection test and bounded paginated company discovery.
+- Review-gated ConnectWise-to-CMDB customer mapping with exact-match suggestions, immutable provider IDs, retained mapping history and attributable audit evidence.
+- Capability-driven provider registry with typed input/output/action declarations and ConnectWise as the reference adapter; future provider writes are visible but disabled.
+- Guided ConnectWise setup with progressive tests, audited discovery filters, read-only dry-run counts and explicit customer mapping.
+- Automatically populated ConnectWise filter menus with bounded one-page sampling, explicit empty/loading states and responsive dry-run previews.
+- Per-customer ConnectWise CI policies with immutable type/status IDs, audited revisions, explicit exclusions and saved continuous-preview intervals.
+- Cross-provider canonical identity linking with reviewed same-customer manual links, provider-ID mappings and tenant/type-scoped strong identifiers.
+- Lease-safe continuous ConnectWise CI previews with per-customer schedules, durable review observations, audited dismissals, evidence-change reopening and zero automatic imports.
+- Provider-neutral reconciliation workbench with exact paging/search, customer/provider/decision filters, side-by-side evidence, explicit identity linking and bounded bulk decisions.
+- Reversible provider-object ignores keyed to immutable external IDs, with bulk policy safeguards, mandatory reasons, an ignored-items workbench and audited restore.
+- Enforced customer field authority during ConnectWise preview and canonical import, including protected-field evidence, source provenance and audited baseline presets.
 - Change approval batches derived from structured business-system ownership, with Microsoft 365 invitations, expiring single-use public review links, multi-approver completion, decline handling and immutable decision evidence.
 - Technician-facing approval delivery/status controls and a branded, login-free external sign-off page scoped to each approver's affected business systems.
 - Governance navigation with MSP- and customer-scoped Audit Center and Reports Center.
@@ -21,14 +32,12 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Self-service **My security** controls plus per-user and environment-level MFA enforcement policy.
 - Platform-admin-only MFA reset with local administrator step-up verification, typed target confirmation, optional ticket evidence, discoverable disabled states, detailed audit metadata and immediate target-session revocation.
 - Replaced root user-management customer checkboxes with a scalable, search-driven scope selector, collapsed selections, filtered bulk management, group/direct/effective counts and assignment-source preview.
-- Blank-database and forward-upgrade coverage through schema `2026.07.21.4`.
+- Blank-database and forward-upgrade coverage through schema `2026.07.21.7`.
 - Guarded semantic-version release automation that reuses CI, publishes attested multi-architecture GHCR images and generates categorized GitHub releases.
 
 ### Planned
 
-- Read-only ConnectWise customer and configuration ingestion with mapping review.
-- Reconciliation inbox and field-authority controls.
-- Scheduled integration worker execution and richer diagnostics.
+- Dedicated worker-service deployment and provider rate-limit telemetry.
 
 ## [0.2.0] - 2026-07-16
 

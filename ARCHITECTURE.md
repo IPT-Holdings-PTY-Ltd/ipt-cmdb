@@ -71,7 +71,7 @@ The API continues to enforce tenant and role authorization after external authen
 
 ## PostgreSQL and migrations
 
-PostgreSQL is the production source of truth. The repository stores customers, users, access groups, CIs, identifiers, relationships, integration connections, mappings, observations, changes, branding, sync runs, reconciliation candidates, data-quality exceptions, field-authority rules and audit events in normalized tables.
+PostgreSQL is the production source of truth. The repository stores customers, users, access groups, CIs, identifiers, relationships, integration connections, mappings, observations, provider-object suppressions, changes, branding, sync runs, reconciliation candidates, data-quality exceptions, field-authority rules and audit events in normalized tables.
 
 Audit rows are append-only and contain sanitised before/after values, field changes, actor attribution, source, outcome and correlation context. Tenant-aware reporting is assembled through controlled report templates rather than allowing arbitrary SQL from the web tier.
 
@@ -106,7 +106,9 @@ Matching follows this order:
 3. a reconciliation candidate for human review;
 4. a new canonical CI only when no safe match exists.
 
-Names, IP addresses and mutable descriptions are evidence, not identity. `ci_field_authority` determines which source can update a canonical field. Lower-authority observations remain visible without silently overwriting the authoritative value.
+Names, IP addresses and mutable descriptions are evidence, not identity. `ci_field_authority` determines which source can update a canonical field. Lower-authority observations remain visible without silently overwriting the authoritative value. The durable `integration_ci_review_items` queue stores sanitized provider evidence, proposed changes, blocked fields and per-field decisions; its root workbench uses server-side customer/provider/action/search filters and exact paging.
+
+Field authority is evaluated during both preview and canonical apply. Accepted values record their source in CI metadata, allowing later providers to be compared with the source that currently owns each field. Reviewed presets materialize as normal audited rules rather than application-only defaults.
 
 The Data Quality Center calculates deterministic findings from canonical CIs and relationships at read time. This allows rule improvements without rebuilding a findings table. Deliberately accepted conditions are stored as scoped, expiring `data_quality_exceptions` rows with mandatory reasons. Reconciliation decisions and authority changes are persisted and audited but do not perform provider writes.
 
@@ -131,7 +133,17 @@ The provider-neutral external-link envelope reserves future ConnectWise ticket s
 
 ## Integration execution boundary
 
-The web API currently exposes integration configuration/status and safe connectivity checks. Production ingestion should run in a separate worker or Azure Container Apps Job so long-running provider calls, retries and rate limits do not consume web requests.
+The integration layer is capability driven. A reviewed provider adapter registers a manifest describing authentication, tenant scopes, filters and typed operations. Operations can be inputs, outputs, triggers or actions; provider-write and approval requirements are explicit metadata rather than implicit behaviour. The React wizard consumes this catalogue while the FastAPI service enforces the same adapter contract.
+
+ConnectWise is the reference adapter and currently implements staged connection tests, company input, saved discovery policy, explicit customer mapping, configuration-item input, durable continuous-preview policies, a persistent provider-neutral review queue and administrator-selected canonical imports. Its change-ticket action is declared but disabled. No provider-write executor exists in this release.
+
+Provider observations enter a common reconciliation boundary. Adapters never write directly to canonical customers, CIs, contacts or relationships. A future workflow action follows a separate route:
+
+```text
+trigger -> canonical event -> typed workflow -> approval -> idempotent action -> verification -> audit
+```
+
+The current image can execute bounded manual discovery and an opt-in continuous-preview loop. Due policies are atomically leased in PostgreSQL so duplicate execution is prevented across replicas. The worker writes sync evidence and review observations only; canonical imports remain administrator-selected. Small installations can run it in the application container, while larger deployments should run the same worker boundary in a dedicated service or Azure Container Apps Job.
 
 Workers should follow:
 

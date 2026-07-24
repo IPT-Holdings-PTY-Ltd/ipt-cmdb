@@ -168,6 +168,373 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.repository.list_integrations()[0]["lastSync"], run["finishedAt"])
         self.assertEqual(self.state["auditEvents"][0]["action"], "sync_completed")
 
+    def test_connectwise_configuration_discovery_and_explicit_mapping(self):
+        configured = self.repository.update_integration_connection(
+            "connectwise",
+            {
+                "configuration": {
+                    "baseUrl": "https://api.example.com/v4_6_release/apis/3.0",
+                    "companyId": "ipt",
+                    "clientId": "client-id",
+                    "pageSize": 100,
+                },
+                "credentialsEncrypted": "ciphertext",
+                "credentialsNonce": "nonce",
+                "enabled": True,
+                "connectionStatus": "configured",
+                "expectedRevision": 1,
+            },
+            "admin",
+        )
+        self.assertEqual(configured["revision"], 2)
+        self.assertNotIn("credentialsEncrypted", self.repository.list_integrations()[0])
+        with self.assertRaisesRegex(ValueError, "reload"):
+            self.repository.update_integration_connection(
+                "connectwise", {"expectedRevision": 1}, "admin"
+            )
+
+        run = {
+            "id": "discovery-1",
+            "type": "connectwise",
+            "status": "review_required",
+            "startedAt": "2026-07-21T10:00:00Z",
+            "finishedAt": "2026-07-21T10:00:01Z",
+            "discovered": 1,
+            "imported": 0,
+            "review": 1,
+            "message": "One company requires review",
+        }
+        self.repository.record_company_discovery(
+            "connectwise",
+            run,
+            [
+                {
+                    "externalId": "42",
+                    "identifier": "ACME",
+                    "name": "Acme",
+                    "status": "Active",
+                    "type": "Customer",
+                    "site": "Head office",
+                    "deleted": False,
+                    "lastUpdated": "2026-07-21T09:00:00Z",
+                }
+            ],
+            "admin",
+        )
+        observed = self.repository.list_provider_companies("connectwise")[0]
+        self.assertIsNone(observed["mappedCompanyId"])
+        mapped = self.repository.map_provider_company("connectwise", "42", "acme", "admin")
+        self.assertEqual(mapped["mappedCompanyId"], "acme")
+        default_policy = self.repository.get_ci_sync_policy("connectwise", "acme", "42")
+        self.assertEqual(default_policy["typeMode"], "all")
+        saved_policy = self.repository.update_ci_sync_policy(
+            "connectwise",
+            "acme",
+            "42",
+            {
+                "typeMode": "selected",
+                "includedTypeIds": ["11"],
+                "typeMappings": {"11": "Server"},
+                "blockUnmappedTypes": True,
+                "statusMode": "selected",
+                "includedStatusIds": ["3"],
+                "syncMode": "continuous_preview",
+                "intervalMinutes": 120,
+                "enabled": True,
+            },
+            expected_revision=0,
+            actor_id="admin",
+        )
+        self.assertEqual(saved_policy["revision"], 1)
+        self.assertEqual(saved_policy["includedTypeIds"], ["11"])
+        self.assertEqual(saved_policy["typeMappings"], {"11": "Server"})
+        self.assertTrue(saved_policy["blockUnmappedTypes"])
+        with self.assertRaisesRegex(ValueError, "reload"):
+            self.repository.update_ci_sync_policy(
+                "connectwise", "acme", "42", {}, expected_revision=0
+            )
+        self.assertTrue(self.repository.unmap_provider_company("connectwise", "42", "admin"))
+        self.assertIsNone(
+            self.repository.list_provider_companies("connectwise")[0]["mappedCompanyId"]
+        )
+        audit_actions = [item["action"] for item in self.state["auditEvents"]]
+        self.assertIn("configuration_updated", audit_actions)
+        self.assertIn("mapped", audit_actions)
+        self.assertIn("created", audit_actions)
+        self.assertIn("unmapped", audit_actions)
+
+    def test_continuous_ci_policy_lease_and_review_queue_are_durable(self):
+        self.repository.update_integration_connection(
+            "connectwise",
+            {
+                "enabled": True,
+                "credentialsEncrypted": "ciphertext",
+                "credentialsNonce": "nonce",
+                "expectedRevision": 1,
+            },
+            "admin",
+        )
+        policy = self.repository.update_ci_sync_policy(
+            "connectwise",
+            "acme",
+            "42",
+            {
+                "syncMode": "continuous_preview",
+                "intervalMinutes": 60,
+                "enabled": True,
+            },
+            expected_revision=0,
+            actor_id="admin",
+        )
+        claimed = self.repository.claim_due_ci_sync_policy(
+            "connectwise", "worker-a", lease_seconds=120
+        )
+        self.assertEqual(claimed["id"], policy["id"])
+        self.assertEqual(claimed["leaseOwner"], "worker-a")
+        self.assertIsNone(self.repository.claim_due_ci_sync_policy("connectwise", "worker-b"))
+
+        observation = {
+            "externalId": "501",
+            "name": "ACME-NEW-01",
+            "action": "create",
+            "assetId": None,
+            "assetName": "",
+            "reason": "No canonical identity was found",
+            "changes": {},
+            "changedFields": [],
+            "record": {
+                "externalId": "501",
+                "name": "ACME-NEW-01",
+                "type": "Laptop",
+                "status": "Active",
+                "providerTypeName": "Managed Laptop",
+                "providerStatusName": "Active",
+            },
+        }
+        summary = self.repository.replace_ci_review_items(
+            policy["id"], "acme", "run-1", [observation], None
+        )
+        self.assertEqual(summary["created"], 1)
+        pending = self.repository.list_ci_review_items("connectwise", "acme")
+        self.assertEqual([item["externalId"] for item in pending], ["501"])
+        self.assertEqual(self.repository.count_ci_review_items("connectwise", "acme"), 1)
+
+        dismissed = self.repository.dismiss_ci_review_item(
+            pending[0]["id"], "Approved duplicate noise", "admin"
+        )
+        self.assertEqual(dismissed["state"], "dismissed")
+        self.repository.replace_ci_review_items(policy["id"], "acme", "run-2", [observation], None)
+        self.assertEqual(
+            self.repository.list_ci_review_items("connectwise", "acme", state="dismissed")[0][
+                "externalId"
+            ],
+            "501",
+        )
+
+        changed = {**observation, "reason": "Provider evidence changed"}
+        self.repository.replace_ci_review_items(policy["id"], "acme", "run-3", [changed], None)
+        self.assertEqual(
+            self.repository.list_ci_review_items("connectwise", "acme")[0]["state"],
+            "pending",
+        )
+        completed = self.repository.complete_ci_sync_policy_run(policy["id"], success=True)
+        self.assertEqual(completed["consecutiveFailures"], 0)
+        self.assertIsNotNone(completed["nextRunAt"])
+        self.assertIsNone(completed.get("leaseOwner"))
+
+    def test_ci_review_ignore_is_durable_audited_and_reversible(self):
+        """Immutable provider IDs should stay hidden until an administrator restores them."""
+
+        policy = self.repository.update_ci_sync_policy(
+            "connectwise",
+            "acme",
+            "42",
+            {"syncMode": "continuous_preview", "enabled": True},
+            expected_revision=0,
+            actor_id="admin",
+        )
+        observation = {
+            "externalId": "501",
+            "name": "ACME-UNMANAGED-01",
+            "action": "create",
+            "assetId": None,
+            "assetName": "",
+            "reason": "No canonical identity was found",
+            "record": {
+                "externalId": "501",
+                "name": "ACME-UNMANAGED-01",
+                "type": "Laptop",
+                "status": "Active",
+            },
+        }
+        self.repository.replace_ci_review_items(policy["id"], "acme", "run-ignore-1", [observation])
+        queued = self.repository.list_ci_review_items("connectwise", "acme")[0]
+
+        suppressions = self.repository.ignore_ci_review_items(
+            [queued["id"]], "Not managed under the MSP agreement", "admin"
+        )
+
+        self.assertEqual(len(suppressions), 1)
+        self.assertEqual(
+            self.repository.get_ci_sync_policy("connectwise", "acme", "42")["excludedExternalIds"],
+            ["501"],
+        )
+        self.assertEqual(
+            self.repository.query_ci_review_items(company_id="acme")["total"],
+            0,
+        )
+        ignored = self.repository.query_integration_object_suppressions(company_id="acme")
+        self.assertEqual(ignored["total"], 1)
+        self.assertEqual(ignored["items"][0]["reason"], "Not managed under the MSP agreement")
+
+        restored = self.repository.restore_integration_object_suppression(
+            suppressions[0]["id"], "Agreement scope was expanded", "admin"
+        )
+
+        self.assertFalse(restored["active"])
+        self.assertEqual(
+            self.repository.query_ci_review_items(company_id="acme")["total"],
+            1,
+        )
+        self.assertEqual(
+            self.repository.get_ci_sync_policy("connectwise", "acme", "42")["excludedExternalIds"],
+            [],
+        )
+        self.assertEqual(
+            self.repository.query_integration_object_suppressions(company_id="acme", active=False)[
+                "total"
+            ],
+            1,
+        )
+        actions = [item["action"] for item in self.state["auditEvents"]]
+        self.assertIn("ignored", actions)
+        self.assertIn("restored", actions)
+
+    def test_integration_lifecycle_is_audited_and_blocks_worker_leases(self):
+        configured = self.repository.update_integration_connection(
+            "connectwise",
+            {
+                "enabled": True,
+                "credentialsEncrypted": "ciphertext",
+                "credentialsNonce": "nonce",
+                "connectionStatus": "verified",
+                "expectedRevision": 1,
+            },
+            "admin",
+        )
+        policy = self.repository.update_ci_sync_policy(
+            "connectwise",
+            "acme",
+            "42",
+            {"syncMode": "continuous_preview", "enabled": True},
+            expected_revision=0,
+            actor_id="admin",
+        )
+        impact = self.repository.integration_lifecycle_impact("connectwise")
+        self.assertEqual(impact["ciPolicies"], 1)
+        self.assertEqual(impact["enabledPolicies"], 1)
+
+        paused = self.repository.change_integration_lifecycle(
+            "connectwise",
+            "paused",
+            "Maintenance window",
+            "admin",
+            configured["revision"],
+        )
+        self.assertFalse(paused["enabled"])
+        self.assertEqual(paused["lifecycleStatus"], "paused")
+        self.assertIsNone(self.repository.claim_due_ci_sync_policy("connectwise", "worker-a"))
+
+        resumed = self.repository.change_integration_lifecycle(
+            "connectwise",
+            "active",
+            "Maintenance completed",
+            "admin",
+            paused["revision"],
+        )
+        self.assertEqual(
+            self.repository.claim_due_ci_sync_policy("connectwise", "worker-b")["id"],
+            policy["id"],
+        )
+        removed = self.repository.change_integration_lifecycle(
+            "connectwise",
+            "removed",
+            "Provider retired",
+            "admin",
+            resumed["revision"],
+            remove_configuration=True,
+        )
+        self.assertEqual(removed["lifecycleStatus"], "removed")
+        self.assertFalse(removed["enabled"])
+        self.assertFalse(removed["credentialsEncrypted"])
+        self.assertEqual(removed["configuration"]["mode"], "removed")
+        self.assertIn(
+            "integration_removed",
+            [item["action"] for item in self.state["auditEvents"]],
+        )
+
+    def test_ci_review_workbench_filters_pages_and_returns_exact_items(self):
+        """The reconciliation workbench should scale without losing decision evidence."""
+
+        policy = self.repository.update_ci_sync_policy(
+            "connectwise",
+            "acme",
+            "42",
+            {"syncMode": "continuous_preview", "enabled": True},
+            expected_revision=0,
+            actor_id="admin",
+        )
+        observations = [
+            {
+                "externalId": str(index),
+                "name": name,
+                "action": action,
+                "assetId": None,
+                "assetName": "",
+                "reason": reason,
+                "changes": {"status": "Active"} if action == "update" else {},
+                "changedFields": ["status"] if action == "update" else [],
+                "blockedFields": ["name"] if action == "conflict" else [],
+                "fieldDecisions": [{"field": "name", "allowed": False, "reason": "protected"}]
+                if action == "conflict"
+                else [],
+                "record": {
+                    "externalId": str(index),
+                    "name": name,
+                    "type": "Server",
+                    "status": "Active",
+                },
+            }
+            for index, name, action, reason in (
+                (501, "ACME-WEB-01", "create", "New provider identity"),
+                (502, "ACME-DB-01", "update", "Mapped CI changed"),
+                (503, "ACME-EDGE-01", "conflict", "Possible duplicate name"),
+            )
+        ]
+        self.repository.replace_ci_review_items(policy["id"], "acme", "run-1", observations)
+
+        first_page = self.repository.query_ci_review_items(
+            kind="connectwise", company_ids={"acme"}, limit=2
+        )
+        self.assertEqual(first_page["total"], 3)
+        self.assertEqual(len(first_page["items"]), 2)
+        self.assertEqual(
+            first_page["summary"], {"create": 1, "update": 1, "link": 0, "conflict": 1}
+        )
+        self.assertEqual(
+            self.repository.query_ci_review_items(company_ids=set())["total"],
+            0,
+        )
+        updates = self.repository.query_ci_review_items(
+            kind="connectwise", company_id="acme", action="update", search="DB-01"
+        )
+        self.assertEqual(updates["total"], 1)
+        self.assertEqual(updates["items"][0]["changedFields"], ["status"])
+        conflict = self.repository.query_ci_review_items(action="conflict")["items"][0]
+        exact = self.repository.get_ci_review_item(conflict["id"])
+        self.assertEqual(exact["blockedFields"], ["name"])
+        self.assertFalse(exact["fieldDecisions"][0]["allowed"])
+
     def test_msp_branding_is_normalized_persisted_and_audited(self):
         self.assertEqual(self.repository.get_msp_branding()["secondaryAccent"], "#7997ff")
         stored = self.repository.update_msp_branding(

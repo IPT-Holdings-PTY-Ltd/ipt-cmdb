@@ -19,6 +19,7 @@ import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,12 @@ from src.cmdb.change_control import (
     transition_change_record,
     update_change_record,
 )
+from src.cmdb.connectwise import (
+    ConnectWiseClient,
+    ConnectWiseConfigurationError,
+    ConnectWiseRequestError,
+    normalize_base_url,
+)
 from src.cmdb.data_quality import RULES as DATA_QUALITY_RULES
 from src.cmdb.data_quality import evaluate_data_quality
 from src.cmdb.email_delivery import (
@@ -50,6 +57,19 @@ from src.cmdb.email_delivery import (
     exchange_rbac_script,
     public_email_connection,
     valid_email_address,
+)
+from src.cmdb.field_authority import authority_catalogue, preset_rules
+from src.cmdb.integration_reconciliation import (
+    apply_ci_policy,
+    apply_ci_type_mappings,
+    configuration_catalogue,
+    normalize_ci_policy,
+    reconcile_configuration_items,
+)
+from src.cmdb.integrations import provider_registry
+from src.cmdb.integrations.providers.connectwise import (
+    ConnectWiseProvider,
+    normalized_policy,
 )
 from src.cmdb.mfa import (
     MfaConfigurationError,
@@ -82,6 +102,7 @@ from src.cmdb.repository import (
     StateRepository,
     canonical_uuid,
     hash_password,
+    integration_connection_audit_value,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -101,6 +122,17 @@ def _notification_worker_interval() -> int:
     return max(15, min(configured, 3600))
 
 
+def _integration_worker_interval() -> int:
+    """Return the bounded polling interval for due integration policies."""
+
+    try:
+        configured = int(os.getenv("INTEGRATION_WORKER_INTERVAL_SECONDS", "60"))
+    except ValueError:
+        LOGGER.warning("Invalid INTEGRATION_WORKER_INTERVAL_SECONDS; using 60 seconds")
+        configured = 60
+    return max(15, min(configured, 3600))
+
+
 async def _notification_worker_loop() -> None:
     """Periodically evaluate rules and drain the durable email outbox."""
 
@@ -114,24 +146,40 @@ async def _notification_worker_loop() -> None:
         await asyncio.sleep(interval)
 
 
+async def _integration_worker_loop() -> None:
+    """Lease and run due read-only integration discovery policies."""
+
+    interval = _integration_worker_interval()
+    while True:
+        try:
+            await asyncio.to_thread(_run_due_integration_previews)
+        except Exception:
+            LOGGER.exception("Integration preview worker cycle failed")
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def application_lifespan(_application: FastAPI):
-    """Run the optional notification worker and stop it cleanly on shutdown."""
+    """Run optional durable workers and stop them cleanly on shutdown."""
 
-    task: asyncio.Task[None] | None = None
+    tasks: list[asyncio.Task[None]] = []
     if os.getenv("NOTIFICATION_WORKER_ENABLED", "false").lower() in {"1", "true", "yes"}:
-        task = asyncio.create_task(_notification_worker_loop())
+        tasks.append(asyncio.create_task(_notification_worker_loop()))
+    if os.getenv("INTEGRATION_WORKER_ENABLED", "false").lower() in {"1", "true", "yes"}:
+        tasks.append(asyncio.create_task(_integration_worker_loop()))
     try:
         yield
     finally:
-        if task:
+        for task in tasks:
             task.cancel()
-            # Gathering the cancelled task lets its cleanup handlers finish.
-            shutdown_result = (await asyncio.gather(task, return_exceptions=True))[0]
-            if isinstance(shutdown_result, BaseException) and not isinstance(
-                shutdown_result, asyncio.CancelledError
-            ):
-                raise shutdown_result
+        if tasks:
+            # Gathering cancelled tasks lets their cleanup handlers finish.
+            shutdown_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for shutdown_result in shutdown_results:
+                if isinstance(shutdown_result, BaseException) and not isinstance(
+                    shutdown_result, asyncio.CancelledError
+                ):
+                    raise shutdown_result
 
 
 api = FastAPI(
@@ -678,8 +726,117 @@ class FieldAuthorityRequest(BaseModel):
     companyId: str = Field(min_length=1)
     ciType: str = Field(default="*", min_length=1, max_length=120)
     fieldName: str = Field(min_length=1, max_length=160)
-    provider: str = Field(pattern="^(connectwise|ncentral|passportal|future)$")
+    provider: str = Field(pattern="^(connectwise|ncentral|passportal|cmdb|future)$")
     priority: int = Field(default=100, ge=0, le=32767)
+
+
+class FieldAuthorityPresetRequest(BaseModel):
+    """Apply one curated, auditable field-authority baseline to a customer."""
+
+    companyId: str = Field(min_length=1, max_length=100)
+    presetKey: str = Field(min_length=1, max_length=80)
+
+
+class IntegrationReviewBulkDismissRequest(BaseModel):
+    """Dismiss a bounded set of unchanged review observations with one reason."""
+
+    itemIds: list[str] = Field(min_length=1, max_length=100)
+    notes: str = Field(min_length=4, max_length=2000)
+
+
+class IntegrationSuppressionRestoreRequest(BaseModel):
+    """Restore one durable provider-object exclusion with governed notes."""
+
+    notes: str = Field(min_length=4, max_length=2000)
+
+
+class IntegrationLifecycleRequest(BaseModel):
+    """Validate an audited, reversible integration lifecycle transition."""
+
+    action: str = Field(pattern="^(pause|resume|disable|reenable|restore)$")
+    reason: str = Field(min_length=4, max_length=1000)
+    expectedRevision: int | None = Field(default=None, ge=1)
+
+
+class IntegrationRemovalRequest(BaseModel):
+    """Validate credential-destructive integration removal."""
+
+    confirmation: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=4, max_length=1000)
+    expectedRevision: int | None = Field(default=None, ge=1)
+
+
+class ConnectWiseConfigurationRequest(BaseModel):
+    """Validate root-managed ConnectWise PSA connection settings."""
+
+    enabled: bool = True
+    baseUrl: str = Field(min_length=8, max_length=500)
+    companyId: str = Field(min_length=1, max_length=160)
+    clientId: str = Field(min_length=1, max_length=160)
+    publicKey: str = Field(default="", max_length=1000)
+    privateKey: str = Field(default="", max_length=2000)
+    pageSize: int = Field(default=100, ge=25, le=1000)
+    expectedRevision: int | None = Field(default=None, ge=1)
+
+
+class ConnectWiseCompanyMappingRequest(BaseModel):
+    """Validate an explicit ConnectWise-company to CMDB-customer mapping."""
+
+    companyId: str = Field(min_length=1, max_length=100)
+
+
+class ConnectWiseDiscoveryPolicyRequest(BaseModel):
+    """Validate a reviewable company-discovery filter policy."""
+
+    includedStatuses: list[str] = Field(default_factory=list, max_length=500)
+    includedTypes: list[str] = Field(default_factory=list, max_length=500)
+    includedSites: list[str] = Field(default_factory=list, max_length=500)
+    includeDeleted: bool = False
+    excludedExternalIds: list[str] = Field(default_factory=list, max_length=500)
+    expectedRevision: int | None = Field(default=None, ge=1)
+
+
+class ConnectWiseConfigurationPreviewRequest(BaseModel):
+    """Select one explicitly mapped provider company for a read-only CI preview."""
+
+    companyId: str = Field(min_length=1, max_length=100)
+    providerCompanyId: str = Field(min_length=1, max_length=160)
+
+
+class ConnectWiseConfigurationImportRequest(ConnectWiseConfigurationPreviewRequest):
+    """Approve a bounded set of previewed provider records for canonical import."""
+
+    externalIds: list[str] = Field(min_length=1, max_length=1000)
+    decisionNotes: str = Field(default="", max_length=2000)
+
+
+class ConnectWiseCiPolicyRequest(ConnectWiseConfigurationPreviewRequest):
+    """Validate an immutable-ID CI filter and future continuous-preview schedule."""
+
+    typeMode: str = Field(default="all", pattern="^(all|selected)$")
+    includedTypeIds: list[str] = Field(default_factory=list, max_length=500)
+    typeMappings: dict[str, str] = Field(default_factory=dict, max_length=500)
+    blockUnmappedTypes: bool = False
+    statusMode: str = Field(default="all", pattern="^(all|selected)$")
+    includedStatusIds: list[str] = Field(default_factory=list, max_length=500)
+    excludedExternalIds: list[str] = Field(default_factory=list, max_length=1000)
+    syncMode: str = Field(default="manual", pattern="^(manual|continuous_preview)$")
+    intervalMinutes: int = Field(default=360, ge=15, le=10080)
+    enabled: bool = False
+    expectedRevision: int | None = Field(default=None, ge=0)
+
+
+class ConnectWiseConfigurationLinkRequest(ConnectWiseConfigurationPreviewRequest):
+    """Explicitly map one immutable provider CI identity to a canonical CI."""
+
+    externalId: str = Field(min_length=1, max_length=160)
+    assetId: str = Field(min_length=1, max_length=100)
+
+
+class ConnectWiseReviewDismissRequest(BaseModel):
+    """Record why one unchanged CI review observation can be ignored."""
+
+    notes: str = Field(min_length=4, max_length=1000)
 
 
 class BrandingRequest(BaseModel):
@@ -3817,6 +3974,177 @@ def list_reconciliation_candidates(
     ]
 
 
+@api.get("/api/integration-reconciliation", tags=["integrations"])
+def integration_reconciliation_workbench(
+    request: Request,
+    companyId: str | None = None,
+    provider: str | None = None,
+    state: str = "pending",
+    action: str | None = None,
+    search: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """Return a tenant-safe, provider-neutral queue with exact server pagination."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    permitted_company_ids: set[str] | None = None
+    if companyId:
+        _company_for_user(companyId, user)
+    elif user.get("role") != "platform_admin":
+        permitted_company_ids = {
+            company["id"]
+            for company in REPOSITORY.list_companies()
+            if core.allowed(user, company["id"])
+        }
+    if state not in {"pending", "dismissed", "resolved", "all"}:
+        raise HTTPException(400, "Choose a valid review state")
+    if action not in {None, "", "create", "update", "link", "conflict"}:
+        raise HTTPException(400, "Choose a valid reconciliation decision")
+    if len(search) > 200:
+        raise HTTPException(400, "Search text is too long")
+    return REPOSITORY.query_ci_review_items(
+        kind=provider or None,
+        company_id=companyId,
+        company_ids=permitted_company_ids,
+        state=None if state == "all" else state,
+        action=action or None,
+        search=search,
+        limit=max(1, min(limit, 250)),
+        offset=max(0, offset),
+    )
+
+
+@api.post("/api/integration-reconciliation/dismiss", tags=["integrations"])
+def bulk_dismiss_integration_reconciliation(
+    payload: IntegrationReviewBulkDismissRequest, request: Request
+) -> dict:
+    """Dismiss selected current observations after validating every tenant boundary."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    item_ids = list(dict.fromkeys(payload.itemIds))
+    if len(item_ids) != len(payload.itemIds):
+        raise HTTPException(400, "Review item selections must be unique")
+    items = [REPOSITORY.get_ci_review_item(item_id) for item_id in item_ids]
+    if any(item is None for item in items):
+        raise HTTPException(404, "One or more review items no longer exist")
+    for item in items:
+        assert item is not None
+        _company_for_user(item["companyId"], user, require_manage=True)
+        if item.get("state") != "pending":
+            raise HTTPException(409, "One or more review items are no longer pending")
+    with core.LOCK:
+        stored = [
+            REPOSITORY.dismiss_ci_review_item(item_id, payload.notes.strip(), user["id"])
+            for item_id in item_ids
+        ]
+    return {"dismissed": sum(item is not None for item in stored), "itemIds": item_ids}
+
+
+@api.post("/api/integration-reconciliation/ignore", tags=["integrations"])
+def bulk_ignore_integration_reconciliation(
+    payload: IntegrationReviewBulkDismissRequest, request: Request
+) -> dict:
+    """Durably exclude selected immutable provider IDs from future reconciliation."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    item_ids = list(dict.fromkeys(payload.itemIds))
+    if len(item_ids) != len(payload.itemIds):
+        raise HTTPException(400, "Review item selections must be unique")
+    items = [REPOSITORY.get_ci_review_item(item_id) for item_id in item_ids]
+    if any(item is None for item in items):
+        raise HTTPException(404, "One or more review items no longer exist")
+    policy_ids: set[str] = set()
+    for item in items:
+        assert item is not None
+        _company_for_user(item["companyId"], user, require_manage=True)
+        if item.get("state") != "pending":
+            raise HTTPException(409, "One or more review items are no longer pending")
+        policy_ids.add(item["policyId"])
+    if len(policy_ids) != 1:
+        raise HTTPException(400, "Ignored configurations must belong to one customer policy")
+    try:
+        with core.LOCK:
+            stored = REPOSITORY.ignore_ci_review_items(item_ids, payload.notes.strip(), user["id"])
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "ignored": len(stored),
+        "itemIds": item_ids,
+        "suppressionIds": [item["id"] for item in stored],
+    }
+
+
+@api.get("/api/integration-reconciliation/ignored", tags=["integrations"])
+def list_ignored_integration_objects(
+    request: Request,
+    companyId: str | None = None,
+    provider: str | None = None,
+    active: bool | None = True,
+    search: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """Return tenant-safe durable provider-object exclusions and restore history."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    permitted_company_ids: set[str] | None = None
+    if companyId:
+        _company_for_user(companyId, user)
+    elif user.get("role") != "platform_admin":
+        permitted_company_ids = {
+            company["id"]
+            for company in REPOSITORY.list_companies()
+            if core.allowed(user, company["id"])
+        }
+    if len(search) > 200:
+        raise HTTPException(400, "Search text is too long")
+    return REPOSITORY.query_integration_object_suppressions(
+        kind=provider or None,
+        company_id=companyId,
+        company_ids=permitted_company_ids,
+        active=active,
+        search=search,
+        limit=max(1, min(limit, 250)),
+        offset=max(0, offset),
+    )
+
+
+@api.post(
+    "/api/integration-reconciliation/ignored/{suppression_id}/restore",
+    tags=["integrations"],
+)
+def restore_ignored_integration_object(
+    suppression_id: str,
+    payload: IntegrationSuppressionRestoreRequest,
+    request: Request,
+) -> dict:
+    """Restore one durable exclusion without deleting or unlinking a canonical CI."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    current = REPOSITORY.get_integration_object_suppression(suppression_id)
+    if not current:
+        raise HTTPException(404, "Ignored configuration not found")
+    _company_for_user(current["companyId"], user, require_manage=True)
+    if not current.get("active"):
+        raise HTTPException(409, "The ignored configuration has already been restored")
+    try:
+        with core.LOCK:
+            restored = REPOSITORY.restore_integration_object_suppression(
+                suppression_id, payload.notes.strip(), user["id"]
+            )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if not restored:
+        raise HTTPException(409, "The ignored configuration has already been restored")
+    return restored
+
+
 @api.patch("/api/reconciliation-candidates/{candidate_id}", tags=["integrations"])
 def decide_reconciliation_candidate(
     candidate_id: str, payload: ReconciliationDecisionRequest, request: Request
@@ -3869,6 +4197,49 @@ def list_field_authority(request: Request, companyId: str | None = None) -> list
     ]
 
 
+@api.get("/api/field-authority/catalogue", tags=["integrations"])
+def get_field_authority_catalogue(request: Request) -> dict:
+    """Return curated canonical fields, providers and reviewed baseline presets."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    catalogue = authority_catalogue()
+    provider_names = {
+        "cmdb": "CMDB managed",
+        "ncentral": "N-central",
+        "passportal": "Passportal",
+        **{manifest["key"]: manifest["name"] for manifest in provider_registry.manifests()},
+    }
+    catalogue["providers"] = [{"key": key, "name": name} for key, name in provider_names.items()]
+    catalogue["ciTypes"] = [
+        "*",
+        *sorted(
+            {
+                str(item.get("type") or "Unclassified")
+                for item in REPOSITORY.list_assets()
+                if core.allowed(user, item["companyId"])
+            }
+        ),
+    ]
+    return catalogue
+
+
+@api.post("/api/field-authority/presets", tags=["integrations"])
+def apply_field_authority_preset(payload: FieldAuthorityPresetRequest, request: Request) -> dict:
+    """Apply a curated field-authority baseline as individually audited rules."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    _company_for_user(payload.companyId, user, require_manage=True)
+    try:
+        rules = preset_rules(payload.presetKey, payload.companyId)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    with core.LOCK:
+        stored = [REPOSITORY.upsert_field_authority(rule, user["id"]) for rule in rules]
+    return {"applied": len(stored), "rules": stored}
+
+
 @api.put("/api/field-authority", tags=["integrations"])
 def upsert_field_authority(payload: FieldAuthorityRequest, request: Request) -> dict:
     user = current_user(request)
@@ -3892,6 +4263,35 @@ def delete_field_authority(
     return {"deleted": True}
 
 
+SUPPORTED_INTEGRATION_KINDS = {"connectwise", "ncentral", "passportal"}
+
+
+def _integration_connection(kind: str) -> dict:
+    """Return one supported root connection or a stable public API error."""
+
+    if kind not in SUPPORTED_INTEGRATION_KINDS:
+        raise HTTPException(404, "Integration not found")
+    connection = REPOSITORY.get_integration_connection(kind)
+    if not connection:
+        raise HTTPException(404, "Integration not found")
+    return connection
+
+
+def _require_integration_active(kind: str) -> dict:
+    """Enforce the connection-level kill switch before every provider call."""
+
+    connection = _integration_connection(kind)
+    lifecycle = connection.get("lifecycleStatus", "active")
+    if lifecycle != "active" or not connection.get("enabled"):
+        label = lifecycle.replace("_", " ")
+        raise HTTPException(
+            409,
+            f"{connection.get('name') or kind} is {label}. Re-enable the integration "
+            "before making provider requests.",
+        )
+    return connection
+
+
 @api.get("/api/integrations", tags=["integrations"])
 def list_integrations(request: Request) -> list[dict]:
     user = current_user(request)
@@ -3904,18 +4304,1121 @@ def list_integrations(request: Request) -> list[dict]:
     for item in REPOSITORY.list_integrations():
         if item.get("scope", "msp") != "msp":
             continue
-        configured = core.configured(item["type"])
+        configured = (
+            _connectwise_connection_public().get("configured", False)
+            if item["type"] == "connectwise"
+            else core.configured(item["type"])
+        )
+        lifecycle = item.get("lifecycleStatus", "active")
         records.append(
             {
                 **item,
                 "scope": "msp",
-                "enabled": configured or item["enabled"],
-                "status": "Ready"
-                if configured and item["status"] == "Not configured"
-                else item["status"],
+                "lifecycleStatus": lifecycle,
+                "enabled": bool(item["enabled"]) and lifecycle == "active",
+                "status": (
+                    lifecycle.title()
+                    if lifecycle != "active"
+                    else (
+                        "Ready"
+                        if configured and item["status"] == "Not configured"
+                        else item["status"]
+                    )
+                ),
             }
         )
     return records
+
+
+@api.get("/api/integrations/{kind}/lifecycle-impact", tags=["integrations"])
+def integration_lifecycle_impact(kind: str, request: Request) -> dict:
+    """Preview retained records before a lifecycle or removal decision."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _integration_connection(kind)
+    try:
+        impact = REPOSITORY.integration_lifecycle_impact(kind)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+    if kind == "connectwise":
+        public = _connectwise_connection_public()
+        impact["managedByEnvironment"] = public.get("managedByEnvironment", False)
+        impact["credentialSource"] = public.get("credentialSource", "not_configured")
+    else:
+        impact["managedByEnvironment"] = False
+        impact["credentialSource"] = "not_configured"
+    return impact
+
+
+@api.post("/api/integrations/{kind}/lifecycle", tags=["integrations"])
+def change_integration_lifecycle(
+    kind: str, payload: IntegrationLifecycleRequest, request: Request
+) -> dict:
+    """Pause, disable or restore a provider connection without deleting evidence."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    connection = _integration_connection(kind)
+    current = connection.get("lifecycleStatus", "active")
+    transitions = {
+        ("active", "pause"): "paused",
+        ("active", "disable"): "disabled",
+        ("paused", "resume"): "active",
+        ("paused", "disable"): "disabled",
+        ("disabled", "reenable"): "active",
+        ("removed", "restore"): "active",
+    }
+    target = transitions.get((current, payload.action))
+    if not target:
+        raise HTTPException(
+            409,
+            f"Cannot {payload.action} an integration whose lifecycle is {current}.",
+        )
+    if current == "removed":
+        try:
+            environment_configuration = (
+                _connectwise_environment_configuration() if kind == "connectwise" else None
+            )
+        except ConnectWiseConfigurationError as error:
+            raise HTTPException(409, str(error)) from error
+        if not environment_configuration:
+            raise HTTPException(
+                409,
+                "Removed database-managed integrations must be configured with new "
+                "credentials before they can be installed again.",
+            )
+    elif target == "active":
+        configured = (
+            _connectwise_connection_public().get("configured", False)
+            if kind == "connectwise"
+            else core.configured(kind)
+        )
+        if not configured:
+            raise HTTPException(409, "Configure integration credentials before re-enabling it")
+    try:
+        with core.LOCK:
+            updated = REPOSITORY.change_integration_lifecycle(
+                kind,
+                target,
+                payload.reason.strip(),
+                user["id"],
+                payload.expectedRevision,
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return integration_connection_audit_value(updated)
+
+
+@api.post("/api/integrations/{kind}/remove", tags=["integrations"])
+def remove_integration(kind: str, payload: IntegrationRemovalRequest, request: Request) -> dict:
+    """Remove usable configuration while retaining canonical and audit evidence."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    connection = _integration_connection(kind)
+    if payload.confirmation.strip() != str(connection.get("name") or ""):
+        raise HTTPException(400, "Enter the exact integration name to confirm removal")
+    if connection.get("lifecycleStatus", "active") == "removed":
+        raise HTTPException(409, "Integration has already been removed")
+    try:
+        impact = REPOSITORY.integration_lifecycle_impact(kind)
+        with core.LOCK:
+            updated = REPOSITORY.change_integration_lifecycle(
+                kind,
+                "removed",
+                payload.reason.strip(),
+                user["id"],
+                payload.expectedRevision,
+                remove_configuration=True,
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return {
+        "integration": integration_connection_audit_value(updated),
+        "retained": impact,
+        "message": (
+            "Stored credentials and editable configuration were removed. Canonical CIs, "
+            "provider identity mappings, sync history and audit evidence were retained."
+        ),
+    }
+
+
+def _connectwise_environment_configuration() -> dict | None:
+    """Return an all-or-nothing environment-managed ConnectWise connection."""
+
+    keys = {
+        "baseUrl": "CW_BASE_URL",
+        "companyId": "CW_COMPANY_ID",
+        "publicKey": "CW_PUBLIC_KEY",
+        "privateKey": "CW_PRIVATE_KEY",
+        "clientId": "CW_CLIENT_ID",
+    }
+    values = {target: str(os.getenv(source) or "").strip() for target, source in keys.items()}
+    if not any(values.values()):
+        return None
+    missing = [target for target, value in values.items() if not value]
+    if missing:
+        raise ConnectWiseConfigurationError(
+            "ConnectWise environment configuration is incomplete: " + ", ".join(missing)
+        )
+    try:
+        page_size = int(os.getenv("CW_PAGE_SIZE", "100"))
+    except ValueError as error:
+        raise ConnectWiseConfigurationError("CW_PAGE_SIZE must be a number") from error
+    return {**values, "baseUrl": normalize_base_url(values["baseUrl"]), "pageSize": page_size}
+
+
+def _connectwise_stored_configuration() -> tuple[dict, dict]:
+    """Load public metadata and decrypt the installation-bound credential bundle."""
+
+    connection = REPOSITORY.get_integration_connection("connectwise")
+    if not connection:
+        raise ConnectWiseConfigurationError("ConnectWise integration connection is unavailable")
+    configuration = deepcopy(connection.get("configuration") or {})
+    encrypted = str(connection.get("credentialsEncrypted") or "")
+    nonce = str(connection.get("credentialsNonce") or "")
+    if not encrypted or not nonce:
+        raise ConnectWiseConfigurationError("ConnectWise credentials are not configured")
+    try:
+        credentials = json.loads(decrypt_secret(encrypted, nonce, "integration:connectwise"))
+    except (MfaConfigurationError, json.JSONDecodeError) as error:
+        raise ConnectWiseConfigurationError(
+            "Stored ConnectWise credentials cannot be decrypted by this installation"
+        ) from error
+    if not isinstance(credentials, dict):
+        raise ConnectWiseConfigurationError("Stored ConnectWise credentials are invalid")
+    return connection, {**configuration, **credentials}
+
+
+def _connectwise_effective_configuration() -> tuple[dict, str]:
+    """Prefer complete environment settings, otherwise use encrypted database settings."""
+
+    _require_integration_active("connectwise")
+    environment = _connectwise_environment_configuration()
+    if environment:
+        return environment, "environment"
+    _connection, stored = _connectwise_stored_configuration()
+    return stored, "encrypted_database"
+
+
+def _connectwise_connection_public() -> dict:
+    """Expose connection metadata without public or private API keys."""
+
+    connection = REPOSITORY.get_integration_connection("connectwise") or {
+        "id": "connectwise",
+        "revision": 1,
+        "enabled": False,
+        "connectionStatus": "not_configured",
+        "configuration": {},
+    }
+    configuration = connection.get("configuration") or {}
+    try:
+        environment = _connectwise_environment_configuration()
+    except ConnectWiseConfigurationError as error:
+        environment = None
+        environment_error = str(error)
+    else:
+        environment_error = ""
+    source = "environment" if environment else "encrypted_database"
+    public_configuration = {**configuration, **(environment or {})}
+    has_stored = bool(connection.get("credentialsEncrypted"))
+    configured = bool(environment) or has_stored
+    lifecycle = connection.get("lifecycleStatus", "active")
+    return {
+        "id": connection.get("id", "connectwise"),
+        "enabled": bool(connection.get("enabled")) and lifecycle == "active",
+        "baseUrl": str(public_configuration.get("baseUrl") or ""),
+        "companyId": str(public_configuration.get("companyId") or ""),
+        "clientId": str(public_configuration.get("clientId") or ""),
+        "pageSize": int(public_configuration.get("pageSize") or 100),
+        "discoveryPolicy": normalized_policy(configuration.get("discoveryPolicy")),
+        "configured": configured,
+        "hasCredentials": configured,
+        "credentialSource": source if configured else "not_configured",
+        "managedByEnvironment": bool(environment) or bool(environment_error),
+        "connectionStatus": "error"
+        if environment_error
+        else connection.get("connectionStatus", "not_configured"),
+        "lastTestAt": connection.get("lastTestAt"),
+        "lastError": environment_error or connection.get("lastError", ""),
+        "revision": int(connection.get("revision") or 1),
+        "lifecycleStatus": lifecycle,
+        "lifecycleReason": connection.get("lifecycleReason", ""),
+        "lifecycleChangedAt": connection.get("lifecycleChangedAt"),
+        "lifecycleChangedBy": connection.get("lifecycleChangedBy"),
+    }
+
+
+def _connectwise_adapter() -> ConnectWiseProvider:
+    """Build the reference adapter while keeping the HTTP client replaceable in tests."""
+
+    return ConnectWiseProvider(client_factory=ConnectWiseClient)
+
+
+def _connectwise_company_rows() -> list[dict]:
+    """Add non-binding exact-match suggestions to persisted provider observations."""
+
+    companies = REPOSITORY.list_companies()
+    by_name: dict[str, list[dict]] = {}
+    by_external_id: dict[str, dict] = {}
+    for company in companies:
+        by_name.setdefault(str(company.get("name") or "").casefold().strip(), []).append(company)
+        for key, value in (company.get("externalIds") or {}).items():
+            if "connectwise" in str(key).casefold() and value:
+                by_external_id[str(value)] = company
+    rows = []
+    for item in REPOSITORY.list_provider_companies("connectwise"):
+        suggestion = None
+        reason = ""
+        if not item.get("mappedCompanyId"):
+            suggestion = by_external_id.get(str(item.get("externalId") or ""))
+            if suggestion:
+                reason = "Existing ConnectWise external ID"
+            else:
+                exact = by_name.get(str(item.get("name") or "").casefold().strip(), [])
+                if len(exact) == 1:
+                    suggestion = exact[0]
+                    reason = "Exact name; operator review required"
+        rows.append(
+            {
+                **item,
+                "suggestedCompanyId": suggestion.get("id") if suggestion else None,
+                "suggestedCompanyName": suggestion.get("name") if suggestion else "",
+                "suggestionReason": reason,
+            }
+        )
+    return rows
+
+
+def _run_connectwise_company_discovery(user: dict) -> dict:
+    """Discover company metadata and persist a review-gated snapshot."""
+
+    started_at = core.now()
+    configuration, _source = _connectwise_effective_configuration()
+    adapter = _connectwise_adapter()
+    discovered = adapter.discover(configuration)
+    policy = _connectwise_connection_public()["discoveryPolicy"]
+    companies, excluded = adapter.apply_filters(discovered, policy)
+    mapped_ids = {
+        item["externalId"]
+        for item in REPOSITORY.list_provider_companies("connectwise")
+        if item.get("mappedCompanyId")
+    }
+    review_count = sum(item["externalId"] not in mapped_ids for item in companies)
+    run = {
+        "id": str(uuid.uuid4()),
+        "type": "connectwise",
+        "startedAt": started_at,
+        "finishedAt": core.now(),
+        "status": "review_required" if review_count else "success",
+        "discovered": len(companies),
+        "imported": 0,
+        "updated": 0,
+        "review": review_count,
+        "message": (
+            f"Read {len(discovered)} companies; included {len(companies)}, excluded "
+            f"{len(excluded)}, and {review_count} require explicit mapping. "
+            "No data was written to ConnectWise."
+        ),
+        "rawDiscovered": len(discovered),
+        "excluded": len(excluded),
+    }
+    with core.LOCK:
+        return REPOSITORY.record_company_discovery("connectwise", run, companies, user["id"])
+
+
+@api.get("/api/integration-providers", tags=["integrations"])
+def list_integration_providers(request: Request) -> list[dict]:
+    """Return reviewed provider manifests used by setup and workflow surfaces."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    return provider_registry.manifests()
+
+
+@api.get("/api/integrations/connectwise/config", tags=["integrations"])
+def get_connectwise_configuration(request: Request) -> dict:
+    """Return write-only ConnectWise configuration metadata to root operators."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    return _connectwise_connection_public()
+
+
+@api.put("/api/integrations/connectwise/config", tags=["integrations"])
+def update_connectwise_configuration(
+    payload: ConnectWiseConfigurationRequest, request: Request
+) -> dict:
+    """Store ConnectWise keys encrypted; environment-managed settings remain immutable."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    public = _connectwise_connection_public()
+    if public.get("managedByEnvironment"):
+        raise HTTPException(409, "ConnectWise settings are managed by environment variables")
+    try:
+        base_url = normalize_base_url(payload.baseUrl)
+    except ConnectWiseConfigurationError as error:
+        raise HTTPException(400, str(error)) from error
+    current = REPOSITORY.get_integration_connection("connectwise") or {}
+    reinstalling = current.get("lifecycleStatus", "active") == "removed"
+    encrypted = str(current.get("credentialsEncrypted") or "")
+    nonce = str(current.get("credentialsNonce") or "")
+    if bool(payload.publicKey) != bool(payload.privateKey):
+        raise HTTPException(400, "Enter both the public and private API keys when rotating keys")
+    if payload.publicKey and payload.privateKey:
+        try:
+            encryption_key()
+            encrypted, nonce = encrypt_secret(
+                json.dumps(
+                    {
+                        "publicKey": payload.publicKey.strip(),
+                        "privateKey": payload.privateKey.strip(),
+                    }
+                ),
+                "integration:connectwise",
+            )
+        except MfaConfigurationError as error:
+            raise HTTPException(
+                503, "Configure MFA_ENCRYPTION_KEY before storing integration credentials"
+            ) from error
+    if not encrypted:
+        raise HTTPException(400, "Enter the ConnectWise public and private API keys")
+    try:
+        with core.LOCK:
+            REPOSITORY.update_integration_connection(
+                "connectwise",
+                {
+                    "configuration": {
+                        "baseUrl": base_url,
+                        "companyId": payload.companyId.strip(),
+                        "clientId": payload.clientId.strip(),
+                        "pageSize": payload.pageSize,
+                        "discoveryPolicy": normalized_policy(
+                            (current.get("configuration") or {}).get("discoveryPolicy")
+                        ),
+                    },
+                    "credentialsEncrypted": encrypted,
+                    "credentialsNonce": nonce,
+                    "enabled": payload.enabled
+                    and (reinstalling or current.get("lifecycleStatus", "active") == "active"),
+                    "lifecycleStatus": (
+                        "active" if reinstalling else current.get("lifecycleStatus", "active")
+                    ),
+                    "lifecycleReason": (
+                        "Integration reinstalled with new credentials"
+                        if reinstalling
+                        else current.get("lifecycleReason", "")
+                    ),
+                    "connectionStatus": "configured",
+                    "lastError": "",
+                    "expectedRevision": payload.expectedRevision,
+                },
+                user["id"],
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return _connectwise_connection_public()
+
+
+@api.post("/api/integrations/connectwise/test", tags=["integrations"])
+def test_connectwise_connection(request: Request) -> dict:
+    """Test authentication and company-read permission without retaining provider data."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    try:
+        configuration, source = _connectwise_effective_configuration()
+        result = _connectwise_adapter().test_connection(configuration)
+    except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
+        with core.LOCK:
+            REPOSITORY.mark_integration_test("connectwise", "error", str(error), user["id"])
+        raise HTTPException(502, str(error)) from error
+    with core.LOCK:
+        REPOSITORY.mark_integration_test(
+            "connectwise", "verified", "Company read permission verified", user["id"]
+        )
+    return {**result, "credentialSource": source, "message": "Company read permission verified"}
+
+
+@api.put("/api/integrations/connectwise/policy", tags=["integrations"])
+def update_connectwise_discovery_policy(
+    payload: ConnectWiseDiscoveryPolicyRequest, request: Request
+) -> dict:
+    """Save discovery filters independently from environment-managed credentials."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    current = REPOSITORY.get_integration_connection("connectwise") or {}
+    policy = normalized_policy(payload.model_dump(exclude={"expectedRevision"}))
+    try:
+        with core.LOCK:
+            REPOSITORY.update_integration_connection(
+                "connectwise",
+                {
+                    "configuration": {"discoveryPolicy": policy},
+                    "enabled": bool(current.get("enabled")),
+                    "connectionStatus": current.get("connectionStatus", "not_configured"),
+                    "lastError": current.get("lastError", ""),
+                    "expectedRevision": payload.expectedRevision,
+                },
+                user["id"],
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return _connectwise_connection_public()
+
+
+@api.post("/api/integrations/connectwise/discovery-preview", tags=["integrations"])
+def preview_connectwise_discovery(request: Request) -> dict:
+    """Read and filter companies without persisting observations or mappings."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    started_at = core.now()
+    try:
+        configuration, source = _connectwise_effective_configuration()
+        preview = _connectwise_adapter().preview(
+            configuration, _connectwise_connection_public()["discoveryPolicy"]
+        )
+    except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
+        raise HTTPException(502, str(error)) from error
+    run = {
+        "id": str(uuid.uuid4()),
+        "type": "connectwise",
+        "status": "success",
+        "startedAt": started_at,
+        "finishedAt": core.now(),
+        "discovered": preview["discovered"],
+        "imported": 0,
+        "updated": 0,
+        "review": preview["included"],
+        "message": (
+            f"Dry-run preview read {preview['discovered']} "
+            f"{'sampled ' if preview.get('truncated') else ''}companies: "
+            f"{preview['included']} included and {preview['excluded']} excluded. "
+            "No observations, mappings or provider records were changed."
+        ),
+    }
+    with core.LOCK:
+        REPOSITORY.record_sync_run("connectwise", run, True, user["id"])
+    return {**preview, "credentialSource": source, "message": run["message"]}
+
+
+@api.get("/api/integrations/connectwise/discovery-options", tags=["integrations"])
+def list_connectwise_discovery_options(request: Request) -> dict:
+    """Load bounded provider values for filter menus without canonical writes."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    try:
+        configuration, source = _connectwise_effective_configuration()
+        options = _connectwise_adapter().discovery_options(configuration)
+    except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
+        raise HTTPException(502, str(error)) from error
+    return {**options, "credentialSource": source}
+
+
+@api.get("/api/integrations/connectwise/companies", tags=["integrations"])
+def list_connectwise_companies(request: Request) -> list[dict]:
+    """List sanitized observations and suggestions without exposing provider payloads."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    return _connectwise_company_rows()
+
+
+@api.put("/api/integrations/connectwise/companies/{external_id}/mapping", tags=["integrations"])
+def map_connectwise_company(
+    external_id: str, payload: ConnectWiseCompanyMappingRequest, request: Request
+) -> dict:
+    """Apply an explicit customer mapping after administrator review."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    if not any(item["id"] == payload.companyId for item in REPOSITORY.list_companies()):
+        raise HTTPException(404, "CMDB customer not found")
+    try:
+        with core.LOCK:
+            return REPOSITORY.map_provider_company(
+                "connectwise", external_id, payload.companyId, user["id"]
+            )
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@api.delete(
+    "/api/integrations/connectwise/companies/{external_id}/mapping",
+    tags=["integrations"],
+)
+def unmap_connectwise_company(external_id: str, request: Request) -> dict:
+    """Deactivate a customer mapping while preserving mapping and audit history."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    with core.LOCK:
+        removed = REPOSITORY.unmap_provider_company("connectwise", external_id, user["id"])
+    if not removed:
+        raise HTTPException(404, "Active ConnectWise company mapping not found")
+    return {"unmapped": True}
+
+
+def _connectwise_mapped_company(company_id: str, provider_company_id: str) -> dict:
+    """Return one active explicit provider-company mapping or reject the scope."""
+
+    mapped = next(
+        (
+            item
+            for item in REPOSITORY.list_provider_companies("connectwise")
+            if item.get("externalId") == provider_company_id
+            and item.get("mappedCompanyId") == company_id
+            and item.get("active", True)
+        ),
+        None,
+    )
+    if not mapped:
+        raise HTTPException(
+            409,
+            "Choose a ConnectWise company that is explicitly mapped to this CMDB customer",
+        )
+    return mapped
+
+
+def _connectwise_configuration_context(
+    company_id: str, provider_company_id: str
+) -> tuple[dict, list[dict], str, dict]:
+    """Validate a company mapping and read its sanitized provider configurations."""
+
+    mapped = _connectwise_mapped_company(company_id, provider_company_id)
+    configuration, source = _connectwise_effective_configuration()
+    records = ConnectWiseClient(configuration).discover_configurations(provider_company_id)
+    policy = REPOSITORY.get_ci_sync_policy("connectwise", company_id, provider_company_id)
+    return mapped, records, source, policy
+
+
+def _connectwise_configuration_preview(company_id: str, provider_company_id: str) -> dict[str, Any]:
+    """Read, filter and classify CIs for one explicit customer mapping."""
+
+    mapped, records, source, policy = _connectwise_configuration_context(
+        company_id, provider_company_id
+    )
+    catalogue = configuration_catalogue(records)
+    included_records, exclusion_reasons = apply_ci_policy(records, policy)
+    mapped_records, type_mapping_summary = apply_ci_type_mappings(included_records, policy)
+    assets = [item for item in REPOSITORY.list_assets() if item["companyId"] == company_id]
+    mappings = REPOSITORY.list_provider_ci_mappings("connectwise", company_id)
+    items = reconcile_configuration_items(
+        connection_id="connectwise",
+        records=mapped_records,
+        assets=assets,
+        mappings=mappings,
+        field_authority=REPOSITORY.list_field_authority(company_id),
+        provider="connectwise",
+    )
+    counts = {
+        action: sum(item["action"] == action for item in items)
+        for action in ("create", "update", "link", "unchanged", "conflict")
+    }
+    return {
+        "companyId": company_id,
+        "companyName": mapped.get("mappedCompanyName") or company_id,
+        "providerCompanyId": provider_company_id,
+        "providerCompanyName": mapped.get("name") or provider_company_id,
+        "credentialSource": source,
+        "readOnly": True,
+        "writesAttempted": False,
+        "discovered": len(records),
+        "included": len(included_records),
+        "excluded": len(records) - len(included_records),
+        "exclusionReasons": exclusion_reasons,
+        "availableTypes": catalogue["types"],
+        "availableStatuses": catalogue["statuses"],
+        "typeMappingSummary": type_mapping_summary,
+        "appliedPolicy": policy,
+        "counts": counts,
+        "items": items,
+    }
+
+
+def _execute_connectwise_ci_preview(
+    company_id: str,
+    provider_company_id: str,
+    *,
+    actor_id: str | None,
+    trigger: str,
+) -> dict[str, Any]:
+    """Execute one read-only preview and persist its current review observations."""
+
+    started_at = core.now()
+    preview = _connectwise_configuration_preview(company_id, provider_company_id)
+    counts = preview["counts"]
+    message = (
+        f"Read {preview['discovered']} ConnectWise configuration items for "
+        f"{preview['providerCompanyName']}; the saved policy included {preview['included']} and "
+        f"excluded {preview['excluded']}: {counts['create']} new, {counts['update']} changed, "
+        f"{counts['link']} identity links, {counts['unchanged']} unchanged and "
+        f"{counts['conflict']} requiring review. No CMDB or ConnectWise records were changed."
+    )
+    run = {
+        "id": str(uuid.uuid4()),
+        "type": "connectwise",
+        "status": "success",
+        "startedAt": started_at,
+        "finishedAt": core.now(),
+        "discovered": preview["discovered"],
+        "imported": 0,
+        "updated": 0,
+        "review": counts["create"] + counts["update"] + counts["link"] + counts["conflict"],
+        "message": message,
+        "attributes": {
+            "operation": "configuration_preview",
+            "trigger": trigger,
+            "companyId": company_id,
+            "providerCompanyId": provider_company_id,
+            "policyId": preview["appliedPolicy"].get("id") or None,
+            "policyRevision": preview["appliedPolicy"].get("revision", 0),
+            "included": preview["included"],
+            "excluded": preview["excluded"],
+            "readOnly": True,
+        },
+    }
+    with core.LOCK:
+        stored_run = REPOSITORY.record_sync_run("connectwise", run, True, actor_id)
+        policy_id = str(preview["appliedPolicy"].get("id") or "")
+        queue_summary = (
+            REPOSITORY.replace_ci_review_items(
+                policy_id,
+                company_id,
+                stored_run["id"],
+                preview["items"],
+                actor_id,
+            )
+            if policy_id
+            else {"pending": 0, "created": 0, "updated": 0, "resolved": 0}
+        )
+        if policy_id:
+            REPOSITORY.complete_ci_sync_policy_run(policy_id, success=True)
+    return {
+        **preview,
+        "message": message,
+        "syncRunId": stored_run["id"],
+        "queueSummary": queue_summary,
+    }
+
+
+def _record_connectwise_ci_preview_failure(policy: dict, error: Exception) -> None:
+    """Persist a sanitized worker failure and release its policy lease."""
+
+    expected = isinstance(error, (ConnectWiseConfigurationError, ConnectWiseRequestError))
+    detail = str(error)[:1000] if expected else "Unexpected integration worker failure"
+    now = core.now()
+    run = {
+        "id": str(uuid.uuid4()),
+        "type": "connectwise",
+        "status": "failed",
+        "startedAt": now,
+        "finishedAt": now,
+        "discovered": 0,
+        "imported": 0,
+        "updated": 0,
+        "review": 0,
+        "message": f"Continuous preview failed for {policy.get('companyName') or policy['companyId']}: {detail}",
+        "attributes": {
+            "operation": "configuration_preview",
+            "trigger": "continuous_preview",
+            "companyId": policy["companyId"],
+            "providerCompanyId": policy["providerParentId"],
+            "policyId": policy["id"],
+            "readOnly": True,
+        },
+    }
+    with core.LOCK:
+        REPOSITORY.record_sync_run("connectwise", run, True, None)
+        REPOSITORY.complete_ci_sync_policy_run(policy["id"], success=False, error=detail)
+
+
+def _run_due_integration_previews(limit: int = 5) -> dict[str, int]:
+    """Drain a bounded number of leased read-only policies for this worker cycle."""
+
+    worker_id = f"{os.getpid()}:{uuid.uuid4()}"
+    processed = 0
+    succeeded = 0
+    failed = 0
+    for _index in range(max(1, min(limit, 25))):
+        policy = REPOSITORY.claim_due_ci_sync_policy("connectwise", worker_id)
+        if not policy:
+            break
+        processed += 1
+        token = set_audit_context(
+            AuditContext(
+                request_id=str(uuid.uuid4()),
+                correlation_id=str(uuid.uuid4()),
+                source_system="integration_worker",
+            )
+        )
+        try:
+            _execute_connectwise_ci_preview(
+                policy["companyId"],
+                policy["providerParentId"],
+                actor_id=None,
+                trigger="continuous_preview",
+            )
+            succeeded += 1
+        except Exception as error:  # Worker boundaries must release leases for every failure.
+            failed += 1
+            LOGGER.exception("Continuous ConnectWise preview failed for policy %s", policy["id"])
+            try:
+                _record_connectwise_ci_preview_failure(policy, error)
+            except Exception:
+                LOGGER.exception(
+                    "Could not persist integration worker failure for %s", policy["id"]
+                )
+                REPOSITORY.complete_ci_sync_policy_run(
+                    policy["id"], success=False, error="Worker failure could not be persisted"
+                )
+        finally:
+            reset_audit_context(token)
+    return {"processed": processed, "succeeded": succeeded, "failed": failed}
+
+
+@api.get("/api/integrations/connectwise/configurations/policy", tags=["integrations"])
+def get_connectwise_ci_policy(request: Request, companyId: str, providerCompanyId: str) -> dict:
+    """Return the saved CI filter/schedule policy for one mapped customer."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _company_for_user(companyId, user)
+    _connectwise_mapped_company(companyId, providerCompanyId)
+    return REPOSITORY.get_ci_sync_policy("connectwise", companyId, providerCompanyId)
+
+
+@api.put("/api/integrations/connectwise/configurations/policy", tags=["integrations"])
+def update_connectwise_ci_policy(payload: ConnectWiseCiPolicyRequest, request: Request) -> dict:
+    """Persist an audited immutable-ID CI policy for future repeatable syncs."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    _company_for_user(payload.companyId, user, require_manage=True)
+    _connectwise_mapped_company(payload.companyId, payload.providerCompanyId)
+    try:
+        with core.LOCK:
+            return REPOSITORY.update_ci_sync_policy(
+                "connectwise",
+                payload.companyId,
+                payload.providerCompanyId,
+                normalize_ci_policy(payload.model_dump()),
+                payload.expectedRevision,
+                user["id"],
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@api.post("/api/integrations/connectwise/configurations/options", tags=["integrations"])
+def get_connectwise_ci_options(
+    payload: ConnectWiseConfigurationPreviewRequest, request: Request
+) -> dict:
+    """Read immutable provider type/status choices for one mapped company."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _company_for_user(payload.companyId, user)
+    try:
+        mapped, records, source, policy = _connectwise_configuration_context(
+            payload.companyId, payload.providerCompanyId
+        )
+    except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
+        raise HTTPException(502, str(error)) from error
+    catalogue = configuration_catalogue(records)
+    return {
+        "companyId": payload.companyId,
+        "providerCompanyId": payload.providerCompanyId,
+        "providerCompanyName": mapped.get("name") or payload.providerCompanyId,
+        "credentialSource": source,
+        "readOnly": True,
+        "writesAttempted": False,
+        "discovered": len(records),
+        "availableTypes": catalogue["types"],
+        "availableStatuses": catalogue["statuses"],
+        "policy": policy,
+    }
+
+
+@api.post("/api/integrations/connectwise/configurations/preview", tags=["integrations"])
+def preview_connectwise_configurations(
+    payload: ConnectWiseConfigurationPreviewRequest, request: Request
+) -> dict:
+    """Preview reconciliation and refresh its durable review queue."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _company_for_user(payload.companyId, user)
+    try:
+        return _execute_connectwise_ci_preview(
+            payload.companyId,
+            payload.providerCompanyId,
+            actor_id=user["id"],
+            trigger="manual",
+        )
+    except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
+        raise HTTPException(502, str(error)) from error
+
+
+@api.get("/api/integrations/continuous-preview/status", tags=["integrations"])
+def continuous_preview_status(request: Request) -> dict:
+    """Summarize worker configuration, schedules and current review backlog."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    policies = REPOSITORY.list_ci_sync_policies("connectwise")
+    connection_enabled = bool(_connectwise_connection_public().get("enabled"))
+    return {
+        "workerEnabled": os.getenv("INTEGRATION_WORKER_ENABLED", "false").lower()
+        in {"1", "true", "yes"},
+        "workerIntervalSeconds": _integration_worker_interval(),
+        "enabledPolicies": sum(
+            item.get("enabled") and item.get("syncMode") == "continuous_preview"
+            for item in policies
+        )
+        if connection_enabled
+        else 0,
+        "pendingReviews": REPOSITORY.count_ci_review_items("connectwise", state="pending"),
+        "policies": policies,
+    }
+
+
+@api.get("/api/integrations/connectwise/configurations/review-queue", tags=["integrations"])
+def list_connectwise_ci_review_queue(
+    request: Request,
+    companyId: str | None = None,
+    state: str = "pending",
+    limit: int = 250,
+) -> dict:
+    """Return current ConnectWise CI observations awaiting an MSP decision."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    if state not in {"pending", "dismissed", "resolved", "all"}:
+        raise HTTPException(400, "Review state must be pending, dismissed, resolved or all")
+    if companyId:
+        _company_for_user(companyId, user)
+    selected_state = None if state == "all" else state
+    return {
+        "items": REPOSITORY.list_ci_review_items(
+            "connectwise", companyId, selected_state, max(1, min(limit, 1000))
+        ),
+        "total": REPOSITORY.count_ci_review_items("connectwise", companyId, selected_state),
+    }
+
+
+@api.post(
+    "/api/integrations/connectwise/configurations/review-queue/{item_id}/dismiss",
+    tags=["integrations"],
+)
+def dismiss_connectwise_ci_review_item(
+    item_id: str, payload: ConnectWiseReviewDismissRequest, request: Request
+) -> dict:
+    """Dismiss one unchanged observation until its provider evidence changes."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    item = REPOSITORY.get_ci_review_item(item_id)
+    if not item:
+        raise HTTPException(404, "CI review item not found")
+    _company_for_user(item["companyId"], user, require_manage=True)
+    with core.LOCK:
+        stored = REPOSITORY.dismiss_ci_review_item(item_id, payload.notes.strip(), user["id"])
+    if not stored:
+        raise HTTPException(404, "CI review item not found")
+    return stored
+
+
+@api.post("/api/integrations/connectwise/configurations/import", tags=["integrations"])
+def import_connectwise_configurations(
+    payload: ConnectWiseConfigurationImportRequest, request: Request
+) -> dict:
+    """Re-read and apply only administrator-selected non-conflicting CI changes."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    selected_ids = {str(value).strip() for value in payload.externalIds if str(value).strip()}
+    if len(selected_ids) != len(payload.externalIds):
+        raise HTTPException(400, "Configuration item selections must be unique and non-empty")
+    started_at = core.now()
+    try:
+        preview = _connectwise_configuration_preview(payload.companyId, payload.providerCompanyId)
+    except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
+        raise HTTPException(502, str(error)) from error
+    items_by_id = {item["externalId"]: item for item in preview["items"]}
+    invalid = sorted(
+        external_id
+        for external_id in selected_ids
+        if external_id not in items_by_id
+        or items_by_id[external_id]["action"] not in {"create", "update", "link"}
+    )
+    if invalid:
+        raise HTTPException(
+            409,
+            "The preview changed or contains conflicts. Refresh it before importing: "
+            + ", ".join(invalid[:10]),
+        )
+
+    created = 0
+    updated = 0
+    linked = 0
+
+    def with_field_sources(metadata: dict, fields: list[str]) -> dict:
+        """Record provider ownership for every canonical field changed by this import."""
+
+        stored = deepcopy(metadata)
+        sources = stored.get("fieldSources")
+        field_sources = deepcopy(sources) if isinstance(sources, dict) else {}
+        for field in fields:
+            field_sources[str(field)] = "connectwise"
+        stored["fieldSources"] = field_sources
+        return stored
+
+    with core.LOCK:
+        for external_id in selected_ids:
+            item = items_by_id[external_id]
+            record = item["record"]
+            asset_id = item.get("assetId")
+            if item["action"] == "create":
+                asset = {
+                    "id": str(uuid.uuid4()),
+                    "companyId": payload.companyId,
+                    "name": record["name"],
+                    "type": record["type"],
+                    "status": record["status"],
+                    "source": "connectwise",
+                    "externalId": record["externalId"],
+                    "lastSeen": core.now(),
+                    "fields": record.get("fields") or {},
+                    "metadata": with_field_sources(
+                        core.normalise_metadata(record.get("metadata") or {}, record["status"]),
+                        item.get("appliedFields") or item.get("changedFields") or [],
+                    ),
+                }
+                asset_id = REPOSITORY.create_asset(asset, user["id"])["id"]
+                created += 1
+            elif item["action"] == "update":
+                changes = {
+                    **item["changes"],
+                    "source": "connectwise",
+                    "externalId": record["externalId"],
+                    "lastSeen": core.now(),
+                }
+                if "metadata" in changes:
+                    changes["metadata"] = core.normalise_metadata(
+                        changes["metadata"], changes.get("status", record["status"])
+                    )
+                current_asset = next(
+                    (asset for asset in REPOSITORY.list_assets() if asset["id"] == asset_id),
+                    None,
+                )
+                current_metadata = deepcopy((current_asset or {}).get("metadata") or {})
+                changes["metadata"] = with_field_sources(
+                    changes.get("metadata") or current_metadata,
+                    item.get("appliedFields") or item.get("changedFields") or [],
+                )
+                if not asset_id or not REPOSITORY.update_asset(asset_id, changes, user["id"]):
+                    raise HTTPException(409, "A selected configuration item changed during import")
+                updated += 1
+            else:
+                linked += 1
+            if not asset_id:
+                raise HTTPException(409, "A selected configuration item has no canonical target")
+            REPOSITORY.record_provider_ci_mapping(
+                "connectwise", payload.companyId, record, asset_id, user["id"]
+            )
+
+        remaining_review = sum(
+            item["action"] in {"create", "update", "link", "conflict"}
+            and item["externalId"] not in selected_ids
+            for item in preview["items"]
+        )
+        message = (
+            f"Imported {created} new, updated {updated} and linked {linked} ConnectWise "
+            f"configuration items for {preview['companyName']}. {remaining_review} remain for review. "
+            "No data was written to ConnectWise."
+        )
+        run = REPOSITORY.record_sync_run(
+            "connectwise",
+            {
+                "id": str(uuid.uuid4()),
+                "type": "connectwise",
+                "status": "review_required" if remaining_review else "success",
+                "startedAt": started_at,
+                "finishedAt": core.now(),
+                "discovered": preview["discovered"],
+                "imported": created + linked,
+                "updated": updated,
+                "review": remaining_review,
+                "message": message,
+                "attributes": {
+                    "operation": "configuration_import",
+                    "companyId": payload.companyId,
+                    "providerCompanyId": payload.providerCompanyId,
+                    "writesProvider": False,
+                    "decisionNotes": payload.decisionNotes.strip(),
+                },
+            },
+            True,
+            user["id"],
+        )
+        policy_id = str(preview["appliedPolicy"].get("id") or "")
+        if policy_id:
+            REPOSITORY.resolve_ci_review_items(policy_id, sorted(selected_ids), user["id"])
+    return {**run, "created": created, "updated": updated, "linked": linked}
+
+
+@api.post("/api/integrations/connectwise/configurations/link", tags=["integrations"])
+def link_connectwise_configuration(
+    payload: ConnectWiseConfigurationLinkRequest, request: Request
+) -> dict:
+    """Explicitly link one provider ID to an existing same-customer canonical CI."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    target = _asset_for_user(payload.assetId, user, require_manage=True)
+    if target["companyId"] != payload.companyId:
+        raise HTTPException(409, "The target CI belongs to another customer")
+    try:
+        preview = _connectwise_configuration_preview(payload.companyId, payload.providerCompanyId)
+    except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
+        raise HTTPException(502, str(error)) from error
+    item = next(
+        (row for row in preview["items"] if row["externalId"] == payload.externalId),
+        None,
+    )
+    if not item:
+        raise HTTPException(
+            409,
+            "The provider CI is no longer included by the saved policy; refresh the preview",
+        )
+    with core.LOCK:
+        mapping = REPOSITORY.record_provider_ci_mapping(
+            "connectwise",
+            payload.companyId,
+            item["record"],
+            target["id"],
+            user["id"],
+        )
+        policy_id = str(preview["appliedPolicy"].get("id") or "")
+        if policy_id:
+            REPOSITORY.resolve_ci_review_items(policy_id, [payload.externalId], user["id"])
+    return {
+        "linked": True,
+        "externalId": payload.externalId,
+        "assetId": target["id"],
+        "assetName": target["name"],
+        "mapping": mapping,
+        "message": (
+            f"Linked ConnectWise configuration {item['name']} to {target['name']} using its "
+            "immutable provider ID. No data was written to ConnectWise."
+        ),
+    }
 
 
 @api.post("/api/integrations/{kind}/sync", tags=["integrations"])
@@ -3926,13 +5429,19 @@ def run_integration_sync(kind: str, request: Request) -> dict:
         {"platform_admin", "msp_operator"},
         "Sync requires MSP operator or platform admin role",
     )
-    if kind not in {"connectwise", "ncentral", "passportal"}:
+    if kind not in SUPPORTED_INTEGRATION_KINDS:
         raise HTTPException(404, "Integration not found")
     if not any(
         item["type"] == kind and item.get("scope", "msp") == "msp"
         for item in REPOSITORY.list_integrations()
     ):
         raise HTTPException(404, "Integration not found")
+    _require_integration_active(kind)
+    if kind == "connectwise":
+        try:
+            return _run_connectwise_company_discovery(user)
+        except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
+            raise HTTPException(502, str(error)) from error
     run = core.execute_sync(kind)
     with core.LOCK:
         return REPOSITORY.record_sync_run(kind, run, core.configured(kind), user["id"])
