@@ -6,7 +6,7 @@ httpx2>=2.9.1,<3
 
 # Local quality automation and coverage enforcement.
 coverage[toml]>=7.15.2,<8
-pre-commit>=4.6.0,<5
+pre-commit>=4.6.1,<5
 
 # Static analysis and maintained third-party type information.
 ruff>=0.16.0,<0.17
