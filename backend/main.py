@@ -5253,7 +5253,11 @@ def _execute_connectwise_ci_preview(
 
 
 def _record_connectwise_ci_preview_failure(
-    policy: dict, error: Exception, *, trigger: str = "continuous_preview"
+    policy: dict,
+    error: Exception,
+    *,
+    trigger: str = "continuous_preview",
+    actor_id: str | None = None,
 ) -> dict:
     """Persist a sanitized scheduled or operator-triggered failure and release its lease."""
 
@@ -5294,7 +5298,7 @@ def _record_connectwise_ci_preview_failure(
         },
     }
     with core.LOCK:
-        stored_run = REPOSITORY.record_sync_run("connectwise", run, True, None)
+        stored_run = REPOSITORY.record_sync_run("connectwise", run, True, actor_id)
         completed_policy = REPOSITORY.complete_ci_sync_policy_run(
             policy["id"], success=False, error=detail
         )
@@ -5482,7 +5486,12 @@ def sync_connectwise_ci_policy_now(policy_id: str, request: Request) -> dict:
             trigger="manual_sync",
         )
     except Exception as error:
-        _record_connectwise_ci_preview_failure(claimed, error, trigger="manual_sync")
+        _record_connectwise_ci_preview_failure(
+            claimed,
+            error,
+            trigger="manual_sync",
+            actor_id=user["id"],
+        )
         if isinstance(error, ConnectWiseConfigurationError):
             detail = (
                 "ConnectWise configuration is invalid or incomplete. "

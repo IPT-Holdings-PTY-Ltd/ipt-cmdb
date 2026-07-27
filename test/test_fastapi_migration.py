@@ -763,10 +763,12 @@ class FastApiMigrationTests(unittest.TestCase):
             "providerParentId": "42",
         }
         recorded_runs = []
+        recorded_actors = []
 
-        def record_run(_kind, run, *_args):
+        def record_run(_kind, run, _update_connection, actor_id):
             stored = {**run}
             recorded_runs.append(stored)
+            recorded_actors.append(actor_id)
             return stored
 
         with (
@@ -790,13 +792,65 @@ class FastApiMigrationTests(unittest.TestCase):
                 policy,
                 backend_main.ConnectWiseRequestError("provider-secret-marker"),
                 trigger="manual_sync",
+                actor_id="operator",
             )
 
         self.assertTrue(recorded_runs[0]["message"].startswith("Continuous preview failed"))
         self.assertTrue(recorded_runs[1]["message"].startswith("Sync now failed"))
         self.assertEqual(recorded_runs[0]["attributes"]["trigger"], "continuous_preview")
         self.assertEqual(recorded_runs[1]["attributes"]["trigger"], "manual_sync")
+        self.assertEqual(recorded_actors, [None, "operator"])
         self.assertNotIn("provider-secret-marker", json.dumps(recorded_runs))
+
+    def test_sync_now_failure_is_attributed_to_the_authenticated_operator(self):
+        """Operator-triggered failure evidence should retain its human actor."""
+
+        policy = {
+            "id": "policy-1",
+            "companyId": "acme",
+            "companyName": "Acme Manufacturing",
+            "providerParentId": "42",
+        }
+        failure = backend_main.ConnectWiseRequestError("provider-secret-marker")
+        with (
+            patch.object(backend_main, "_require_integration_active"),
+            patch.object(
+                backend_main.REPOSITORY,
+                "list_ci_sync_policies",
+                return_value=[policy],
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "claim_ci_sync_policy_now",
+                return_value=policy,
+            ),
+            patch.object(
+                backend_main,
+                "_execute_connectwise_ci_preview",
+                side_effect=failure,
+            ),
+            patch.object(
+                backend_main,
+                "_record_connectwise_ci_preview_failure",
+            ) as record_failure,
+        ):
+            response = self.client.post(
+                "/api/integrations/connectwise/configurations/policies/policy-1/sync-now",
+                headers=self._headers("operator@example.com"),
+            )
+
+        self.assertEqual(response.status_code, 502, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "ConnectWise could not complete the requested read operation. "
+            "Verify connectivity, credentials and API permissions.",
+        )
+        record_failure.assert_called_once_with(
+            policy,
+            failure,
+            trigger="manual_sync",
+            actor_id="operator",
+        )
 
     def test_local_password_recovery_is_generic_single_use_and_revokes_credentials(self):
         backend_main.REPOSITORY.update_email_connection(
