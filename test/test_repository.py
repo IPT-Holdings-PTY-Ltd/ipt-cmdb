@@ -205,6 +205,24 @@ class RepositoryTests(unittest.TestCase):
             )[0]["id"],
             "run-1",
         )
+        self.assertEqual(
+            self.repository.list_sync_runs(
+                "connectwise",
+                "blocked",
+                "configuration_preview",
+                company_ids={"acme"},
+            )[0]["id"],
+            "run-1",
+        )
+        self.assertEqual(
+            self.repository.list_sync_runs(
+                "connectwise",
+                "blocked",
+                "configuration_preview",
+                company_ids={"northwind"},
+            ),
+            [],
+        )
         self.assertEqual(self.repository.list_sync_runs(operation="company_discovery"), [])
         self.assertEqual(self.repository.list_integrations()[0]["lastSync"], run["finishedAt"])
         self.assertEqual(self.state["auditEvents"][0]["action"], "sync_completed")

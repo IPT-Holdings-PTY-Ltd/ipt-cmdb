@@ -565,6 +565,15 @@ class PostgresRepositoryContractTests(unittest.TestCase):
             filtered_sync_runs[0]["attributes"]["operation"],
             "company_discovery",
         )
+        self.assertEqual(
+            repository.list_sync_runs(
+                "connectwise",
+                "review_required",
+                "company_discovery",
+                company_ids={"northwind"},
+            ),
+            [],
+        )
         self.assertEqual(repository.list_notification_preferences(), [])
         self.assertEqual(repository.list_notification_preferences("acme"), [])
         self.assertEqual(repository.list_notification_events(), [])

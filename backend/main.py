@@ -171,6 +171,7 @@ def _integration_alert_delivery_ready() -> bool:
         notification_worker
         and connection.get("enabled")
         and connection.get("senderAddress")
+        and connection.get("status") in {"configured", "verified"}
         and _integration_alert_recipients()
     )
 
@@ -586,6 +587,18 @@ def _company_for_user(company_id: str, user: dict, require_manage: bool = False)
     if not permitted:
         raise HTTPException(403, "You do not have access to this company")
     return company
+
+
+def _permitted_company_ids(user: dict) -> set[str] | None:
+    """Return an explicit tenant scope, or ``None`` for platform administrators."""
+
+    if user.get("role") == "platform_admin":
+        return None
+    return {
+        company["id"]
+        for company in REPOSITORY.list_companies()
+        if core.allowed(user, company["id"])
+    }
 
 
 class LoginRequest(BaseModel):
@@ -2099,7 +2112,9 @@ def dashboard(request: Request, companyId: str | None = None) -> dict:
     ]
     changes = [item for item in REPOSITORY.list_changes() if core.allowed(user, item["companyId"])]
     integrations = REPOSITORY.list_integrations() if not companyId else []
-    sync_runs = REPOSITORY.list_sync_runs() if not companyId else []
+    sync_runs = (
+        REPOSITORY.list_sync_runs(company_ids=_permitted_company_ids(user)) if not companyId else []
+    )
     return core.dashboard_snapshot(
         companies,
         assets,
@@ -4757,10 +4772,14 @@ def _connectwise_adapter() -> ConnectWiseProvider:
     return ConnectWiseProvider(client_factory=ConnectWiseClient)
 
 
-def _connectwise_company_rows() -> list[dict]:
+def _connectwise_company_rows(company_ids: set[str] | None = None) -> list[dict]:
     """Add non-binding exact-match suggestions to persisted provider observations."""
 
-    companies = REPOSITORY.list_companies()
+    companies = [
+        company
+        for company in REPOSITORY.list_companies()
+        if company_ids is None or company["id"] in company_ids
+    ]
     by_name: dict[str, list[dict]] = {}
     by_external_id: dict[str, dict] = {}
     for company in companies:
@@ -4770,6 +4789,8 @@ def _connectwise_company_rows() -> list[dict]:
                 by_external_id[str(value)] = company
     rows = []
     for item in REPOSITORY.list_provider_companies("connectwise"):
+        if company_ids is not None and item.get("mappedCompanyId") not in company_ids:
+            continue
         suggestion = None
         reason = ""
         if not item.get("mappedCompanyId"):
@@ -5007,6 +5028,12 @@ def preview_connectwise_discovery(request: Request) -> dict:
     }
     with core.LOCK:
         REPOSITORY.record_sync_run("connectwise", run, True, user["id"])
+    if user.get("role") != "platform_admin":
+        preview = {
+            **preview,
+            "sampleIncluded": [],
+            "sampleExcluded": [],
+        }
     return {**preview, "credentialSource": source, "message": run["message"]}
 
 
@@ -5032,7 +5059,7 @@ def list_connectwise_companies(request: Request) -> list[dict]:
 
     user = current_user(request)
     _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
-    return _connectwise_company_rows()
+    return _connectwise_company_rows(_permitted_company_ids(user))
 
 
 @api.put("/api/integrations/connectwise/companies/{external_id}/mapping", tags=["integrations"])
@@ -5211,7 +5238,7 @@ def _execute_connectwise_ci_preview(
         _queue_integration_alert(
             {
                 **preview["appliedPolicy"],
-                "lastRunAt": preview["appliedPolicy"].get("lastRunAt"),
+                "lastRunAt": stored_run.get("finishedAt"),
             },
             event="recovered",
             detail="The latest continuous preview completed successfully.",
@@ -5467,7 +5494,18 @@ def continuous_preview_status(request: Request) -> dict:
 
     user = current_user(request)
     _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
-    policies = REPOSITORY.list_ci_sync_policies("connectwise")
+    permitted_company_ids = _permitted_company_ids(user)
+    policies = [
+        item
+        for item in REPOSITORY.list_ci_sync_policies("connectwise")
+        if permitted_company_ids is None or item.get("companyId") in permitted_company_ids
+    ]
+    pending_reviews = REPOSITORY.query_ci_review_items(
+        kind="connectwise",
+        company_ids=permitted_company_ids,
+        state="pending",
+        limit=1,
+    )["total"]
     connection_enabled = bool(_connectwise_connection_public().get("enabled"))
     return {
         "workerEnabled": os.getenv("INTEGRATION_WORKER_ENABLED", "false").lower()
@@ -5483,7 +5521,7 @@ def continuous_preview_status(request: Request) -> dict:
         )
         if connection_enabled
         else 0,
-        "pendingReviews": REPOSITORY.count_ci_review_items("connectwise", state="pending"),
+        "pendingReviews": pending_reviews,
         "policies": policies,
     }
 
@@ -5504,11 +5542,30 @@ def list_connectwise_ci_review_queue(
     if companyId:
         _company_for_user(companyId, user)
     selected_state = None if state == "all" else state
+    permitted_company_ids = None if companyId else _permitted_company_ids(user)
+    if companyId or permitted_company_ids is None:
+        return {
+            "items": REPOSITORY.list_ci_review_items(
+                "connectwise",
+                companyId,
+                selected_state,
+                max(1, min(limit, 1000)),
+            ),
+            "total": REPOSITORY.count_ci_review_items(
+                "connectwise",
+                companyId,
+                selected_state,
+            ),
+        }
+    result = REPOSITORY.query_ci_review_items(
+        kind="connectwise",
+        company_ids=permitted_company_ids,
+        state=selected_state,
+        limit=max(1, min(limit, 1000)),
+    )
     return {
-        "items": REPOSITORY.list_ci_review_items(
-            "connectwise", companyId, selected_state, max(1, min(limit, 1000))
-        ),
-        "total": REPOSITORY.count_ci_review_items("connectwise", companyId, selected_state),
+        "items": result["items"],
+        "total": result["total"],
     }
 
 
@@ -5785,6 +5842,7 @@ def list_sync_runs(
         operation,
         companyId,
         max(1, min(limit, 250)),
+        company_ids=None if companyId else _permitted_company_ids(user),
     )
 
 
@@ -6703,7 +6761,11 @@ def _governance_report(report_id: str, user: dict, company_id: str | None) -> di
         changes=changes,
         users=REPOSITORY.list_users() if root_scope else [],
         integrations=REPOSITORY.list_integrations() if root_scope else [],
-        sync_runs=REPOSITORY.list_sync_runs() if root_scope else [],
+        sync_runs=(
+            REPOSITORY.list_sync_runs(company_ids=_permitted_company_ids(user))
+            if root_scope
+            else []
+        ),
         audit_events=audit_events,
         company_id=company_id,
     )

@@ -258,6 +258,33 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(operator_queue.status_code, 200, operator_queue.text)
         self.assertEqual(operator_queue.json()["total"], 1)
         self.assertEqual(operator_queue.json()["items"][0]["companyId"], "acme")
+        legacy_operator_queue = self.client.get(
+            "/api/integrations/connectwise/configurations/review-queue",
+            headers=operator_headers,
+        )
+        self.assertEqual(legacy_operator_queue.status_code, 200, legacy_operator_queue.text)
+        self.assertEqual(legacy_operator_queue.json()["total"], 1)
+        self.assertEqual(legacy_operator_queue.json()["items"][0]["companyId"], "acme")
+        operator_status = self.client.get(
+            "/api/integrations/continuous-preview/status",
+            headers=operator_headers,
+        )
+        self.assertEqual(operator_status.status_code, 200, operator_status.text)
+        self.assertEqual(operator_status.json()["pendingReviews"], 1)
+        self.assertEqual(
+            {item["companyId"] for item in operator_status.json()["policies"]},
+            {"acme"},
+        )
+        admin_status = self.client.get(
+            "/api/integrations/continuous-preview/status",
+            headers=admin_headers,
+        )
+        self.assertEqual(admin_status.status_code, 200, admin_status.text)
+        self.assertEqual(admin_status.json()["pendingReviews"], 2)
+        self.assertEqual(
+            {item["companyId"] for item in admin_status.json()["policies"]},
+            {"acme", "northwind"},
+        )
         self.assertEqual(
             self.client.get("/api/integration-reconciliation", headers=client_headers).status_code,
             403,
@@ -334,6 +361,135 @@ class FastApiMigrationTests(unittest.TestCase):
             backend_main.REPOSITORY.get_ci_review_item(queued_ids["northwind"])["state"],
             "pending",
         )
+
+    def test_connectwise_company_observations_and_preview_samples_respect_scope(self):
+        """Scoped operators must not see other or unmapped provider-company names."""
+
+        backend_main.REPOSITORY.record_company_discovery(
+            "connectwise",
+            {
+                "id": "company-discovery-scope",
+                "type": "connectwise",
+                "status": "success",
+                "startedAt": "2026-07-27T10:00:00Z",
+                "finishedAt": "2026-07-27T10:00:01Z",
+                "discovered": 3,
+                "imported": 0,
+                "updated": 0,
+                "review": 3,
+                "message": "Three companies discovered",
+            },
+            [
+                {
+                    "externalId": "42",
+                    "identifier": "ACME",
+                    "name": "Acme Manufacturing",
+                    "status": "Active",
+                    "type": "Customer",
+                    "site": "South",
+                    "deleted": False,
+                    "lastUpdated": "2026-07-27T09:00:00Z",
+                },
+                {
+                    "externalId": "84",
+                    "identifier": "NORTHWIND",
+                    "name": "Northwind Traders",
+                    "status": "Active",
+                    "type": "Customer",
+                    "site": "North",
+                    "deleted": False,
+                    "lastUpdated": "2026-07-27T09:00:00Z",
+                },
+                {
+                    "externalId": "99",
+                    "identifier": "UNMAPPED",
+                    "name": "Unmapped Customer",
+                    "status": "Active",
+                    "type": "Customer",
+                    "site": "West",
+                    "deleted": False,
+                    "lastUpdated": "2026-07-27T09:00:00Z",
+                },
+            ],
+            "admin",
+        )
+        backend_main.REPOSITORY.map_provider_company("connectwise", "42", "acme", "admin")
+        backend_main.REPOSITORY.map_provider_company(
+            "connectwise",
+            "84",
+            "northwind",
+            "admin",
+        )
+
+        operator_headers = self._headers("operator@example.com")
+        operator_companies = self.client.get(
+            "/api/integrations/connectwise/companies",
+            headers=operator_headers,
+        )
+        self.assertEqual(operator_companies.status_code, 200, operator_companies.text)
+        self.assertEqual(
+            {item["externalId"] for item in operator_companies.json()},
+            {"42"},
+        )
+        self.assertNotIn("Northwind Traders", operator_companies.text)
+        self.assertNotIn("Unmapped Customer", operator_companies.text)
+
+        admin_companies = self.client.get(
+            "/api/integrations/connectwise/companies",
+            headers=self._headers("admin@example.com"),
+        )
+        self.assertEqual(
+            {item["externalId"] for item in admin_companies.json()},
+            {"42", "84", "99"},
+        )
+
+        preview = {
+            "readOnly": True,
+            "writesAttempted": False,
+            "appliedPolicy": {},
+            "discovered": 2,
+            "included": 2,
+            "excluded": 0,
+            "truncated": False,
+            "exclusionReasons": {},
+            "availableStatuses": ["Active"],
+            "availableTypes": ["Customer"],
+            "availableSites": ["North", "South"],
+            "sampleIncluded": [
+                {"externalId": "84", "name": "Northwind Traders"},
+                {"externalId": "42", "name": "Acme Manufacturing"},
+            ],
+            "sampleExcluded": [],
+        }
+        with (
+            patch.object(
+                backend_main,
+                "_connectwise_effective_configuration",
+                return_value=({}, "saved"),
+            ),
+            patch.object(
+                backend_main,
+                "_connectwise_connection_public",
+                return_value={"discoveryPolicy": {}},
+            ),
+            patch.object(backend_main, "_connectwise_adapter") as adapter_factory,
+        ):
+            adapter_factory.return_value.preview.return_value = preview
+            operator_preview = self.client.post(
+                "/api/integrations/connectwise/discovery-preview",
+                headers=operator_headers,
+            )
+            admin_preview = self.client.post(
+                "/api/integrations/connectwise/discovery-preview",
+                headers=self._headers("admin@example.com"),
+            )
+
+        self.assertEqual(operator_preview.status_code, 200, operator_preview.text)
+        self.assertEqual(operator_preview.json()["sampleIncluded"], [])
+        self.assertEqual(operator_preview.json()["sampleExcluded"], [])
+        self.assertNotIn("Northwind Traders", operator_preview.text)
+        self.assertEqual(admin_preview.status_code, 200, admin_preview.text)
+        self.assertEqual(admin_preview.json()["sampleIncluded"], preview["sampleIncluded"])
 
     def test_root_email_configuration_is_write_only_and_test_delivery_is_audited(self):
         admin_headers = self._headers("admin@example.com")
@@ -487,6 +643,115 @@ class FastApiMigrationTests(unittest.TestCase):
             ["admin@example.com", "ops@example.com"],
         )
         self.assertIn("120 minute(s)", core.DB["emailOutbox"][0]["bodyText"])
+
+    def test_integration_alerts_require_a_delivery_ready_email_connection(self):
+        """Enabled but unconfigured email must not accumulate doomed alert messages."""
+
+        backend_main.REPOSITORY.update_email_connection(
+            {
+                "enabled": True,
+                "authMode": "managed_identity",
+                "senderAddress": "cmdb@example.com",
+                "status": "not_configured",
+            },
+            None,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "NOTIFICATION_WORKER_ENABLED": "true",
+                "INTEGRATION_ALERT_RECIPIENTS": "ops@example.com",
+            },
+            clear=False,
+        ):
+            self.assertFalse(backend_main._integration_alert_delivery_ready())
+            self.assertIsNone(
+                backend_main._queue_integration_alert(
+                    {
+                        "id": "policy-1",
+                        "companyId": "acme",
+                        "companyName": "Acme Manufacturing",
+                        "lastRunAt": "2026-07-27T10:00:00Z",
+                    },
+                    event="failed",
+                    detail="Provider unavailable",
+                    consecutive_failures=1,
+                    retry_delay_minutes=15,
+                )
+            )
+        self.assertEqual(core.DB.get("emailOutbox", []), [])
+
+    def test_recovery_alert_uses_the_completed_sync_run_timestamp(self):
+        """Recovery idempotency must identify the run that actually recovered."""
+
+        preview = {
+            "companyId": "acme",
+            "companyName": "Acme Manufacturing",
+            "providerCompanyId": "42",
+            "providerCompanyName": "Acme Manufacturing",
+            "credentialSource": "saved",
+            "readOnly": True,
+            "writesAttempted": False,
+            "discovered": 0,
+            "included": 0,
+            "excluded": 0,
+            "exclusionReasons": {},
+            "availableTypes": [],
+            "availableStatuses": [],
+            "typeMappingSummary": {},
+            "appliedPolicy": {
+                "id": "policy-1",
+                "revision": 3,
+                "lastRunAt": "2026-07-27T09:00:00Z",
+                "consecutiveFailures": 2,
+            },
+            "counts": {
+                "create": 0,
+                "update": 0,
+                "link": 0,
+                "unchanged": 0,
+                "conflict": 0,
+            },
+            "items": [],
+        }
+        with (
+            patch.object(
+                backend_main,
+                "_connectwise_configuration_preview",
+                return_value=preview,
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "record_sync_run",
+                return_value={
+                    "id": "run-recovered",
+                    "finishedAt": "2026-07-27T10:05:00Z",
+                },
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "replace_ci_review_items",
+                return_value={"pending": 0, "created": 0, "updated": 0, "resolved": 0},
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "complete_ci_sync_policy_run",
+                return_value={"id": "policy-1", "consecutiveFailures": 0},
+            ),
+            patch.object(backend_main, "_queue_integration_alert") as queue_alert,
+        ):
+            backend_main._execute_connectwise_ci_preview(
+                "acme",
+                "42",
+                actor_id=None,
+                trigger="continuous_preview",
+            )
+
+        queue_alert.assert_called_once()
+        self.assertEqual(
+            queue_alert.call_args.args[0]["lastRunAt"],
+            "2026-07-27T10:05:00Z",
+        )
 
     def test_local_password_recovery_is_generic_single_use_and_revokes_credentials(self):
         backend_main.REPOSITORY.update_email_connection(
@@ -902,6 +1167,89 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(root.status_code, 200)
         self.assertEqual(root.json()["scope"], "msp")
         self.assertEqual(root.json()["summary"]["customers"], 2)
+
+    def test_sync_history_dashboard_and_report_respect_msp_customer_scope(self):
+        """Every sync-history consumer must enforce the operator's tenant boundary."""
+
+        runs = (
+            (
+                "run-global",
+                "success",
+                "Global provider health",
+                "2026-07-27T10:00:00Z",
+                {"operation": "company_discovery"},
+            ),
+            (
+                "run-acme",
+                "success",
+                "Acme permitted detail",
+                "2026-07-27T11:00:00Z",
+                {"operation": "configuration_preview", "companyId": "acme"},
+            ),
+            (
+                "run-northwind",
+                "failed",
+                "Northwind restricted detail",
+                "2026-07-27T12:00:00Z",
+                {"operation": "configuration_preview", "companyId": "northwind"},
+            ),
+        )
+        for run_id, status, message, started_at, attributes in runs:
+            backend_main.REPOSITORY.record_sync_run(
+                "connectwise",
+                {
+                    "id": run_id,
+                    "type": "connectwise",
+                    "status": status,
+                    "startedAt": started_at,
+                    "finishedAt": started_at,
+                    "discovered": 0,
+                    "imported": 0,
+                    "updated": 0,
+                    "review": 0,
+                    "message": message,
+                    "attributes": attributes,
+                },
+                False,
+                "admin",
+            )
+
+        operator_headers = self._headers("operator@example.com")
+        operator_history = self.client.get("/api/sync-runs", headers=operator_headers)
+        self.assertEqual(operator_history.status_code, 200, operator_history.text)
+        self.assertEqual(
+            {item["id"] for item in operator_history.json()},
+            {"run-global", "run-acme"},
+        )
+        self.assertNotIn("Northwind restricted detail", operator_history.text)
+
+        admin_history = self.client.get(
+            "/api/sync-runs",
+            headers=self._headers("admin@example.com"),
+        )
+        self.assertEqual(
+            {item["id"] for item in admin_history.json()},
+            {"run-global", "run-acme", "run-northwind"},
+        )
+
+        operator_dashboard = self.client.get("/api/dashboard", headers=operator_headers)
+        self.assertEqual(operator_dashboard.status_code, 200, operator_dashboard.text)
+        self.assertEqual(
+            operator_dashboard.json()["integrations"][0]["lastRunAt"],
+            "2026-07-27T11:00:00Z",
+        )
+        self.assertNotIn("Northwind restricted detail", operator_dashboard.text)
+
+        operator_report = self.client.get(
+            "/api/reports/integration-health/preview",
+            headers=operator_headers,
+        )
+        self.assertEqual(operator_report.status_code, 200, operator_report.text)
+        self.assertEqual(
+            operator_report.json()["rows"][0]["message"],
+            "Acme permitted detail",
+        )
+        self.assertNotIn("Northwind restricted detail", operator_report.text)
 
     def test_openapi_identifies_the_direct_fastapi_surface(self):
         schema = api.openapi()

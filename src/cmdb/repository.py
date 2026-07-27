@@ -4061,9 +4061,12 @@ class StateRepository:
         operation: str | None = None,
         company_id: str | None = None,
         limit: int = 50,
+        *,
+        company_ids: Iterable[str] | None = None,
     ) -> list[dict]:
         """Return recent sync evidence using provider-neutral filters."""
 
+        permitted_companies = set(company_ids) if company_ids is not None else None
         records = []
         for raw in self.state.get("syncRuns", []):
             item = deepcopy(raw)
@@ -4075,6 +4078,12 @@ class StateRepository:
             if operation and attributes.get("operation") != operation:
                 continue
             if company_id and attributes.get("companyId") != company_id:
+                continue
+            if (
+                permitted_companies is not None
+                and attributes.get("companyId") is not None
+                and attributes.get("companyId") not in permitted_companies
+            ):
                 continue
             item["attributes"] = deepcopy(attributes)
             records.append(item)
@@ -11314,11 +11323,15 @@ class PostgresCmdbRepository(StateRepository):
         operation: str | None = None,
         company_id: str | None = None,
         limit: int = 50,
+        *,
+        company_ids: Iterable[str] | None = None,
     ) -> list[dict]:
         """Return recent sync evidence using indexed, bounded filters."""
 
         provider = PROVIDER_TO_DB.get(kind, kind) if kind else None
         database_status = "succeeded" if status == "success" else status
+        restrict_companies = company_ids is not None
+        permitted_companies = sorted(set(company_ids or []))
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -11331,6 +11344,8 @@ class PostgresCmdbRepository(StateRepository):
                   AND (%s::text IS NULL OR sr.status = %s)
                   AND (%s::text IS NULL OR sr.attributes ->> 'operation' = %s)
                   AND (%s::text IS NULL OR sr.attributes ->> 'companyId' = %s)
+                  AND (%s = false OR sr.attributes ->> 'companyId' IS NULL
+                       OR sr.attributes ->> 'companyId' = ANY(%s::text[]))
                 ORDER BY sr.started_at DESC, sr.id DESC
                 LIMIT %s
                 """,
@@ -11343,6 +11358,8 @@ class PostgresCmdbRepository(StateRepository):
                     operation,
                     company_id,
                     company_id,
+                    restrict_companies,
+                    permitted_companies,
                     max(1, min(limit, 250)),
                 ),
             )

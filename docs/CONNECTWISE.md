@@ -96,7 +96,7 @@ NOTIFICATION_WORKER_INTERVAL_SECONDS=60
 INTEGRATION_ALERT_RECIPIENTS=integration-ops@example.com
 ```
 
-`INTEGRATION_ALERT_RECIPIENTS` accepts a comma- or semicolon-separated list. When it is blank, active platform-administrator email addresses are used. Alerts require an enabled Microsoft 365 email connection and notification worker. A failed policy queues an alert on failure 1, 2, 4, 8 and so on, which keeps an extended outage visible without sending on every retry. A successful unattended run after failures queues one recovery message.
+`INTEGRATION_ALERT_RECIPIENTS` accepts a comma- or semicolon-separated list. When it is blank, active platform-administrator email addresses are used. Alerts require an enabled Microsoft 365 email connection in `configured` or `verified` state plus the notification worker. A failed policy queues an alert on failure 1, 2, 4, 8 and so on, which keeps an extended outage visible without sending on every retry. A successful unattended run after failures queues one recovery message.
 
 The polling interval is bounded between 15 and 3,600 seconds. Each customer policy retains its own 15-minute to seven-day preview interval. PostgreSQL leases use `FOR UPDATE SKIP LOCKED`, so multiple application replicas can safely have the worker enabled without executing the same due policy concurrently. A failed call releases the lease, records sanitized sync evidence and uses bounded exponential retry delays of 15, 30, 60 minutes and so on up to 24 hours. A successful run returns to the customer policy's normal interval; no canonical import occurs.
 
