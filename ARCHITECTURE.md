@@ -145,7 +145,7 @@ Provider observations enter a common reconciliation boundary. Adapters never wri
 trigger -> canonical event -> typed workflow -> approval -> idempotent action -> verification -> audit
 ```
 
-The current image can execute bounded manual discovery and an opt-in continuous-preview loop. Due policies are atomically leased in PostgreSQL so duplicate execution is prevented across replicas. The worker writes sync evidence and review observations only; canonical imports remain administrator-selected. Small installations can run it in the application container, while larger deployments should run the same worker boundary in a dedicated service or Azure Container Apps Job.
+The current image can execute bounded manual discovery and an opt-in continuous-preview loop. Due policies and operator-triggered **Sync now** runs take the same atomic PostgreSQL lease, so duplicate execution is prevented across replicas. Failed unattended runs use bounded exponential backoff from 15 minutes to 24 hours and retain sanitized run evidence. When Microsoft 365 email and the notification worker are enabled, failures are rate-limited at power-of-two streaks and a recovery message closes the incident signal. The worker writes sync evidence and review observations only; canonical imports remain administrator-selected. Small installations can run it in the application container, while larger deployments should run the same worker boundary in a dedicated service or Azure Container Apps Job.
 
 Workers should follow:
 

@@ -24,6 +24,17 @@ DEFAULT_CI_POLICY: dict[str, Any] = {
 }
 
 
+def ci_sync_retry_delay_minutes(consecutive_failures: int) -> int:
+    """Return a bounded exponential delay for an unattended CI sync retry.
+
+    The first retry waits 15 minutes. Repeated failures back off to at most one
+    day, while a successful run returns to the policy's normal interval.
+    """
+
+    failures = max(1, int(consecutive_failures))
+    return min(15 * (2 ** min(failures - 1, 7)), 1440)
+
+
 def normalize_ci_policy(policy: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return an explicit, provider-neutral CI discovery and sync policy."""
 

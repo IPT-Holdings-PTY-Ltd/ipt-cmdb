@@ -5,6 +5,7 @@ import unittest
 from src.cmdb.integration_reconciliation import (
     apply_ci_policy,
     apply_ci_type_mappings,
+    ci_sync_retry_delay_minutes,
     configuration_catalogue,
     normalize_ci_policy,
     reconcile_configuration_items,
@@ -31,6 +32,16 @@ def record(external_id: str, name: str, serial: str = "") -> dict:
 
 class IntegrationReconciliationTests(unittest.TestCase):
     """Keep provider IDs authoritative and mutable names review-only."""
+
+    def test_continuous_sync_retry_delay_is_exponential_and_bounded(self):
+        """Worker retries should slow repeated failures without going silent."""
+
+        self.assertEqual(ci_sync_retry_delay_minutes(1), 15)
+        self.assertEqual(ci_sync_retry_delay_minutes(2), 30)
+        self.assertEqual(ci_sync_retry_delay_minutes(3), 60)
+        self.assertEqual(ci_sync_retry_delay_minutes(7), 960)
+        self.assertEqual(ci_sync_retry_delay_minutes(8), 1440)
+        self.assertEqual(ci_sync_retry_delay_minutes(50), 1440)
 
     def test_existing_mapping_turns_rename_into_an_update(self):
         items = reconcile_configuration_items(

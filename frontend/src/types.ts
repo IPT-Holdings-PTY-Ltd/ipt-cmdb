@@ -398,6 +398,8 @@ export type ConnectWiseCiPolicy = {
   lastSuccessAt?: string | null;
   lastError?: string;
   consecutiveFailures?: number;
+  backoffActive?: boolean;
+  retryDelayMinutes?: number;
   companyName?: string;
   leaseOwner?: string | null;
   leaseUntil?: string | null;
@@ -406,6 +408,9 @@ export type ConnectWiseCiPolicy = {
 export type IntegrationPreviewStatus = {
   workerEnabled: boolean;
   workerIntervalSeconds: number;
+  notificationWorkerEnabled: boolean;
+  alertDeliveryConfigured: boolean;
+  alertRecipientCount: number;
   enabledPolicies: number;
   pendingReviews: number;
   policies: ConnectWiseCiPolicy[];
@@ -526,6 +531,17 @@ export type SyncRun = {
   startedAt?: string;
   finishedAt?: string;
   discovered?: number;
+  imported?: number;
+  updated?: number;
+  review?: number;
+  attributes?: {
+    operation?: string;
+    trigger?: string;
+    companyId?: string;
+    providerCompanyId?: string;
+    policyId?: string;
+    [key: string]: unknown;
+  };
 };
 
 export type ChangeImpactItem = {

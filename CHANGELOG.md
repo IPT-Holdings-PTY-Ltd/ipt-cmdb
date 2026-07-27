@@ -14,6 +14,8 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Per-customer ConnectWise CI policies with immutable type/status IDs, audited revisions, explicit exclusions and saved continuous-preview intervals.
 - Cross-provider canonical identity linking with reviewed same-customer manual links, provider-ID mappings and tenant/type-scoped strong identifiers.
 - Lease-safe continuous ConnectWise CI previews with per-customer schedules, durable review observations, audited dismissals, evidence-change reopening and zero automatic imports.
+- Lease-aware **Sync now** execution, customer-aware run history and bounded sync-history filters for ConnectWise operations.
+- Bounded exponential retry scheduling for failed continuous previews, with rate-limited Microsoft 365 failure alerts and recovery notifications.
 - Provider-neutral reconciliation workbench with exact paging/search, customer/provider/decision filters, side-by-side evidence, explicit identity linking and bounded bulk decisions.
 - Reversible provider-object ignores keyed to immutable external IDs, with bulk policy safeguards, mandatory reasons, an ignored-items workbench and audited restore.
 - Enforced customer field authority during ConnectWise preview and canonical import, including protected-field evidence, source provenance and audited baseline presets.

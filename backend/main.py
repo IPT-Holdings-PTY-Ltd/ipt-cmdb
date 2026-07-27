@@ -69,6 +69,7 @@ from src.cmdb.field_authority import authority_catalogue, preset_rules
 from src.cmdb.integration_reconciliation import (
     apply_ci_policy,
     apply_ci_type_mappings,
+    ci_sync_retry_delay_minutes,
     configuration_catalogue,
     normalize_ci_policy,
     reconcile_configuration_items,
@@ -138,6 +139,135 @@ def _integration_worker_interval() -> int:
         LOGGER.warning("Invalid INTEGRATION_WORKER_INTERVAL_SECONDS; using 60 seconds")
         configured = 60
     return max(15, min(configured, 3600))
+
+
+def _integration_alert_recipients() -> list[str]:
+    """Return explicit alert recipients or active platform administrators."""
+
+    configured = re.split(
+        r"[,;]",
+        str(os.getenv("INTEGRATION_ALERT_RECIPIENTS") or ""),
+    )
+    candidates = [item.strip().casefold() for item in configured if item.strip()]
+    if not candidates:
+        candidates = [
+            str(user.get("email") or "").strip().casefold()
+            for user in REPOSITORY.list_users()
+            if user.get("role") == "platform_admin" and user.get("status", "active") == "active"
+        ]
+    return sorted({item for item in candidates if valid_email_address(item)})
+
+
+def _integration_alert_delivery_ready() -> bool:
+    """Return whether unattended integration alerts can enter a live outbox."""
+
+    connection = REPOSITORY.get_email_connection()
+    notification_worker = os.getenv("NOTIFICATION_WORKER_ENABLED", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    return bool(
+        notification_worker
+        and connection.get("enabled")
+        and connection.get("senderAddress")
+        and connection.get("status") in {"configured", "verified"}
+        and _integration_alert_recipients()
+    )
+
+
+def _integration_alert_message(
+    policy: dict,
+    *,
+    event: str,
+    detail: str,
+    consecutive_failures: int,
+    retry_delay_minutes: int,
+) -> dict:
+    """Build a sanitized failure or recovery message for platform operators."""
+
+    brand = REPOSITORY.get_msp_branding()
+    brand_name = str(brand.get("name") or "CMDB Hub")
+    provider_name = "ConnectWise Manage"
+    company_name = str(policy.get("companyName") or policy.get("companyId") or "customer")
+    safe_brand = html.escape(brand_name)
+    safe_provider = html.escape(provider_name)
+    safe_detail = html.escape(detail)
+    fingerprint = hashlib.sha256(
+        (
+            f"{event}:{policy.get('id')}:{policy.get('lastRunAt')}:{consecutive_failures}:{detail}"
+        ).encode()
+    ).hexdigest()[:20]
+    if event == "recovered":
+        subject = f"{brand_name}: {provider_name} sync recovered for {company_name}"
+        headline = "Integration sync recovered"
+        summary = (
+            f"{provider_name} continuous preview recovered for {company_name} "
+            f"after {consecutive_failures} consecutive failure(s)."
+        )
+    else:
+        subject = f"{brand_name}: {provider_name} sync failed for {company_name}"
+        headline = "Integration sync requires attention"
+        summary = (
+            f"{provider_name} continuous preview failed for {company_name} "
+            f"({consecutive_failures} consecutive failure(s))."
+        )
+    retry_text = (
+        f" The next automatic retry is scheduled in approximately {retry_delay_minutes} minute(s)."
+        if event == "failed" and retry_delay_minutes
+        else ""
+    )
+    retry_html = f"<p>{html.escape(retry_text.strip())}</p>" if retry_text else ""
+    return {
+        "idempotencyKey": f"integration-{event}:{policy.get('id')}:{fingerprint}",
+        "companyId": policy.get("companyId") or None,
+        "to": _integration_alert_recipients(),
+        "subject": subject[:300],
+        "bodyHtml": (
+            f"<h2>{html.escape(headline)}</h2>"
+            f"<p>{html.escape(summary)}</p>"
+            f"<p><strong>Status detail:</strong> {safe_detail}</p>"
+            f"{retry_html}"
+            f"<p>Review the {safe_provider} integration and sync history in {safe_brand}.</p>"
+        ),
+        "bodyText": (
+            f"{headline}\n\n{summary}\nStatus detail: {detail}.{retry_text}\n"
+            f"Review the {provider_name} integration and sync history in {brand_name}."
+        ),
+        "templateKey": f"integration_sync_{event}",
+        "templateVersion": 1,
+        "maxAttempts": 5,
+    }
+
+
+def _queue_integration_alert(
+    policy: dict,
+    *,
+    event: str,
+    detail: str,
+    consecutive_failures: int,
+    retry_delay_minutes: int = 0,
+) -> dict | None:
+    """Queue a durable, rate-limited integration alert when delivery is ready."""
+
+    if not _integration_alert_delivery_ready():
+        return None
+    if event == "failed" and consecutive_failures & (consecutive_failures - 1):
+        return None
+    try:
+        return REPOSITORY.create_email_outbox(
+            _integration_alert_message(
+                policy,
+                event=event,
+                detail=detail,
+                consecutive_failures=consecutive_failures,
+                retry_delay_minutes=retry_delay_minutes,
+            ),
+            None,
+        )
+    except Exception:
+        LOGGER.exception("Could not queue integration %s alert", event)
+        return None
 
 
 async def _notification_worker_loop() -> None:
@@ -457,6 +587,18 @@ def _company_for_user(company_id: str, user: dict, require_manage: bool = False)
     if not permitted:
         raise HTTPException(403, "You do not have access to this company")
     return company
+
+
+def _permitted_company_ids(user: dict) -> set[str] | None:
+    """Return an explicit tenant scope, or ``None`` for platform administrators."""
+
+    if user.get("role") == "platform_admin":
+        return None
+    return {
+        company["id"]
+        for company in REPOSITORY.list_companies()
+        if core.allowed(user, company["id"])
+    }
 
 
 class LoginRequest(BaseModel):
@@ -1970,7 +2112,9 @@ def dashboard(request: Request, companyId: str | None = None) -> dict:
     ]
     changes = [item for item in REPOSITORY.list_changes() if core.allowed(user, item["companyId"])]
     integrations = REPOSITORY.list_integrations() if not companyId else []
-    sync_runs = REPOSITORY.list_sync_runs() if not companyId else []
+    sync_runs = (
+        REPOSITORY.list_sync_runs(company_ids=_permitted_company_ids(user)) if not companyId else []
+    )
     return core.dashboard_snapshot(
         companies,
         assets,
@@ -4628,10 +4772,14 @@ def _connectwise_adapter() -> ConnectWiseProvider:
     return ConnectWiseProvider(client_factory=ConnectWiseClient)
 
 
-def _connectwise_company_rows() -> list[dict]:
+def _connectwise_company_rows(company_ids: set[str] | None = None) -> list[dict]:
     """Add non-binding exact-match suggestions to persisted provider observations."""
 
-    companies = REPOSITORY.list_companies()
+    companies = [
+        company
+        for company in REPOSITORY.list_companies()
+        if company_ids is None or company["id"] in company_ids
+    ]
     by_name: dict[str, list[dict]] = {}
     by_external_id: dict[str, dict] = {}
     for company in companies:
@@ -4641,6 +4789,8 @@ def _connectwise_company_rows() -> list[dict]:
                 by_external_id[str(value)] = company
     rows = []
     for item in REPOSITORY.list_provider_companies("connectwise"):
+        if company_ids is not None and item.get("mappedCompanyId") not in company_ids:
+            continue
         suggestion = None
         reason = ""
         if not item.get("mappedCompanyId"):
@@ -4878,6 +5028,12 @@ def preview_connectwise_discovery(request: Request) -> dict:
     }
     with core.LOCK:
         REPOSITORY.record_sync_run("connectwise", run, True, user["id"])
+    if user.get("role") != "platform_admin":
+        preview = {
+            **preview,
+            "sampleIncluded": [],
+            "sampleExcluded": [],
+        }
     return {**preview, "credentialSource": source, "message": run["message"]}
 
 
@@ -4903,7 +5059,7 @@ def list_connectwise_companies(request: Request) -> list[dict]:
 
     user = current_user(request)
     _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
-    return _connectwise_company_rows()
+    return _connectwise_company_rows(_permitted_company_ids(user))
 
 
 @api.put("/api/integrations/connectwise/companies/{external_id}/mapping", tags=["integrations"])
@@ -5060,6 +5216,8 @@ def _execute_connectwise_ci_preview(
             "readOnly": True,
         },
     }
+    previous_failures = int(preview["appliedPolicy"].get("consecutiveFailures") or 0)
+    completed_policy = None
     with core.LOCK:
         stored_run = REPOSITORY.record_sync_run("connectwise", run, True, actor_id)
         policy_id = str(preview["appliedPolicy"].get("id") or "")
@@ -5075,7 +5233,17 @@ def _execute_connectwise_ci_preview(
             else {"pending": 0, "created": 0, "updated": 0, "resolved": 0}
         )
         if policy_id:
-            REPOSITORY.complete_ci_sync_policy_run(policy_id, success=True)
+            completed_policy = REPOSITORY.complete_ci_sync_policy_run(policy_id, success=True)
+    if completed_policy and previous_failures and trigger == "continuous_preview":
+        _queue_integration_alert(
+            {
+                **preview["appliedPolicy"],
+                "lastRunAt": stored_run.get("finishedAt"),
+            },
+            event="recovered",
+            detail="The latest continuous preview completed successfully.",
+            consecutive_failures=previous_failures,
+        )
     return {
         **preview,
         "message": message,
@@ -5084,14 +5252,28 @@ def _execute_connectwise_ci_preview(
     }
 
 
-def _record_connectwise_ci_preview_failure(policy: dict, error: Exception) -> None:
-    """Persist a sanitized worker failure and release its policy lease."""
+def _record_connectwise_ci_preview_failure(
+    policy: dict,
+    error: Exception,
+    *,
+    trigger: str = "continuous_preview",
+    actor_id: str | None = None,
+) -> dict:
+    """Persist a sanitized scheduled or operator-triggered failure and release its lease."""
 
+    run_label = {
+        "continuous_preview": "Continuous preview",
+        "manual_sync": "Sync now",
+    }.get(trigger, "Configuration preview")
+    failure_operation = {
+        "continuous_preview": "continuous configuration preview",
+        "manual_sync": "operator-triggered configuration preview",
+    }.get(trigger, "configuration preview")
     if isinstance(error, (ConnectWiseConfigurationError, ConnectWiseRequestError)):
-        detail = _connectwise_public_failure(error, "continuous configuration preview")
+        detail = _connectwise_public_failure(error, failure_operation)
     else:
-        LOGGER.exception("Unexpected continuous ConnectWise preview failure")
-        detail = "Unexpected integration worker failure"
+        LOGGER.exception("Unexpected ConnectWise %s failure", run_label.casefold())
+        detail = "Unexpected integration sync failure"
     now = core.now()
     run = {
         "id": str(uuid.uuid4()),
@@ -5103,10 +5285,12 @@ def _record_connectwise_ci_preview_failure(policy: dict, error: Exception) -> No
         "imported": 0,
         "updated": 0,
         "review": 0,
-        "message": f"Continuous preview failed for {policy.get('companyName') or policy['companyId']}: {detail}",
+        "message": (
+            f"{run_label} failed for {policy.get('companyName') or policy['companyId']}: {detail}"
+        ),
         "attributes": {
             "operation": "configuration_preview",
-            "trigger": "continuous_preview",
+            "trigger": trigger,
             "companyId": policy["companyId"],
             "providerCompanyId": policy["providerParentId"],
             "policyId": policy["id"],
@@ -5114,8 +5298,26 @@ def _record_connectwise_ci_preview_failure(policy: dict, error: Exception) -> No
         },
     }
     with core.LOCK:
-        REPOSITORY.record_sync_run("connectwise", run, True, None)
-        REPOSITORY.complete_ci_sync_policy_run(policy["id"], success=False, error=detail)
+        stored_run = REPOSITORY.record_sync_run("connectwise", run, True, actor_id)
+        completed_policy = REPOSITORY.complete_ci_sync_policy_run(
+            policy["id"], success=False, error=detail
+        )
+    failures = int((completed_policy or {}).get("consecutiveFailures") or 0)
+    if trigger == "continuous_preview" and failures:
+        _queue_integration_alert(
+            {
+                **policy,
+                "lastRunAt": stored_run.get("finishedAt"),
+            },
+            event="failed",
+            detail=detail,
+            consecutive_failures=failures,
+            retry_delay_minutes=int(
+                (completed_policy or {}).get("retryDelayMinutes")
+                or ci_sync_retry_delay_minutes(failures)
+            ),
+        )
+    return stored_run
 
 
 def _run_due_integration_previews(limit: int = 5) -> dict[str, int]:
@@ -5249,25 +5451,96 @@ def preview_connectwise_configurations(
         ) from error
 
 
+@api.post(
+    "/api/integrations/connectwise/configurations/policies/{policy_id}/sync-now",
+    tags=["integrations"],
+)
+def sync_connectwise_ci_policy_now(policy_id: str, request: Request) -> dict:
+    """Run one saved CI policy immediately under the same lease used by workers."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _require_integration_active("connectwise")
+    policy = next(
+        (
+            item
+            for item in REPOSITORY.list_ci_sync_policies("connectwise")
+            if item["id"] == policy_id
+        ),
+        None,
+    )
+    if not policy:
+        raise HTTPException(404, "ConnectWise CI policy not found")
+    _company_for_user(policy["companyId"], user)
+    claimed = REPOSITORY.claim_ci_sync_policy_now(
+        policy_id,
+        f"manual:{user['id']}:{uuid.uuid4()}",
+    )
+    if not claimed:
+        raise HTTPException(409, "This policy is already running; refresh its status and retry")
+    try:
+        return _execute_connectwise_ci_preview(
+            claimed["companyId"],
+            claimed["providerParentId"],
+            actor_id=user["id"],
+            trigger="manual_sync",
+        )
+    except Exception as error:
+        _record_connectwise_ci_preview_failure(
+            claimed,
+            error,
+            trigger="manual_sync",
+            actor_id=user["id"],
+        )
+        if isinstance(error, ConnectWiseConfigurationError):
+            detail = (
+                "ConnectWise configuration is invalid or incomplete. "
+                "Review the saved endpoint, company ID and credentials."
+            )
+        elif isinstance(error, ConnectWiseRequestError):
+            detail = (
+                "ConnectWise could not complete the requested read operation. "
+                "Verify connectivity, credentials and API permissions."
+            )
+        else:
+            detail = "Unexpected integration sync failure"
+        raise HTTPException(502, detail) from error
+
+
 @api.get("/api/integrations/continuous-preview/status", tags=["integrations"])
 def continuous_preview_status(request: Request) -> dict:
     """Summarize worker configuration, schedules and current review backlog."""
 
     user = current_user(request)
     _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
-    policies = REPOSITORY.list_ci_sync_policies("connectwise")
+    permitted_company_ids = _permitted_company_ids(user)
+    policies = [
+        item
+        for item in REPOSITORY.list_ci_sync_policies("connectwise")
+        if permitted_company_ids is None or item.get("companyId") in permitted_company_ids
+    ]
+    pending_reviews = REPOSITORY.query_ci_review_items(
+        kind="connectwise",
+        company_ids=permitted_company_ids,
+        state="pending",
+        limit=1,
+    )["total"]
     connection_enabled = bool(_connectwise_connection_public().get("enabled"))
     return {
         "workerEnabled": os.getenv("INTEGRATION_WORKER_ENABLED", "false").lower()
         in {"1", "true", "yes"},
         "workerIntervalSeconds": _integration_worker_interval(),
+        "notificationWorkerEnabled": os.getenv("NOTIFICATION_WORKER_ENABLED", "false").lower()
+        in {"1", "true", "yes"},
+        "alertDeliveryConfigured": _integration_alert_delivery_ready(),
+        "alertRecipientCount": len(_integration_alert_recipients()),
         "enabledPolicies": sum(
             item.get("enabled") and item.get("syncMode") == "continuous_preview"
             for item in policies
         )
         if connection_enabled
         else 0,
-        "pendingReviews": REPOSITORY.count_ci_review_items("connectwise", state="pending"),
+        "pendingReviews": pending_reviews,
         "policies": policies,
     }
 
@@ -5288,11 +5561,30 @@ def list_connectwise_ci_review_queue(
     if companyId:
         _company_for_user(companyId, user)
     selected_state = None if state == "all" else state
+    permitted_company_ids = None if companyId else _permitted_company_ids(user)
+    if companyId or permitted_company_ids is None:
+        return {
+            "items": REPOSITORY.list_ci_review_items(
+                "connectwise",
+                companyId,
+                selected_state,
+                max(1, min(limit, 1000)),
+            ),
+            "total": REPOSITORY.count_ci_review_items(
+                "connectwise",
+                companyId,
+                selected_state,
+            ),
+        }
+    result = REPOSITORY.query_ci_review_items(
+        kind="connectwise",
+        company_ids=permitted_company_ids,
+        state=selected_state,
+        limit=max(1, min(limit, 1000)),
+    )
     return {
-        "items": REPOSITORY.list_ci_review_items(
-            "connectwise", companyId, selected_state, max(1, min(limit, 1000))
-        ),
-        "total": REPOSITORY.count_ci_review_items("connectwise", companyId, selected_state),
+        "items": result["items"],
+        "total": result["total"],
     }
 
 
@@ -5538,14 +5830,39 @@ def run_integration_sync(kind: str, request: Request) -> dict:
 
 
 @api.get("/api/sync-runs", tags=["integrations"])
-def list_sync_runs(request: Request) -> list[dict]:
+def list_sync_runs(
+    request: Request,
+    provider: str | None = None,
+    status: str | None = None,
+    operation: str | None = None,
+    companyId: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return bounded sync evidence using root-safe operational filters."""
+
     user = current_user(request)
     _require_role(
         user,
         {"platform_admin", "msp_operator"},
         "Sync history requires root or MSP role",
     )
-    return REPOSITORY.list_sync_runs()
+    if provider and provider not in SUPPORTED_INTEGRATION_KINDS:
+        raise HTTPException(400, "Choose a supported integration provider")
+    allowed_statuses = {"success", "review_required", "blocked", "failed"}
+    if status and status not in allowed_statuses:
+        raise HTTPException(400, "Choose a valid sync status")
+    if operation and not re.fullmatch(r"[a-z][a-z0-9_]{1,79}", operation):
+        raise HTTPException(400, "Choose a valid sync operation")
+    if companyId:
+        _company_for_user(companyId, user)
+    return REPOSITORY.list_sync_runs(
+        provider,
+        status,
+        operation,
+        companyId,
+        max(1, min(limit, 250)),
+        company_ids=None if companyId else _permitted_company_ids(user),
+    )
 
 
 def _company_for_change(company_id: str, user: dict, require_manage: bool = False) -> dict:
@@ -6463,7 +6780,11 @@ def _governance_report(report_id: str, user: dict, company_id: str | None) -> di
         changes=changes,
         users=REPOSITORY.list_users() if root_scope else [],
         integrations=REPOSITORY.list_integrations() if root_scope else [],
-        sync_runs=REPOSITORY.list_sync_runs() if root_scope else [],
+        sync_runs=(
+            REPOSITORY.list_sync_runs(company_ids=_permitted_company_ids(user))
+            if root_scope
+            else []
+        ),
         audit_events=audit_events,
         company_id=company_id,
     )

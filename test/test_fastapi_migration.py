@@ -258,6 +258,33 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(operator_queue.status_code, 200, operator_queue.text)
         self.assertEqual(operator_queue.json()["total"], 1)
         self.assertEqual(operator_queue.json()["items"][0]["companyId"], "acme")
+        legacy_operator_queue = self.client.get(
+            "/api/integrations/connectwise/configurations/review-queue",
+            headers=operator_headers,
+        )
+        self.assertEqual(legacy_operator_queue.status_code, 200, legacy_operator_queue.text)
+        self.assertEqual(legacy_operator_queue.json()["total"], 1)
+        self.assertEqual(legacy_operator_queue.json()["items"][0]["companyId"], "acme")
+        operator_status = self.client.get(
+            "/api/integrations/continuous-preview/status",
+            headers=operator_headers,
+        )
+        self.assertEqual(operator_status.status_code, 200, operator_status.text)
+        self.assertEqual(operator_status.json()["pendingReviews"], 1)
+        self.assertEqual(
+            {item["companyId"] for item in operator_status.json()["policies"]},
+            {"acme"},
+        )
+        admin_status = self.client.get(
+            "/api/integrations/continuous-preview/status",
+            headers=admin_headers,
+        )
+        self.assertEqual(admin_status.status_code, 200, admin_status.text)
+        self.assertEqual(admin_status.json()["pendingReviews"], 2)
+        self.assertEqual(
+            {item["companyId"] for item in admin_status.json()["policies"]},
+            {"acme", "northwind"},
+        )
         self.assertEqual(
             self.client.get("/api/integration-reconciliation", headers=client_headers).status_code,
             403,
@@ -334,6 +361,135 @@ class FastApiMigrationTests(unittest.TestCase):
             backend_main.REPOSITORY.get_ci_review_item(queued_ids["northwind"])["state"],
             "pending",
         )
+
+    def test_connectwise_company_observations_and_preview_samples_respect_scope(self):
+        """Scoped operators must not see other or unmapped provider-company names."""
+
+        backend_main.REPOSITORY.record_company_discovery(
+            "connectwise",
+            {
+                "id": "company-discovery-scope",
+                "type": "connectwise",
+                "status": "success",
+                "startedAt": "2026-07-27T10:00:00Z",
+                "finishedAt": "2026-07-27T10:00:01Z",
+                "discovered": 3,
+                "imported": 0,
+                "updated": 0,
+                "review": 3,
+                "message": "Three companies discovered",
+            },
+            [
+                {
+                    "externalId": "42",
+                    "identifier": "ACME",
+                    "name": "Acme Manufacturing",
+                    "status": "Active",
+                    "type": "Customer",
+                    "site": "South",
+                    "deleted": False,
+                    "lastUpdated": "2026-07-27T09:00:00Z",
+                },
+                {
+                    "externalId": "84",
+                    "identifier": "NORTHWIND",
+                    "name": "Northwind Traders",
+                    "status": "Active",
+                    "type": "Customer",
+                    "site": "North",
+                    "deleted": False,
+                    "lastUpdated": "2026-07-27T09:00:00Z",
+                },
+                {
+                    "externalId": "99",
+                    "identifier": "UNMAPPED",
+                    "name": "Unmapped Customer",
+                    "status": "Active",
+                    "type": "Customer",
+                    "site": "West",
+                    "deleted": False,
+                    "lastUpdated": "2026-07-27T09:00:00Z",
+                },
+            ],
+            "admin",
+        )
+        backend_main.REPOSITORY.map_provider_company("connectwise", "42", "acme", "admin")
+        backend_main.REPOSITORY.map_provider_company(
+            "connectwise",
+            "84",
+            "northwind",
+            "admin",
+        )
+
+        operator_headers = self._headers("operator@example.com")
+        operator_companies = self.client.get(
+            "/api/integrations/connectwise/companies",
+            headers=operator_headers,
+        )
+        self.assertEqual(operator_companies.status_code, 200, operator_companies.text)
+        self.assertEqual(
+            {item["externalId"] for item in operator_companies.json()},
+            {"42"},
+        )
+        self.assertNotIn("Northwind Traders", operator_companies.text)
+        self.assertNotIn("Unmapped Customer", operator_companies.text)
+
+        admin_companies = self.client.get(
+            "/api/integrations/connectwise/companies",
+            headers=self._headers("admin@example.com"),
+        )
+        self.assertEqual(
+            {item["externalId"] for item in admin_companies.json()},
+            {"42", "84", "99"},
+        )
+
+        preview = {
+            "readOnly": True,
+            "writesAttempted": False,
+            "appliedPolicy": {},
+            "discovered": 2,
+            "included": 2,
+            "excluded": 0,
+            "truncated": False,
+            "exclusionReasons": {},
+            "availableStatuses": ["Active"],
+            "availableTypes": ["Customer"],
+            "availableSites": ["North", "South"],
+            "sampleIncluded": [
+                {"externalId": "84", "name": "Northwind Traders"},
+                {"externalId": "42", "name": "Acme Manufacturing"},
+            ],
+            "sampleExcluded": [],
+        }
+        with (
+            patch.object(
+                backend_main,
+                "_connectwise_effective_configuration",
+                return_value=({}, "saved"),
+            ),
+            patch.object(
+                backend_main,
+                "_connectwise_connection_public",
+                return_value={"discoveryPolicy": {}},
+            ),
+            patch.object(backend_main, "_connectwise_adapter") as adapter_factory,
+        ):
+            adapter_factory.return_value.preview.return_value = preview
+            operator_preview = self.client.post(
+                "/api/integrations/connectwise/discovery-preview",
+                headers=operator_headers,
+            )
+            admin_preview = self.client.post(
+                "/api/integrations/connectwise/discovery-preview",
+                headers=self._headers("admin@example.com"),
+            )
+
+        self.assertEqual(operator_preview.status_code, 200, operator_preview.text)
+        self.assertEqual(operator_preview.json()["sampleIncluded"], [])
+        self.assertEqual(operator_preview.json()["sampleExcluded"], [])
+        self.assertNotIn("Northwind Traders", operator_preview.text)
+        self.assertEqual(admin_preview.status_code, 200, admin_preview.text)
+        self.assertEqual(admin_preview.json()["sampleIncluded"], preview["sampleIncluded"])
 
     def test_root_email_configuration_is_write_only_and_test_delivery_is_audited(self):
         admin_headers = self._headers("admin@example.com")
@@ -421,6 +577,280 @@ class FastApiMigrationTests(unittest.TestCase):
                 event for event in core.DB["auditEvents"] if event["action"] == "delivery_failed"
             )
             self.assertEqual(failed_delivery_event["outcome"], "failed")
+
+    def test_integration_failure_alerts_are_durable_rate_limited_and_idempotent(self):
+        """Unattended failures should alert operators without sending on every retry."""
+
+        backend_main.REPOSITORY.update_email_connection(
+            {
+                "enabled": True,
+                "authMode": "managed_identity",
+                "senderAddress": "cmdb@example.com",
+                "status": "verified",
+            },
+            None,
+        )
+        policy = {
+            "id": "policy-1",
+            "companyId": "acme",
+            "companyName": "Acme Manufacturing",
+            "lastRunAt": "2026-07-27T10:00:00Z",
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "NOTIFICATION_WORKER_ENABLED": "true",
+                "INTEGRATION_ALERT_RECIPIENTS": "ops@example.com;admin@example.com",
+            },
+            clear=False,
+        ):
+            first = backend_main._queue_integration_alert(
+                policy,
+                event="failed",
+                detail="Provider unavailable",
+                consecutive_failures=1,
+                retry_delay_minutes=15,
+            )
+            duplicate = backend_main._queue_integration_alert(
+                policy,
+                event="failed",
+                detail="Provider unavailable",
+                consecutive_failures=1,
+                retry_delay_minutes=15,
+            )
+            suppressed = backend_main._queue_integration_alert(
+                {**policy, "lastRunAt": "2026-07-27T11:00:00Z"},
+                event="failed",
+                detail="Provider unavailable",
+                consecutive_failures=3,
+                retry_delay_minutes=60,
+            )
+            fourth = backend_main._queue_integration_alert(
+                {**policy, "lastRunAt": "2026-07-27T12:00:00Z"},
+                event="failed",
+                detail="Provider unavailable",
+                consecutive_failures=4,
+                retry_delay_minutes=120,
+            )
+
+        self.assertIsNotNone(first)
+        self.assertEqual(duplicate["id"], first["id"])
+        self.assertIsNone(suppressed)
+        self.assertIsNotNone(fourth)
+        self.assertEqual(len(core.DB["emailOutbox"]), 2)
+        self.assertEqual(
+            core.DB["emailOutbox"][0]["to"],
+            ["admin@example.com", "ops@example.com"],
+        )
+        self.assertIn("120 minute(s)", core.DB["emailOutbox"][0]["bodyText"])
+
+    def test_integration_alerts_require_a_delivery_ready_email_connection(self):
+        """Enabled but unconfigured email must not accumulate doomed alert messages."""
+
+        backend_main.REPOSITORY.update_email_connection(
+            {
+                "enabled": True,
+                "authMode": "managed_identity",
+                "senderAddress": "cmdb@example.com",
+                "status": "not_configured",
+            },
+            None,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "NOTIFICATION_WORKER_ENABLED": "true",
+                "INTEGRATION_ALERT_RECIPIENTS": "ops@example.com",
+            },
+            clear=False,
+        ):
+            self.assertFalse(backend_main._integration_alert_delivery_ready())
+            self.assertIsNone(
+                backend_main._queue_integration_alert(
+                    {
+                        "id": "policy-1",
+                        "companyId": "acme",
+                        "companyName": "Acme Manufacturing",
+                        "lastRunAt": "2026-07-27T10:00:00Z",
+                    },
+                    event="failed",
+                    detail="Provider unavailable",
+                    consecutive_failures=1,
+                    retry_delay_minutes=15,
+                )
+            )
+        self.assertEqual(core.DB.get("emailOutbox", []), [])
+
+    def test_recovery_alert_uses_the_completed_sync_run_timestamp(self):
+        """Recovery idempotency must identify the run that actually recovered."""
+
+        preview = {
+            "companyId": "acme",
+            "companyName": "Acme Manufacturing",
+            "providerCompanyId": "42",
+            "providerCompanyName": "Acme Manufacturing",
+            "credentialSource": "saved",
+            "readOnly": True,
+            "writesAttempted": False,
+            "discovered": 0,
+            "included": 0,
+            "excluded": 0,
+            "exclusionReasons": {},
+            "availableTypes": [],
+            "availableStatuses": [],
+            "typeMappingSummary": {},
+            "appliedPolicy": {
+                "id": "policy-1",
+                "revision": 3,
+                "lastRunAt": "2026-07-27T09:00:00Z",
+                "consecutiveFailures": 2,
+            },
+            "counts": {
+                "create": 0,
+                "update": 0,
+                "link": 0,
+                "unchanged": 0,
+                "conflict": 0,
+            },
+            "items": [],
+        }
+        with (
+            patch.object(
+                backend_main,
+                "_connectwise_configuration_preview",
+                return_value=preview,
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "record_sync_run",
+                return_value={
+                    "id": "run-recovered",
+                    "finishedAt": "2026-07-27T10:05:00Z",
+                },
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "replace_ci_review_items",
+                return_value={"pending": 0, "created": 0, "updated": 0, "resolved": 0},
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "complete_ci_sync_policy_run",
+                return_value={"id": "policy-1", "consecutiveFailures": 0},
+            ),
+            patch.object(backend_main, "_queue_integration_alert") as queue_alert,
+        ):
+            backend_main._execute_connectwise_ci_preview(
+                "acme",
+                "42",
+                actor_id=None,
+                trigger="continuous_preview",
+            )
+
+        queue_alert.assert_called_once()
+        self.assertEqual(
+            queue_alert.call_args.args[0]["lastRunAt"],
+            "2026-07-27T10:05:00Z",
+        )
+
+    def test_connectwise_failure_history_names_the_trigger_that_failed(self):
+        """Sync history should distinguish scheduled failures from Sync now failures."""
+
+        policy = {
+            "id": "policy-1",
+            "companyId": "acme",
+            "companyName": "Acme Manufacturing",
+            "providerParentId": "42",
+        }
+        recorded_runs = []
+        recorded_actors = []
+
+        def record_run(_kind, run, _update_connection, actor_id):
+            stored = {**run}
+            recorded_runs.append(stored)
+            recorded_actors.append(actor_id)
+            return stored
+
+        with (
+            patch.object(
+                backend_main.REPOSITORY,
+                "record_sync_run",
+                side_effect=record_run,
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "complete_ci_sync_policy_run",
+                return_value={"id": "policy-1", "consecutiveFailures": 0},
+            ),
+        ):
+            backend_main._record_connectwise_ci_preview_failure(
+                policy,
+                backend_main.ConnectWiseRequestError("provider-secret-marker"),
+                trigger="continuous_preview",
+            )
+            backend_main._record_connectwise_ci_preview_failure(
+                policy,
+                backend_main.ConnectWiseRequestError("provider-secret-marker"),
+                trigger="manual_sync",
+                actor_id="operator",
+            )
+
+        self.assertTrue(recorded_runs[0]["message"].startswith("Continuous preview failed"))
+        self.assertTrue(recorded_runs[1]["message"].startswith("Sync now failed"))
+        self.assertEqual(recorded_runs[0]["attributes"]["trigger"], "continuous_preview")
+        self.assertEqual(recorded_runs[1]["attributes"]["trigger"], "manual_sync")
+        self.assertEqual(recorded_actors, [None, "operator"])
+        self.assertNotIn("provider-secret-marker", json.dumps(recorded_runs))
+
+    def test_sync_now_failure_is_attributed_to_the_authenticated_operator(self):
+        """Operator-triggered failure evidence should retain its human actor."""
+
+        policy = {
+            "id": "policy-1",
+            "companyId": "acme",
+            "companyName": "Acme Manufacturing",
+            "providerParentId": "42",
+        }
+        failure = backend_main.ConnectWiseRequestError("provider-secret-marker")
+        with (
+            patch.object(backend_main, "_require_integration_active"),
+            patch.object(
+                backend_main.REPOSITORY,
+                "list_ci_sync_policies",
+                return_value=[policy],
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "claim_ci_sync_policy_now",
+                return_value=policy,
+            ),
+            patch.object(
+                backend_main,
+                "_execute_connectwise_ci_preview",
+                side_effect=failure,
+            ),
+            patch.object(
+                backend_main,
+                "_record_connectwise_ci_preview_failure",
+            ) as record_failure,
+        ):
+            response = self.client.post(
+                "/api/integrations/connectwise/configurations/policies/policy-1/sync-now",
+                headers=self._headers("operator@example.com"),
+            )
+
+        self.assertEqual(response.status_code, 502, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "ConnectWise could not complete the requested read operation. "
+            "Verify connectivity, credentials and API permissions.",
+        )
+        record_failure.assert_called_once_with(
+            policy,
+            failure,
+            trigger="manual_sync",
+            actor_id="operator",
+        )
 
     def test_local_password_recovery_is_generic_single_use_and_revokes_credentials(self):
         backend_main.REPOSITORY.update_email_connection(
@@ -836,6 +1266,89 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(root.status_code, 200)
         self.assertEqual(root.json()["scope"], "msp")
         self.assertEqual(root.json()["summary"]["customers"], 2)
+
+    def test_sync_history_dashboard_and_report_respect_msp_customer_scope(self):
+        """Every sync-history consumer must enforce the operator's tenant boundary."""
+
+        runs = (
+            (
+                "run-global",
+                "success",
+                "Global provider health",
+                "2026-07-27T10:00:00Z",
+                {"operation": "company_discovery"},
+            ),
+            (
+                "run-acme",
+                "success",
+                "Acme permitted detail",
+                "2026-07-27T11:00:00Z",
+                {"operation": "configuration_preview", "companyId": "acme"},
+            ),
+            (
+                "run-northwind",
+                "failed",
+                "Northwind restricted detail",
+                "2026-07-27T12:00:00Z",
+                {"operation": "configuration_preview", "companyId": "northwind"},
+            ),
+        )
+        for run_id, status, message, started_at, attributes in runs:
+            backend_main.REPOSITORY.record_sync_run(
+                "connectwise",
+                {
+                    "id": run_id,
+                    "type": "connectwise",
+                    "status": status,
+                    "startedAt": started_at,
+                    "finishedAt": started_at,
+                    "discovered": 0,
+                    "imported": 0,
+                    "updated": 0,
+                    "review": 0,
+                    "message": message,
+                    "attributes": attributes,
+                },
+                False,
+                "admin",
+            )
+
+        operator_headers = self._headers("operator@example.com")
+        operator_history = self.client.get("/api/sync-runs", headers=operator_headers)
+        self.assertEqual(operator_history.status_code, 200, operator_history.text)
+        self.assertEqual(
+            {item["id"] for item in operator_history.json()},
+            {"run-global", "run-acme"},
+        )
+        self.assertNotIn("Northwind restricted detail", operator_history.text)
+
+        admin_history = self.client.get(
+            "/api/sync-runs",
+            headers=self._headers("admin@example.com"),
+        )
+        self.assertEqual(
+            {item["id"] for item in admin_history.json()},
+            {"run-global", "run-acme", "run-northwind"},
+        )
+
+        operator_dashboard = self.client.get("/api/dashboard", headers=operator_headers)
+        self.assertEqual(operator_dashboard.status_code, 200, operator_dashboard.text)
+        self.assertEqual(
+            operator_dashboard.json()["integrations"][0]["lastRunAt"],
+            "2026-07-27T11:00:00Z",
+        )
+        self.assertNotIn("Northwind restricted detail", operator_dashboard.text)
+
+        operator_report = self.client.get(
+            "/api/reports/integration-health/preview",
+            headers=operator_headers,
+        )
+        self.assertEqual(operator_report.status_code, 200, operator_report.text)
+        self.assertEqual(
+            operator_report.json()["rows"][0]["message"],
+            "Acme permitted detail",
+        )
+        self.assertNotIn("Northwind restricted detail", operator_report.text)
 
     def test_openapi_identifies_the_direct_fastapi_surface(self):
         schema = api.openapi()
@@ -2131,6 +2644,25 @@ class FastApiMigrationTests(unittest.TestCase):
             self.assertEqual(ci_preview.json()["excluded"], 1)
             self.assertTrue(ci_preview.json()["readOnly"])
             self.assertEqual(ci_preview.json()["queueSummary"]["pending"], 2)
+            policy_id = saved_ci_policy.json()["id"]
+            leased = backend_main.REPOSITORY.claim_ci_sync_policy_now(
+                policy_id,
+                "test-worker",
+                lease_seconds=120,
+            )
+            self.assertIsNotNone(leased)
+            already_running = self.client.post(
+                (f"/api/integrations/connectwise/configurations/policies/{policy_id}/sync-now"),
+                headers=headers,
+            )
+            self.assertEqual(already_running.status_code, 409, already_running.text)
+            backend_main.REPOSITORY.complete_ci_sync_policy_run(policy_id, success=True)
+            manual_sync = self.client.post(
+                (f"/api/integrations/connectwise/configurations/policies/{policy_id}/sync-now"),
+                headers=headers,
+            )
+            self.assertEqual(manual_sync.status_code, 200, manual_sync.text)
+            self.assertEqual(manual_sync.json()["queueSummary"]["pending"], 2)
             review_queue = self.client.get(
                 "/api/integrations/connectwise/configurations/review-queue?companyId=acme",
                 headers=headers,
@@ -2211,6 +2743,26 @@ class FastApiMigrationTests(unittest.TestCase):
 
         history = self.client.get("/api/sync-runs", headers=headers)
         self.assertEqual(history.json()[0]["type"], "connectwise")
+        filtered_history = self.client.get(
+            (
+                "/api/sync-runs?provider=connectwise"
+                "&operation=configuration_preview&companyId=acme&limit=5"
+            ),
+            headers=headers,
+        )
+        self.assertEqual(filtered_history.status_code, 200, filtered_history.text)
+        self.assertTrue(filtered_history.json())
+        self.assertTrue(
+            all(
+                item["attributes"]["operation"] == "configuration_preview"
+                and item["attributes"]["companyId"] == "acme"
+                for item in filtered_history.json()
+            )
+        )
+        self.assertEqual(
+            filtered_history.json()[0]["attributes"]["trigger"],
+            "manual_sync",
+        )
         serialized = json.dumps(core.DB)
         self.assertNotIn("public-key", serialized)
         self.assertNotIn("private-key", serialized)

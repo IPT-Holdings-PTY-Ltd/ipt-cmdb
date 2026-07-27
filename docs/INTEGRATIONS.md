@@ -99,6 +99,8 @@ Canonical apply remains a separate administrator decision. The workbench permits
 
 Store the sync run, mapping decision, affected canonical IDs, field-authority decisions and sanitized failure details.
 
+Operational history is queryable by provider, status, operation and customer. Scheduled and operator-triggered previews carry a trigger attribute so an MSP can distinguish automation from technician actions without retaining provider secrets or raw response bodies.
+
 ## Customer mapping
 
 An MSP-level provider tenant often has a different customer identifier from IPT CMDB. Store explicit mappings between provider company IDs and canonical `companies.id`. Name matching can suggest a mapping but must not silently become the durable key.
@@ -133,7 +135,7 @@ See the [ConnectWise company discovery runbook](CONNECTWISE.md) for setup, permi
 
 ## Worker behaviour
 
-Only one active run should process a connection/cursor at a time. Workers should use bounded retries, persist checkpoints after durable writes, distinguish provider rejection from temporary failure and avoid logging full provider responses.
+Only one active run should process a connection/cursor at a time. Scheduled and manual runs must share the same durable lease. Workers use bounded exponential retry delays, persist checkpoints after durable writes, distinguish provider rejection from temporary failure and avoid logging full provider responses. Alerting should be durable and rate-limited, with a recovery signal after a failure streak.
 
 ## Inputs, outputs and workflows
 
