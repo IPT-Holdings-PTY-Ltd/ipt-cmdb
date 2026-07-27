@@ -307,6 +307,10 @@ class PostgresRepositoryContractTests(unittest.TestCase):
                 "imported": 0,
                 "review": 1,
                 "message": "One company requires review",
+                "attributes": {
+                    "operation": "company_discovery",
+                    "companyId": "acme",
+                },
             },
             [
                 {
@@ -334,6 +338,53 @@ class PostgresRepositoryContractTests(unittest.TestCase):
             expected_revision=0,
             actor_id=actor_id,
         )
+        claimed_policy = repository.claim_due_ci_sync_policy(
+            "connectwise",
+            "contract-worker-a",
+            lease_seconds=120,
+        )
+        self.assertEqual(claimed_policy["id"], ci_policy["id"])
+        self.assertIsNone(
+            repository.claim_ci_sync_policy_now(
+                ci_policy["id"],
+                "contract-worker-b",
+                lease_seconds=120,
+            )
+        )
+        first_failure = repository.complete_ci_sync_policy_run(
+            ci_policy["id"],
+            success=False,
+            error="Provider unavailable",
+        )
+        self.assertTrue(first_failure["backoffActive"])
+        self.assertEqual(first_failure["retryDelayMinutes"], 15)
+        self.assertIsNotNone(
+            repository.claim_ci_sync_policy_now(
+                ci_policy["id"],
+                "contract-worker-b",
+                lease_seconds=120,
+            )
+        )
+        second_failure = repository.complete_ci_sync_policy_run(
+            ci_policy["id"],
+            success=False,
+            error="Provider still unavailable",
+        )
+        self.assertEqual(second_failure["consecutiveFailures"], 2)
+        self.assertEqual(second_failure["retryDelayMinutes"], 30)
+        self.assertIsNotNone(
+            repository.claim_ci_sync_policy_now(
+                ci_policy["id"],
+                "contract-worker-c",
+                lease_seconds=120,
+            )
+        )
+        recovered_policy = repository.complete_ci_sync_policy_run(
+            ci_policy["id"],
+            success=True,
+        )
+        self.assertFalse(recovered_policy["backoffActive"])
+        self.assertEqual(recovered_policy["retryDelayMinutes"], 0)
         repository.replace_ci_review_items(
             ci_policy["id"],
             "acme",
@@ -502,6 +553,18 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         sync_statuses = {item["status"] for item in repository.list_sync_runs()}
         self.assertIn("success", sync_statuses)
         self.assertIn("review_required", sync_statuses)
+        filtered_sync_runs = repository.list_sync_runs(
+            "connectwise",
+            "review_required",
+            "company_discovery",
+            "acme",
+            10,
+        )
+        self.assertEqual(len(filtered_sync_runs), 1)
+        self.assertEqual(
+            filtered_sync_runs[0]["attributes"]["operation"],
+            "company_discovery",
+        )
         self.assertEqual(repository.list_notification_preferences(), [])
         self.assertEqual(repository.list_notification_preferences("acme"), [])
         self.assertEqual(repository.list_notification_events(), [])

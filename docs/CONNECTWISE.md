@@ -91,9 +91,16 @@ To enable scheduled previews in a container deployment:
 ```text
 INTEGRATION_WORKER_ENABLED=true
 INTEGRATION_WORKER_INTERVAL_SECONDS=60
+NOTIFICATION_WORKER_ENABLED=true
+NOTIFICATION_WORKER_INTERVAL_SECONDS=60
+INTEGRATION_ALERT_RECIPIENTS=integration-ops@example.com
 ```
 
-The polling interval is bounded between 15 and 3,600 seconds. Each customer policy retains its own 15-minute to seven-day preview interval. PostgreSQL leases use `FOR UPDATE SKIP LOCKED`, so multiple application replicas can safely have the worker enabled without executing the same due policy concurrently. Failed calls release the lease, record sanitized sync evidence and schedule the next policy attempt; no canonical import occurs.
+`INTEGRATION_ALERT_RECIPIENTS` accepts a comma- or semicolon-separated list. When it is blank, active platform-administrator email addresses are used. Alerts require an enabled Microsoft 365 email connection and notification worker. A failed policy queues an alert on failure 1, 2, 4, 8 and so on, which keeps an extended outage visible without sending on every retry. A successful unattended run after failures queues one recovery message.
+
+The polling interval is bounded between 15 and 3,600 seconds. Each customer policy retains its own 15-minute to seven-day preview interval. PostgreSQL leases use `FOR UPDATE SKIP LOCKED`, so multiple application replicas can safely have the worker enabled without executing the same due policy concurrently. A failed call releases the lease, records sanitized sync evidence and uses bounded exponential retry delays of 15, 30, 60 minutes and so on up to 24 hours. A successful run returns to the customer policy's normal interval; no canonical import occurs.
+
+**Sync now** runs the saved filter and mapping policy immediately while taking the same exclusive lease. It is therefore safe to use during normal scheduler operation and returns a conflict if another replica is already running that policy. The wizard's sync-history table shows the customer, trigger, status and discovered/reviewed counts for recent ConnectWise runs.
 
 For a small MSP or dedicated customer instance, enabling the worker in the single application container is the simplest supported topology. At larger scale the same execution function can move to a dedicated worker service while sharing PostgreSQL, policy leases and the review queue.
 
@@ -118,6 +125,8 @@ For duplicate candidates, **Link existing** lets a platform administrator explic
 - Provider response bodies are not retained on failed requests.
 - Each connection test, discovery run, mapping and unmapping action is attributable in the audit ledger.
 - Continuous previews are opt-in at both deployment and policy level; they populate review evidence only.
+- Manual **Sync now** and scheduled work share one exclusive policy lease.
+- Failures use bounded exponential backoff and rate-limited email alerts; recovery is also reported.
 - Review dismissals require notes and are reopened by changed provider evidence.
 - Durable ignores require notes, use immutable provider IDs and remain excluded until restored.
 - MSP operators can test and discover. Only platform administrators can change credentials or mappings.
@@ -134,6 +143,8 @@ For duplicate candidates, **Link existing** lets a platform administrator explic
 | Discovery reaches the safety limit | Reduce the visible company scope or raise `CW_PAGE_SIZE`; the hard page limit intentionally cannot exceed 100 |
 | A suggested company is wrong | Ignore the suggestion and explicitly choose the correct CMDB customer |
 | An enabled policy never runs | Set `INTEGRATION_WORKER_ENABLED=true`, restart the container and check the worker/status chips in CI reconciliation |
+| Failure alerts are not ready | Enable and verify Microsoft 365 email, enable `NOTIFICATION_WORKER_ENABLED`, and configure `INTEGRATION_ALERT_RECIPIENTS` or active platform-administrator email addresses |
+| Sync now says the policy is already running | Wait for the active lease/run to finish, refresh the status and retry; do not bypass the lease |
 | Review item returns after dismissal | Its normalized provider evidence changed, so the platform deliberately reopened the decision |
 
 ConnectWise is a trademark of ConnectWise, LLC. IPT CMDB uses the ConnectWise API but is not endorsed or certified by ConnectWise.

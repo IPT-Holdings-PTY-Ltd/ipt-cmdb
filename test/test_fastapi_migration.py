@@ -422,6 +422,72 @@ class FastApiMigrationTests(unittest.TestCase):
             )
             self.assertEqual(failed_delivery_event["outcome"], "failed")
 
+    def test_integration_failure_alerts_are_durable_rate_limited_and_idempotent(self):
+        """Unattended failures should alert operators without sending on every retry."""
+
+        backend_main.REPOSITORY.update_email_connection(
+            {
+                "enabled": True,
+                "authMode": "managed_identity",
+                "senderAddress": "cmdb@example.com",
+                "status": "verified",
+            },
+            None,
+        )
+        policy = {
+            "id": "policy-1",
+            "companyId": "acme",
+            "companyName": "Acme Manufacturing",
+            "lastRunAt": "2026-07-27T10:00:00Z",
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "NOTIFICATION_WORKER_ENABLED": "true",
+                "INTEGRATION_ALERT_RECIPIENTS": "ops@example.com;admin@example.com",
+            },
+            clear=False,
+        ):
+            first = backend_main._queue_integration_alert(
+                policy,
+                event="failed",
+                detail="Provider unavailable",
+                consecutive_failures=1,
+                retry_delay_minutes=15,
+            )
+            duplicate = backend_main._queue_integration_alert(
+                policy,
+                event="failed",
+                detail="Provider unavailable",
+                consecutive_failures=1,
+                retry_delay_minutes=15,
+            )
+            suppressed = backend_main._queue_integration_alert(
+                {**policy, "lastRunAt": "2026-07-27T11:00:00Z"},
+                event="failed",
+                detail="Provider unavailable",
+                consecutive_failures=3,
+                retry_delay_minutes=60,
+            )
+            fourth = backend_main._queue_integration_alert(
+                {**policy, "lastRunAt": "2026-07-27T12:00:00Z"},
+                event="failed",
+                detail="Provider unavailable",
+                consecutive_failures=4,
+                retry_delay_minutes=120,
+            )
+
+        self.assertIsNotNone(first)
+        self.assertEqual(duplicate["id"], first["id"])
+        self.assertIsNone(suppressed)
+        self.assertIsNotNone(fourth)
+        self.assertEqual(len(core.DB["emailOutbox"]), 2)
+        self.assertEqual(
+            core.DB["emailOutbox"][0]["to"],
+            ["admin@example.com", "ops@example.com"],
+        )
+        self.assertIn("120 minute(s)", core.DB["emailOutbox"][0]["bodyText"])
+
     def test_local_password_recovery_is_generic_single_use_and_revokes_credentials(self):
         backend_main.REPOSITORY.update_email_connection(
             {
@@ -2131,6 +2197,25 @@ class FastApiMigrationTests(unittest.TestCase):
             self.assertEqual(ci_preview.json()["excluded"], 1)
             self.assertTrue(ci_preview.json()["readOnly"])
             self.assertEqual(ci_preview.json()["queueSummary"]["pending"], 2)
+            policy_id = saved_ci_policy.json()["id"]
+            leased = backend_main.REPOSITORY.claim_ci_sync_policy_now(
+                policy_id,
+                "test-worker",
+                lease_seconds=120,
+            )
+            self.assertIsNotNone(leased)
+            already_running = self.client.post(
+                (f"/api/integrations/connectwise/configurations/policies/{policy_id}/sync-now"),
+                headers=headers,
+            )
+            self.assertEqual(already_running.status_code, 409, already_running.text)
+            backend_main.REPOSITORY.complete_ci_sync_policy_run(policy_id, success=True)
+            manual_sync = self.client.post(
+                (f"/api/integrations/connectwise/configurations/policies/{policy_id}/sync-now"),
+                headers=headers,
+            )
+            self.assertEqual(manual_sync.status_code, 200, manual_sync.text)
+            self.assertEqual(manual_sync.json()["queueSummary"]["pending"], 2)
             review_queue = self.client.get(
                 "/api/integrations/connectwise/configurations/review-queue?companyId=acme",
                 headers=headers,
@@ -2211,6 +2296,26 @@ class FastApiMigrationTests(unittest.TestCase):
 
         history = self.client.get("/api/sync-runs", headers=headers)
         self.assertEqual(history.json()[0]["type"], "connectwise")
+        filtered_history = self.client.get(
+            (
+                "/api/sync-runs?provider=connectwise"
+                "&operation=configuration_preview&companyId=acme&limit=5"
+            ),
+            headers=headers,
+        )
+        self.assertEqual(filtered_history.status_code, 200, filtered_history.text)
+        self.assertTrue(filtered_history.json())
+        self.assertTrue(
+            all(
+                item["attributes"]["operation"] == "configuration_preview"
+                and item["attributes"]["companyId"] == "acme"
+                for item in filtered_history.json()
+            )
+        )
+        self.assertEqual(
+            filtered_history.json()[0]["attributes"]["trigger"],
+            "manual_sync",
+        )
         serialized = json.dumps(core.DB)
         self.assertNotIn("public-key", serialized)
         self.assertNotIn("private-key", serialized)

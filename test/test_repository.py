@@ -187,10 +187,25 @@ class RepositoryTests(unittest.TestCase):
             "discovered": 0,
             "imported": 0,
             "message": "Credentials are not configured",
+            "attributes": {
+                "operation": "configuration_preview",
+                "companyId": "acme",
+            },
         }
         stored = self.repository.record_sync_run("connectwise", run, False, "admin")
         self.assertEqual(stored["status"], "blocked")
         self.assertEqual(self.repository.list_sync_runs()[0]["id"], "run-1")
+        self.assertEqual(
+            self.repository.list_sync_runs(
+                "connectwise",
+                "blocked",
+                "configuration_preview",
+                "acme",
+                10,
+            )[0]["id"],
+            "run-1",
+        )
+        self.assertEqual(self.repository.list_sync_runs(operation="company_discovery"), [])
         self.assertEqual(self.repository.list_integrations()[0]["lastSync"], run["finishedAt"])
         self.assertEqual(self.state["auditEvents"][0]["action"], "sync_completed")
 
@@ -367,6 +382,48 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(completed["consecutiveFailures"], 0)
         self.assertIsNotNone(completed["nextRunAt"])
         self.assertIsNone(completed.get("leaseOwner"))
+
+        manually_claimed = self.repository.claim_ci_sync_policy_now(
+            policy["id"], "operator-a", lease_seconds=120
+        )
+        self.assertEqual(manually_claimed["leaseOwner"], "operator-a")
+        self.assertIsNone(
+            self.repository.claim_ci_sync_policy_now(policy["id"], "operator-b", lease_seconds=120)
+        )
+        first_failure = self.repository.complete_ci_sync_policy_run(
+            policy["id"], success=False, error="Provider unavailable"
+        )
+        self.assertTrue(first_failure["backoffActive"])
+        self.assertEqual(first_failure["consecutiveFailures"], 1)
+        self.assertEqual(first_failure["retryDelayMinutes"], 15)
+        self.assertIsNotNone(first_failure["nextRunAt"])
+
+        self.assertIsNotNone(
+            self.repository.claim_ci_sync_policy_now(policy["id"], "operator-b", lease_seconds=120)
+        )
+        second_failure = self.repository.complete_ci_sync_policy_run(
+            policy["id"], success=False, error="Provider still unavailable"
+        )
+        self.assertEqual(second_failure["consecutiveFailures"], 2)
+        self.assertEqual(second_failure["retryDelayMinutes"], 30)
+
+        manual_policy = self.repository.update_ci_sync_policy(
+            "connectwise",
+            "acme",
+            "manual-parent",
+            {"syncMode": "manual", "enabled": False},
+            expected_revision=0,
+            actor_id="admin",
+        )
+        self.assertIsNotNone(
+            self.repository.claim_ci_sync_policy_now(
+                manual_policy["id"], "operator-c", lease_seconds=120
+            )
+        )
+        manual_completed = self.repository.complete_ci_sync_policy_run(
+            manual_policy["id"], success=False, error="Manual preview failed"
+        )
+        self.assertIsNone(manual_completed["nextRunAt"])
 
     def test_ci_review_ignore_is_durable_audited_and_reversible(self):
         """Immutable provider IDs should stay hidden until an administrator restores them."""

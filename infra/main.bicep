@@ -40,6 +40,15 @@ param bootstrapImage string = 'mcr.microsoft.com/azuredocs/containerapps-hellowo
 @description('Optional external HTTPS origin. Set this when using a custom domain.')
 param publicBaseUrl string = ''
 
+@description('Enable the durable Microsoft Graph notification worker.')
+param enableNotificationWorker bool = false
+
+@description('Enable lease-safe scheduled integration previews.')
+param enableIntegrationWorker bool = false
+
+@description('Optional comma-separated integration alert recipients. Active platform administrators are used when blank.')
+param integrationAlertRecipients string = ''
+
 @description('PostgreSQL SKU. Increase this for production workload and HA requirements.')
 param postgresSkuName string = 'Standard_B1ms'
 
@@ -420,6 +429,26 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
             {
               name: 'ALLOW_LOCAL_DEVELOPMENT'
               value: 'false'
+            }
+            {
+              name: 'NOTIFICATION_WORKER_ENABLED'
+              value: enableNotificationWorker ? 'true' : 'false'
+            }
+            {
+              name: 'NOTIFICATION_WORKER_INTERVAL_SECONDS'
+              value: '60'
+            }
+            {
+              name: 'INTEGRATION_WORKER_ENABLED'
+              value: enableIntegrationWorker ? 'true' : 'false'
+            }
+            {
+              name: 'INTEGRATION_WORKER_INTERVAL_SECONDS'
+              value: '60'
+            }
+            {
+              name: 'INTEGRATION_ALERT_RECIPIENTS'
+              value: integrationAlertRecipients
             }
           ]
           probes: [

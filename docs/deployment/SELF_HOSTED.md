@@ -61,6 +61,20 @@ docker compose --env-file .env.production -f compose.production.yml pull
 docker compose --env-file .env.production -f compose.production.yml up -d
 ```
 
+After Microsoft 365 email is configured and verified, unattended ConnectWise previews
+can be enabled in `.env.production`:
+
+```text
+INTEGRATION_WORKER_ENABLED=true
+INTEGRATION_WORKER_INTERVAL_SECONDS=60
+NOTIFICATION_WORKER_ENABLED=true
+NOTIFICATION_WORKER_INTERVAL_SECONDS=60
+INTEGRATION_ALERT_RECIPIENTS=integration-ops@example.com
+```
+
+The alert recipient list is optional; active platform administrators are the fallback.
+The integration worker remains read-only and only refreshes the governed review queue.
+
 ## 4. Configure the identity proxy
 
 The proxy must:

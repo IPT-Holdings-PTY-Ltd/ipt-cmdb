@@ -31,7 +31,7 @@ IPT CMDB combines a tenant-aware asset inventory, business-system modelling, int
 | Governance | Append-only attributable audit ledger, request correlation, tenant-aware Audit Center and CI activity timelines |
 | Data quality | MSP/customer quality scores, prioritized findings, audited exceptions, provider-neutral reconciliation workbench and enforced per-customer field authority |
 | Reports | Controlled MSP/customer report catalogue with branded PDF, filterable XLSX and UTF-8 CSV exports |
-| Integrations | Capability-driven provider registry; guided ConnectWise setup, immutable-ID filters, explicit customer mapping, lease-safe continuous previews, scalable review workbench and authority-governed imports |
+| Integrations | Capability-driven provider registry; guided ConnectWise setup, immutable-ID filters, explicit customer mapping, lease-safe continuous previews and Sync now, exponential retry/failure alerts, customer-aware run history, scalable review workbench and authority-governed imports |
 | Email | Root-managed Microsoft Graph sender, Azure managed identity or app credentials, Exchange mailbox scoping, audited outbox and test delivery |
 
 Passportal passwords, secure notes and credential values are explicitly out of scope. Only approved metadata associations should enter the CMDB.

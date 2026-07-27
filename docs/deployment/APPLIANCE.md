@@ -74,6 +74,18 @@ docker compose --env-file $environment -f compose.appliance.yml up -d
 docker compose --env-file $environment -f compose.appliance.yml ps
 ```
 
+Once Microsoft 365 email is verified, the same environment file can enable the
+read-only ConnectWise scheduler and alert delivery:
+
+```text
+INTEGRATION_WORKER_ENABLED=true
+NOTIFICATION_WORKER_ENABLED=true
+INTEGRATION_ALERT_RECIPIENTS=integration-ops@example.com
+```
+
+Leave these values false during initial setup. When the recipient list is blank, active
+platform-administrator email addresses are used.
+
 The application binds to `127.0.0.1:3000` by default. Read the generated bootstrap
 password from `secrets/bootstrap-admin-password.txt`, sign in with the selected email,
 and enroll an authenticator during the first login. The known demonstration password is

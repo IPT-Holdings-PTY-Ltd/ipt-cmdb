@@ -29,7 +29,10 @@ from src.cmdb.audit import (
     sanitize_audit_value,
 )
 from src.cmdb.change_templates import DEFAULT_CHANGE_TEMPLATES, normalize_template_content
-from src.cmdb.integration_reconciliation import normalize_ci_policy
+from src.cmdb.integration_reconciliation import (
+    ci_sync_retry_delay_minutes,
+    normalize_ci_policy,
+)
 from src.cmdb.notifications import DEFAULT_NOTIFICATION_RULES, DEFAULT_NOTIFICATION_TEMPLATES
 
 CMDB_NAMESPACE = uuid.UUID("a12d44c4-64a7-4d6f-b829-3a8b691f0fa4")
@@ -3184,7 +3187,13 @@ class StateRepository:
             None,
         )
         if record:
-            return {**deepcopy(record), **normalize_ci_policy(record)}
+            failures = int(record.get("consecutiveFailures") or 0)
+            return {
+                **deepcopy(record),
+                **normalize_ci_policy(record),
+                "backoffActive": failures > 0,
+                "retryDelayMinutes": (ci_sync_retry_delay_minutes(failures) if failures else 0),
+            }
         return {
             "id": "",
             "provider": kind,
@@ -3198,6 +3207,8 @@ class StateRepository:
             "lastSuccessAt": None,
             "lastError": "",
             "consecutiveFailures": 0,
+            "backoffActive": False,
+            "retryDelayMinutes": 0,
         }
 
     def update_ci_sync_policy(
@@ -3268,6 +3279,10 @@ class StateRepository:
             for item in self.state.get("integrationCiPolicies", [])
             if kind is None or item.get("provider") == kind
         ]
+        for policy in policies:
+            failures = int(policy.get("consecutiveFailures") or 0)
+            policy["backoffActive"] = failures > 0
+            policy["retryDelayMinutes"] = ci_sync_retry_delay_minutes(failures) if failures else 0
         return sorted(policies, key=lambda item: (item.get("companyId", ""), item.get("id", "")))
 
     def claim_due_ci_sync_policy(
@@ -3304,12 +3319,51 @@ class StateRepository:
             (now + timedelta(seconds=max(30, lease_seconds))).isoformat().replace("+00:00", "Z")
         )
         self.save_state(self.state)
+        return self.get_ci_sync_policy(
+            str(policy.get("provider") or ""),
+            str(policy.get("companyId") or ""),
+            str(policy.get("providerParentId") or ""),
+        )
+
+    def claim_ci_sync_policy_now(
+        self, policy_id: str, worker_id: str, lease_seconds: int = 300
+    ) -> dict | None:
+        """Lease one saved policy immediately for an operator-triggered preview."""
+
+        policy = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("id") == policy_id
+            ),
+            None,
+        )
+        if not policy:
+            return None
+        connection = self.get_integration_connection(str(policy.get("provider") or ""))
+        if (
+            not connection
+            or not connection.get("enabled")
+            or connection.get("lifecycleStatus", "active") != "active"
+        ):
+            return None
+        now = datetime.now(UTC)
+        lease_until = parse_timestamp(policy.get("leaseUntil"))
+        if lease_until and lease_until > now:
+            return None
+        policy["leaseOwner"] = worker_id[:120]
+        policy["leaseUntil"] = (
+            (now + timedelta(seconds=max(30, min(lease_seconds, 3600))))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        self.save_state(self.state)
         return deepcopy(policy)
 
     def complete_ci_sync_policy_run(
         self, policy_id: str, *, success: bool, error: str = ""
     ) -> dict | None:
-        """Release a policy lease and calculate its next bounded execution."""
+        """Release a policy lease and calculate its next scheduled execution."""
 
         policy = next(
             (
@@ -3324,6 +3378,8 @@ class StateRepository:
         now = datetime.now(UTC)
         failures = 0 if success else int(policy.get("consecutiveFailures") or 0) + 1
         interval = max(15, min(int(policy.get("intervalMinutes") or 360), 10080))
+        scheduled = policy.get("enabled") and policy.get("syncMode") == "continuous_preview"
+        delay = interval if success else ci_sync_retry_delay_minutes(failures)
         policy.update(
             lastRunAt=now.isoformat().replace("+00:00", "Z"),
             lastSuccessAt=(
@@ -3331,12 +3387,20 @@ class StateRepository:
             ),
             lastError="" if success else str(error)[:1000],
             consecutiveFailures=failures,
-            nextRunAt=(now + timedelta(minutes=interval)).isoformat().replace("+00:00", "Z"),
+            nextRunAt=(
+                (now + timedelta(minutes=delay)).isoformat().replace("+00:00", "Z")
+                if scheduled
+                else None
+            ),
             leaseOwner=None,
             leaseUntil=None,
         )
         self.save_state(self.state)
-        return deepcopy(policy)
+        return self.get_ci_sync_policy(
+            str(policy.get("provider") or ""),
+            str(policy.get("companyId") or ""),
+            str(policy.get("providerParentId") or ""),
+        )
 
     def replace_ci_review_items(
         self,
@@ -3990,8 +4054,31 @@ class StateRepository:
         self.save_state(self.state)
         return deepcopy(mapping)
 
-    def list_sync_runs(self) -> list[dict]:
-        return deepcopy(self.state.get("syncRuns", []))
+    def list_sync_runs(
+        self,
+        kind: str | None = None,
+        status: str | None = None,
+        operation: str | None = None,
+        company_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Return recent sync evidence using provider-neutral filters."""
+
+        records = []
+        for raw in self.state.get("syncRuns", []):
+            item = deepcopy(raw)
+            attributes = item.get("attributes") or {}
+            if kind and item.get("type") != kind:
+                continue
+            if status and item.get("status") != status:
+                continue
+            if operation and attributes.get("operation") != operation:
+                continue
+            if company_id and attributes.get("companyId") != company_id:
+                continue
+            item["attributes"] = deepcopy(attributes)
+            records.append(item)
+        return records[: max(1, min(limit, 250))]
 
     def list_audit_events(
         self,
@@ -8516,7 +8603,13 @@ class PostgresCmdbRepository(StateRepository):
                     len(companies),
                     int(run.get("review") or 0),
                     run.get("message") or "",
-                    json.dumps({"operation": "company_discovery", "readOnly": True}),
+                    json.dumps(
+                        {
+                            **deepcopy(run.get("attributes") or {}),
+                            "operation": "company_discovery",
+                            "readOnly": True,
+                        }
+                    ),
                 ),
             )
             for company in companies:
@@ -8835,6 +8928,8 @@ class PostgresCmdbRepository(StateRepository):
                 "lastSuccessAt": None,
                 "lastError": "",
                 "consecutiveFailures": 0,
+                "backoffActive": False,
+                "retryDelayMinutes": 0,
             }
         normalized = normalize_ci_policy(
             {
@@ -8844,6 +8939,7 @@ class PostgresCmdbRepository(StateRepository):
                 "enabled": row[4],
             }
         )
+        failures = int(row[11] or 0)
         return {
             "id": str(row[0]),
             "provider": kind,
@@ -8856,7 +8952,9 @@ class PostgresCmdbRepository(StateRepository):
             "lastRunAt": self._timestamp(row[8]) or None,
             "lastSuccessAt": self._timestamp(row[9]) or None,
             "lastError": row[10] or "",
-            "consecutiveFailures": int(row[11] or 0),
+            "consecutiveFailures": failures,
+            "backoffActive": failures > 0,
+            "retryDelayMinutes": ci_sync_retry_delay_minutes(failures) if failures else 0,
         }
 
     def update_ci_sync_policy(
@@ -8995,6 +9093,7 @@ class PostgresCmdbRepository(StateRepository):
                     "enabled": row[8],
                 }
             )
+            failures = int(row[15] or 0)
             policies.append(
                 {
                     "id": str(row[0]),
@@ -9009,7 +9108,9 @@ class PostgresCmdbRepository(StateRepository):
                     "lastRunAt": self._timestamp(row[12]) or None,
                     "lastSuccessAt": self._timestamp(row[13]) or None,
                     "lastError": row[14] or "",
-                    "consecutiveFailures": int(row[15] or 0),
+                    "consecutiveFailures": failures,
+                    "backoffActive": failures > 0,
+                    "retryDelayMinutes": (ci_sync_retry_delay_minutes(failures) if failures else 0),
                     "leaseOwner": row[16] or None,
                     "leaseUntil": self._timestamp(row[17]) or None,
                 }
@@ -9086,10 +9187,70 @@ class PostgresCmdbRepository(StateRepository):
             "leaseUntil": self._timestamp(row[17]) or None,
         }
 
+    def claim_ci_sync_policy_now(
+        self, policy_id: str, worker_id: str, lease_seconds: int = 300
+    ) -> dict | None:
+        """Atomically lease one saved policy for an operator-triggered preview."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_ci_policies policy
+                SET lease_owner = %s,
+                    lease_until = now() + (%s * interval '1 second')
+                FROM integration_connections integration, companies company
+                WHERE policy.id = %s::uuid
+                  AND integration.id = policy.integration_connection_id
+                  AND company.id = policy.company_id
+                  AND integration.enabled = true
+                  AND integration.lifecycle_status = 'active'
+                  AND (policy.lease_until IS NULL OR policy.lease_until < now())
+                RETURNING policy.id, integration.provider, company.slug, company.name,
+                          policy.external_parent_id, policy.filter_policy, policy.sync_mode,
+                          policy.interval_minutes, policy.enabled, policy.revision,
+                          policy.updated_at, policy.next_run_at, policy.last_run_at,
+                          policy.last_success_at, policy.last_error,
+                          policy.consecutive_failures, policy.lease_owner, policy.lease_until
+                """,
+                (
+                    worker_id[:120],
+                    max(30, min(lease_seconds, 3600)),
+                    policy_id,
+                ),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        normalized = normalize_ci_policy(
+            {
+                **(row[5] or {}),
+                "syncMode": row[6],
+                "intervalMinutes": row[7],
+                "enabled": row[8],
+            }
+        )
+        return {
+            "id": str(row[0]),
+            "provider": PROVIDER_FROM_DB.get(row[1], row[1]),
+            "companyId": row[2],
+            "companyName": row[3],
+            "providerParentId": row[4],
+            **normalized,
+            "revision": int(row[9]),
+            "updatedAt": self._timestamp(row[10]),
+            "nextRunAt": self._timestamp(row[11]) or None,
+            "lastRunAt": self._timestamp(row[12]) or None,
+            "lastSuccessAt": self._timestamp(row[13]) or None,
+            "lastError": row[14] or "",
+            "consecutiveFailures": int(row[15] or 0),
+            "leaseOwner": row[16] or None,
+            "leaseUntil": self._timestamp(row[17]) or None,
+        }
+
     def complete_ci_sync_policy_run(
         self, policy_id: str, *, success: bool, error: str = ""
     ) -> dict | None:
-        """Release a policy lease and schedule its next execution."""
+        """Release a policy lease and schedule normal or backoff execution."""
 
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -9100,13 +9261,20 @@ class PostgresCmdbRepository(StateRepository):
                     last_error = CASE WHEN %s THEN NULL ELSE %s END,
                     consecutive_failures = CASE WHEN %s THEN 0 ELSE consecutive_failures + 1 END,
                     next_run_at = CASE WHEN enabled AND sync_mode = 'continuous_preview'
-                        THEN now() + (interval_minutes * interval '1 minute') ELSE NULL END,
+                        THEN now() + (
+                            CASE WHEN %s THEN interval_minutes
+                                 ELSE LEAST(
+                                     1440,
+                                     15 * power(2, LEAST(consecutive_failures, 7))
+                                 )
+                            END * interval '1 minute'
+                        ) ELSE NULL END,
                     lease_owner = NULL,
                     lease_until = NULL
                 WHERE id = %s::uuid
                 RETURNING id
                 """,
-                (success, success, str(error)[:1000], success, policy_id),
+                (success, success, str(error)[:1000], success, success, policy_id),
             )
             row = cursor.fetchone()
         if not row:
@@ -11139,18 +11307,44 @@ class PostgresCmdbRepository(StateRepository):
         self.state.setdefault("auditEvents", [])
         return self.bootstrap()
 
-    def list_sync_runs(self) -> list[dict]:
+    def list_sync_runs(
+        self,
+        kind: str | None = None,
+        status: str | None = None,
+        operation: str | None = None,
+        company_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Return recent sync evidence using indexed, bounded filters."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind) if kind else None
+        database_status = "succeeded" if status == "success" else status
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 SELECT sr.id, ic.provider, sr.status, sr.message, sr.started_at,
                        sr.finished_at, sr.discovered_count, sr.created_count,
-                       sr.updated_count, sr.review_count
+                       sr.updated_count, sr.review_count, sr.attributes
                 FROM sync_runs sr
                 JOIN integration_connections ic ON ic.id = sr.integration_connection_id
+                WHERE (%s::text IS NULL OR ic.provider = %s)
+                  AND (%s::text IS NULL OR sr.status = %s)
+                  AND (%s::text IS NULL OR sr.attributes ->> 'operation' = %s)
+                  AND (%s::text IS NULL OR sr.attributes ->> 'companyId' = %s)
                 ORDER BY sr.started_at DESC, sr.id DESC
-                LIMIT 50
-                """
+                LIMIT %s
+                """,
+                (
+                    provider,
+                    provider,
+                    database_status,
+                    database_status,
+                    operation,
+                    operation,
+                    company_id,
+                    company_id,
+                    max(1, min(limit, 250)),
+                ),
             )
             status_labels = {"succeeded": "success"}
             return [
@@ -11165,8 +11359,9 @@ class PostgresCmdbRepository(StateRepository):
                     "imported": created,
                     "updated": updated,
                     "review": review,
+                    "attributes": attributes or {},
                 }
-                for run_id, provider, status, message, started_at, finished_at, discovered, created, updated, review in cursor.fetchall()
+                for run_id, provider, status, message, started_at, finished_at, discovered, created, updated, review, attributes in cursor.fetchall()
             ]
 
     def record_sync_run(
