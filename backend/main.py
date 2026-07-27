@@ -5255,13 +5255,21 @@ def _execute_connectwise_ci_preview(
 def _record_connectwise_ci_preview_failure(
     policy: dict, error: Exception, *, trigger: str = "continuous_preview"
 ) -> dict:
-    """Persist a sanitized worker failure and release its policy lease."""
+    """Persist a sanitized scheduled or operator-triggered failure and release its lease."""
 
+    run_label = {
+        "continuous_preview": "Continuous preview",
+        "manual_sync": "Sync now",
+    }.get(trigger, "Configuration preview")
+    failure_operation = {
+        "continuous_preview": "continuous configuration preview",
+        "manual_sync": "operator-triggered configuration preview",
+    }.get(trigger, "configuration preview")
     if isinstance(error, (ConnectWiseConfigurationError, ConnectWiseRequestError)):
-        detail = _connectwise_public_failure(error, "continuous configuration preview")
+        detail = _connectwise_public_failure(error, failure_operation)
     else:
-        LOGGER.exception("Unexpected continuous ConnectWise preview failure")
-        detail = "Unexpected integration worker failure"
+        LOGGER.exception("Unexpected ConnectWise %s failure", run_label.casefold())
+        detail = "Unexpected integration sync failure"
     now = core.now()
     run = {
         "id": str(uuid.uuid4()),
@@ -5273,7 +5281,9 @@ def _record_connectwise_ci_preview_failure(
         "imported": 0,
         "updated": 0,
         "review": 0,
-        "message": f"Continuous preview failed for {policy.get('companyName') or policy['companyId']}: {detail}",
+        "message": (
+            f"{run_label} failed for {policy.get('companyName') or policy['companyId']}: {detail}"
+        ),
         "attributes": {
             "operation": "configuration_preview",
             "trigger": trigger,

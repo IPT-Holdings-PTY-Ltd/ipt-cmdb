@@ -753,6 +753,51 @@ class FastApiMigrationTests(unittest.TestCase):
             "2026-07-27T10:05:00Z",
         )
 
+    def test_connectwise_failure_history_names_the_trigger_that_failed(self):
+        """Sync history should distinguish scheduled failures from Sync now failures."""
+
+        policy = {
+            "id": "policy-1",
+            "companyId": "acme",
+            "companyName": "Acme Manufacturing",
+            "providerParentId": "42",
+        }
+        recorded_runs = []
+
+        def record_run(_kind, run, *_args):
+            stored = {**run}
+            recorded_runs.append(stored)
+            return stored
+
+        with (
+            patch.object(
+                backend_main.REPOSITORY,
+                "record_sync_run",
+                side_effect=record_run,
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "complete_ci_sync_policy_run",
+                return_value={"id": "policy-1", "consecutiveFailures": 0},
+            ),
+        ):
+            backend_main._record_connectwise_ci_preview_failure(
+                policy,
+                backend_main.ConnectWiseRequestError("provider-secret-marker"),
+                trigger="continuous_preview",
+            )
+            backend_main._record_connectwise_ci_preview_failure(
+                policy,
+                backend_main.ConnectWiseRequestError("provider-secret-marker"),
+                trigger="manual_sync",
+            )
+
+        self.assertTrue(recorded_runs[0]["message"].startswith("Continuous preview failed"))
+        self.assertTrue(recorded_runs[1]["message"].startswith("Sync now failed"))
+        self.assertEqual(recorded_runs[0]["attributes"]["trigger"], "continuous_preview")
+        self.assertEqual(recorded_runs[1]["attributes"]["trigger"], "manual_sync")
+        self.assertNotIn("provider-secret-marker", json.dumps(recorded_runs))
+
     def test_local_password_recovery_is_generic_single_use_and_revokes_credentials(self):
         backend_main.REPOSITORY.update_email_connection(
             {
