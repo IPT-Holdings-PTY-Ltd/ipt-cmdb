@@ -136,6 +136,34 @@ def main() -> None:
         )
         assert accepted_email and accepted_email["status"] == "accepted"
         assert "bodyText" not in repository.list_email_outbox()[0]
+        repository.record_worker_runtime(
+            "integrations",
+            "upgrade-worker",
+            "dedicated",
+            60,
+            "starting",
+        )
+        worker_runtime = repository.record_worker_runtime(
+            "integrations",
+            "upgrade-worker",
+            "dedicated",
+            60,
+            "cycle_succeeded",
+            processed=2,
+            metadata={"result": {"processed": 2}},
+        )
+        assert worker_runtime["status"] == "running"
+        assert worker_runtime["itemsProcessed"] == 2
+        rate_limit = repository.record_provider_rate_limit(
+            "connectwise",
+            {
+                "httpStatus": 200,
+                "limit": 1200,
+                "remaining": 1199,
+                "requestPath": "/company/companies",
+            },
+        )
+        assert rate_limit["remaining"] == 1199
         with factory() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT id FROM companies WHERE slug = 'acme'")
             company_id = str(cursor.fetchone()[0])
@@ -209,7 +237,8 @@ def main() -> None:
         print(
             f"Upgrade verified: versions={','.join(versions)} "
             "customer_branding=preserved legacy_state=retired "
-            "relationship_reconnect=verified email_outbox=verified"
+            "relationship_reconnect=verified email_outbox=verified "
+            "worker_telemetry=verified"
         )
     finally:
         with (

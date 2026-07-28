@@ -102,7 +102,7 @@ The polling interval is bounded between 15 and 3,600 seconds. Each customer poli
 
 **Sync now** runs the saved filter and mapping policy immediately while taking the same exclusive lease. It is therefore safe to use during normal scheduler operation and returns a conflict if another replica is already running that policy. The wizard's sync-history table shows the customer, trigger, status and discovered/reviewed counts for recent ConnectWise runs.
 
-For a small MSP or dedicated customer instance, enabling the worker in the single application container is the simplest supported topology. At larger scale the same execution function can move to a dedicated worker service while sharing PostgreSQL, policy leases and the review queue.
+For a small MSP or dedicated customer instance, enabling the worker in the single application container is the simplest supported topology. At larger scale, apply the [worker deployment runbook](deployment/WORKERS.md) to move the same execution function to a dedicated service while sharing PostgreSQL, policy leases and the review queue.
 
 The preview never changes either system. It classifies each record as:
 
@@ -127,6 +127,8 @@ For duplicate candidates, **Link existing** lets a platform administrator explic
 - Continuous previews are opt-in at both deployment and policy level; they populate review evidence only.
 - Manual **Sync now** and scheduled work share one exclusive policy lease.
 - Failures use bounded exponential backoff and rate-limited email alerts; recovery is also reported.
+- Sanitized HTTP and provider rate-limit headers are retained as current operational
+  telemetry; response bodies, query strings and credentials are excluded.
 - Review dismissals require notes and are reopened by changed provider evidence.
 - Durable ignores require notes, use immutable provider IDs and remain excluded until restored.
 - MSP operators can test and discover. Only platform administrators can change credentials or mappings.

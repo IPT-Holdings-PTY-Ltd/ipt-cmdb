@@ -9,6 +9,7 @@ The `infra/` Bicep baseline provisions a complete Azure runtime:
 - Key Vault references through a user-assigned managed identity
 - Log Analytics
 - startup, liveness, and readiness probes
+- a non-ingress worker Container App that scales to zero until dedicated mode is selected
 - optional Microsoft Entra authentication at the Container Apps boundary
 
 The default PostgreSQL SKU and single app replica are economical starting values, not
@@ -60,6 +61,9 @@ azd env set CMDB_BOOTSTRAP_ADMIN_EMAIL '<first-platform-admin-email>'
 azd env set CMDB_BOOTSTRAP_ADMIN_PASSWORD '<generated-bootstrap-password>'
 azd env set CMDB_ENTRA_CLIENT_ID '<application-client-id>'
 azd env set CMDB_ENTRA_CLIENT_SECRET '<application-client-secret>'
+azd env set CMDB_WORKER_DEPLOYMENT_MODE embedded
+azd env set CMDB_ENABLE_NOTIFICATION_WORKER false
+azd env set CMDB_ENABLE_INTEGRATION_WORKER false
 ```
 
 ## 3. Provision and deploy
@@ -95,6 +99,24 @@ parameters. After Microsoft 365 email is verified in the root workspace, set
 active platform-administrator email addresses receive alerts. The Container App receives
 the same `INTEGRATION_*` and `NOTIFICATION_*` settings used by Docker deployments.
 
+The default `workerDeploymentMode=embedded` retains one API replica with optional
+in-process jobs. After the environment is initialized and `/api/ready` succeeds, set
+`workerDeploymentMode=dedicated`, reprovision, and deploy both azd services:
+
+```powershell
+azd env set CMDB_WORKER_DEPLOYMENT_MODE dedicated
+azd env set CMDB_ENABLE_NOTIFICATION_WORKER true
+azd env set CMDB_ENABLE_INTEGRATION_WORKER true
+azd provision
+azd deploy api
+azd deploy worker
+```
+
+Dedicated mode changes the API process role to `web` and keeps exactly one non-ingress
+worker replica. Both services use the same image source, managed identity, Key Vault
+references and PostgreSQL database. See the [worker runbook](WORKERS.md) for the
+one-shot Container Apps Job option and monitoring behaviour.
+
 ## 4. Verify
 
 The auth boundary intentionally excludes only health endpoints. Test them first:
@@ -123,6 +145,8 @@ Then verify:
   by policy; validate Container Apps secret refresh before enforcing it.
 - The app starts at one replica. Do not increase it until first-start repository seeding
   is moved to a deployment job or is certified for concurrent cold starts.
+- Keep the worker at zero replicas until the first web startup completes on a blank
+  database. Dedicated mode is a post-bootstrap topology change.
 - Raise the PostgreSQL SKU, enable zone-redundant HA where supported, and extend backup
   retention according to the service tier and recovery objectives.
 - Add a custom domain and managed certificate before production launch.

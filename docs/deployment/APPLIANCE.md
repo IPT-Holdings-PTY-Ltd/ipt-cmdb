@@ -40,7 +40,7 @@ From the repository root on Windows:
   -AdminEmail 'owner@example.com' `
   -InstanceName 'customer-acme' `
   -Port 3001 `
-  -Image 'ghcr.io/ipt-holdings-pty-ltd/ipt-cmdb:v0.4.0'
+  -Image 'ghcr.io/ipt-holdings-pty-ltd/ipt-cmdb:v0.3.0'
 ```
 
 On Linux:
@@ -49,7 +49,7 @@ On Linux:
 ./scripts/initialize-appliance.sh \
   owner@example.com \
   customer-acme \
-  ghcr.io/ipt-holdings-pty-ltd/ipt-cmdb:v0.4.0 \
+  ghcr.io/ipt-holdings-pty-ltd/ipt-cmdb:v0.3.0 \
   3001
 ```
 
@@ -85,6 +85,12 @@ INTEGRATION_ALERT_RECIPIENTS=integration-ops@example.com
 
 Leave these values false during initial setup. When the recipient list is blank, active
 platform-administrator email addresses are used.
+
+For a busier dedicated instance, initialize the appliance first, require `/api/ready`,
+and then add `-f compose.worker.yml` to the Compose commands. This moves the same
+enabled jobs into an isolated service without moving PostgreSQL or changing review
+controls. The complete cutover and rollback sequence is in the
+[worker runbook](WORKERS.md).
 
 The application binds to `127.0.0.1:3000` by default. Read the generated bootstrap
 password from `secrets/bootstrap-admin-password.txt`, sign in with the selected email,

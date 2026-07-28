@@ -160,6 +160,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime, tenancy, identity and re
 - [Self-hosted container deployment](docs/deployment/SELF_HOSTED.md)
 - [Compact Docker appliance](docs/deployment/APPLIANCE.md)
 - [Azure Container Apps deployment](docs/deployment/AZURE_CONTAINER_APPS.md)
+- [Background worker deployment and monitoring](docs/deployment/WORKERS.md)
 - [Operations, upgrades and recovery](docs/OPERATIONS.md)
 - [Release process and container publishing](docs/RELEASING.md)
 - [Contributing](CONTRIBUTING.md)
@@ -174,8 +175,8 @@ Interactive API documentation is available at `/docs` while the API is running.
 1. Add N-central and Passportal adapters through the provider registry, persistent review queue and canonical identity mapping layer.
 2. Bulk ownership, relationship-layer and lifecycle correction actions from data-quality findings.
 3. Expand change approval with reusable policies, escalation reminders and ConnectWise ticket publishing.
-4. Move continuous integration execution into an optional dedicated worker deployment for high-scale installations.
-5. Explicitly approved ConnectWise change-ticket publishing with PDF attachment and idempotency.
+4. Explicitly approved ConnectWise change-ticket publishing with PDF attachment and idempotency.
+5. Add governed workflow triggers and outputs through the provider-neutral worker boundary.
 
 External provider writes remain disabled until a reviewable, auditable workflow is implemented.
 

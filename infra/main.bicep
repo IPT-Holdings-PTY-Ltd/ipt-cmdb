@@ -43,8 +43,29 @@ param publicBaseUrl string = ''
 @description('Enable the durable Microsoft Graph notification worker.')
 param enableNotificationWorker bool = false
 
+@description('azd environment override for the notification worker.')
+@allowed([
+  'false'
+  'true'
+])
+param notificationWorkerSetting string = 'false'
+
 @description('Enable lease-safe scheduled integration previews.')
 param enableIntegrationWorker bool = false
+
+@description('azd environment override for the integration worker.')
+@allowed([
+  'false'
+  'true'
+])
+param integrationWorkerSetting string = 'false'
+
+@description('Run enabled workers in the API replica or an isolated Container App.')
+@allowed([
+  'embedded'
+  'dedicated'
+])
+param workerDeploymentMode string = 'embedded'
 
 @description('Optional comma-separated integration alert recipients. Active platform administrators are used when blank.')
 param integrationAlertRecipients string = ''
@@ -68,6 +89,9 @@ var commonTags = {
   environment: environmentName
 }
 var appName = 'cmdb-${environmentName}-${suffix}'
+var workerAppName = 'cmdb-worker-${environmentName}-${suffix}'
+var notificationWorkerEnabled = enableNotificationWorker || notificationWorkerSetting == 'true'
+var integrationWorkerEnabled = enableIntegrationWorker || integrationWorkerSetting == 'true'
 var postgresName = 'cmdb-pg-${environmentName}-${suffix}'
 var databaseUrl = 'postgresql://${postgresAdministratorLogin}:${postgresAdministratorPassword}@${postgresName}.postgres.database.azure.com:5432/cmdb?sslmode=require'
 var keyVaultSecrets = concat([
@@ -391,6 +415,10 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
               value: 'empty'
             }
             {
+              name: 'CMDB_PROCESS_ROLE'
+              value: workerDeploymentMode == 'dedicated' ? 'web' : 'combined'
+            }
+            {
               name: 'BOOTSTRAP_ADMIN_EMAIL'
               value: bootstrapAdminEmail
             }
@@ -432,7 +460,7 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
             }
             {
               name: 'NOTIFICATION_WORKER_ENABLED'
-              value: enableNotificationWorker ? 'true' : 'false'
+              value: notificationWorkerEnabled ? 'true' : 'false'
             }
             {
               name: 'NOTIFICATION_WORKER_INTERVAL_SECONDS'
@@ -440,7 +468,7 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
             }
             {
               name: 'INTEGRATION_WORKER_ENABLED'
-              value: enableIntegrationWorker ? 'true' : 'false'
+              value: integrationWorkerEnabled ? 'true' : 'false'
             }
             {
               name: 'INTEGRATION_WORKER_INTERVAL_SECONDS'
@@ -506,6 +534,118 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
   ]
 }
 
+resource workerApp 'Microsoft.App/containerApps@2025-01-01' = {
+  name: workerAppName
+  location: location
+  tags: union(commonTags, {
+    'azd-service-name': 'worker'
+  })
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${appIdentity.id}': {}
+    }
+  }
+  properties: {
+    managedEnvironmentId: containerAppsEnvironment.id
+    configuration: {
+      activeRevisionsMode: 'Single'
+      registries: [
+        {
+          server: registry.properties.loginServer
+          identity: appIdentity.id
+        }
+      ]
+      secrets: keyVaultSecrets
+    }
+    template: {
+      containers: [
+        {
+          name: 'worker'
+          image: bootstrapImage
+          command: [
+            'python'
+          ]
+          args: [
+            '-m'
+            'backend.worker'
+          ]
+          env: [
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
+            }
+            {
+              name: 'DATABASE_SEED_MODE'
+              value: 'empty'
+            }
+            {
+              name: 'CMDB_PROCESS_ROLE'
+              value: 'worker'
+            }
+            {
+              name: 'BOOTSTRAP_ADMIN_EMAIL'
+              value: bootstrapAdminEmail
+            }
+            {
+              name: 'BOOTSTRAP_ADMIN_PASSWORD'
+              secretRef: 'bootstrap-admin-password'
+            }
+            {
+              name: 'MFA_ENCRYPTION_KEY'
+              secretRef: 'mfa-encryption-key'
+            }
+            {
+              name: 'ALLOW_UI_DATABASE_CONFIG'
+              value: 'false'
+            }
+            {
+              name: 'ALLOW_LOCAL_DEVELOPMENT'
+              value: 'false'
+            }
+            {
+              name: 'NOTIFICATION_WORKER_ENABLED'
+              value: workerDeploymentMode == 'dedicated' && notificationWorkerEnabled ? 'true' : 'false'
+            }
+            {
+              name: 'NOTIFICATION_WORKER_INTERVAL_SECONDS'
+              value: '60'
+            }
+            {
+              name: 'INTEGRATION_WORKER_ENABLED'
+              value: workerDeploymentMode == 'dedicated' && integrationWorkerEnabled ? 'true' : 'false'
+            }
+            {
+              name: 'INTEGRATION_WORKER_INTERVAL_SECONDS'
+              value: '60'
+            }
+            {
+              name: 'INTEGRATION_ALERT_RECIPIENTS'
+              value: integrationAlertRecipients
+            }
+          ]
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+        }
+      ]
+      scale: {
+        minReplicas: workerDeploymentMode == 'dedicated' ? 1 : 0
+        maxReplicas: 1
+      }
+    }
+  }
+  dependsOn: [
+    acrPull
+    containerApp
+    databaseUrlSecret
+    mfaKeySecret
+    bootstrapAdminPasswordSecret
+    keyVaultSecretsUser
+  ]
+}
+
 resource authConfig 'Microsoft.App/containerApps/authConfigs@2025-01-01' = if (enableEntraAuth) {
   parent: containerApp
   name: 'current'
@@ -551,5 +691,6 @@ resource authConfig 'Microsoft.App/containerApps/authConfigs@2025-01-01' = if (e
 output AZURE_CONTAINER_REGISTRY_ENDPOINT string = registry.properties.loginServer
 output AZURE_CONTAINER_APP_NAME string = containerApp.name
 output AZURE_CONTAINER_APP_FQDN string = containerApp.properties.configuration.ingress.fqdn
+output AZURE_CONTAINER_WORKER_APP_NAME string = workerApp.name
 output AZURE_KEY_VAULT_NAME string = keyVault.name
 output AZURE_POSTGRESQL_SERVER_NAME string = postgres.name

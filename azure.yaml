@@ -9,6 +9,15 @@ services:
       context: .
       platform: amd64
       remoteBuild: true
+  worker:
+    project: .
+    host: containerapp
+    language: python
+    docker:
+      path: ./Dockerfile
+      context: .
+      platform: amd64
+      remoteBuild: true
 infra:
   provider: bicep
   path: infra

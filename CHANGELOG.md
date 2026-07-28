@@ -4,9 +4,16 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ## [Unreleased]
 
-### Planned
+### Added
 
-- Dedicated worker-service deployment and provider rate-limit telemetry.
+- Backward-compatible `combined`, `web`, and `worker` process roles, with a reusable
+  dedicated worker entry point and `--once` mode for scheduled container jobs.
+- Optional Docker Compose worker overlay and zero-idle-cost Azure Container Apps worker
+  deployment using the same application image and canonical PostgreSQL repository.
+- Durable worker heartbeat, cycle, result and failure telemetry surfaced in the
+  integration and notification administration screens.
+- Sanitized ConnectWise HTTP/rate-limit telemetry that retains status, quota headers and
+  request path only, without provider payloads, query strings or credentials.
 
 ## [0.3.0] - 2026-07-28
 

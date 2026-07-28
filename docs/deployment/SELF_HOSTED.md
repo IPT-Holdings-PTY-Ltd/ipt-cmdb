@@ -75,6 +75,18 @@ INTEGRATION_ALERT_RECIPIENTS=integration-ops@example.com
 The alert recipient list is optional; active platform administrators are the fallback.
 The integration worker remains read-only and only refreshes the governed review queue.
 
+Small installations can keep these jobs in the application container. To isolate them,
+first start the web service and verify `/api/ready`, then apply `compose.worker.yml`:
+
+```powershell
+docker compose --env-file .env.production `
+  -f compose.production.yml -f compose.worker.yml up -d
+```
+
+The overlay preserves the same immutable image and PostgreSQL data while changing the
+web process to API-only mode. See the [worker runbook](WORKERS.md) for one-shot
+execution, monitoring and rollback.
+
 ## 4. Configure the identity proxy
 
 The proxy must:

@@ -19,8 +19,10 @@ from src.cmdb.connectwise import (
 class FakeResponse:
     """Minimal context-managed HTTP response used by the client tests."""
 
-    def __init__(self, payload):
+    def __init__(self, payload, *, headers=None, status=200):
         self.payload = payload
+        self.headers = headers or {}
+        self.status = status
 
     def __enter__(self):
         return self
@@ -30,6 +32,9 @@ class FakeResponse:
 
     def read(self):
         return json.dumps(self.payload).encode("utf-8")
+
+    def getcode(self):
+        return self.status
 
 
 class ConnectWiseClientTests(unittest.TestCase):
@@ -277,6 +282,61 @@ class ConnectWiseClientTests(unittest.TestCase):
         message = str(caught.exception)
         self.assertNotIn("private-key", message)
         self.assertNotIn("Unauthorized", message)
+
+    def test_rate_limit_telemetry_is_sanitized_and_non_blocking(self):
+        observations = []
+
+        def opener(request, *, timeout):
+            del timeout
+            return FakeResponse(
+                [{"id": 7, "name": "Acme"}],
+                headers={
+                    "X-RateLimit-Limit": "1200",
+                    "X-RateLimit-Remaining": "1175",
+                    "X-RateLimit-Reset": "2026-07-28T13:00:00Z",
+                },
+            )
+
+        ConnectWiseClient(
+            self.configuration,
+            opener=opener,
+            telemetry_callback=observations.append,
+        ).test_connection()
+
+        self.assertEqual(observations[0]["httpStatus"], 200)
+        self.assertEqual(observations[0]["limit"], 1200)
+        self.assertEqual(observations[0]["remaining"], 1175)
+        self.assertFalse(observations[0]["limited"])
+        self.assertEqual(
+            observations[0]["requestPath"],
+            "/v4_6_release/apis/3.0/company/companies",
+        )
+        self.assertNotIn("companyId", observations[0])
+        self.assertNotIn("Authorization", str(observations[0]))
+
+    def test_http_429_emits_retry_telemetry_before_sanitized_error(self):
+        observations = []
+
+        def opener(request, *, timeout):
+            del timeout
+            raise HTTPError(
+                request.full_url,
+                429,
+                "Private provider response",
+                {"Retry-After": "45", "X-RateLimit-Remaining": "0"},
+                None,
+            )
+
+        with self.assertRaisesRegex(ConnectWiseRequestError, "HTTP 429"):
+            ConnectWiseClient(
+                self.configuration,
+                opener=opener,
+                telemetry_callback=observations.append,
+            ).test_connection()
+
+        self.assertTrue(observations[0]["limited"])
+        self.assertEqual(observations[0]["retryAfterSeconds"], 45)
+        self.assertEqual(observations[0]["remaining"], 0)
 
 
 if __name__ == "__main__":
