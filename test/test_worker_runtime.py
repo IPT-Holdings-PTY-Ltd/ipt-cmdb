@@ -94,7 +94,7 @@ class WorkerRuntimeTests(unittest.TestCase):
                 await started.wait()
                 cycle.cancel()
                 with self.assertRaises(asyncio.CancelledError):
-                    await cycle
+                    _ = await cycle
 
             self.assertTrue(execution_finished.is_set())
 

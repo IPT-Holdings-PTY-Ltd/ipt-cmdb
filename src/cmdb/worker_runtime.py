@@ -8,7 +8,6 @@ import os
 import socket
 import uuid
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -110,8 +109,7 @@ async def run_worker_cycle(
         result = await execution
     except asyncio.CancelledError:
         execution.cancel()
-        with suppress(asyncio.CancelledError):
-            await execution
+        await asyncio.gather(execution, return_exceptions=True)
         raise
     except Exception as error:
         LOGGER.exception("%s worker cycle failed", worker.name.capitalize())
