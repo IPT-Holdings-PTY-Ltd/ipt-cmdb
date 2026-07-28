@@ -406,14 +406,50 @@ export type ConnectWiseCiPolicy = {
 };
 
 export type IntegrationPreviewStatus = {
+  workerConfigured: boolean;
   workerEnabled: boolean;
+  workerHealthy: boolean;
   workerIntervalSeconds: number;
+  executionMode: 'embedded' | 'dedicated' | 'one_shot';
+  heartbeatAgeSeconds?: number | null;
+  runtime?: WorkerRuntimeStatus | null;
+  providerRateLimit?: ProviderRateLimitStatus | null;
   notificationWorkerEnabled: boolean;
   alertDeliveryConfigured: boolean;
   alertRecipientCount: number;
   enabledPolicies: number;
   pendingReviews: number;
   policies: ConnectWiseCiPolicy[];
+};
+
+export type WorkerRuntimeStatus = {
+  workerName: string;
+  workerId: string;
+  deploymentMode: 'embedded' | 'dedicated' | 'one_shot';
+  status: 'starting' | 'running' | 'degraded' | 'stopped';
+  intervalSeconds: number;
+  lastStartedAt?: string | null;
+  lastHeartbeatAt: string;
+  lastCycleStartedAt?: string | null;
+  lastCycleFinishedAt?: string | null;
+  lastSuccessAt?: string | null;
+  lastErrorAt?: string | null;
+  lastError?: string;
+  cyclesCompleted: number;
+  itemsProcessed: number;
+  metadata?: Record<string, unknown>;
+};
+
+export type ProviderRateLimitStatus = {
+  provider: string;
+  observedAt: string;
+  httpStatus?: number | null;
+  limit?: number | null;
+  remaining?: number | null;
+  resetAt?: string | null;
+  retryAfterSeconds?: number | null;
+  limited: boolean;
+  requestPath?: string;
 };
 
 export type CiReviewItem = {

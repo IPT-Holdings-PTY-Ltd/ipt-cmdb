@@ -148,6 +148,78 @@ def parse_timestamp(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
+def updated_worker_runtime(
+    current: dict[str, Any] | None,
+    worker_name: str,
+    worker_id: str,
+    deployment_mode: str,
+    interval_seconds: int,
+    event: str,
+    *,
+    processed: int = 0,
+    error: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply one worker lifecycle event to a JSON-safe runtime record."""
+
+    now = utc_now()
+    record = {
+        "workerName": worker_name[:80],
+        "workerId": worker_id[:160],
+        "deploymentMode": deployment_mode,
+        "status": "starting",
+        "intervalSeconds": max(1, min(int(interval_seconds), 86400)),
+        "lastStartedAt": None,
+        "lastHeartbeatAt": now,
+        "lastCycleStartedAt": None,
+        "lastCycleFinishedAt": None,
+        "lastSuccessAt": None,
+        "lastErrorAt": None,
+        "lastError": "",
+        "cyclesCompleted": 0,
+        "itemsProcessed": 0,
+        "metadata": {},
+        **deepcopy(current or {}),
+    }
+    record.update(
+        workerName=worker_name[:80],
+        workerId=worker_id[:160],
+        deploymentMode=deployment_mode,
+        intervalSeconds=max(1, min(int(interval_seconds), 86400)),
+        lastHeartbeatAt=now,
+    )
+    if event == "starting":
+        record.update(status="starting", lastStartedAt=now)
+    elif event == "cycle_started":
+        record.update(status="running", lastCycleStartedAt=now)
+    elif event == "heartbeat":
+        record["status"] = "running"
+    elif event == "cycle_succeeded":
+        record.update(
+            status="running",
+            lastCycleFinishedAt=now,
+            lastSuccessAt=now,
+            lastError="",
+            cyclesCompleted=int(record.get("cyclesCompleted") or 0) + 1,
+            itemsProcessed=int(record.get("itemsProcessed") or 0) + max(0, int(processed)),
+            metadata=deepcopy(metadata or {}),
+        )
+    elif event == "cycle_failed":
+        record.update(
+            status="degraded",
+            lastCycleFinishedAt=now,
+            lastErrorAt=now,
+            lastError=error[:500],
+            cyclesCompleted=int(record.get("cyclesCompleted") or 0) + 1,
+            metadata=deepcopy(metadata or {}),
+        )
+    elif event == "stopped":
+        record["status"] = "stopped"
+    else:
+        raise ValueError(f"Unsupported worker runtime event: {event}")
+    return record
+
+
 def canonical_uuid(kind: str, current_id: str) -> str:
     """Keep existing UUIDs and deterministically migrate prototype string IDs."""
     try:
@@ -271,6 +343,69 @@ class StateRepository:
         self.state.setdefault("changeTemplates", default_change_template_records())
         self.state.setdefault("providerCompanyObservations", [])
         self.state.setdefault("providerCompanyMappings", [])
+        self.state.setdefault("workerRuntimeStatus", {})
+        self.state.setdefault("providerRateLimitStatus", {})
+
+    def record_worker_runtime(
+        self,
+        worker_name: str,
+        worker_id: str,
+        deployment_mode: str,
+        interval_seconds: int,
+        event: str,
+        *,
+        processed: int = 0,
+        error: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict:
+        """Persist the latest worker heartbeat for local development and tests."""
+
+        current = self.state["workerRuntimeStatus"].get(worker_name)
+        stored = updated_worker_runtime(
+            current,
+            worker_name,
+            worker_id,
+            deployment_mode,
+            interval_seconds,
+            event,
+            processed=processed,
+            error=error,
+            metadata=metadata,
+        )
+        self.state["workerRuntimeStatus"][worker_name] = stored
+        self.save_state(self.state)
+        return deepcopy(stored)
+
+    def get_worker_runtime(self, worker_name: str) -> dict | None:
+        """Return one worker's latest local runtime evidence."""
+
+        stored = self.state.get("workerRuntimeStatus", {}).get(worker_name)
+        return deepcopy(stored) if stored else None
+
+    def record_provider_rate_limit(self, provider: str, observation: dict[str, Any]) -> dict:
+        """Retain only the latest sanitized provider throttle observation."""
+
+        stored = {
+            "provider": provider[:80],
+            "observedAt": utc_now(),
+            "httpStatus": observation.get("httpStatus"),
+            "limit": observation.get("limit"),
+            "remaining": observation.get("remaining"),
+            "resetAt": str(observation.get("resetAt") or "")[:160] or None,
+            "retryAfterSeconds": observation.get("retryAfterSeconds"),
+            "limited": bool(observation.get("limited")),
+            "requestPath": str(observation.get("requestPath") or "")[:500],
+            "metadata": deepcopy(observation.get("metadata") or {}),
+        }
+        self.state["providerRateLimitStatus"][provider] = stored
+        self.save_state(self.state)
+        return deepcopy(stored)
+
+    def get_provider_rate_limit(self, provider: str) -> dict | None:
+        """Return the latest local throttle observation for one provider."""
+
+        stored = self.state.get("providerRateLimitStatus", {}).get(provider)
+        return deepcopy(stored) if stored else None
 
     def list_companies(self) -> list[dict]:
         return deepcopy(self.state["companies"])
@@ -4843,6 +4978,203 @@ class PostgresCmdbRepository(StateRepository):
         super().__init__(state, save_state)
         self.connection_factory = connection_factory
         self._ensure_default_change_templates()
+
+    @staticmethod
+    def _worker_runtime_from_row(row: tuple) -> dict:
+        """Convert a canonical worker status row to the public runtime shape."""
+
+        return {
+            "workerName": row[0],
+            "workerId": row[1],
+            "deploymentMode": row[2],
+            "status": row[3],
+            "intervalSeconds": int(row[4]),
+            "lastStartedAt": PostgresCmdbRepository._timestamp(row[5]) or None,
+            "lastHeartbeatAt": PostgresCmdbRepository._timestamp(row[6]),
+            "lastCycleStartedAt": PostgresCmdbRepository._timestamp(row[7]) or None,
+            "lastCycleFinishedAt": PostgresCmdbRepository._timestamp(row[8]) or None,
+            "lastSuccessAt": PostgresCmdbRepository._timestamp(row[9]) or None,
+            "lastErrorAt": PostgresCmdbRepository._timestamp(row[10]) or None,
+            "lastError": row[11] or "",
+            "cyclesCompleted": int(row[12]),
+            "itemsProcessed": int(row[13]),
+            "metadata": row[14] or {},
+        }
+
+    def record_worker_runtime(
+        self,
+        worker_name: str,
+        worker_id: str,
+        deployment_mode: str,
+        interval_seconds: int,
+        event: str,
+        *,
+        processed: int = 0,
+        error: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict:
+        """Upsert a cross-replica worker heartbeat in canonical PostgreSQL."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT worker_name, worker_id, deployment_mode, status, interval_seconds,
+                       last_started_at, last_heartbeat_at, last_cycle_started_at,
+                       last_cycle_finished_at, last_success_at, last_error_at, last_error,
+                       cycles_completed, items_processed, metadata
+                FROM worker_runtime_status
+                WHERE worker_name = %s
+                FOR UPDATE
+                """,
+                (worker_name,),
+            )
+            row = cursor.fetchone()
+            current = self._worker_runtime_from_row(row) if row else None
+            stored = updated_worker_runtime(
+                current,
+                worker_name,
+                worker_id,
+                deployment_mode,
+                interval_seconds,
+                event,
+                processed=processed,
+                error=error,
+                metadata=metadata,
+            )
+            cursor.execute(
+                """
+                INSERT INTO worker_runtime_status (
+                    worker_name, worker_id, deployment_mode, status, interval_seconds,
+                    last_started_at, last_heartbeat_at, last_cycle_started_at,
+                    last_cycle_finished_at, last_success_at, last_error_at, last_error,
+                    cycles_completed, items_processed, metadata, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s::timestamptz, %s::timestamptz, %s::timestamptz,
+                    %s::timestamptz, %s::timestamptz, %s::timestamptz, %s,
+                    %s, %s, %s::jsonb, now()
+                )
+                ON CONFLICT (worker_name) DO UPDATE SET
+                    worker_id = EXCLUDED.worker_id,
+                    deployment_mode = EXCLUDED.deployment_mode,
+                    status = EXCLUDED.status,
+                    interval_seconds = EXCLUDED.interval_seconds,
+                    last_started_at = EXCLUDED.last_started_at,
+                    last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+                    last_cycle_started_at = EXCLUDED.last_cycle_started_at,
+                    last_cycle_finished_at = EXCLUDED.last_cycle_finished_at,
+                    last_success_at = EXCLUDED.last_success_at,
+                    last_error_at = EXCLUDED.last_error_at,
+                    last_error = EXCLUDED.last_error,
+                    cycles_completed = EXCLUDED.cycles_completed,
+                    items_processed = EXCLUDED.items_processed,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = now()
+                """,
+                (
+                    stored["workerName"],
+                    stored["workerId"],
+                    stored["deploymentMode"],
+                    stored["status"],
+                    stored["intervalSeconds"],
+                    stored["lastStartedAt"],
+                    stored["lastHeartbeatAt"],
+                    stored["lastCycleStartedAt"],
+                    stored["lastCycleFinishedAt"],
+                    stored["lastSuccessAt"],
+                    stored["lastErrorAt"],
+                    stored["lastError"] or None,
+                    stored["cyclesCompleted"],
+                    stored["itemsProcessed"],
+                    json.dumps(stored["metadata"]),
+                ),
+            )
+        return self.get_worker_runtime(worker_name) or stored
+
+    def get_worker_runtime(self, worker_name: str) -> dict | None:
+        """Return one canonical worker heartbeat."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT worker_name, worker_id, deployment_mode, status, interval_seconds,
+                       last_started_at, last_heartbeat_at, last_cycle_started_at,
+                       last_cycle_finished_at, last_success_at, last_error_at, last_error,
+                       cycles_completed, items_processed, metadata
+                FROM worker_runtime_status
+                WHERE worker_name = %s
+                """,
+                (worker_name,),
+            )
+            row = cursor.fetchone()
+        return self._worker_runtime_from_row(row) if row else None
+
+    def record_provider_rate_limit(self, provider: str, observation: dict[str, Any]) -> dict:
+        """Upsert sanitized provider throttle metadata without retaining payloads."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO provider_rate_limit_status (
+                    provider, observed_at, http_status, limit_value, remaining_value,
+                    reset_at, retry_after_seconds, limited, request_path, metadata, updated_at
+                ) VALUES (
+                    %s, now(), %s, %s, %s, %s, %s, %s, %s, %s::jsonb, now()
+                )
+                ON CONFLICT (provider) DO UPDATE SET
+                    observed_at = EXCLUDED.observed_at,
+                    http_status = EXCLUDED.http_status,
+                    limit_value = EXCLUDED.limit_value,
+                    remaining_value = EXCLUDED.remaining_value,
+                    reset_at = EXCLUDED.reset_at,
+                    retry_after_seconds = EXCLUDED.retry_after_seconds,
+                    limited = EXCLUDED.limited,
+                    request_path = EXCLUDED.request_path,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = now()
+                """,
+                (
+                    provider[:80],
+                    observation.get("httpStatus"),
+                    observation.get("limit"),
+                    observation.get("remaining"),
+                    str(observation.get("resetAt") or "")[:160] or None,
+                    observation.get("retryAfterSeconds"),
+                    bool(observation.get("limited")),
+                    str(observation.get("requestPath") or "")[:500] or None,
+                    json.dumps(observation.get("metadata") or {}),
+                ),
+            )
+        return self.get_provider_rate_limit(provider) or {}
+
+    def get_provider_rate_limit(self, provider: str) -> dict | None:
+        """Return the latest canonical throttle observation for one provider."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT provider, observed_at, http_status, limit_value, remaining_value,
+                       reset_at, retry_after_seconds, limited, request_path, metadata
+                FROM provider_rate_limit_status
+                WHERE provider = %s
+                """,
+                (provider,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "provider": row[0],
+            "observedAt": self._timestamp(row[1]),
+            "httpStatus": row[2],
+            "limit": row[3],
+            "remaining": row[4],
+            "resetAt": row[5] or None,
+            "retryAfterSeconds": row[6],
+            "limited": bool(row[7]),
+            "requestPath": row[8] or "",
+            "metadata": row[9] or {},
+        }
 
     @staticmethod
     def _change_template_from_row(row: tuple) -> dict:

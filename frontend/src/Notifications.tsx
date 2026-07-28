@@ -15,8 +15,17 @@ import { useWorkspace } from './workspace';
 
 type Notice = { severity: 'success' | 'error' | 'info' | 'warning'; message: string } | null;
 type NotificationStatus = {
+  workerConfigured: boolean;
   workerEnabled: boolean;
+  workerHealthy: boolean;
   workerIntervalSeconds: number;
+  executionMode: 'embedded' | 'dedicated' | 'one_shot';
+  heartbeatAgeSeconds?: number | null;
+  runtime?: {
+    status: 'starting' | 'running' | 'degraded' | 'stopped';
+    lastSuccessAt?: string | null;
+    lastError?: string;
+  } | null;
   queued: number;
   failed: number;
   deadLetter: number;
@@ -207,8 +216,9 @@ export function NotificationsPage() {
     </Stack>
     {notice && <Alert severity={notice.severity} onClose={() => setNotice(null)} sx={{ mb: 2 }}>{notice.message}</Alert>}
     {status && !status.email.enabled && <Alert severity="warning" sx={{ mb: 2 }}>Microsoft 365 email delivery is disabled. Rules can be evaluated safely, but queued messages will not be sent.</Alert>}
+    {status?.workerConfigured && !status.workerHealthy && <Alert severity="warning" sx={{ mb: 2 }}>The {status.executionMode.replaceAll('_', ' ')} notification worker is configured but has no fresh heartbeat.{status.runtime?.lastError ? ` Last error: ${status.runtime.lastError}` : ''}</Alert>}
     <Grid container spacing={2} sx={{ mb: 3 }}>
-      <Grid size={{ xs: 6, md: 2.4 }}><SummaryCard label="Worker" value={status?.workerEnabled ? 'Running' : 'Manual'} tone={status?.workerEnabled ? 'success.main' : 'warning.main'} /></Grid>
+      <Grid size={{ xs: 6, md: 2.4 }}><SummaryCard label="Worker" value={status?.workerHealthy ? `${status.executionMode.replaceAll('_', ' ')} · healthy` : status?.workerConfigured ? 'Attention' : 'Manual'} tone={status?.workerHealthy ? 'success.main' : 'warning.main'} /></Grid>
       <Grid size={{ xs: 6, md: 2.4 }}><SummaryCard label="Queued" value={status?.queued ?? '—'} /></Grid>
       <Grid size={{ xs: 6, md: 2.4 }}><SummaryCard label="Retrying" value={status?.failed ?? '—'} tone="warning.main" /></Grid>
       <Grid size={{ xs: 6, md: 2.4 }}><SummaryCard label="Dead letter" value={status?.deadLetter ?? '—'} tone="error.main" /></Grid>

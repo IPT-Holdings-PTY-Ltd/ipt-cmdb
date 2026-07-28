@@ -28,6 +28,15 @@
     },
     "entraClientSecret": {
       "value": "${CMDB_ENTRA_CLIENT_SECRET}"
+    },
+    "workerDeploymentMode": {
+      "value": "${CMDB_WORKER_DEPLOYMENT_MODE}"
+    },
+    "notificationWorkerSetting": {
+      "value": "${CMDB_ENABLE_NOTIFICATION_WORKER}"
+    },
+    "integrationWorkerSetting": {
+      "value": "${CMDB_ENABLE_INTEGRATION_WORKER}"
     }
   }
 }

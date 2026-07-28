@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from collections.abc import Callable
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
+
+LOGGER = logging.getLogger("cmdb.integrations.connectwise")
 
 
 class ConnectWiseConfigurationError(ValueError):
@@ -181,6 +184,7 @@ class ConnectWiseClient:
         *,
         opener: Callable[..., Any] = urlopen,
         timeout: int = 20,
+        telemetry_callback: Callable[[dict[str, Any]], Any] | None = None,
     ):
         self.base_url = normalize_base_url(str(configuration.get("baseUrl") or ""))
         required = {
@@ -207,6 +211,61 @@ class ConnectWiseClient:
         self.page_size = page_size
         self.timeout = max(5, min(int(timeout), 60))
         self.opener = opener
+        self.telemetry_callback = telemetry_callback
+
+    @staticmethod
+    def _bounded_non_negative_integer(value: Any) -> int | None:
+        """Return a non-negative integer from a provider header when possible."""
+
+        try:
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 0 else None
+
+    def _record_telemetry(self, source: Any, request: Request, status: int) -> None:
+        """Emit sanitized throttle metadata without affecting provider reads."""
+
+        if not self.telemetry_callback:
+            return
+        raw_headers = getattr(source, "headers", None)
+        if raw_headers is None and hasattr(source, "info"):
+            raw_headers = source.info()
+        items = (
+            raw_headers.items() if raw_headers is not None and hasattr(raw_headers, "items") else []
+        )
+        headers = {str(key).casefold(): str(value) for key, value in items}
+
+        def first(*names: str) -> str | None:
+            return next((headers[name] for name in names if headers.get(name)), None)
+
+        limit = self._bounded_non_negative_integer(
+            first("x-ratelimit-limit", "x-rate-limit-limit", "ratelimit-limit")
+        )
+        remaining = self._bounded_non_negative_integer(
+            first("x-ratelimit-remaining", "x-rate-limit-remaining", "ratelimit-remaining")
+        )
+        retry_after = self._bounded_non_negative_integer(first("retry-after"))
+        reset_at = first("x-ratelimit-reset", "x-rate-limit-reset", "ratelimit-reset")
+        try:
+            self.telemetry_callback(
+                {
+                    "httpStatus": status,
+                    "limit": limit,
+                    "remaining": remaining,
+                    "resetAt": str(reset_at or "")[:160] or None,
+                    "retryAfterSeconds": retry_after,
+                    "limited": status == 429 or remaining == 0,
+                    "requestPath": urlparse(request.full_url).path[:500],
+                    "metadata": {
+                        "rateLimitHeadersPresent": any(
+                            value is not None for value in (limit, remaining, reset_at, retry_after)
+                        )
+                    },
+                }
+            )
+        except Exception:
+            LOGGER.exception("Could not persist sanitized ConnectWise request telemetry")
 
     def _collection(self, path: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
         """Fetch one hard-coded API collection with sanitized provider errors."""
@@ -221,7 +280,15 @@ class ConnectWiseClient:
             # The URL is validated as an administrator-supplied HTTPS endpoint above.
             with self.opener(request, timeout=self.timeout) as response:  # nosec B310
                 payload = json.loads(response.read())
+                self._record_telemetry(
+                    response,
+                    request,
+                    int(getattr(response, "status", None) or response.getcode() or 200)
+                    if hasattr(response, "getcode")
+                    else int(getattr(response, "status", None) or 200),
+                )
         except HTTPError as error:
+            self._record_telemetry(error, request, int(error.code))
             raise ConnectWiseRequestError(f"ConnectWise returned HTTP {error.code}") from error
         except (URLError, TimeoutError) as error:
             raise ConnectWiseRequestError(

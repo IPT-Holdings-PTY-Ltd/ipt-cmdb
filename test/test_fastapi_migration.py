@@ -162,6 +162,81 @@ class FastApiMigrationTests(unittest.TestCase):
 
         asyncio.run(exercise_lifespan())
 
+    def test_web_process_role_never_starts_embedded_workers(self):
+        events: list[str] = []
+
+        async def worker() -> None:
+            events.append("started")
+
+        async def exercise_lifespan() -> None:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "CMDB_PROCESS_ROLE": "web",
+                        "NOTIFICATION_WORKER_ENABLED": "true",
+                        "INTEGRATION_WORKER_ENABLED": "true",
+                    },
+                ),
+                patch.object(backend_main, "_notification_worker_loop", worker),
+                patch.object(backend_main, "_integration_worker_loop", worker),
+            ):
+                async with backend_main.application_lifespan(api):
+                    await asyncio.sleep(0)
+            self.assertEqual(events, [])
+
+        asyncio.run(exercise_lifespan())
+
+    def test_worker_status_surfaces_durable_heartbeat_and_provider_quota(self):
+        headers = self._headers("admin@example.com")
+        backend_main.REPOSITORY.record_worker_runtime(
+            "integrations",
+            "worker-status-test",
+            "dedicated",
+            60,
+            "starting",
+        )
+        backend_main.REPOSITORY.record_worker_runtime(
+            "integrations",
+            "worker-status-test",
+            "dedicated",
+            60,
+            "cycle_succeeded",
+            processed=4,
+        )
+        backend_main.REPOSITORY.record_provider_rate_limit(
+            "connectwise",
+            {
+                "httpStatus": 200,
+                "limit": 1000,
+                "remaining": 900,
+                "requestPath": "/company/companies",
+            },
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "CMDB_PROCESS_ROLE": "web",
+                "INTEGRATION_WORKER_ENABLED": "true",
+                "NOTIFICATION_WORKER_ENABLED": "true",
+            },
+        ):
+            response = self.client.get(
+                "/api/integrations/continuous-preview/status",
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        status = response.json()
+        self.assertTrue(status["workerConfigured"])
+        self.assertTrue(status["workerEnabled"])
+        self.assertTrue(status["workerHealthy"])
+        self.assertTrue(status["notificationWorkerEnabled"])
+        self.assertEqual(status["executionMode"], "dedicated")
+        self.assertEqual(status["runtime"]["itemsProcessed"], 4)
+        self.assertEqual(status["providerRateLimit"]["remaining"], 900)
+
     def test_authorization_matrix_enforces_customer_read_scope(self):
         routes = [
             "/api/dashboard?companyId={company}",

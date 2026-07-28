@@ -112,6 +112,7 @@ from src.cmdb.repository import (
     hash_password,
     integration_connection_audit_value,
 )
+from src.cmdb.worker_runtime import PeriodicWorker, process_role, run_periodic_worker
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST", ROOT / "frontend" / "dist"))
@@ -162,13 +163,8 @@ def _integration_alert_delivery_ready() -> bool:
     """Return whether unattended integration alerts can enter a live outbox."""
 
     connection = REPOSITORY.get_email_connection()
-    notification_worker = os.getenv("NOTIFICATION_WORKER_ENABLED", "false").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
     return bool(
-        notification_worker
+        _worker_flag("NOTIFICATION_WORKER_ENABLED")
         and connection.get("enabled")
         and connection.get("senderAddress")
         and connection.get("status") in {"configured", "verified"}
@@ -270,29 +266,105 @@ def _queue_integration_alert(
         return None
 
 
+def _worker_flag(name: str) -> bool:
+    """Return whether one deployment-owned background function is enabled."""
+
+    return os.getenv(name, "false").strip().casefold() in {"1", "true", "yes"}
+
+
+def _worker_runtime_summary(worker_name: str, configured: bool, interval: int) -> dict:
+    """Combine deployment intent with durable heartbeat freshness."""
+
+    runtime = REPOSITORY.get_worker_runtime(worker_name)
+    heartbeat_age: int | None = None
+    fresh = False
+    if runtime and runtime.get("lastHeartbeatAt"):
+        try:
+            heartbeat = datetime.fromisoformat(
+                str(runtime["lastHeartbeatAt"]).replace("Z", "+00:00")
+            )
+            if not heartbeat.tzinfo:
+                heartbeat = heartbeat.replace(tzinfo=UTC)
+            heartbeat_age = max(0, int((datetime.now(UTC) - heartbeat).total_seconds()))
+            fresh = heartbeat_age <= max(120, interval * 3)
+        except ValueError:
+            fresh = False
+    runtime_status = str((runtime or {}).get("status") or "")
+    mode = str((runtime or {}).get("deploymentMode") or "")
+    healthy = fresh and (
+        runtime_status in {"starting", "running"}
+        or (
+            mode == "one_shot"
+            and runtime_status == "stopped"
+            and bool((runtime or {}).get("lastSuccessAt"))
+        )
+    )
+    return {
+        "workerConfigured": configured,
+        "workerEnabled": configured,
+        "workerHealthy": healthy,
+        "executionMode": mode or ("embedded" if process_role() == "combined" else "dedicated"),
+        "heartbeatAgeSeconds": heartbeat_age,
+        "runtime": runtime,
+    }
+
+
+def _notification_worker_cycle() -> dict[str, Any]:
+    """Evaluate notification rules and drain the outbox as one observable cycle."""
+
+    evaluated = _run_notification_scan()
+    delivered = _process_notification_outbox()
+    return {
+        "processed": delivered["processed"],
+        "rulesEvaluated": evaluated["rulesEvaluated"],
+        "candidates": evaluated["candidates"],
+        "queued": evaluated["queued"],
+        "accepted": delivered["accepted"],
+        "failed": delivered["failed"],
+        "deadLetter": delivered["deadLetter"],
+    }
+
+
+def _notification_worker_definition() -> PeriodicWorker:
+    """Return the reusable notification worker definition."""
+
+    return PeriodicWorker(
+        name="notifications",
+        interval_seconds=_notification_worker_interval(),
+        execute=_notification_worker_cycle,
+    )
+
+
+def _integration_worker_definition() -> PeriodicWorker:
+    """Return the reusable read-only integration worker definition."""
+
+    return PeriodicWorker(
+        name="integrations",
+        interval_seconds=_integration_worker_interval(),
+        execute=_run_due_integration_previews,
+    )
+
+
+async def _run_worker_definition(worker: PeriodicWorker, *, one_shot: bool = False) -> bool:
+    """Execute one reusable worker in embedded, dedicated, or one-shot mode."""
+
+    return await run_periodic_worker(
+        worker,
+        REPOSITORY.record_worker_runtime,
+        one_shot=one_shot,
+    )
+
+
 async def _notification_worker_loop() -> None:
     """Periodically evaluate rules and drain the durable email outbox."""
 
-    interval = _notification_worker_interval()
-    while True:
-        try:
-            await asyncio.to_thread(_run_notification_scan)
-            await asyncio.to_thread(_process_notification_outbox)
-        except Exception:
-            LOGGER.exception("Notification worker cycle failed")
-        await asyncio.sleep(interval)
+    await _run_worker_definition(_notification_worker_definition())
 
 
 async def _integration_worker_loop() -> None:
     """Lease and run due read-only integration discovery policies."""
 
-    interval = _integration_worker_interval()
-    while True:
-        try:
-            await asyncio.to_thread(_run_due_integration_previews)
-        except Exception:
-            LOGGER.exception("Integration preview worker cycle failed")
-        await asyncio.sleep(interval)
+    await _run_worker_definition(_integration_worker_definition())
 
 
 @asynccontextmanager
@@ -300,9 +372,10 @@ async def application_lifespan(_application: FastAPI):
     """Run optional durable workers and stop them cleanly on shutdown."""
 
     tasks: list[asyncio.Task[None]] = []
-    if os.getenv("NOTIFICATION_WORKER_ENABLED", "false").lower() in {"1", "true", "yes"}:
+    workers_embedded = process_role() == "combined"
+    if workers_embedded and _worker_flag("NOTIFICATION_WORKER_ENABLED"):
         tasks.append(asyncio.create_task(_notification_worker_loop()))
-    if os.getenv("INTEGRATION_WORKER_ENABLED", "false").lower() in {"1", "true", "yes"}:
+    if workers_embedded and _worker_flag("INTEGRATION_WORKER_ENABLED"):
         tasks.append(asyncio.create_task(_integration_worker_loop()))
     try:
         yield
@@ -1233,6 +1306,7 @@ def health() -> dict:
         "databaseAvailable": database_available,
         "expectedSchemaVersion": core.SCHEMA_VERSION,
         "authentication": os.getenv("AUTH_MODE", "local"),
+        "processRole": process_role(),
     }
 
 
@@ -3609,9 +3683,13 @@ def get_notification_status(request: Request) -> dict:
     _require_role(user, {"platform_admin"}, "Notifications require platform admin access")
     outbox = REPOSITORY.list_email_outbox(500)
     events = REPOSITORY.list_notification_events(limit=500)
+    runtime = _worker_runtime_summary(
+        "notifications",
+        _worker_flag("NOTIFICATION_WORKER_ENABLED"),
+        _notification_worker_interval(),
+    )
     return {
-        "workerEnabled": os.getenv("NOTIFICATION_WORKER_ENABLED", "false").lower()
-        in {"1", "true", "yes"},
+        **runtime,
         "workerIntervalSeconds": _notification_worker_interval(),
         "email": public_email_connection(REPOSITORY.get_email_connection()),
         "queued": sum(item.get("status") == "queued" for item in outbox),
@@ -4769,7 +4847,17 @@ def _connectwise_connection_public() -> dict:
 def _connectwise_adapter() -> ConnectWiseProvider:
     """Build the reference adapter while keeping the HTTP client replaceable in tests."""
 
-    return ConnectWiseProvider(client_factory=ConnectWiseClient)
+    return ConnectWiseProvider(client_factory=_connectwise_client)
+
+
+def _connectwise_client(configuration: dict[str, Any]) -> ConnectWiseClient:
+    """Build a client that emits sanitized provider request telemetry."""
+
+    client = ConnectWiseClient(configuration)
+    client.telemetry_callback = lambda observation: REPOSITORY.record_provider_rate_limit(
+        "connectwise", observation
+    )
+    return client
 
 
 def _connectwise_company_rows(company_ids: set[str] | None = None) -> list[dict]:
@@ -5125,7 +5213,7 @@ def _connectwise_configuration_context(
 
     mapped = _connectwise_mapped_company(company_id, provider_company_id)
     configuration, source = _connectwise_effective_configuration()
-    records = ConnectWiseClient(configuration).discover_configurations(provider_company_id)
+    records = _connectwise_client(configuration).discover_configurations(provider_company_id)
     policy = REPOSITORY.get_ci_sync_policy("connectwise", company_id, provider_company_id)
     return mapped, records, source, policy
 
@@ -5526,14 +5614,18 @@ def continuous_preview_status(request: Request) -> dict:
         limit=1,
     )["total"]
     connection_enabled = bool(_connectwise_connection_public().get("enabled"))
+    runtime = _worker_runtime_summary(
+        "integrations",
+        _worker_flag("INTEGRATION_WORKER_ENABLED"),
+        _integration_worker_interval(),
+    )
     return {
-        "workerEnabled": os.getenv("INTEGRATION_WORKER_ENABLED", "false").lower()
-        in {"1", "true", "yes"},
+        **runtime,
         "workerIntervalSeconds": _integration_worker_interval(),
-        "notificationWorkerEnabled": os.getenv("NOTIFICATION_WORKER_ENABLED", "false").lower()
-        in {"1", "true", "yes"},
+        "notificationWorkerEnabled": _worker_flag("NOTIFICATION_WORKER_ENABLED"),
         "alertDeliveryConfigured": _integration_alert_delivery_ready(),
         "alertRecipientCount": len(_integration_alert_recipients()),
+        "providerRateLimit": REPOSITORY.get_provider_rate_limit("connectwise"),
         "enabledPolicies": sum(
             item.get("enabled") and item.get("syncMode") == "continuous_preview"
             for item in policies

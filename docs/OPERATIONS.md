@@ -16,6 +16,8 @@ surfaces rather than traffic gates.
 - PostgreSQL storage, connections, locks and replication/backup state
 - Schema version against the packaged expected version
 - Integration last-run status and age
+- Background worker heartbeat, deployment mode and last successful cycle
+- Provider quota remaining or retry-after state when the provider supplies it
 - Reconciliation backlog
 - CIs with stale observations, missing owners or no relationships
 - Upcoming renewals and end-of-life dates

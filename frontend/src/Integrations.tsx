@@ -232,6 +232,7 @@ export function IntegrationsPage() {
       </Stack>
 
       {error ? <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert> : null}
+      {previewStatus?.workerConfigured && !previewStatus.workerHealthy ? <Alert severity="warning" sx={{ mb: 2 }}>The {previewStatus.executionMode.replaceAll('_', ' ')} integration worker is configured but has no fresh heartbeat. Review the worker container or Container App logs before relying on scheduled discovery.</Alert> : null}
       {loading ? <Card><CardContent><Stack direction="row" spacing={2} sx={{ alignItems: 'center' }}><CircularProgress size={22} /><Typography>Loading integration directory…</Typography></Stack></CardContent></Card> : <>
         <Grid container spacing={2} sx={{ mb: 3 }}>
           <Grid size={{ xs: 12, sm: 4 }}><Metric label="Installed" value={installed.length} detail="Configured provider connections" /></Grid>
@@ -270,6 +271,8 @@ export function IntegrationsPage() {
                     <Typography color="text.secondary">{entry.description}</Typography>
                     <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
                       {availableOperations.length ? availableOperations.map(operation => <Chip key={operation.key} size="small" variant="outlined" label={`${operation.label} · ${operation.direction}`} />) : <Chip size="small" variant="outlined" label="Provider capability" />}
+                      {entry.key === 'connectwise' && previewStatus?.workerConfigured && <Chip size="small" color={previewStatus.workerHealthy ? 'success' : 'warning'} variant="outlined" label={`${previewStatus.executionMode.replaceAll('_', ' ')} worker ${previewStatus.workerHealthy ? 'healthy' : 'needs attention'}`} />}
+                      {entry.key === 'connectwise' && previewStatus?.providerRateLimit && <Chip size="small" color={previewStatus.providerRateLimit.limited ? 'error' : 'info'} variant="outlined" label={previewStatus.providerRateLimit.remaining != null ? `API quota ${previewStatus.providerRateLimit.remaining}${previewStatus.providerRateLimit.limit != null ? ` / ${previewStatus.providerRateLimit.limit}` : ''}` : `Last API response ${previewStatus.providerRateLimit.httpStatus || 'observed'}`} />}
                     </Stack>
                     <Grid container spacing={1.5}>
                       <Grid size={{ xs: 12, sm: 6 }}><Typography variant="caption" color="text.secondary">Last activity</Typography><Typography variant="body2">{formatDate(entry.integration?.lastSync)}</Typography></Grid>

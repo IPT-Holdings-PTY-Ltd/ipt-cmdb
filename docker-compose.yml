@@ -8,6 +8,7 @@ services:
       DATA_DIR: /app/data
       DATABASE_URL: postgresql://cmdb:${POSTGRES_PASSWORD:-cmdb}@postgres:5432/cmdb
       DATABASE_SEED_MODE: demo
+      CMDB_PROCESS_ROLE: ${CMDB_PROCESS_ROLE:-combined}
       AUTH_MODE: ${AUTH_MODE:-local}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
       ALLOW_LOCAL_DEVELOPMENT: "false"

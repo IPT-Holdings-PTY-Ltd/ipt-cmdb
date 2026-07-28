@@ -1,0 +1,41 @@
+# Optional worker split for compose.production.yml or compose.appliance.yml.
+# Apply only after the web service has initialized and /api/ready succeeds.
+services:
+  cmdb:
+    environment:
+      CMDB_PROCESS_ROLE: web
+
+  worker:
+    image: ${CMDB_IMAGE:?Set CMDB_IMAGE to the same immutable image as the web service}
+    command: ["python", "-m", "backend.worker"]
+    environment:
+      DATA_DIR: /app/data
+      DATABASE_URL_FILE: /run/secrets/database_url
+      DATABASE_SEED_MODE: empty
+      CMDB_PROCESS_ROLE: worker
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?Set BOOTSTRAP_ADMIN_EMAIL}
+      BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/bootstrap_admin_password
+      MFA_ENCRYPTION_KEY_FILE: /run/secrets/mfa_encryption_key
+      ALLOW_UI_DATABASE_CONFIG: "false"
+      ALLOW_LOCAL_DEVELOPMENT: "false"
+      NOTIFICATION_WORKER_ENABLED: ${NOTIFICATION_WORKER_ENABLED:-false}
+      NOTIFICATION_WORKER_INTERVAL_SECONDS: ${NOTIFICATION_WORKER_INTERVAL_SECONDS:-60}
+      INTEGRATION_WORKER_ENABLED: ${INTEGRATION_WORKER_ENABLED:-false}
+      INTEGRATION_WORKER_INTERVAL_SECONDS: ${INTEGRATION_WORKER_INTERVAL_SECONDS:-60}
+      INTEGRATION_ALERT_RECIPIENTS: ${INTEGRATION_ALERT_RECIPIENTS:-}
+    secrets:
+      - database_url
+      - bootstrap_admin_password
+      - mfa_encryption_key
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: ${CMDB_WORKER_MEMORY_LIMIT:-512m}
+    cpus: ${CMDB_WORKER_CPU_LIMIT:-0.5}
+    restart: unless-stopped
+    stop_grace_period: 30s

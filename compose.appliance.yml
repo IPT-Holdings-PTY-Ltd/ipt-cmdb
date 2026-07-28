@@ -8,6 +8,7 @@ services:
       DATA_DIR: /app/data
       DATABASE_URL_FILE: /run/secrets/database_url
       DATABASE_SEED_MODE: empty
+      CMDB_PROCESS_ROLE: ${CMDB_PROCESS_ROLE:-combined}
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?Set BOOTSTRAP_ADMIN_EMAIL}
       BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/bootstrap_admin_password
       AUTH_MODE: ${AUTH_MODE:-local}
