@@ -219,6 +219,7 @@ class FastApiMigrationTests(unittest.TestCase):
             {
                 "CMDB_PROCESS_ROLE": "web",
                 "INTEGRATION_WORKER_ENABLED": "true",
+                "NOTIFICATION_WORKER_ENABLED": "true",
             },
         ):
             response = self.client.get(
@@ -229,7 +230,9 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         status = response.json()
         self.assertTrue(status["workerConfigured"])
+        self.assertTrue(status["workerEnabled"])
         self.assertTrue(status["workerHealthy"])
+        self.assertTrue(status["notificationWorkerEnabled"])
         self.assertEqual(status["executionMode"], "dedicated")
         self.assertEqual(status["runtime"]["itemsProcessed"], 4)
         self.assertEqual(status["providerRateLimit"]["remaining"], 900)

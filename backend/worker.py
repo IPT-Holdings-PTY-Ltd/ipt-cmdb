@@ -17,9 +17,9 @@ def _enabled_workers() -> list:
     """Return explicitly enabled worker definitions."""
 
     workers = []
-    if os.getenv("NOTIFICATION_WORKER_ENABLED", "false").casefold() in {"1", "true", "yes"}:
+    if backend_main._worker_flag("NOTIFICATION_WORKER_ENABLED"):
         workers.append(backend_main._notification_worker_definition())
-    if os.getenv("INTEGRATION_WORKER_ENABLED", "false").casefold() in {"1", "true", "yes"}:
+    if backend_main._worker_flag("INTEGRATION_WORKER_ENABLED"):
         workers.append(backend_main._integration_worker_definition())
     return workers
 

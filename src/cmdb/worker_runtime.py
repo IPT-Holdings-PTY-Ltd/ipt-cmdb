@@ -8,6 +8,7 @@ import os
 import socket
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -96,8 +97,8 @@ async def run_worker_cycle(
     """Run one worker cycle and record its bounded result."""
 
     _observe(observer, worker, worker_id, mode, "cycle_started")
+    execution = asyncio.create_task(asyncio.to_thread(worker.execute))
     try:
-        execution = asyncio.create_task(asyncio.to_thread(worker.execute))
         heartbeat_interval = max(5, min(worker.interval_seconds, 30))
         while not execution.done():
             completed, _pending = await asyncio.wait(
@@ -107,6 +108,11 @@ async def run_worker_cycle(
             if not completed:
                 _observe(observer, worker, worker_id, mode, "heartbeat")
         result = await execution
+    except asyncio.CancelledError:
+        execution.cancel()
+        with suppress(asyncio.CancelledError):
+            await execution
+        raise
     except Exception as error:
         LOGGER.exception("%s worker cycle failed", worker.name.capitalize())
         _observe(

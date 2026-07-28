@@ -69,6 +69,37 @@ class WorkerRuntimeTests(unittest.TestCase):
         self.assertIn("RuntimeError", runtime["lastError"])
         self.assertIsNotNone(runtime["lastErrorAt"])
 
+    def test_cancelled_cycle_cancels_and_awaits_execution_task(self):
+        async def exercise_cancellation() -> None:
+            started = asyncio.Event()
+            execution_finished = asyncio.Event()
+
+            async def fake_to_thread(_execute):
+                started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    execution_finished.set()
+
+            worker = PeriodicWorker("integrations", 60, lambda: {"processed": 0})
+            with patch("src.cmdb.worker_runtime.asyncio.to_thread", fake_to_thread):
+                cycle = asyncio.create_task(
+                    run_worker_cycle(
+                        worker,
+                        self.repository.record_worker_runtime,
+                        worker_id="worker-test",
+                        mode="dedicated",
+                    )
+                )
+                await started.wait()
+                cycle.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await cycle
+
+            self.assertTrue(execution_finished.is_set())
+
+        asyncio.run(exercise_cancellation())
+
     def test_invalid_process_role_falls_back_to_combined(self):
         with patch.dict("os.environ", {"CMDB_PROCESS_ROLE": "not-a-role"}):
             self.assertEqual(process_role(), "combined")

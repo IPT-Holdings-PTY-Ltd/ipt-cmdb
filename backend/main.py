@@ -163,13 +163,8 @@ def _integration_alert_delivery_ready() -> bool:
     """Return whether unattended integration alerts can enter a live outbox."""
 
     connection = REPOSITORY.get_email_connection()
-    notification_worker = os.getenv("NOTIFICATION_WORKER_ENABLED", "false").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
     return bool(
-        notification_worker
+        _worker_flag("NOTIFICATION_WORKER_ENABLED")
         and connection.get("enabled")
         and connection.get("senderAddress")
         and connection.get("status") in {"configured", "verified"}
@@ -274,7 +269,7 @@ def _queue_integration_alert(
 def _worker_flag(name: str) -> bool:
     """Return whether one deployment-owned background function is enabled."""
 
-    return os.getenv(name, "false").casefold() in {"1", "true", "yes"}
+    return os.getenv(name, "false").strip().casefold() in {"1", "true", "yes"}
 
 
 def _worker_runtime_summary(worker_name: str, configured: bool, interval: int) -> dict:
@@ -304,10 +299,9 @@ def _worker_runtime_summary(worker_name: str, configured: bool, interval: int) -
             and bool((runtime or {}).get("lastSuccessAt"))
         )
     )
-    embedded_configured = configured and process_role() == "combined"
     return {
         "workerConfigured": configured,
-        "workerEnabled": embedded_configured or healthy,
+        "workerEnabled": configured,
         "workerHealthy": healthy,
         "executionMode": mode or ("embedded" if process_role() == "combined" else "dedicated"),
         "heartbeatAgeSeconds": heartbeat_age,
@@ -5628,11 +5622,7 @@ def continuous_preview_status(request: Request) -> dict:
     return {
         **runtime,
         "workerIntervalSeconds": _integration_worker_interval(),
-        "notificationWorkerEnabled": _worker_runtime_summary(
-            "notifications",
-            _worker_flag("NOTIFICATION_WORKER_ENABLED"),
-            _notification_worker_interval(),
-        )["workerEnabled"],
+        "notificationWorkerEnabled": _worker_flag("NOTIFICATION_WORKER_ENABLED"),
         "alertDeliveryConfigured": _integration_alert_delivery_ready(),
         "alertRecipientCount": len(_integration_alert_recipients()),
         "providerRateLimit": REPOSITORY.get_provider_rate_limit("connectwise"),
