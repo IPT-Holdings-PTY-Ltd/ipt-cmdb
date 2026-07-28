@@ -6,10 +6,10 @@ import {
   Alert, Autocomplete, Box, Button, Card, CardActions, CardContent, Chip, CircularProgress, Dialog, DialogActions,
   DialogContent, DialogTitle, FormControl, Grid, InputLabel, MenuItem, Select, Stack, TextField, Typography,
 } from '@mui/material';
-import { useEffect, useMemo, useState } from 'react';
-import { Title } from 'react-admin';
-import { useNavigate } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router';
 import { apiFetch, getSession } from './session';
+import { Title } from './ui';
 import type { Asset, AssetMetadata, Contact, Relationship } from './types';
 import { useWorkspace } from './workspace';
 
@@ -50,7 +50,7 @@ export function BusinessSystemsPage() {
   const [error, setError] = useState('');
   const [draft, setDraft] = useState<BusinessSystemDraft | null>(null);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true); setError('');
     try {
       const suffix = `?companyId=${encodeURIComponent(workspace.companyId)}`;
@@ -61,9 +61,9 @@ export function BusinessSystemsPage() {
       setAssets(assetData); setRelationships(relationshipData); setContacts(contactData);
     } catch (value) { setError(value instanceof Error ? value.message : 'Business systems could not be loaded.'); }
     finally { setLoading(false); }
-  };
+  }, [workspace.companyId]);
 
-  useEffect(() => { if (!workspace.isRoot) void load(); }, [workspace.companyId, workspace.isRoot]);
+  useEffect(() => { if (!workspace.isRoot) void load(); }, [workspace.isRoot, load]);
   const systems = useMemo(() => assets.filter(asset => asset.type === 'Business system').sort((a, b) => a.name.localeCompare(b.name)), [assets]);
 
   const editSystem = (asset: Asset) => setDraft({

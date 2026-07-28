@@ -11,10 +11,10 @@ import {
   MenuItem, Paper, Select, Stack, Tab, Table, TableBody, TableCell, TableContainer,
   TableHead, TablePagination, TableRow, Tabs, TextField, Typography,
 } from '@mui/material';
-import { useEffect, useMemo, useState } from 'react';
-import { Title } from 'react-admin';
-import { Navigate } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Navigate } from 'react-router';
 import { apiFetch, getSession } from './session';
+import { Title } from './ui';
 import type {
   Asset, CiReviewItem, FieldAuthorityCatalogue, FieldAuthorityRule,
   IntegrationObjectSuppression, IntegrationObjectSuppressionQueue,
@@ -94,7 +94,7 @@ export function ReconciliationPage() {
     [rules, companyId],
   );
 
-  async function loadReferences() {
+  const loadReferences = useCallback(async () => {
     try {
       const [authorityCatalogue, storedRules] = await Promise.all([
         apiFetch<FieldAuthorityCatalogue>('/api/field-authority/catalogue'),
@@ -105,9 +105,9 @@ export function ReconciliationPage() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Reconciliation controls could not be loaded.');
     }
-  }
+  }, []);
 
-  async function loadQueue() {
+  const loadQueue = useCallback(async () => {
     setBusy('queue'); setError('');
     try {
       const params = new URLSearchParams({
@@ -123,9 +123,9 @@ export function ReconciliationPage() {
     } finally {
       setBusy('');
     }
-  }
+  }, [action, companyId, page, provider, rowsPerPage, search]);
 
-  async function loadSuppressions() {
+  const loadSuppressions = useCallback(async () => {
     setBusy('suppressions'); setError('');
     try {
       const params = new URLSearchParams({
@@ -146,13 +146,13 @@ export function ReconciliationPage() {
     } finally {
       setBusy('');
     }
-  }
+  }, [companyId, provider, rowsPerPage, search, suppressionPage]);
 
-  useEffect(() => { void loadReferences(); }, []);
-  useEffect(() => { void loadQueue(); }, [companyId, provider, action, search, page, rowsPerPage]);
+  useEffect(() => { void loadReferences(); }, [loadReferences]);
+  useEffect(() => { void loadQueue(); }, [loadQueue]);
   useEffect(() => {
     if (tab === 1) void loadSuppressions();
-  }, [tab, companyId, provider, search, suppressionPage, rowsPerPage]);
+  }, [tab, loadSuppressions]);
 
   async function openDetail(item: CiReviewItem) {
     setDetail(item); setDetailAsset(null); setError('');

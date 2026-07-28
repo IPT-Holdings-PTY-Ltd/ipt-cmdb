@@ -11,8 +11,8 @@ import {
   Switch, TextField, Typography,
 } from '@mui/material';
 import { useEffect, useMemo, useState } from 'react';
-import { Title } from 'react-admin';
 import { apiFetch, getSession } from './session';
+import { Title } from './ui';
 import type { ChangeTemplate, ChangeTemplateClosureTest, ChangeTemplateContent, ChangeTemplateParameter, Company, User } from './types';
 import { PageHeading, RootGuard } from './RootAdmin';
 import { useWorkspace } from './workspace';

@@ -4,8 +4,8 @@ import {
   Alert, Box, Button, Card, CardContent, Checkbox, Chip, Dialog, DialogActions,
   DialogContent, DialogTitle, FormControlLabel, Grid, Stack, TextField, Typography,
 } from '@mui/material';
-import { Title } from 'react-admin';
 import { apiFetch, setSession } from './session';
+import { Title } from './ui';
 import type { MfaEnrollment } from './authProvider';
 
 type MfaStatus = {

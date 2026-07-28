@@ -12,10 +12,10 @@ import {
   DialogContent, DialogTitle, FormControl, Grid, InputAdornment, InputLabel, MenuItem, Paper, Select,
   Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography,
 } from '@mui/material';
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { Title } from 'react-admin';
-import { useNavigate } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useNavigate } from 'react-router';
 import { AuditTimeline } from './Governance';
+import { Title } from './ui';
 import { apiFetch, getSession } from './session';
 import type { Contact, ContactResponsibility } from './types';
 import { useWorkspace } from './workspace';
@@ -61,7 +61,7 @@ export function ContactsPage() {
   const [reassignmentReason, setReassignmentReason] = useState('');
 
   const companyNames = useMemo(() => new Map(workspace.companies.map(item => [item.id, item.name])), [workspace.companies]);
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     try {
       const suffix = workspace.isRoot ? '' : `?companyId=${encodeURIComponent(workspace.companyId)}`;
@@ -69,8 +69,8 @@ export function ContactsPage() {
     } catch (error) {
       setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Contacts could not be loaded.' });
     } finally { setLoading(false); }
-  };
-  useEffect(() => { void load(); }, [workspace.companyId, workspace.isRoot]);
+  }, [workspace.companyId, workspace.isRoot]);
+  useEffect(() => { void load(); }, [load]);
 
   const visible = useMemo(() => contacts.filter(contact => {
     const search = query.trim().toLowerCase();

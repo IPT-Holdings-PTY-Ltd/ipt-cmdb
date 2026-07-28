@@ -15,9 +15,9 @@ import {
   type ChipProps,
 } from '@mui/material';
 import { useEffect, useMemo, useState } from 'react';
-import { Title } from 'react-admin';
-import { Navigate, useNavigate } from 'react-router-dom';
+import { Navigate, useNavigate } from 'react-router';
 import { apiFetch, getSession } from './session';
+import { Title } from './ui';
 import type {
   ConnectWiseConnection,
   Integration,

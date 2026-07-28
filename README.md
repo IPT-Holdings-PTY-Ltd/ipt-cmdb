@@ -112,6 +112,7 @@ python -m pre_commit run --all-files
 python -m coverage run -m unittest discover -s test -v
 python -m coverage report
 npm test
+npm run lint
 npm run typecheck
 npm run build
 docker build --tag ipt-cmdb:local .
@@ -124,7 +125,7 @@ the Python suite with branch coverage and enforces the checked-in coverage floor
 
 ```mermaid
 flowchart LR
-    SPA[React Admin SPA] -->|Authenticated HTTPS| API[FastAPI API]
+    SPA[React SPA with MUI and React Router 8] -->|Authenticated HTTPS| API[FastAPI API]
     API --> PG[(PostgreSQL)]
     API --> PDF[Change PDF generator]
     ENTRA[Microsoft Entra ID / Easy Auth] --> API

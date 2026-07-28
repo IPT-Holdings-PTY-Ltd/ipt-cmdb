@@ -3,7 +3,7 @@
 ## Supported toolchain
 
 - Python 3.12
-- Node.js 22
+- Node.js 22.22.2 or newer
 - npm with the committed `package-lock.json`
 - PostgreSQL 16
 - Docker Compose v2 for the simplest setup

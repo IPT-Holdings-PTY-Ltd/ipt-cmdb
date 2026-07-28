@@ -1,15 +1,15 @@
-import Inventory2Outlined from '@mui/icons-material/Inventory2Outlined';
-import { Box, CircularProgress } from '@mui/material';
-import { createTheme } from '@mui/material/styles';
-import { Admin, CustomRoutes, Resource } from 'react-admin';
-import { Route } from 'react-router-dom';
-import { authProvider } from './authProvider';
-import { dataProvider } from './dataProvider';
+import { CssBaseline } from '@mui/material';
+import { createTheme, ThemeProvider } from '@mui/material/styles';
+import { lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { HashRouter, Navigate, Route, Routes, useNavigate } from 'react-router';
+import { checkAuth } from './authProvider';
+import { BrandingProvider, useMspBranding } from './branding';
 import { WorkspaceLayout } from './Layout';
 import { LoginPage } from './LoginPage';
+import { RouteErrorBoundary, RouteLoadingFallback } from './RouteFeedback';
+import { getSession } from './session';
+import { NotificationProvider } from './ui';
 import { WorkspaceProvider } from './workspace';
-import { BrandingProvider, useMspBranding } from './branding';
-import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 
 const AssetList = lazy(() => import('./assets').then(module => ({ default: module.AssetList })));
 const AssetShow = lazy(() => import('./assets').then(module => ({ default: module.AssetShow })));
@@ -39,30 +39,60 @@ const SecurityPage = lazy(() => import('./SecurityPage').then(module => ({ defau
 const ChangeApprovalPage = lazy(() => import('./ChangeApprovalPage').then(module => ({ default: module.ChangeApprovalPage })));
 const ChangeTemplatesPage = lazy(() => import('./ChangeTemplates').then(module => ({ default: module.ChangeTemplatesPage })));
 
-function RouteLoadingFallback() {
-  return <Box sx={{ display: 'grid', minHeight: '45vh', placeItems: 'center' }}><CircularProgress aria-label="Loading workspace" /></Box>;
+function PublicLazyRoute({ children }: { children: ReactNode }) {
+  return (
+    <RouteErrorBoundary>
+      <Suspense fallback={<RouteLoadingFallback />}>{children}</Suspense>
+    </RouteErrorBoundary>
+  );
 }
 
-function BrandedApplication() {
-  const { brand } = useMspBranding();
-  const theme = useMemo(() => createTheme({
-    palette: {
-      mode: 'dark',
-      primary: { main: brand.accent },
-      secondary: { main: brand.secondaryAccent },
-      background: { default: '#080f1d', paper: '#111b2e' },
-    },
-    shape: { borderRadius: 10 },
-    typography: { fontFamily: 'Inter, Segoe UI, system-ui, sans-serif', h3: { fontWeight: 800, fontSize: '2rem' }, h6: { fontWeight: 750 } },
-    components: {
-      MuiPaper: { styleOverrides: { root: { backgroundImage: 'none', border: '1px solid #243552' } } },
-      MuiButton: { styleOverrides: { root: { textTransform: 'none', fontWeight: 750 } } },
-    },
-  }), [brand.accent, brand.secondaryAccent]);
-  return <WorkspaceProvider><Suspense fallback={<RouteLoadingFallback />}>
-      <Admin dataProvider={dataProvider} authProvider={authProvider} dashboard={Dashboard} layout={WorkspaceLayout} loginPage={LoginPage} theme={theme} requireAuth>
-        <Resource name="assets" list={AssetList} show={AssetShow} edit={AssetEdit} create={AssetCreate} icon={Inventory2Outlined} recordRepresentation="name" />
-        <CustomRoutes>
+/**
+ * Verifies the server-side session before protected routes render and responds
+ * immediately when an API request clears an expired browser session.
+ */
+function AuthenticationBoundary({ children }: { children: ReactNode }) {
+  const navigate = useNavigate();
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    checkAuth()
+      .then(() => { if (active) setReady(true); })
+      .catch(() => { if (active) navigate('/login', { replace: true }); });
+    const sessionChanged = () => {
+      if (!getSession()) navigate('/login', { replace: true });
+    };
+    window.addEventListener('cmdb-auth-change', sessionChanged);
+    return () => {
+      active = false;
+      window.removeEventListener('cmdb-auth-change', sessionChanged);
+    };
+  }, [navigate]);
+
+  return ready ? children : <RouteLoadingFallback />;
+}
+
+function ApplicationRoutes() {
+  return (
+    <HashRouter>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/approve" element={<PublicLazyRoute><ChangeApprovalPage /></PublicLazyRoute>} />
+        <Route
+          element={(
+            <AuthenticationBoundary>
+              <WorkspaceProvider>
+                <WorkspaceLayout />
+              </WorkspaceProvider>
+            </AuthenticationBoundary>
+          )}
+        >
+          <Route index element={<Dashboard />} />
+          <Route path="/assets" element={<AssetList />} />
+          <Route path="/assets/create" element={<AssetCreate />} />
+          <Route path="/assets/:assetId" element={<AssetEdit />} />
+          <Route path="/assets/:assetId/show" element={<AssetShow />} />
           <Route path="/business-systems" element={<BusinessSystemsPage />} />
           <Route path="/relationships" element={<Relationships />} />
           <Route path="/changes" element={<ChangeControlPage />} />
@@ -84,17 +114,45 @@ function BrandedApplication() {
           <Route path="/admin/branding" element={<BrandingPage />} />
           <Route path="/admin/database" element={<DatabasePage />} />
           <Route path="/profile/security" element={<SecurityPage />} />
-        </CustomRoutes>
-      </Admin>
-    </Suspense></WorkspaceProvider>;
+        </Route>
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </HashRouter>
+  );
 }
 
+function BrandedApplication() {
+  const { brand } = useMspBranding();
+  const theme = useMemo(() => createTheme({
+    palette: {
+      mode: 'dark',
+      primary: { main: brand.accent },
+      secondary: { main: brand.secondaryAccent },
+      background: { default: '#080f1d', paper: '#111b2e' },
+    },
+    shape: { borderRadius: 10 },
+    typography: {
+      fontFamily: 'Inter, Segoe UI, system-ui, sans-serif',
+      h3: { fontWeight: 800, fontSize: '2rem' },
+      h6: { fontWeight: 750 },
+    },
+    components: {
+      MuiPaper: { styleOverrides: { root: { backgroundImage: 'none', border: '1px solid #243552' } } },
+      MuiButton: { styleOverrides: { root: { textTransform: 'none', fontWeight: 750 } } },
+    },
+  }), [brand.accent, brand.secondaryAccent]);
+
+  return (
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <NotificationProvider>
+        <ApplicationRoutes />
+      </NotificationProvider>
+    </ThemeProvider>
+  );
+}
+
+/** Root application with public branding and a React Router 8 route graph. */
 export function App() {
-  const [publicApproval, setPublicApproval] = useState(window.location.hash.split('?')[0] === '#/approve');
-  useEffect(() => {
-    const routeChanged = () => setPublicApproval(window.location.hash.split('?')[0] === '#/approve');
-    window.addEventListener('hashchange', routeChanged);
-    return () => window.removeEventListener('hashchange', routeChanged);
-  }, []);
-  return <BrandingProvider><Suspense fallback={<RouteLoadingFallback />}>{publicApproval ? <ChangeApprovalPage /> : <BrandedApplication />}</Suspense></BrandingProvider>;
+  return <BrandingProvider><BrandedApplication /></BrandingProvider>;
 }

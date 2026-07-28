@@ -1,10 +1,11 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Alert, Box, Button, Paper, Stack, TextField, Typography } from '@mui/material';
-import { useLogin } from 'react-admin';
+import { useSearchParams } from 'react-router';
 import { BrandLogo, useMspBranding } from './branding';
 import {
   completeLoginMfa,
   getAuthConfiguration,
+  login,
   MfaRequiredError,
   startLoginMfaEnrollment,
   type AuthConfiguration,
@@ -16,23 +17,17 @@ import { apiFetch, setSession } from './session';
 
 type LoginMode = 'login' | 'request-reset' | 'reset-password';
 
-function loginQuery() {
-  return new URLSearchParams(window.location.hash.split('?', 2)[1] || '');
-}
-
-function clearLoginQuery() {
-  window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#/login`);
-}
-
 export function LoginPage() {
-  const login = useLogin();
   const { brand } = useMspBranding();
-  const initialToken = loginQuery().get('resetToken') || '';
+  const [searchParams, setSearchParams] = useSearchParams();
+  const routedResetToken = searchParams.get('resetToken') || '';
+  const passwordChanged = searchParams.has('passwordChanged');
+  const initialToken = routedResetToken;
   const [mode, setMode] = useState<LoginMode>(initialToken ? 'reset-password' : 'login');
   const [username, setUsername] = useState('admin@example.com');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
-  const [notice, setNotice] = useState(loginQuery().has('passwordChanged') ? 'Password changed. Sign in again with your new password.' : '');
+  const [notice, setNotice] = useState(passwordChanged ? 'Password changed. Sign in again with your new password.' : '');
   const [busy, setBusy] = useState(false);
   const [configuration, setConfiguration] = useState<AuthConfiguration | null>(null);
   const [challenge, setChallenge] = useState<MfaChallenge | null>(null);
@@ -50,18 +45,16 @@ export function LoginPage() {
   }, []);
 
   useEffect(() => {
-    const syncRoute = () => {
-      const token = loginQuery().get('resetToken') || '';
-      if (!token) return;
-      setResetToken(token);
+    if (routedResetToken) {
+      setResetToken(routedResetToken);
       setResetValid(null);
       setMode('reset-password');
       setError('');
       setNotice('');
-    };
-    window.addEventListener('hashchange', syncRoute);
-    return () => window.removeEventListener('hashchange', syncRoute);
-  }, []);
+    } else if (passwordChanged) {
+      setNotice('Password changed. Sign in again with your new password.');
+    }
+  }, [passwordChanged, routedResetToken]);
 
   useEffect(() => {
     if (mode !== 'reset-password' || !resetToken) return;
@@ -71,7 +64,7 @@ export function LoginPage() {
   }, [mode, resetToken]);
 
   function returnToLogin(message = '') {
-    clearLoginQuery();
+    setSearchParams({}, { replace: true });
     setMode('login');
     setChallenge(null);
     setEnrollment(null);
@@ -84,7 +77,10 @@ export function LoginPage() {
     setBusy(true);
     setError('');
     setNotice('');
-    try { await login({ username, password }); }
+    try {
+      await login(username, password);
+      if (!configuration?.external || configuration.localLoginEnabled) window.location.assign('/#/');
+    }
     catch (reason) {
       if (reason instanceof MfaRequiredError) {
         setChallenge(reason.challenge);
@@ -167,13 +163,13 @@ export function LoginPage() {
               <TextField label="Manual setup key" value={enrollment.manualKey} slotProps={{ htmlInput: { readOnly: true } }} />
             </>}
             {!challenge.mfaEnrollmentRequired && <><Typography variant="h6">Authenticator verification</Typography><Typography color="text.secondary">Enter the current six-digit code or a recovery code.</Typography></>}
-            <TextField label="Authenticator or recovery code" value={code} onChange={event => setCode(event.target.value)} autoComplete="one-time-code" autoFocus required />
+            <TextField label="Authenticator or recovery code" value={code} onChange={event => setCode(event.target.value)} autoComplete="one-time-code" required />
             <Button type="submit" variant="contained" size="large" disabled={busy || code.length < 6}>{busy ? 'Verifying…' : challenge.mfaEnrollmentRequired ? 'Complete setup' : 'Verify and sign in'}</Button>
             <Button type="button" onClick={() => { setChallenge(null); setEnrollment(null); setCode(''); }}>Back to password</Button>
           </> : mode === 'request-reset' ? <>
             <Typography variant="h5">Reset local password</Typography>
             <Typography color="text.secondary">Enter your local account email. If it is eligible, we will send a single-use link that expires in 30 minutes.</Typography>
-            <TextField label="Email address" type="email" value={username} onChange={event => setUsername(event.target.value)} autoComplete="email" required autoFocus />
+            <TextField label="Email address" type="email" value={username} onChange={event => setUsername(event.target.value)} autoComplete="email" required />
             <Button type="submit" variant="contained" size="large" disabled={busy}>{busy ? 'Sending…' : 'Send reset link'}</Button>
             <Button type="button" onClick={() => returnToLogin()}>Back to sign in</Button>
           </> : mode === 'reset-password' ? <>
