@@ -138,7 +138,13 @@ The provider-neutral external-link envelope reserves future ConnectWise ticket s
 
 The integration layer is capability driven. A reviewed provider adapter registers a manifest describing authentication, tenant scopes, filters and typed operations. Operations can be inputs, outputs, triggers or actions; provider-write and approval requirements are explicit metadata rather than implicit behaviour. The React wizard consumes this catalogue while the FastAPI service enforces the same adapter contract.
 
-ConnectWise is the reference adapter and currently implements staged connection tests, company input, saved discovery policy, explicit customer mapping, configuration-item input, durable continuous-preview policies, a persistent provider-neutral review queue and administrator-selected canonical imports. Its change-ticket action is declared but disabled. No provider-write executor exists in this release.
+ConnectWise and N-central are the reference adapters. Both implement staged connection
+tests, saved discovery policy, explicit customer mapping, configuration-item input,
+durable continuous-preview policies, a persistent provider-neutral review queue and
+administrator-selected canonical imports. N-central exchanges its permanent User-API
+token for a short-lived bearer token in memory and applies its native device-filter ID
+before CMDB class/status policy. The ConnectWise change-ticket action is declared but
+disabled. No provider-write executor exists in this release.
 
 Provider observations enter a common reconciliation boundary. Adapters never write directly to canonical customers, CIs, contacts or relationships. A future workflow action follows a separate route:
 

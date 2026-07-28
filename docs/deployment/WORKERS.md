@@ -3,7 +3,7 @@
 IPT CMDB uses the same image and PostgreSQL repository for web requests and background
 work. The default remains one low-cost application process. Larger installations can
 move enabled jobs into a dedicated process without changing policies, review queues,
-email outbox records or ConnectWise leases.
+email outbox records or provider policy leases.
 
 ## Process roles
 
@@ -23,9 +23,10 @@ INTEGRATION_WORKER_ENABLED=true
 NOTIFICATION_WORKER_ENABLED=true
 ```
 
-The integration worker performs read-only ConnectWise previews and takes the existing
-PostgreSQL policy lease. The notification worker evaluates rules and claims durable
-outbox messages. Neither process role enables provider writes or bypasses review.
+The integration worker performs read-only ConnectWise and N-central previews and takes
+the existing PostgreSQL policy lease. The notification worker evaluates rules and
+claims durable outbox messages. Neither process role enables provider writes or
+bypasses review.
 
 ## Safe cutover sequence
 
@@ -107,10 +108,10 @@ The integration and notification screens show:
 - completed cycles and processed-item count;
 - the latest sanitized failure.
 
-ConnectWise requests update `provider_rate_limit_status` with HTTP status, quota limit,
-remaining quota, reset/retry headers and URL path. Query strings, response bodies and
-credentials are never stored. Providers that omit quota headers still expose their
-latest HTTP status; the UI does not invent a limit.
+ConnectWise and N-central requests update `provider_rate_limit_status` with HTTP status,
+quota limit, remaining quota, reset/retry headers and URL path. Query strings, response
+bodies and credentials are never stored. Providers that omit quota headers still expose
+their latest HTTP status; the UI does not invent a limit.
 
 Alert when a continuously configured worker has no heartbeat for the larger of two
 minutes or three polling intervals. A one-shot worker is healthy only when its most

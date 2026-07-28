@@ -44,7 +44,10 @@ PROVIDER_TO_DB = {
 PROVIDER_FROM_DB = {value: key for key, value in PROVIDER_TO_DB.items()}
 CREDENTIAL_REFERENCES = {
     "connectwise": "env://CW_BASE_URL,CW_COMPANY_ID,CW_PUBLIC_KEY,CW_PRIVATE_KEY,CW_CLIENT_ID",
-    "ncentral": "env://NCENTRAL_BASE_URL,NCENTRAL_API_TOKEN",
+    "ncentral": (
+        "env://NCENTRAL_BASE_URL,"
+        "NCENTRAL_USER_API_TOKEN|NCENTRAL_USER_API_TOKEN_FILE|NCENTRAL_API_TOKEN"
+    ),
     "passportal": "env://PASSPORTAL_BASE_URL,PASSPORTAL_API_TOKEN",
 }
 DEFAULT_MSP_BRANDING = {
@@ -2965,6 +2968,50 @@ class StateRepository:
             **deepcopy(record),
         }
 
+    def ensure_integration_connection(
+        self, kind: str, name: str, actor_id: str | None = None
+    ) -> dict:
+        """Install a supported root provider row before its first configuration save."""
+
+        existing = self.get_integration_connection(kind)
+        if existing:
+            return existing
+        if kind not in CREDENTIAL_REFERENCES:
+            raise ValueError("Unsupported integration provider")
+        record = {
+            "id": kind,
+            "name": name[:160],
+            "type": kind,
+            "enabled": False,
+            "mode": "configured_in_application",
+            "lastSync": None,
+            "status": "Not configured",
+            "scope": "msp",
+            "configuration": {"scope": "msp", "mode": "configured_in_application"},
+            "credentialsEncrypted": "",
+            "credentialsNonce": "",
+            "connectionStatus": "not_configured",
+            "lastTestAt": None,
+            "lastError": "",
+            "revision": 1,
+            "lifecycleStatus": "active",
+            "lifecycleReason": "",
+            "createdAt": utc_now(),
+            "updatedAt": utc_now(),
+        }
+        self.state.setdefault("integrations", []).append(record)
+        self._audit(
+            None,
+            actor_id,
+            "integration_connection",
+            kind,
+            "installed",
+            None,
+            integration_connection_audit_value(record),
+        )
+        self.save_state(self.state)
+        return self.get_integration_connection(kind) or deepcopy(record)
+
     def update_integration_connection(
         self, kind: str, changes: dict, actor_id: str | None = None
     ) -> dict:
@@ -3129,7 +3176,7 @@ class StateRepository:
             "connection_tested",
             before,
             after,
-            outcome="success" if status == "verified" else "failure",
+            outcome="success" if status == "verified" else "failed",
             reason=message,
         )
         self.save_state(self.state)
@@ -3790,6 +3837,35 @@ class StateRepository:
             "blockedFields": deepcopy(evidence.get("blockedFields") or []),
             "fieldDecisions": deepcopy(evidence.get("fieldDecisions") or []),
         }
+
+    def get_ci_review_item_by_identity(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        external_id: str,
+        state: str | None = "pending",
+    ) -> dict | None:
+        """Return one exact provider observation without depending on queue pagination."""
+
+        policy_ids = {
+            item["id"]
+            for item in self.state.get("integrationCiPolicies", [])
+            if item.get("provider") == kind
+            and item.get("companyId") == company_id
+            and item.get("providerParentId") == provider_parent_id
+        }
+        raw = next(
+            (
+                item
+                for item in self.state.get("integrationCiReviewItems", [])
+                if item.get("policyId") in policy_ids
+                and item.get("externalId") == external_id
+                and (state is None or item.get("state") == state)
+            ),
+            None,
+        )
+        return self.get_ci_review_item(str(raw["id"])) if raw else None
 
     def dismiss_ci_review_item(self, item_id: str, notes: str, actor_id: str) -> dict | None:
         """Dismiss one unchanged review observation with audited notes."""
@@ -8623,6 +8699,67 @@ class PostgresCmdbRepository(StateRepository):
             "lifecycleChangedBy": str(row[17]) if row[17] else None,
         }
 
+    def ensure_integration_connection(
+        self, kind: str, name: str, actor_id: str | None = None
+    ) -> dict:
+        """Install a supported root provider row before its first configuration save."""
+
+        existing = self.get_integration_connection(kind)
+        if existing:
+            return existing
+        if kind not in CREDENTIAL_REFERENCES:
+            raise ValueError("Unsupported integration provider")
+        connection_id = canonical_uuid("integration_connection", kind)
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        configuration = {"scope": "msp", "mode": "configured_in_application"}
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO integration_connections (
+                    id, slug, company_id, provider, name, credential_reference,
+                    configuration, enabled
+                ) VALUES (
+                    %s::uuid, %s, NULL, %s, %s, %s, %s::jsonb, false
+                )
+                ON CONFLICT (slug) DO NOTHING
+                RETURNING id
+                """,
+                (
+                    connection_id,
+                    kind,
+                    provider,
+                    name[:160],
+                    CREDENTIAL_REFERENCES[kind],
+                    json.dumps(configuration),
+                ),
+            )
+            inserted = cursor.fetchone()
+            if inserted:
+                self._insert_audit(
+                    cursor,
+                    None,
+                    actor_id,
+                    "integration_connection",
+                    str(inserted[0]),
+                    "installed",
+                    None,
+                    {
+                        "id": kind,
+                        "name": name[:160],
+                        "type": kind,
+                        "enabled": False,
+                        "scope": "msp",
+                        "configuration": configuration,
+                        "revision": 1,
+                        "lifecycleStatus": "active",
+                        "hasCredentials": False,
+                    },
+                )
+        installed = self.get_integration_connection(kind)
+        if not installed:
+            raise ValueError("Integration connection could not be installed")
+        return installed
+
     def update_integration_connection(
         self, kind: str, changes: dict, actor_id: str | None = None
     ) -> dict:
@@ -8652,7 +8789,7 @@ class PostgresCmdbRepository(StateRepository):
                     configuration = %s::jsonb,
                     credentials_encrypted = %s,
                     credentials_nonce = %s,
-                    credential_reference = 'encrypted://integration/connectwise',
+                    credential_reference = %s,
                     enabled = %s,
                     lifecycle_status = %s,
                     lifecycle_reason = CASE WHEN %s THEN %s ELSE lifecycle_reason END,
@@ -8671,6 +8808,7 @@ class PostgresCmdbRepository(StateRepository):
                     or before.get("credentialsEncrypted")
                     or None,
                     changes.get("credentialsNonce") or before.get("credentialsNonce") or None,
+                    f"encrypted://integration/{kind}",
                     enabled,
                     lifecycle_status,
                     lifecycle_changed,
@@ -8903,7 +9041,7 @@ class PostgresCmdbRepository(StateRepository):
                 "connection_tested",
                 integration_connection_audit_value(before),
                 integration_connection_audit_value(after),
-                outcome="success" if status == "verified" else "failure",
+                outcome="success" if status == "verified" else "failed",
                 reason=message,
             )
         return self.get_integration_connection(kind) or after
@@ -9317,6 +9455,7 @@ class PostgresCmdbRepository(StateRepository):
         filter_policy = {
             key: normalized[key]
             for key in (
+                "providerFilterId",
                 "typeMode",
                 "includedTypeIds",
                 "typeMappings",
@@ -9963,6 +10102,52 @@ class PostgresCmdbRepository(StateRepository):
                 WHERE item.id = %s::uuid
                 """,
                 (parsed_id,),
+            )
+            row = cursor.fetchone()
+        return self._ci_review_from_row(row) if row else None
+
+    def get_ci_review_item_by_identity(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        external_id: str,
+        state: str | None = "pending",
+    ) -> dict | None:
+        """Return one exact provider observation without loading the review queue."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT item.id, integration.provider, policy.id, company.slug, company.name,
+                       policy.external_parent_id, item.external_id, item.external_name,
+                       item.decision, item.candidate_ci_id, ci.display_name, item.reason,
+                       item.provider_record, item.evidence, item.state,
+                       item.first_seen_at, item.last_seen_at, item.reviewed_at,
+                       item.review_notes
+                FROM integration_ci_review_items item
+                JOIN integration_ci_policies policy ON policy.id = item.policy_id
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = item.company_id
+                LEFT JOIN configuration_items ci ON ci.id = item.candidate_ci_id
+                WHERE integration.provider = %s
+                  AND company.slug = %s
+                  AND policy.external_parent_id = %s
+                  AND item.external_id = %s
+                  AND (%s::text IS NULL OR item.state = %s)
+                ORDER BY item.last_seen_at DESC
+                LIMIT 1
+                """,
+                (
+                    provider,
+                    company_id,
+                    provider_parent_id,
+                    external_id,
+                    state,
+                    state,
+                ),
             )
             row = cursor.fetchone()
         return self._ci_review_from_row(row) if row else None

@@ -5,7 +5,7 @@
 | Provider | Current repository capability | Not yet implemented |
 |---|---|---|
 | ConnectWise PSA (formerly Manage) | Encrypted or environment-managed setup, connection test, paginated company discovery, explicit customer mapping, saved CI type/status policy, lease-safe continuous previews, governed canonical imports and audited sync evidence | Ticket publishing |
-| N-central | Root connection placeholder and adapter boundary | Customer/device/site normalization and scheduled ingestion |
+| N-central | Encrypted/environment/secret-file setup, User-API token exchange, explicit customer mapping, native device filters, reviewed device reconciliation and lease-safe continuous previews | Provider device writes |
 | Passportal | Root connection placeholder and metadata-only policy | Approved owner/folder/asset metadata association |
 
 The application must not ingest Passportal passwords, secure notes, OTP seeds or credential values.
@@ -57,7 +57,7 @@ separately when decommissioning the external credential.
 
 Reviewed built-in adapters register a capability manifest containing provider identity, supported scopes, authentication modes, prerequisites, discovery filters and bounded operations. Operations declare a direction (`input`, `output`, `bidirectional`, `trigger` or `action`), entity type, implementation status, provider-write behaviour and approval requirement.
 
-The setup UI consumes the public manifest rather than duplicating provider capability descriptions. Provider code implements the shared `test_connection`, `discovery_options`, `discover`, `apply_filters` and `preview` boundary. `discovery_options` must be bounded and responsive so menus can populate independently from a full sync. ConnectWise is the reference adapter. New providers should reuse the registry and contract tests rather than add provider branches directly to the web application.
+The setup UI consumes the public manifest rather than duplicating provider capability descriptions. Provider code implements the shared `test_connection`, `discovery_options`, `discover`, `apply_filters` and `preview` boundary. `discovery_options` must be bounded and responsive so menus can populate independently from a full sync. ConnectWise and N-central are the reference adapters. New providers should reuse the registry and contract tests rather than add ungoverned provider writes directly to the web application.
 
 Arbitrary runtime package installation is not supported. Adapters are reviewed, compiled application code so a provider cannot supply executable frontend JavaScript or bypass tenancy, secret handling and audit controls.
 
@@ -132,6 +132,7 @@ Authority is evaluated at the most-specific matching CI type, falling back to `*
 - Future ticket publishing must use an idempotency/external-reference strategy and explicit technician confirmation.
 
 See the [ConnectWise company discovery runbook](CONNECTWISE.md) for setup, permissions, mapping and troubleshooting.
+See the [N-central inventory runbook](NCENTRAL.md) for token exchange, customer mapping, native device filters, reconciliation and container secret options.
 
 ## Worker behaviour
 

@@ -239,6 +239,60 @@ export type ConnectWiseConnection = {
   discoveryPolicy: ConnectWiseDiscoveryPolicy;
 };
 
+export type NcentralConnection = {
+  id: string;
+  enabled: boolean;
+  baseUrl: string;
+  pageSize: number;
+  configured: boolean;
+  hasCredentials: boolean;
+  credentialSource: 'environment' | 'encrypted_database' | 'not_configured';
+  managedByEnvironment: boolean;
+  connectionStatus: 'not_configured' | 'configured' | 'verified' | 'error';
+  lastTestAt?: string | null;
+  lastError?: string;
+  revision: number;
+  lifecycleStatus: 'active' | 'paused' | 'disabled' | 'removed';
+  lifecycleReason?: string;
+  lifecycleChangedAt?: string | null;
+  lifecycleChangedBy?: string | null;
+  discoveryPolicy: { excludedExternalIds: string[] };
+};
+
+export type NcentralDiscoveryPreview = {
+  readOnly: boolean;
+  writesAttempted: boolean;
+  appliedPolicy: { excludedExternalIds: string[] };
+  discovered: number;
+  included: number;
+  excluded: number;
+  truncated: boolean;
+  sampleIncluded: ProviderCompany[];
+  sampleExcluded: Array<{ externalId: string; name: string; reason: string }>;
+  credentialSource: string;
+  message: string;
+};
+
+export type NcentralDeviceFilter = {
+  id: string;
+  name: string;
+  description: string;
+};
+
+export type NcentralDeviceOptions = {
+  companyId: string;
+  providerCompanyId: string;
+  providerCompanyName: string;
+  credentialSource: string;
+  readOnly: boolean;
+  writesAttempted: boolean;
+  discovered: number;
+  deviceFilters: NcentralDeviceFilter[];
+  availableTypes: ProviderFilterOption[];
+  availableStatuses: ProviderFilterOption[];
+  policy: ConnectWiseCiPolicy;
+};
+
 export type IntegrationLifecycleImpact = {
   provider: Integration['type'];
   lifecycleStatus: Integration['lifecycleStatus'];
@@ -388,6 +442,7 @@ export type ConnectWiseCiPolicy = {
   statusMode: 'all' | 'selected';
   includedStatusIds: string[];
   excludedExternalIds: string[];
+  providerFilterId?: string;
   syncMode: 'manual' | 'continuous_preview';
   intervalMinutes: number;
   enabled: boolean;
@@ -414,6 +469,7 @@ export type IntegrationPreviewStatus = {
   heartbeatAgeSeconds?: number | null;
   runtime?: WorkerRuntimeStatus | null;
   providerRateLimit?: ProviderRateLimitStatus | null;
+  providerRateLimits?: Record<string, ProviderRateLimitStatus | null>;
   notificationWorkerEnabled: boolean;
   alertDeliveryConfigured: boolean;
   alertRecipientCount: number;

@@ -14,6 +14,13 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
   integration and notification administration screens.
 - Sanitized ConnectWise HTTP/rate-limit telemetry that retains status, quota headers and
   request path only, without provider payloads, query strings or credentials.
+- Guided read-only N-central setup using the documented User-API token exchange,
+  bounded connection tests, customer organization discovery and explicit tenant mapping.
+- Native N-central device-filter, class and status policies with immutable provider IDs,
+  reviewed dry-run reconciliation, manual identity linking and lease-safe continuous
+  previews.
+- Provider-neutral reviewed import and linking controls so ConnectWise and N-central
+  observations can converge on one canonical CI without provider-side writes.
 
 ## [0.3.0] - 2026-07-28
 

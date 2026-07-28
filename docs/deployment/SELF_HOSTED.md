@@ -61,8 +61,8 @@ docker compose --env-file .env.production -f compose.production.yml pull
 docker compose --env-file .env.production -f compose.production.yml up -d
 ```
 
-After Microsoft 365 email is configured and verified, unattended ConnectWise previews
-can be enabled in `.env.production`:
+After Microsoft 365 email is configured and verified, unattended ConnectWise and
+N-central previews can be enabled in `.env.production`:
 
 ```text
 INTEGRATION_WORKER_ENABLED=true

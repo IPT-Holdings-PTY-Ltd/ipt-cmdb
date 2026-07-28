@@ -2469,6 +2469,246 @@ class FastApiMigrationTests(unittest.TestCase):
             any(event["action"] == "external_approved" for event in core.DB["auditEvents"])
         )
 
+    def test_ncentral_inventory_is_root_scoped_review_gated_and_token_safe(self):
+        """Exercise the public N-central setup, mapping and reviewed import boundary."""
+
+        headers = self._headers("admin@example.com")
+        encryption_key = base64.urlsafe_b64encode(b"n" * 32).decode("ascii")
+        device_discovery_calls = []
+
+        class FakeNcentralClient:
+            def __init__(self, configuration):
+                self.configuration = configuration
+
+            def test_connection(self):
+                return {
+                    "reachable": True,
+                    "accessExpirySeconds": 3600,
+                    "accessibleOrganizations": 1,
+                    "sampleOrganization": {
+                        "externalId": "101",
+                        "name": "Acme Manufacturing",
+                        "type": "CUSTOMER",
+                    },
+                }
+
+            def discover_customers(self):
+                return [
+                    {
+                        "externalId": "101",
+                        "identifier": "ACME-NC",
+                        "name": "Acme Manufacturing",
+                        "type": "CUSTOMER",
+                        "parentId": "50",
+                        "metadata": {"externalId": "ACME"},
+                    }
+                ]
+
+            def list_device_filters(self):
+                return [
+                    {
+                        "id": "managed-servers",
+                        "name": "Managed servers",
+                        "description": "Production server devices",
+                    }
+                ]
+
+            def discover_devices(self, org_unit_id, *, filter_id="", enrich_limit=0):
+                device_discovery_calls.append(
+                    {
+                        "orgUnitId": org_unit_id,
+                        "filterId": filter_id,
+                        "enrichLimit": enrich_limit,
+                    }
+                )
+                if org_unit_id != "101":
+                    raise AssertionError("unexpected organization")
+                if filter_id and filter_id != "managed-servers":
+                    raise AssertionError("unexpected device filter")
+                return [
+                    {
+                        "externalId": "7001",
+                        "name": "ACME-NC01",
+                        "type": "Server",
+                        "status": "Active",
+                        "providerTypeId": "server",
+                        "providerTypeName": "Server",
+                        "providerStatusId": "normal",
+                        "providerStatusName": "Normal",
+                        "fields": {
+                            "serialNumber": "NC-SERIAL-7001",
+                            "ipAddress": "10.0.0.71",
+                        },
+                        "metadata": {
+                            "lifecycle": "in_service",
+                            "serialNumber": "NC-SERIAL-7001",
+                        },
+                        "identifiers": {"serial_number": "NC-SERIAL-7001"},
+                        "providerVersion": "2026-07-28T10:00:00Z",
+                    },
+                    {
+                        "externalId": "7002",
+                        "name": "ACME-NC02",
+                        "type": "Server",
+                        "status": "Active",
+                        "providerTypeId": "server",
+                        "providerTypeName": "Server",
+                        "providerStatusId": "normal",
+                        "providerStatusName": "Normal",
+                        "fields": {"ipAddress": "10.0.0.72"},
+                        "metadata": {"lifecycle": "in_service"},
+                        "identifiers": {},
+                        "providerVersion": "2026-07-28T10:00:00Z",
+                    },
+                ]
+
+        environment = {
+            "MFA_ENCRYPTION_KEY": encryption_key,
+            "NCENTRAL_BASE_URL": "",
+            "NCENTRAL_USER_API_TOKEN": "",
+            "NCENTRAL_USER_API_TOKEN_FILE": "",
+            "NCENTRAL_API_TOKEN": "",
+            "NCENTRAL_PAGE_SIZE": "",
+        }
+        with (
+            patch.dict(os.environ, environment),
+            patch.object(backend_main, "NcentralClient", FakeNcentralClient),
+        ):
+            configured = self.client.put(
+                "/api/integrations/ncentral/config",
+                headers=headers,
+                json={
+                    "enabled": True,
+                    "baseUrl": "https://ncentral.example.com",
+                    "userApiToken": "permanent-user-api-token",
+                    "pageSize": 250,
+                    "expectedRevision": 1,
+                },
+            )
+            self.assertEqual(configured.status_code, 200, configured.text)
+            self.assertTrue(configured.json()["hasCredentials"])
+            self.assertNotIn("userApiToken", configured.json())
+            tested = self.client.post("/api/integrations/ncentral/test", headers=headers)
+            self.assertEqual(tested.status_code, 200, tested.text)
+            self.assertEqual(
+                [stage["status"] for stage in tested.json()["stages"]],
+                ["passed", "passed", "passed", "passed"],
+            )
+            self.assertFalse(tested.json()["writesAttempted"])
+
+            discovered = self.client.post("/api/integrations/ncentral/discover", headers=headers)
+            self.assertEqual(discovered.status_code, 200, discovered.text)
+            self.assertEqual(discovered.json()["discovered"], 1)
+            mapped = self.client.put(
+                "/api/integrations/ncentral/organizations/101/mapping",
+                headers=headers,
+                json={"companyId": "acme"},
+            )
+            self.assertEqual(mapped.status_code, 200, mapped.text)
+
+            options = self.client.post(
+                "/api/integrations/ncentral/devices/options",
+                headers=headers,
+                json={"companyId": "acme", "providerCompanyId": "101"},
+            )
+            self.assertEqual(options.status_code, 200, options.text)
+            self.assertEqual(options.json()["deviceFilters"][0]["id"], "managed-servers")
+            policy = self.client.get(
+                "/api/integrations/ncentral/devices/policy?companyId=acme&providerCompanyId=101",
+                headers=headers,
+            )
+            saved_policy = self.client.put(
+                "/api/integrations/ncentral/devices/policy",
+                headers=headers,
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "101",
+                    "providerFilterId": "managed-servers",
+                    "typeMode": "selected",
+                    "includedTypeIds": ["server"],
+                    "typeMappings": {"server": "Server"},
+                    "statusMode": "selected",
+                    "includedStatusIds": ["normal"],
+                    "syncMode": "manual",
+                    "enabled": False,
+                    "expectedRevision": policy.json()["revision"],
+                },
+            )
+            self.assertEqual(saved_policy.status_code, 200, saved_policy.text)
+            self.assertEqual(saved_policy.json()["providerFilterId"], "managed-servers")
+
+            preview = self.client.post(
+                "/api/integrations/ncentral/devices/preview",
+                headers=headers,
+                json={"companyId": "acme", "providerCompanyId": "101"},
+            )
+            self.assertEqual(preview.status_code, 200, preview.text)
+            self.assertEqual(preview.json()["counts"]["create"], 2)
+            self.assertTrue(preview.json()["readOnly"])
+            imported = self.client.post(
+                "/api/integrations/ncentral/devices/import",
+                headers=headers,
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "101",
+                    "externalIds": ["7001"],
+                    "decisionNotes": "Approved test import",
+                },
+            )
+            self.assertEqual(imported.status_code, 200, imported.text)
+            self.assertEqual(imported.json()["created"], 1)
+            imported_asset = next(
+                item
+                for item in backend_main.REPOSITORY.list_assets()
+                if item["name"] == "ACME-NC01"
+            )
+            self.assertEqual(imported_asset["source"], "ncentral")
+            self.assertEqual(imported_asset["externalId"], "7001")
+            calls_before_link = len(device_discovery_calls)
+            linked = self.client.post(
+                "/api/integrations/ncentral/devices/link",
+                headers=headers,
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "101",
+                    "externalId": "7002",
+                    "assetId": "asset-1",
+                },
+            )
+            self.assertEqual(linked.status_code, 200, linked.text)
+            self.assertEqual(linked.json()["assetName"], "ACME-DC01")
+            self.assertEqual(len(device_discovery_calls), calls_before_link)
+
+    def test_ncentral_active_but_disabled_connection_reports_the_recovery_action(self):
+        """Do not mislabel a disabled connection as active in provider-call errors."""
+
+        headers = self._headers("admin@example.com")
+        backend_main.REPOSITORY.ensure_integration_connection("ncentral", "N-central", "admin")
+
+        tested = self.client.post("/api/integrations/ncentral/test", headers=headers)
+
+        self.assertEqual(tested.status_code, 409, tested.text)
+        self.assertEqual(
+            tested.json()["detail"],
+            "N-central is disabled. Save and enable the connection before making "
+            "provider requests.",
+        )
+
+    def test_ncentral_auth_rejection_returns_an_actionable_token_safe_error(self):
+        """Map provider authorization failures without exposing their response body."""
+
+        marker = "provider-secret-response-marker"
+        error = backend_main.NcentralRequestError(marker, status_code=401)
+
+        detail = backend_main._ncentral_public_failure(error, "connection test")
+
+        self.assertEqual(
+            detail,
+            "N-central rejected the saved User-API token or its access scope. "
+            "Generate or verify the token, save the connection, and retry.",
+        )
+        self.assertNotIn(marker, detail)
+
     def test_connectwise_company_discovery_is_root_scoped_review_gated_and_secret_safe(self):
         client_token = self._login("client@acme.example")
         forbidden = self.client.get(

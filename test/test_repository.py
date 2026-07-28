@@ -247,6 +247,11 @@ class RepositoryTests(unittest.TestCase):
         )
         self.assertEqual(configured["revision"], 2)
         self.assertNotIn("credentialsEncrypted", self.repository.list_integrations()[0])
+        failed_test = self.repository.mark_integration_test(
+            "connectwise", "error", "Provider rejected the credentials", "admin"
+        )
+        self.assertEqual(failed_test["connectionStatus"], "error")
+        self.assertEqual(self.state["auditEvents"][0]["outcome"], "failed")
         with self.assertRaisesRegex(ValueError, "reload"):
             self.repository.update_integration_connection(
                 "connectwise", {"expectedRevision": 1}, "admin"

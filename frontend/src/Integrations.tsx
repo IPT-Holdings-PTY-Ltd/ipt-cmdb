@@ -24,6 +24,7 @@ import type {
   IntegrationLifecycleImpact,
   IntegrationPreviewStatus,
   IntegrationProviderManifest,
+  NcentralConnection,
   SyncRun,
 } from './types';
 import { useWorkspace } from './workspace';
@@ -67,14 +68,18 @@ function Metric({ label, value, detail, warning = false }: { label: string; valu
   );
 }
 
-function statusPresentation(entry: DirectoryEntry, connectWise: ConnectWiseConnection | null): { label: string; color: ChipProps['color'] } {
+function statusPresentation(
+  entry: DirectoryEntry,
+  connections: Record<string, ConnectWiseConnection | NcentralConnection | null>,
+): { label: string; color: ChipProps['color'] } {
   const lifecycle = entry.integration?.lifecycleStatus || 'active';
   if (lifecycle === 'paused') return { label: 'Paused', color: 'warning' };
   if (lifecycle === 'disabled') return { label: 'Disabled', color: 'default' };
   if (lifecycle === 'removed') return { label: 'Removed', color: 'default' };
-  if (entry.key === 'connectwise') {
-    if (connectWise?.connectionStatus === 'verified') return { label: 'Healthy', color: 'success' };
-    if (connectWise?.connectionStatus === 'error') return { label: 'Connection error', color: 'error' };
+  if (entry.key === 'connectwise' || entry.key === 'ncentral') {
+    const connection = connections[entry.key];
+    if (connection?.connectionStatus === 'verified') return { label: 'Healthy', color: 'success' };
+    if (connection?.connectionStatus === 'error') return { label: 'Connection error', color: 'error' };
     return { label: 'Review required', color: 'warning' };
   }
   if (entry.integration?.connectionStatus === 'error') return { label: 'Connection error', color: 'error' };
@@ -92,6 +97,7 @@ export function IntegrationsPage() {
   const [providers, setProviders] = useState<IntegrationProviderManifest[]>([]);
   const [runs, setRuns] = useState<SyncRun[]>([]);
   const [connectWise, setConnectWise] = useState<ConnectWiseConnection | null>(null);
+  const [ncentral, setNcentral] = useState<NcentralConnection | null>(null);
   const [previewStatus, setPreviewStatus] = useState<IntegrationPreviewStatus | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -106,17 +112,19 @@ export function IntegrationsPage() {
     setLoading(true);
     setError('');
     try {
-      const [configured, catalogue, activity, connection, workerStatus] = await Promise.all([
+      const [configured, catalogue, activity, connection, ncentralConnection, workerStatus] = await Promise.all([
         apiFetch<Integration[]>('/api/integrations'),
         apiFetch<IntegrationProviderManifest[]>('/api/integration-providers'),
         apiFetch<SyncRun[]>('/api/sync-runs'),
         apiFetch<ConnectWiseConnection>('/api/integrations/connectwise/config'),
+        apiFetch<NcentralConnection>('/api/integrations/ncentral/config'),
         apiFetch<IntegrationPreviewStatus>('/api/integrations/continuous-preview/status'),
       ]);
       setIntegrations(configured);
       setProviders(catalogue);
       setRuns(activity);
       setConnectWise(connection);
+      setNcentral(ncentralConnection);
       setPreviewStatus(workerStatus);
     } catch (value) {
       setError(value instanceof Error ? value.message : 'The integration directory could not be loaded.');
@@ -134,21 +142,28 @@ export function IntegrationsPage() {
       name: manifest?.name || integration.name,
       description: manifest?.description || providerDescriptions[integration.type] || 'A governed CMDB provider integration.',
       installed: integration.lifecycleStatus !== 'removed' && (
-        integration.type === 'connectwise'
-          ? Boolean(connectWise?.configured || integration.enabled || ['paused', 'disabled'].includes(integration.lifecycleStatus))
+        ['connectwise', 'ncentral'].includes(integration.type)
+          ? Boolean(
+            (integration.type === 'connectwise' ? connectWise?.configured : ncentral?.configured)
+            || integration.enabled || ['paused', 'disabled'].includes(integration.lifecycleStatus),
+          )
           : integration.enabled
       ),
       integration,
       manifest,
     };
-  }), [connectWise?.configured, integrations, providers]);
+  }), [connectWise?.configured, ncentral?.configured, integrations, providers]);
   const installed = entries.filter(entry => entry.installed);
   const available = entries.filter(entry => !entry.installed);
-  const attention = installed.filter(entry => statusPresentation(entry, connectWise).color !== 'success').length;
+  const connectionMap = { connectwise: connectWise, ncentral };
+  const attention = installed.filter(
+    entry => statusPresentation(entry, connectionMap).color !== 'success',
+  ).length;
   const removalConfirmationName = lifecycleEntry?.integration?.name || '';
 
   const openConfiguration = (entry: DirectoryEntry) => {
     if (entry.key === 'connectwise') navigate('/admin/integrations/connectwise');
+    if (entry.key === 'ncentral') navigate('/admin/integrations/ncentral');
   };
 
   const openLifecycle = async (entry: DirectoryEntry) => {
@@ -260,7 +275,7 @@ export function IntegrationsPage() {
                 <Box><Typography variant="h5">Installed integrations</Typography><Typography variant="body2" color="text.secondary">Health and operational controls for active provider connections.</Typography></Box>
               </Stack>
               {!installed.length ? <Alert severity="info" action={<Button color="inherit" size="small" onClick={() => setTab('available')}>Browse providers</Button>}>No provider integrations have been installed.</Alert> : <Grid container spacing={2}>{installed.map(entry => {
-                const state = statusPresentation(entry, connectWise);
+                const state = statusPresentation(entry, connectionMap);
                 const availableOperations = entry.manifest?.operations.filter(operation => operation.status === 'available') || [];
                 return <Grid key={entry.key} size={{ xs: 12, xl: 6 }}><Paper variant="outlined" sx={{ p: 2.5, height: '100%' }}>
                   <Stack spacing={2} sx={{ height: '100%' }}>
@@ -271,15 +286,15 @@ export function IntegrationsPage() {
                     <Typography color="text.secondary">{entry.description}</Typography>
                     <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
                       {availableOperations.length ? availableOperations.map(operation => <Chip key={operation.key} size="small" variant="outlined" label={`${operation.label} · ${operation.direction}`} />) : <Chip size="small" variant="outlined" label="Provider capability" />}
-                      {entry.key === 'connectwise' && previewStatus?.workerConfigured && <Chip size="small" color={previewStatus.workerHealthy ? 'success' : 'warning'} variant="outlined" label={`${previewStatus.executionMode.replaceAll('_', ' ')} worker ${previewStatus.workerHealthy ? 'healthy' : 'needs attention'}`} />}
-                      {entry.key === 'connectwise' && previewStatus?.providerRateLimit && <Chip size="small" color={previewStatus.providerRateLimit.limited ? 'error' : 'info'} variant="outlined" label={previewStatus.providerRateLimit.remaining != null ? `API quota ${previewStatus.providerRateLimit.remaining}${previewStatus.providerRateLimit.limit != null ? ` / ${previewStatus.providerRateLimit.limit}` : ''}` : `Last API response ${previewStatus.providerRateLimit.httpStatus || 'observed'}`} />}
+                      {['connectwise', 'ncentral'].includes(entry.key) && previewStatus?.workerConfigured && <Chip size="small" color={previewStatus.workerHealthy ? 'success' : 'warning'} variant="outlined" label={`${previewStatus.executionMode.replaceAll('_', ' ')} worker ${previewStatus.workerHealthy ? 'healthy' : 'needs attention'}`} />}
+                      {previewStatus?.providerRateLimits?.[entry.key] && <Chip size="small" color={previewStatus.providerRateLimits[entry.key]?.limited ? 'error' : 'info'} variant="outlined" label={previewStatus.providerRateLimits[entry.key]?.limited ? 'Provider throttling observed' : `Last API response ${previewStatus.providerRateLimits[entry.key]?.httpStatus || 'observed'}`} />}
                     </Stack>
                     <Grid container spacing={1.5}>
                       <Grid size={{ xs: 12, sm: 6 }}><Typography variant="caption" color="text.secondary">Last activity</Typography><Typography variant="body2">{formatDate(entry.integration?.lastSync)}</Typography></Grid>
-                      <Grid size={{ xs: 12, sm: 6 }}><Typography variant="caption" color="text.secondary">Credential source</Typography><Typography variant="body2">{entry.key === 'connectwise' ? (connectWise?.credentialSource || 'Not configured').replaceAll('_', ' ') : 'Installation configuration'}</Typography></Grid>
+                      <Grid size={{ xs: 12, sm: 6 }}><Typography variant="caption" color="text.secondary">Credential source</Typography><Typography variant="body2">{entry.key === 'connectwise' ? (connectWise?.credentialSource || 'Not configured').replaceAll('_', ' ') : entry.key === 'ncentral' ? (ncentral?.credentialSource || 'Not configured').replaceAll('_', ' ') : 'Installation configuration'}</Typography></Grid>
                     </Grid>
                     <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mt: 'auto' }}>
-                      <Button variant="contained" startIcon={<SettingsOutlined />} onClick={() => openConfiguration(entry)} disabled={entry.key !== 'connectwise'}>Change configuration</Button>
+                      <Button variant="contained" startIcon={<SettingsOutlined />} onClick={() => openConfiguration(entry)} disabled={!['connectwise', 'ncentral'].includes(entry.key)}>Change configuration</Button>
                       <Button variant="outlined" startIcon={<PauseCircleOutlineOutlined />} onClick={() => void openLifecycle(entry)} disabled={!isAdmin}>Manage lifecycle</Button>
                       <Button variant="outlined" onClick={() => navigate('/admin/reconciliation')}>Open reconciliation</Button>
                     </Stack>
@@ -295,7 +310,7 @@ export function IntegrationsPage() {
               </Stack>
               {!available.length ? <Alert severity="success">Every available integration has been installed.</Alert> : <Grid container spacing={2}>{available.map(entry => {
                 const removed = entry.integration?.lifecycleStatus === 'removed';
-                const canInstall = entry.key === 'connectwise';
+                const canInstall = ['connectwise', 'ncentral'].includes(entry.key);
                 return <Grid key={entry.key} size={{ xs: 12, md: 6, xl: 4 }}><Paper variant="outlined" sx={{ p: 2.5, height: '100%' }}>
                   <Stack spacing={1.5} sx={{ height: '100%' }}>
                     <Stack direction="row" sx={{ justifyContent: 'space-between', alignItems: 'center' }}><ExtensionOutlined color="primary" /><Chip size="small" label={removed ? 'Removed' : canInstall ? 'Ready to install' : 'Planned'} color={canInstall && !removed ? 'info' : 'default'} /></Stack>

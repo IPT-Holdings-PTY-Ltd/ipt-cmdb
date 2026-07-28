@@ -4,6 +4,7 @@ import unittest
 
 from src.cmdb.integrations import provider_registry
 from src.cmdb.integrations.providers.connectwise import ConnectWiseProvider, normalized_policy
+from src.cmdb.integrations.providers.ncentral import NcentralProvider
 
 
 class FakeConnectWiseClient:
@@ -68,6 +69,23 @@ class IntegrationProviderTests(unittest.TestCase):
         self.assertEqual(operations["change_ticket.create"]["direction"], "action")
         self.assertEqual(operations["change_ticket.create"]["status"], "disabled")
         self.assertTrue(operations["change_ticket.create"]["requires_approval"])
+        ncentral = next(item for item in provider_registry.manifests() if item["key"] == "ncentral")
+        ncentral_operations = {item["key"]: item for item in ncentral["operations"]}
+        self.assertEqual(ncentral_operations["device.discover"]["status"], "available")
+        self.assertEqual(ncentral_operations["device.manage"]["status"], "disabled")
+        self.assertTrue(ncentral_operations["device.manage"]["writes_provider"])
+
+    def test_ncentral_adapter_declares_four_read_only_test_stages(self):
+        class FakeNcentralClient:
+            def __init__(self, configuration):
+                self.configuration = configuration
+
+            def test_connection(self):
+                return {"reachable": True, "accessibleOrganizations": 2}
+
+        result = NcentralProvider(client_factory=FakeNcentralClient).test_connection({})
+        self.assertEqual(len(result["stages"]), 4)
+        self.assertFalse(result["writesAttempted"])
 
     def test_progressive_test_never_attempts_a_provider_write(self):
         result = self.provider.test_connection({"baseUrl": "https://example.invalid"})
