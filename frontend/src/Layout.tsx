@@ -176,6 +176,7 @@ function WorkspaceNavigation({ close }: { close: () => void }) {
  */
 export function WorkspaceLayout() {
   const [mobileOpen, setMobileOpen] = useState(false);
+  const location = useLocation();
   const workspace = useWorkspace();
   const user = getSession()?.user;
   const drawer = <WorkspaceNavigation close={() => setMobileOpen(false)} />;

@@ -19,7 +19,7 @@ import {
   Alert, Autocomplete, Box, Button, Chip, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, Divider,
   FormControl, FormControlLabel, IconButton, InputAdornment, InputLabel, MenuItem, Paper, Select, Stack, Switch, TextField, Tooltip, Typography,
 } from '@mui/material';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Background, Controls, Handle, MarkerType, MiniMap, Panel, Position, ReactFlow, useEdgesState, useNodesState,
   type Connection, type Edge, type FinalConnectionState, type Node, type NodeProps, type ReactFlowInstance,
@@ -323,8 +323,11 @@ export function Relationships() {
   const requestedTopologyView = perspectiveFromQuery(routeState.view);
   const role = getSession()?.user.role;
   const canEdit = !workspace.isRoot && ['platform_admin', 'msp_operator'].includes(role || '');
+  const workspaceKey = workspace.isRoot ? '__root__' : workspace.companyId;
   const [assets, setAssets] = useState<Asset[]>([]);
   const [relationships, setRelationships] = useState<Relationship[]>([]);
+  const relationshipsRef = useRef<Relationship[]>([]);
+  const [loadedWorkspaceKey, setLoadedWorkspaceKey] = useState('');
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<CiNodeData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [flow, setFlow] = useState<ReactFlowInstance<Node<CiNodeData>, Edge> | null>(null);
@@ -357,29 +360,61 @@ export function Relationships() {
   const reloadRelationships = useCallback(async () => {
     const suffix = workspace.isRoot ? '' : `?companyId=${encodeURIComponent(workspace.companyId)}`;
     const records = await apiFetch<Relationship[]>(`/api/relationships${suffix}`);
+    relationshipsRef.current = records;
     setRelationships(records); setEdges(makeEdges(records));
   }, [workspace.companyId, workspace.isRoot, setEdges]);
 
+  // Remote topology data changes with the workspace, not with the selected
+  // perspective or layout direction.
   useEffect(() => {
     let active = true;
     const load = async () => {
       setLoading(true); setError(''); setSelectedRelationshipId('');
+      setLoadedWorkspaceKey('');
       try {
         const suffix = workspace.isRoot ? '' : `?companyId=${encodeURIComponent(workspace.companyId)}`;
         const [assetData, relationshipData] = await Promise.all([apiFetch<Asset[]>(`/api/assets${suffix}`), apiFetch<Relationship[]>(`/api/relationships${suffix}`)]);
         if (!active) return;
-        setAssets(assetData); setRelationships(relationshipData);
-        const nextEdges = makeEdges(relationshipData);
-        let nextNodes = initialNodes(assetData, workspace.companyId, canEdit, topologyView);
-        if (!Object.keys(savedPositions(workspace.companyId, topologyView)).length && !['APPLICATION', 'NETWORK', 'STORAGE', 'STACK'].includes(topologyView) && nextNodes.length) nextNodes = await elkLayout(nextNodes, nextEdges, layoutDirection);
-        if (!active) return;
-        setNodes(nextNodes); setEdges(nextEdges);
-      } catch (value) { if (active) setError(value instanceof Error ? value.message : 'The relationship map could not be loaded.'); }
-      finally { if (active) setLoading(false); }
+        relationshipsRef.current = relationshipData;
+        setAssets(assetData); setRelationships(relationshipData); setEdges(makeEdges(relationshipData));
+        setLoadedWorkspaceKey(workspaceKey);
+      } catch (value) {
+        if (active) {
+          setError(value instanceof Error ? value.message : 'The relationship map could not be loaded.');
+          setLoading(false);
+        }
+      }
     };
     void load();
     return () => { active = false; };
-  }, [workspace.companyId, workspace.isRoot, canEdit, setNodes, setEdges, topologyView, layoutDirection]);
+  }, [workspace.companyId, workspace.isRoot, workspaceKey, setEdges]);
+
+  // Rebuild the graph from cached API data when its presentation changes.
+  useEffect(() => {
+    if (loadedWorkspaceKey !== workspaceKey) return;
+    let active = true;
+    const arrange = async () => {
+      setLayoutBusy(true);
+      try {
+        const nextEdges = makeEdges(relationshipsRef.current);
+        let nextNodes = initialNodes(assets, workspace.companyId, canEdit, topologyView);
+        if (!Object.keys(savedPositions(workspace.companyId, topologyView)).length && !['APPLICATION', 'NETWORK', 'STORAGE', 'STACK'].includes(topologyView) && nextNodes.length) {
+          nextNodes = await elkLayout(nextNodes, nextEdges, layoutDirection);
+        }
+        if (!active) return;
+        setNodes(nextNodes); setError('');
+      } catch (value) {
+        if (active) setError(value instanceof Error ? value.message : 'The relationship map could not be arranged.');
+      } finally {
+        if (active) {
+          setLoading(false);
+          setLayoutBusy(false);
+        }
+      }
+    };
+    void arrange();
+    return () => { active = false; };
+  }, [assets, loadedWorkspaceKey, workspaceKey, workspace.companyId, canEdit, topologyView, layoutDirection, setNodes]);
 
   const assetById = useMemo(() => new Map(assets.map(asset => [asset.id, asset])), [assets]);
   const selectedAsset = assetById.get(selectedAssetId);

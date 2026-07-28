@@ -51,7 +51,7 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 ### Changed
 
 - Migrated the frontend shell, authentication boundary, navigation, notifications and asset CRUD from React Admin to application-owned MUI components on React Router 8.3.
-- Raised the supported frontend runtime to Node.js 22.22 or newer in local development, CI and container builds.
+- Raised the supported frontend runtime to Node.js 22.22.2 or newer in local development, CI and container builds.
 - Hardened the React 19 migration with recoverable lazy routes, Router-native deep links, semantic navigation, Vitest regression coverage and React hooks/accessibility linting in CI.
 
 ### Security

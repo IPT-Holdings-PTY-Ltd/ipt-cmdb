@@ -49,7 +49,7 @@ jobs:
           cache-dependency-path: requirements-dev.txt
       - uses: actions/setup-node@v7
         with:
-          node-version: '22.22.0'
+          node-version: '22.22.2'
           cache: npm
 
       - name: Install Python dependencies
