@@ -11,9 +11,9 @@ import {
   Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Tooltip, Typography,
 } from '@mui/material';
 import { useEffect, useState, type ReactNode } from 'react';
-import { Title } from 'react-admin';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { apiFetch } from './session';
+import { Title } from './ui';
 import { useWorkspace } from './workspace';
 
 type DashboardAttention = { assetId: string; assetName: string; assetType: string; companyId: string; companyName: string; owner: string; reasons: string[]; score: number; severity: 'critical' | 'warning' | 'info' };

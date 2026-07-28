@@ -9,9 +9,9 @@ import {
   FormControl, Grid, InputLabel, MenuItem, Paper, Select, Stack, Tab, Table, TableBody, TableCell,
   TableContainer, TableHead, TableRow, Tabs, TextField, Typography,
 } from '@mui/material';
-import { useEffect, useMemo, useState } from 'react';
-import { Title, useRedirect } from 'react-admin';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { apiFetch, getSession } from './session';
+import { Title, useRedirect } from './ui';
 import type { DataQualityFinding, DataQualitySnapshot, FieldAuthorityRule, ReconciliationCandidate } from './types';
 import { useWorkspace } from './workspace';
 
@@ -39,8 +39,8 @@ export function DataQualityPage() {
   const [authority, setAuthority] = useState<FieldAuthorityRule | null>(null);
   const companyNames = useMemo(() => new Map(workspace.companies.map(item => [item.id, item.name])), [workspace.companies]);
   const suffix = workspace.isRoot ? '' : `?companyId=${encodeURIComponent(workspace.companyId)}`;
-  const load = async () => { setLoading(true); setError(''); try { setSnapshot(await apiFetch<DataQualitySnapshot>(`/api/data-quality${suffix}`)); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Data quality could not be evaluated.'); } finally { setLoading(false); } };
-  useEffect(() => { void load(); }, [workspace.companyId, workspace.isRoot]);
+  const load = useCallback(async () => { setLoading(true); setError(''); try { setSnapshot(await apiFetch<DataQualitySnapshot>(`/api/data-quality${suffix}`)); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Data quality could not be evaluated.'); } finally { setLoading(false); } }, [suffix]);
+  useEffect(() => { void load(); }, [load]);
   const findings = useMemo(() => (snapshot?.findings || []).filter(item => (!severity || item.severity === severity) && (!search || `${item.assetName} ${item.assetType} ${item.ruleLabel} ${item.evidence}`.toLowerCase().includes(search.toLowerCase()))), [snapshot, search, severity]);
   async function saveException() { if (!waive) return; try { await apiFetch('/api/data-quality/exceptions', { method: 'POST', body: JSON.stringify({ companyId: waive.companyId, ruleKey: waive.ruleKey, entityId: waive.assetId, reason, expiresAt: expiresAt || null }) }); setWaive(null); setReason(''); setExpiresAt(''); await load(); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Exception could not be recorded.'); } }
   async function saveDecision() { if (!decision) return; try { await apiFetch(`/api/reconciliation-candidates/${decision.id}`, { method: 'PATCH', body: JSON.stringify({ decision: decisionType, notes: decisionNotes, targetAssetId: decisionType === 'use_existing' ? (targetAssetId || decision.candidateAssetId) : null }) }); setDecision(null); setDecisionNotes(''); await load(); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Decision could not be recorded.'); } }

@@ -8,9 +8,9 @@ import {
   TableRow, Tabs, TextField, Typography,
 } from '@mui/material';
 import { useEffect, useMemo, useState } from 'react';
-import { Title } from 'react-admin';
-import { Navigate } from 'react-router-dom';
+import { Navigate } from 'react-router';
 import { apiFetch, getSession } from './session';
+import { Title } from './ui';
 import { useWorkspace } from './workspace';
 
 type Notice = { severity: 'success' | 'error' | 'info' | 'warning'; message: string } | null;

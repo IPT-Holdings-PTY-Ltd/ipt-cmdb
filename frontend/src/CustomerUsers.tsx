@@ -2,10 +2,10 @@ import CheckCircleOutlined from '@mui/icons-material/CheckCircleOutlined';
 import PersonAddAltOutlined from '@mui/icons-material/PersonAddAltOutlined';
 import SecurityOutlined from '@mui/icons-material/SecurityOutlined';
 import { Alert, Box, Button, Card, CardContent, Chip, CircularProgress, Grid, List, ListItem, ListItemIcon, ListItemText, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material';
-import { useEffect, useState, type FormEvent } from 'react';
-import { Title } from 'react-admin';
-import { Navigate } from 'react-router-dom';
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { Navigate } from 'react-router';
 import { apiFetch, getSession } from './session';
+import { Title } from './ui';
 import type { User } from './types';
 import { useWorkspace } from './workspace';
 
@@ -22,7 +22,7 @@ export function CustomerUsersPage() {
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
 
-  const loadUsers = async () => {
+  const loadUsers = useCallback(async () => {
     setLoading(true);
     try {
       const records = await apiFetch<User[]>(`/api/users?companyId=${encodeURIComponent(workspace.companyId)}`);
@@ -32,9 +32,9 @@ export function CustomerUsersPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [workspace.companyId]);
 
-  useEffect(() => { if (!workspace.isRoot && canManageUsers) void loadUsers(); }, [workspace.companyId, workspace.isRoot]);
+  useEffect(() => { if (!workspace.isRoot && canManageUsers) void loadUsers(); }, [workspace.isRoot, canManageUsers, loadUsers]);
 
   async function createCustomerUser(event: FormEvent) {
     event.preventDefault(); setSaving(true); setNotice(null);

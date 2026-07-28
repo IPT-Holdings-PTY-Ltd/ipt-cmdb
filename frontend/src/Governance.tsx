@@ -8,9 +8,9 @@ import {
   Grid, InputLabel, MenuItem, Paper, Select, Stack, Table, TableBody, TableCell, TableContainer,
   TableHead, TableRow, TextField, Typography,
 } from '@mui/material';
-import { useEffect, useMemo, useState } from 'react';
-import { Title } from 'react-admin';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiDownload, apiFetch } from './session';
+import { Title } from './ui';
 import type { AuditEvent, ReportDefinition, ReportPreview } from './types';
 import { useWorkspace } from './workspace';
 
@@ -94,12 +94,14 @@ export function AuditCenterPage() {
   const [outcome, setOutcome] = useState('');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
+  const searchRef = useRef(search);
+  searchRef.current = search;
   const companyNames = useMemo(() => new Map(workspace.companies.map(item => [item.id, item.name])), [workspace.companies]);
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true); setError('');
     const query = new URLSearchParams({ limit: '500' });
     if (!workspace.isRoot) query.set('companyId', workspace.companyId);
-    if (search) query.set('search', search);
+    if (searchRef.current) query.set('search', searchRef.current);
     if (category) query.set('category', category);
     if (outcome) query.set('outcome', outcome);
     if (dateFrom) query.set('dateFrom', dateFrom);
@@ -107,8 +109,8 @@ export function AuditCenterPage() {
     try { setEvents(await apiFetch<AuditEvent[]>(`/api/audit-events?${query}`)); }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Audit events could not be loaded.'); }
     finally { setLoading(false); }
-  };
-  useEffect(() => { void load(); }, [workspace.companyId, workspace.isRoot, category, outcome, dateFrom, dateTo]);
+  }, [workspace.companyId, workspace.isRoot, category, outcome, dateFrom, dateTo]);
+  useEffect(() => { void load(); }, [load]);
   return (
     <Box className="governance-page"><Title title="Audit activity" />
       {heading('Governance', workspace.isRoot ? 'MSP audit center' : `${workspace.companyName} audit`, 'Trace security, access, configuration and CMDB changes with attributable actors, outcomes and correlation references.', <HistoryOutlined />)}
@@ -148,7 +150,7 @@ export function ReportsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const suffix = workspace.isRoot ? '' : `?companyId=${encodeURIComponent(workspace.companyId)}`;
-  useEffect(() => { let active = true; setLoading(true); setError(''); apiFetch<ReportDefinition[]>(`/api/reports/catalog${suffix}`).then(records => { if (!active) return; setCatalog(records); setReportId(current => records.some(item => item.id === current) ? current : records[0]?.id || ''); }).catch(reason => { if (active) setError(reason instanceof Error ? reason.message : 'Report catalogue could not be loaded.'); }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, [workspace.companyId, workspace.isRoot]);
+  useEffect(() => { let active = true; setLoading(true); setError(''); apiFetch<ReportDefinition[]>(`/api/reports/catalog${suffix}`).then(records => { if (!active) return; setCatalog(records); setReportId(current => records.some(item => item.id === current) ? current : records[0]?.id || ''); }).catch(reason => { if (active) setError(reason instanceof Error ? reason.message : 'Report catalogue could not be loaded.'); }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, [suffix]);
   useEffect(() => { if (!reportId) { setPreview(null); return; } let active = true; setLoading(true); apiFetch<ReportPreview>(`/api/reports/${encodeURIComponent(reportId)}/preview${suffix}`).then(value => { if (active) { setPreview(value); setError(''); } }).catch(reason => { if (active) setError(reason instanceof Error ? reason.message : 'Report could not be generated.'); }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, [reportId, suffix]);
   async function download(format: 'pdf' | 'xlsx' | 'csv') { try { const separator = suffix ? '&' : '?'; const result = await apiDownload(`/api/reports/${encodeURIComponent(reportId)}/download${suffix}${separator}format=${format}`); downloadBlob(result.blob, result.filename); } catch (reason) { setError(reason instanceof Error ? reason.message : 'Report download failed.'); } }
   return (

@@ -13,9 +13,9 @@ import {
   TableContainer, TableHead, TableRow, TextField, Typography,
 } from '@mui/material';
 import { useEffect, useMemo, useState } from 'react';
-import { Title } from 'react-admin';
-import { Navigate } from 'react-router-dom';
+import { Navigate } from 'react-router';
 import { apiDownload, apiFetch, getSession } from './session';
+import { Title } from './ui';
 import { useWorkspace } from './workspace';
 
 type Notice = { severity: 'success' | 'error' | 'info' | 'warning'; message: string } | null;
@@ -81,7 +81,7 @@ function PageHeading({ connection, restart }: { connection: EmailConnection | nu
 }
 
 function ChoiceCard({ selected, icon, title, copy, recommended, onClick }: { selected: boolean; icon: React.ReactNode; title: string; copy: string; recommended?: boolean; onClick: () => void }) {
-  return <Paper variant="outlined" role="radio" aria-checked={selected} aria-label={title} tabIndex={0} onClick={onClick} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onClick(); } }} sx={{ p: 2.5, height: '100%', cursor: 'pointer', borderColor: selected ? 'primary.main' : undefined, bgcolor: selected ? 'action.selected' : undefined }}>
+  return <Paper component="button" type="button" variant="outlined" aria-pressed={selected} aria-label={title} onClick={onClick} sx={{ p: 2.5, width: '100%', height: '100%', cursor: 'pointer', textAlign: 'left', color: 'inherit', borderColor: selected ? 'primary.main' : undefined, bgcolor: selected ? 'action.selected' : undefined }}>
     <Stack direction="row" spacing={1.5} sx={{ alignItems: 'flex-start' }}><Radio checked={selected} tabIndex={-1} aria-hidden /><Box sx={{ flex: 1 }}>{icon}<Stack direction="row" spacing={1} sx={{ mt: 1, alignItems: 'center', flexWrap: 'wrap' }}><Typography variant="h6">{title}</Typography>{recommended && <Chip size="small" color="success" label="Recommended" />}</Stack><Typography color="text.secondary" variant="body2" sx={{ mt: 0.75 }}>{copy}</Typography></Box></Stack>
   </Paper>;
 }
@@ -263,7 +263,7 @@ export function EmailPage() {
     </Grid>;
 
     if (activeStep === 1) return <Grid container spacing={3}>
-      <Grid size={{ xs: 12, lg: 7 }}><Card><CardContent><Stack spacing={2}><Typography variant="h5">Choose the sender mailbox</Typography><FormControl fullWidth><InputLabel>Mailbox setup</InputLabel><Select label="Mailbox setup" value={mailboxMode} onChange={event => setMailboxMode(event.target.value as 'create' | 'existing')}><MenuItem value="create">Create a dedicated shared mailbox with the script</MenuItem><MenuItem value="existing">Use an existing shared or service mailbox</MenuItem></Select></FormControl><TextField label="Sender mailbox" type="email" value={connection.senderAddress} onChange={event => update('senderAddress', event.target.value)} placeholder="cmdb@contoso.com" autoFocus /><TextField label="Sender display name" value={connection.senderName} onChange={event => update('senderName', event.target.value)} placeholder="Contoso CMDB" /><TextField label="Reply-to address (optional)" type="email" value={connection.replyTo} onChange={event => update('replyTo', event.target.value)} placeholder="support@contoso.com" /></Stack></CardContent></Card></Grid>
+      <Grid size={{ xs: 12, lg: 7 }}><Card><CardContent><Stack spacing={2}><Typography variant="h5">Choose the sender mailbox</Typography><FormControl fullWidth><InputLabel>Mailbox setup</InputLabel><Select label="Mailbox setup" value={mailboxMode} onChange={event => setMailboxMode(event.target.value as 'create' | 'existing')}><MenuItem value="create">Create a dedicated shared mailbox with the script</MenuItem><MenuItem value="existing">Use an existing shared or service mailbox</MenuItem></Select></FormControl><TextField label="Sender mailbox" type="email" value={connection.senderAddress} onChange={event => update('senderAddress', event.target.value)} placeholder="cmdb@contoso.com" /><TextField label="Sender display name" value={connection.senderName} onChange={event => update('senderName', event.target.value)} placeholder="Contoso CMDB" /><TextField label="Reply-to address (optional)" type="email" value={connection.replyTo} onChange={event => update('replyTo', event.target.value)} placeholder="support@contoso.com" /></Stack></CardContent></Card></Grid>
       <Grid size={{ xs: 12, lg: 5 }}><Card><CardContent><Typography variant="h5">Administrator guidance</Typography><List dense><ListItem><ListItemIcon><CheckCircleOutlined color="success" /></ListItemIcon><ListItemText primary={mailboxMode === 'create' ? 'The generated script creates the shared mailbox' : 'Confirm the existing mailbox address'} secondary="A dedicated shared mailbox keeps the CMDB sender separate from human accounts." /></ListItem><ListItem><ListItemIcon><CheckCircleOutlined color="success" /></ListItemIcon><ListItemText primary="No mailbox password is used" secondary="Microsoft Graph authenticates the application identity, not a mailbox user." /></ListItem></List><Button href={sharedMailboxesUrl} target="_blank" rel="noreferrer" endIcon={<OpenInNewOutlined />}>Open shared mailboxes</Button></CardContent></Card></Grid>
     </Grid>;
 

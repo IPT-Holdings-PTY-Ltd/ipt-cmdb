@@ -4,6 +4,12 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ## [Unreleased]
 
+### Planned
+
+- Dedicated worker-service deployment and provider rate-limit telemetry.
+
+## [0.3.0] - 2026-07-28
+
 ### Added
 
 - Root-managed ConnectWise PSA setup with AES-GCM encrypted API keys or environment-owned configuration, a least-data connection test and bounded paginated company discovery.
@@ -42,9 +48,16 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Blank-database and forward-upgrade coverage through schema `2026.07.24.6`.
 - Guarded semantic-version release automation that reuses CI, publishes attested multi-architecture GHCR images and generates categorized GitHub releases.
 
-### Planned
+### Changed
 
-- Dedicated worker-service deployment and provider rate-limit telemetry.
+- Migrated the frontend shell, authentication boundary, navigation, notifications and asset CRUD from React Admin to application-owned MUI components on React Router 8.3.
+- Raised the supported frontend runtime to Node.js 22.22 or newer in local development, CI and container builds.
+- Hardened the React 19 migration with recoverable lazy routes, Router-native deep links, semantic navigation, Vitest regression coverage and React hooks/accessibility linting in CI.
+
+### Security
+
+- Removed the React Router 7 and `react-router-dom` dependency tree affected by GHSA-qwww-vcr4-c8h2.
+- Added a blocking npm advisory audit to CI so high-severity frontend dependency findings cannot be merged unnoticed.
 
 ## [0.2.0] - 2026-07-16
 

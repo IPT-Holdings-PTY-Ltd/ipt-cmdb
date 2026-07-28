@@ -25,10 +25,10 @@ import {
   DialogTitle, Divider, FormControl, FormControlLabel, Grid, InputLabel, List, ListItem, ListItemIcon, ListItemText,
   MenuItem, Paper, Select, Stack, Step, StepLabel, Stepper, Table, TableBody, TableCell, TableContainer, TableHead, TablePagination, TableRow, TextField, Typography,
 } from '@mui/material';
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { Title, useNotify } from 'react-admin';
-import { Navigate, useNavigate } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { Navigate, useNavigate } from 'react-router';
 import { apiDownload, apiFetch, getSession } from './session';
+import { Title, useNotify } from './ui';
 import type { AccessGroup, AccessGroupImpact, ApiToken, Asset, CiReviewItem, CiReviewQueue, Company, ConfigurationReconciliationItem, ConfigurationReconciliationPreview, ConnectWiseCiOptions, ConnectWiseCiPolicy, ConnectWiseConnection, ConnectWiseDiscoveryOptions, DiscoveryPreview, IntegrationPreviewStatus, IntegrationProviderManifest, IntegrationTestResult, ProviderCompany, RoleTemplate, SyncRun, User } from './types';
 import { useWorkspace } from './workspace';
 import { DEFAULT_MSP_BRAND, useMspBranding, type Brand } from './branding';
@@ -193,15 +193,15 @@ export function UsersPage() {
   const [tokenCompanyIds, setTokenCompanyIds] = useState<string[]>([]);
   const [revealedToken, setRevealedToken] = useState('');
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     try {
       const [userData, groupData] = await Promise.all([apiFetch<User[]>('/api/users'), apiFetch<AccessGroup[]>('/api/access-groups')]);
       setUsers(userData); setGroups(groupData); setCompanyId(value => value || workspace.companies[0]?.id || '');
     } catch (error) { setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Users could not be loaded.' }); }
     finally { setLoading(false); }
-  };
-  useEffect(() => { void load(); }, []);
+  }, [workspace.companies]);
+  useEffect(() => { void load(); }, [load]);
 
   async function createUser(event: FormEvent) {
     event.preventDefault(); setNotice(null);
@@ -442,7 +442,7 @@ export function UsersPage() {
         </Stack>
       </Dialog>
       <Dialog open={Boolean(passwordUser)} onClose={() => setPasswordUser(null)} fullWidth maxWidth="xs">
-        <Stack component="form" onSubmit={resetPassword}><DialogTitle>Change local password</DialogTitle><DialogContent><Stack spacing={2} sx={{ pt: 1 }}><Typography color="text.secondary">Set a new password for {passwordUser?.email}.</Typography><TextField autoFocus label="New password" type="password" value={newPassword} onChange={event => setNewPassword(event.target.value)} slotProps={{ htmlInput: { minLength: 12 } }} helperText="At least 12 characters" required /><Alert severity="warning">All active browser sessions for this user will be revoked.</Alert></Stack></DialogContent><DialogActions><Button onClick={() => setPasswordUser(null)}>Cancel</Button><Button type="submit" variant="contained">Change password</Button></DialogActions></Stack>
+        <Stack component="form" onSubmit={resetPassword}><DialogTitle>Change local password</DialogTitle><DialogContent><Stack spacing={2} sx={{ pt: 1 }}><Typography color="text.secondary">Set a new password for {passwordUser?.email}.</Typography><TextField label="New password" type="password" value={newPassword} onChange={event => setNewPassword(event.target.value)} slotProps={{ htmlInput: { minLength: 12 } }} helperText="At least 12 characters" required /><Alert severity="warning">All active browser sessions for this user will be revoked.</Alert></Stack></DialogContent><DialogActions><Button onClick={() => setPasswordUser(null)}>Cancel</Button><Button type="submit" variant="contained">Change password</Button></DialogActions></Stack>
       </Dialog>
       <Dialog open={Boolean(mfaResetUser)} onClose={closeMfaReset} fullWidth maxWidth="sm">
         <Stack component="form" onSubmit={resetMfa}><DialogTitle>Reset authenticator</DialogTitle><DialogContent><Stack spacing={2} sx={{ pt: 1 }}><Alert severity="warning">This removes the enrolled authenticator and every recovery code for {mfaResetUser?.email}. All browser sessions will be revoked, while the account’s MFA-required policy remains unchanged.</Alert><TextField label="Reset reason" value={mfaResetReason} onChange={event => setMfaResetReason(event.target.value)} required slotProps={{ htmlInput: { minLength: 4, maxLength: 500 } }} /><TextField label="Ticket or change reference (optional)" value={mfaResetTicket} onChange={event => setMfaResetTicket(event.target.value)} slotProps={{ htmlInput: { maxLength: 120 } }} />{actor?.authSource === 'local' ? <><Divider>Administrator verification</Divider><TextField label="Your current password" type="password" value={mfaResetAdminPassword} onChange={event => setMfaResetAdminPassword(event.target.value)} required />{actor.mfaEnabled && <TextField label="Your authenticator or recovery code" value={mfaResetAdminCode} onChange={event => setMfaResetAdminCode(event.target.value)} required slotProps={{ htmlInput: { autoComplete: 'one-time-code', maxLength: 64 } }} />}</> : <Alert severity="info">Your Microsoft Entra session authorizes this administrative action. Conditional Access remains responsible for Entra step-up authentication.</Alert>}<Divider>Destructive action confirmation</Divider><TextField label={`Type ${mfaResetUser?.email || 'the user email'} to confirm`} value={mfaResetConfirmation} onChange={event => setMfaResetConfirmation(event.target.value)} required autoComplete="off" /></Stack></DialogContent><DialogActions><Button onClick={closeMfaReset}>Cancel</Button><Button type="submit" color="warning" variant="contained" disabled={mfaResetConfirmation.trim().toLowerCase() !== (mfaResetUser?.email || '').toLowerCase()}>Reset MFA and revoke sessions</Button></DialogActions></Stack>
@@ -702,12 +702,6 @@ export function ConnectWiseIntegrationPage() {
     } catch (value) { setError(value); }
   };
   useEffect(() => { void load(); }, []);
-  useEffect(() => {
-    if (activeStep === 3 && connectWise?.configured && !discoveryOptions) void loadDiscoveryOptions();
-  }, [activeStep, connectWise?.configured]);
-  useEffect(() => {
-    if (activeStep === 5 && configurationCompanyId) void loadConfigurationOptions();
-  }, [activeStep, configurationCompanyId]);
   const connectWiseManifest = providers.find(item => item.key === 'connectwise');
   const filteredCompanies = useMemo(() => providerCompanies.filter(item => `${item.name} ${item.identifier} ${item.externalId} ${item.mappedCompanyName}`.toLowerCase().includes(companySearch.toLowerCase())), [providerCompanies, companySearch]);
   const mappedCompanies = useMemo(() => providerCompanies.filter(item => item.active && item.mappedCompanyId), [providerCompanies]);
@@ -724,12 +718,12 @@ export function ConnectWiseIntegrationPage() {
     setConnectWise(current => current ? ({ ...current, discoveryPolicy: { ...current.discoveryPolicy, ...changes } }) : current);
     setPreviewStale(Boolean(preview));
   };
-  async function loadDiscoveryOptions() {
+  const loadDiscoveryOptions = useCallback(async () => {
     setFilterChoicesLoading(true); setError(null);
     try {
       setDiscoveryOptions(await apiFetch<ConnectWiseDiscoveryOptions>('/api/integrations/connectwise/discovery-options'));
     } catch (value) { setError(value); } finally { setFilterChoicesLoading(false); }
-  }
+  }, []);
   async function sync(type: string) {
     setBusy(type); setError(null); setNotice({ severity: 'info', message: 'Reading ConnectWise companies. Nothing will be written to ConnectWise or mapped automatically.' });
     try {
@@ -840,7 +834,15 @@ export function ConnectWiseIntegrationPage() {
     });
     updateConfigurationPolicy({ typeMappings: mappings });
   };
-  async function loadConfigurationOptions() {
+  const loadCiReviewQueue = useCallback(async (companyId?: string) => {
+    const selectedCompanyId = companyId || configurationPolicy.companyId;
+    if (!selectedCompanyId) { setCiReviewItems([]); setCiReviewTotal(0); return; }
+    try {
+      const queue = await apiFetch<CiReviewQueue>(`/api/integrations/connectwise/configurations/review-queue?companyId=${encodeURIComponent(selectedCompanyId)}&state=pending&limit=500`);
+      setCiReviewItems(queue.items); setCiReviewTotal(queue.total);
+    } catch (value) { setError(value); }
+  }, [configurationPolicy.companyId]);
+  const loadConfigurationOptions = useCallback(async () => {
     const mapped = mappedCompanies.find(item => item.externalId === configurationCompanyId);
     if (!mapped?.mappedCompanyId) return;
     setConfigurationOptionsLoading(true); setError(null);
@@ -851,15 +853,13 @@ export function ConnectWiseIntegrationPage() {
       setConfigurationOptions(options); setConfigurationPolicy(options.policy);
       await loadCiReviewQueue(mapped.mappedCompanyId);
     } catch (value) { setError(value); } finally { setConfigurationOptionsLoading(false); }
-  }
-  async function loadCiReviewQueue(companyId?: string) {
-    const selectedCompanyId = companyId || configurationPolicy.companyId;
-    if (!selectedCompanyId) { setCiReviewItems([]); setCiReviewTotal(0); return; }
-    try {
-      const queue = await apiFetch<CiReviewQueue>(`/api/integrations/connectwise/configurations/review-queue?companyId=${encodeURIComponent(selectedCompanyId)}&state=pending&limit=500`);
-      setCiReviewItems(queue.items); setCiReviewTotal(queue.total);
-    } catch (value) { setError(value); }
-  }
+  }, [configurationCompanyId, loadCiReviewQueue, mappedCompanies]);
+  useEffect(() => {
+    if (activeStep === 3 && connectWise?.configured && !discoveryOptions) void loadDiscoveryOptions();
+  }, [activeStep, connectWise?.configured, discoveryOptions, loadDiscoveryOptions]);
+  useEffect(() => {
+    if (activeStep === 5 && configurationCompanyId) void loadConfigurationOptions();
+  }, [activeStep, configurationCompanyId, loadConfigurationOptions]);
   async function saveConfigurationPolicy(showNotice = true): Promise<ConnectWiseCiPolicy | null> {
     if (!isAdmin || !configurationPolicy.companyId || !configurationPolicy.providerParentId) return configurationPolicy;
     setBusy('save-ci-policy'); setError(null);

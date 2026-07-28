@@ -7,7 +7,7 @@ IPT CMDB is a tenant-aware web platform with a React single-page application, a 
 ```mermaid
 flowchart TB
     USER[MSP or customer user] --> EDGE[HTTPS and identity gateway]
-    EDGE --> SPA[React Admin SPA]
+    EDGE --> SPA[React SPA with MUI and React Router 8]
     EDGE --> API[FastAPI]
     SPA --> API
     API --> PG[(PostgreSQL)]
@@ -24,8 +24,9 @@ The current Docker image contains the compiled SPA and API. This keeps local hos
 The frontend uses:
 
 - React and TypeScript;
-- React Admin for resource routing and authenticated application structure;
+- React Router 8 for hash-based routing and protected workspace routes;
 - Material UI for components and theming;
+- application-owned authentication, notifications, navigation and asset forms;
 - React Flow and ELK for interactive topology and automatic layout.
 
 The workspace selector is the tenant boundary in the user experience. Root users can select the MSP workspace or an authorised customer. Customer users are constrained to their assigned tenant. A workspace change triggers a new API-scoped load; cached data from the previous customer is not reused as authority.

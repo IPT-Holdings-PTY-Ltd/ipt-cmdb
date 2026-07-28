@@ -1,9 +1,20 @@
-import { HttpError } from 'react-admin';
 import type { User } from './types';
 
 const sessionKey = 'cmdb.react.session';
 
 export type Session = { token: string; expiresAt: string; user: User };
+
+/** HTTP error with the response status and structured API response body. */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public body: unknown,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
 
 export function getSession(): Session | null {
   try {
@@ -38,7 +49,7 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
   const payload = response.status === 204 ? {} : await response.json().catch(() => ({}));
   if (!response.ok) {
     if (response.status === 401) setSession(null);
-    throw new HttpError(payload.error || payload.detail || response.statusText, response.status, payload);
+    throw new ApiError(payload.error || payload.detail || response.statusText, response.status, payload);
   }
   return payload as T;
 }
@@ -56,7 +67,7 @@ export async function apiDownload(path: string, init: RequestInit = {}): Promise
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     if (response.status === 401) setSession(null);
-    throw new HttpError(payload.error || payload.detail || response.statusText, response.status, payload);
+    throw new ApiError(payload.error || payload.detail || response.statusText, response.status, payload);
   }
   const disposition = response.headers.get('content-disposition') || '';
   const match = disposition.match(/filename="?([^";]+)"?/i);

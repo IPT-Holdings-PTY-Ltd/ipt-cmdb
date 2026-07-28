@@ -25,9 +25,10 @@ import {
   type Connection, type Edge, type FinalConnectionState, type Node, type NodeProps, type ReactFlowInstance,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { Title } from 'react-admin';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router';
+import { createRelationshipSearchParams, readRelationshipRouteState } from './routeState';
 import { apiFetch, getSession } from './session';
+import { Title } from './ui';
 import { displayLayer, displayLayerLabels, displayLayerOrder, traverseImpact as traverse, type DisplayLayer } from './topology';
 import type { Asset, Relationship } from './types';
 import { useWorkspace } from './workspace';
@@ -91,14 +92,6 @@ function isStoragePerspectiveAsset(asset: Asset) {
 function perspectiveFromQuery(value: string | null): TopologyView {
   const match = Object.keys(perspectiveLabels).find(item => item.toLowerCase() === String(value || '').toLowerCase());
   return (match as TopologyView) || (value === 'business' ? 'BUSINESS' : value === 'virtualization' ? 'VIRTUALIZATION' : 'TECHNICAL');
-}
-
-function syncRelationshipQuery(view: TopologyView, businessAppId: string, showSharedImpact: boolean) {
-  const query = new URLSearchParams();
-  query.set('view', view.toLowerCase());
-  if (businessAppId) query.set('businessAppId', businessAppId);
-  if (businessAppId && showSharedImpact) query.set('sharedImpact', '1');
-  window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.search}#/relationships?${query.toString()}`);
 }
 
 const nodeTypes = { ci: CiNode };
@@ -325,9 +318,11 @@ function storedRelationship(connection: Connection, type: RelationshipType, impa
 export function Relationships() {
   const workspace = useWorkspace();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const routeState = readRelationshipRouteState(searchParams);
+  const requestedTopologyView = perspectiveFromQuery(routeState.view);
   const role = getSession()?.user.role;
   const canEdit = !workspace.isRoot && ['platform_admin', 'msp_operator'].includes(role || '');
-  const initialQuery = useMemo(() => new URLSearchParams(window.location.hash.split('?', 2)[1] || ''), []);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [relationships, setRelationships] = useState<Relationship[]>([]);
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<CiNodeData>>([]);
@@ -337,20 +332,27 @@ export function Relationships() {
   const [error, setError] = useState('');
   const [layoutBusy, setLayoutBusy] = useState(false);
   const [layoutDirection, setLayoutDirection] = useState<LayoutDirection>('RIGHT');
-  const [topologyView, setTopologyView] = useState<TopologyView>(perspectiveFromQuery(initialQuery.get('view')));
-  const [focusedBusinessSystemId, setFocusedBusinessSystemId] = useState(initialQuery.get('businessAppId') || '');
-  const [showSharedImpact, setShowSharedImpact] = useState(initialQuery.get('sharedImpact') === '1');
+  const [topologyView, setTopologyView] = useState<TopologyView>(requestedTopologyView);
+  const [focusedBusinessSystemId, setFocusedBusinessSystemId] = useState(routeState.businessAppId);
+  const [showSharedImpact, setShowSharedImpact] = useState(routeState.showSharedImpact);
   const [expandedClusters, setExpandedClusters] = useState<Set<string>>(new Set());
   const [locked, setLocked] = useState(false);
   const [search, setSearch] = useState('');
   const [visibleTypes, setVisibleTypes] = useState<Set<RelationshipType>>(() => new Set(allRelationshipTypes));
-  const [selectedAssetId, setSelectedAssetId] = useState('');
+  const [selectedAssetId, setSelectedAssetId] = useState(routeState.assetId);
   const [selectedRelationshipId, setSelectedRelationshipId] = useState('');
   const [pendingConnection, setPendingConnection] = useState<Connection | null>(null);
   const [pendingType, setPendingType] = useState<RelationshipType>('connected_to');
   const [pendingImpactPolicy, setPendingImpactPolicy] = useState<ImpactPolicy>('required');
   const [savingRelationship, setSavingRelationship] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const syncRelationshipQuery = useCallback((
+    view: TopologyView,
+    businessAppId: string,
+    sharedImpact: boolean,
+  ) => {
+    setSearchParams(createRelationshipSearchParams(view, businessAppId, sharedImpact), { replace: true });
+  }, [setSearchParams]);
 
   const reloadRelationships = useCallback(async () => {
     const suffix = workspace.isRoot ? '' : `?companyId=${encodeURIComponent(workspace.companyId)}`;
@@ -361,7 +363,7 @@ export function Relationships() {
   useEffect(() => {
     let active = true;
     const load = async () => {
-      setLoading(true); setError(''); setSelectedAssetId(initialQuery.get('assetId') || ''); setSelectedRelationshipId('');
+      setLoading(true); setError(''); setSelectedRelationshipId('');
       try {
         const suffix = workspace.isRoot ? '' : `?companyId=${encodeURIComponent(workspace.companyId)}`;
         const [assetData, relationshipData] = await Promise.all([apiFetch<Asset[]>(`/api/assets${suffix}`), apiFetch<Relationship[]>(`/api/relationships${suffix}`)]);
@@ -377,7 +379,7 @@ export function Relationships() {
     };
     void load();
     return () => { active = false; };
-  }, [workspace.companyId, workspace.isRoot, canEdit, setNodes, setEdges]);
+  }, [workspace.companyId, workspace.isRoot, canEdit, setNodes, setEdges, topologyView, layoutDirection]);
 
   const assetById = useMemo(() => new Map(assets.map(asset => [asset.id, asset])), [assets]);
   const selectedAsset = assetById.get(selectedAssetId);
@@ -477,11 +479,17 @@ export function Relationships() {
   }, [topologyView, assets, businessVisibleIds, virtualizationVisibleIds, selectedAssetId, relatedIds, focusedBusinessSystem, businessScopeIds]);
   const networkZones = useMemo(() => [...new Set(assets.filter(asset => perspectiveVisibleIds.has(asset.id) && topologyView === 'NETWORK').map(asset => asset.metadata?.networkZone).filter(Boolean))].sort(), [assets, perspectiveVisibleIds, topologyView]);
   useEffect(() => {
+    setTopologyView(requestedTopologyView);
+    setFocusedBusinessSystemId(routeState.businessAppId);
+    setShowSharedImpact(routeState.showSharedImpact);
+    setSelectedRelationshipId('');
+  }, [requestedTopologyView, routeState.businessAppId, routeState.showSharedImpact]);
+  useEffect(() => {
     if (!loading && focusedBusinessSystemId && !focusedBusinessSystem) {
       setFocusedBusinessSystemId(''); setShowSharedImpact(false);
       syncRelationshipQuery(topologyView, '', false);
     }
-  }, [loading, focusedBusinessSystemId, focusedBusinessSystem, topologyView]);
+  }, [loading, focusedBusinessSystemId, focusedBusinessSystem, topologyView, syncRelationshipQuery]);
   const toggleCluster = (clusterId: string) => setExpandedClusters(current => {
     const next = new Set(current); if (next.has(clusterId)) next.delete(clusterId); else next.add(clusterId); return next;
   });

@@ -7,8 +7,8 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
-    // React Admin and MUI form one shared runtime chunk. Feature screens remain
-    // lazy-loaded; 650 kB is the reviewed ceiling for this initial shell.
+    // MUI forms the shared runtime chunk. Feature screens remain lazy-loaded;
+    // 650 kB is the reviewed ceiling for the application shell.
     chunkSizeWarningLimit: 650,
   },
   server: {

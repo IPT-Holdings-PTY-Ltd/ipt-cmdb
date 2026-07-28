@@ -12,26 +12,15 @@ import {
   MenuItem, Paper, Select, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
   TextField as MuiTextField, Tooltip, Typography,
 } from '@mui/material';
-import {
-  Create,
-  DateInput,
-  Edit,
-  FormDataConsumer,
-  SelectInput,
-  Show,
-  SimpleForm,
-  TextInput,
-  Title,
-  useRecordContext,
-} from 'react-admin';
-import { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useNavigate, useParams } from 'react-router';
 import { apiFetch, getSession } from './session';
 import { businessApplicationMemberships, displayLayer, displayLayerColors, displayLayerLabels, displayLayerOrder, type DisplayLayer } from './topology';
-import type { Asset, ChangePackage, Contact, Relationship } from './types';
+import type { Asset, AssetMetadata, ChangePackage, Contact, Relationship } from './types';
 import { useWorkspace } from './workspace';
 import { AuditTimeline } from './Governance';
 import { canonicalAssetTypes } from './assetCatalog';
+import { Title } from './ui';
 
 const types = canonicalAssetTypes.map(id => ({ id, name: id }));
 const statuses = ['Active', 'Planned', 'Retired'].map(id => ({ id, name: id }));
@@ -295,118 +284,337 @@ export function AssetList() {
   );
 }
 
-function ContactOwnershipInputs({ businessSystem = false }: { businessSystem?: boolean }) {
+type AssetFormData = {
+  name: string;
+  type: string;
+  status: string;
+  fields: Record<string, unknown>;
+  metadata: Partial<AssetMetadata>;
+  ownerSelections: Record<string, string>;
+};
+
+const defaultAssetForm: AssetFormData = {
+  name: '',
+  type: 'Device',
+  status: 'Active',
+  fields: {},
+  metadata: {
+    lifecycle: 'in_service',
+    operationalStatus: 'healthy',
+    criticality: 'medium',
+    environment: 'production',
+  },
+  ownerSelections: {},
+};
+
+function assetFormData(asset?: Asset): AssetFormData {
+  if (!asset) return { ...defaultAssetForm, fields: {}, metadata: { ...defaultAssetForm.metadata }, ownerSelections: {} };
+  return {
+    name: asset.name,
+    type: asset.type,
+    status: asset.status,
+    fields: { ...asset.fields },
+    metadata: { ...asset.metadata },
+    ownerSelections: Object.fromEntries(
+      (asset.responsibilities || [])
+        .filter(item => !item.effectiveUntil && item.isPrimary)
+        .map(item => [item.role, item.contactId]),
+    ),
+  };
+}
+
+function assetPayload(data: AssetFormData) {
+  return {
+    name: data.name.trim(),
+    type: data.type,
+    status: data.status,
+    fields: data.fields,
+    metadata: data.metadata,
+    responsibilities: Object.entries(data.ownerSelections)
+      .filter(([, contactId]) => Boolean(contactId))
+      .map(([role, contactId]) => ({ role, contactId, isPrimary: true, escalationOrder: 1 })),
+  };
+}
+
+function fieldValue(data: AssetFormData, source: string) {
+  if (source.startsWith('metadata.')) return String(data.metadata[source.slice(9) as keyof AssetMetadata] || '');
+  if (source.startsWith('ownerSelections.')) return data.ownerSelections[source.slice(16)] || '';
+  return String(data[source as keyof Pick<AssetFormData, 'name' | 'type' | 'status'>] || '');
+}
+
+function updateField(data: AssetFormData, source: string, value: string): AssetFormData {
+  if (source.startsWith('metadata.')) {
+    return { ...data, metadata: { ...data.metadata, [source.slice(9)]: value } };
+  }
+  if (source.startsWith('ownerSelections.')) {
+    return { ...data, ownerSelections: { ...data.ownerSelections, [source.slice(16)]: value } };
+  }
+  return { ...data, [source]: value };
+}
+
+function AssetTextInput({
+  data,
+  setData,
+  source,
+  label,
+  type = 'text',
+  helperText,
+  required = false,
+}: {
+  data: AssetFormData;
+  setData: (value: AssetFormData) => void;
+  source: string;
+  label: string;
+  type?: string;
+  helperText?: string;
+  required?: boolean;
+}) {
+  return (
+    <MuiTextField
+      label={label}
+      type={type}
+      value={fieldValue(data, source)}
+      onChange={event => setData(updateField(data, source, event.target.value))}
+      helperText={helperText}
+      required={required}
+      fullWidth
+    />
+  );
+}
+
+function AssetSelectInput({
+  data,
+  setData,
+  source,
+  label,
+  choices,
+  helperText,
+  emptyText,
+  required = false,
+}: {
+  data: AssetFormData;
+  setData: (value: AssetFormData) => void;
+  source: string;
+  label: string;
+  choices: Array<{ id: string; name: string }>;
+  helperText?: string;
+  emptyText?: string;
+  required?: boolean;
+}) {
+  return (
+    <MuiTextField
+      select
+      label={label}
+      value={fieldValue(data, source)}
+      onChange={event => setData(updateField(data, source, event.target.value))}
+      helperText={helperText}
+      required={required}
+      fullWidth
+    >
+      {emptyText !== undefined && <MenuItem value="">{emptyText}</MenuItem>}
+      {choices.map(choice => <MenuItem key={choice.id} value={choice.id}>{choice.name}</MenuItem>)}
+    </MuiTextField>
+  );
+}
+
+function ContactOwnershipInputs({
+  businessSystem,
+  data,
+  setData,
+}: {
+  businessSystem: boolean;
+  data: AssetFormData;
+  setData: (value: AssetFormData) => void;
+}) {
   const workspace = useWorkspace();
   const navigate = useNavigate();
   const [contacts, setContacts] = useState<Contact[]>([]);
   useEffect(() => {
-    if (!workspace.isRoot) apiFetch<Contact[]>(`/api/contacts?companyId=${encodeURIComponent(workspace.companyId)}`).then(setContacts).catch(() => setContacts([]));
+    if (!workspace.isRoot) {
+      apiFetch<Contact[]>(`/api/contacts?companyId=${encodeURIComponent(workspace.companyId)}`)
+        .then(setContacts)
+        .catch(() => setContacts([]));
+    }
   }, [workspace.companyId, workspace.isRoot]);
   const choices = contacts.filter(item => ['active', 'on_leave'].includes(item.status)).map(item => ({
-    id: item.id, name: `${item.displayName}${item.department ? ` · ${item.department}` : ''}`,
+    id: item.id,
+    name: `${item.displayName}${item.department ? ` · ${item.department}` : ''}`,
   }));
+  const owner = (source: string, label: string, emptyText = 'Unassigned') => (
+    <AssetSelectInput data={data} setData={setData} source={`ownerSelections.${source}`} label={label} choices={choices} emptyText={emptyText} />
+  );
   return <>
-    {businessSystem && <Grid size={{ xs: 12, md: 4 }}><SelectInput source="ownerSelections.business_owner" label="Business owner" choices={choices} emptyText="Unassigned" fullWidth /></Grid>}
-    <Grid size={{ xs: 12, md: 4 }}><SelectInput source="ownerSelections.service_owner" label="Service owner" choices={choices} emptyText="Unassigned" fullWidth /></Grid>
-    <Grid size={{ xs: 12, md: 4 }}><SelectInput source="ownerSelections.technical_owner" label="Technical owner" choices={choices} emptyText="Unassigned" fullWidth /></Grid>
-    {!businessSystem && <Grid size={{ xs: 12, md: 4 }}><SelectInput source="ownerSelections.custodian" label="Custodian" choices={choices} emptyText="Unassigned" fullWidth /></Grid>}
-    {businessSystem && <Grid size={{ xs: 12, md: 4 }}><SelectInput source="ownerSelections.signoff_delegate" label="Signoff delegate" choices={choices} emptyText="Owner signs off" fullWidth /></Grid>}
+    {businessSystem && <Grid size={{ xs: 12, md: 4 }}>{owner('business_owner', 'Business owner')}</Grid>}
+    <Grid size={{ xs: 12, md: 4 }}>{owner('service_owner', 'Service owner')}</Grid>
+    <Grid size={{ xs: 12, md: 4 }}>{owner('technical_owner', 'Technical owner')}</Grid>
+    {!businessSystem && <Grid size={{ xs: 12, md: 4 }}>{owner('custodian', 'Custodian')}</Grid>}
+    {businessSystem && <Grid size={{ xs: 12, md: 4 }}>{owner('signoff_delegate', 'Signoff delegate', 'Owner signs off')}</Grid>}
     <Grid size={{ xs: 12 }}><Button size="small" startIcon={<AddOutlined />} onClick={() => navigate('/contacts')}>Create or update contacts</Button></Grid>
   </>;
 }
 
-function AssetForm() {
+function AssetForm({
+  initial,
+  saving,
+  error,
+  submitLabel,
+  onSubmit,
+}: {
+  initial: AssetFormData;
+  saving: boolean;
+  error: string;
+  submitLabel: string;
+  onSubmit: (data: AssetFormData) => Promise<void>;
+}) {
+  const navigate = useNavigate();
+  const [data, setData] = useState(initial);
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    void onSubmit(data);
+  };
+  const text = (source: string, label: string, helperText?: string, type?: string) => (
+    <AssetTextInput data={data} setData={setData} source={source} label={label} helperText={helperText} type={type} />
+  );
+  const select = (source: string, label: string, choices: Array<{ id: string; name: string }>, helperText?: string) => (
+    <AssetSelectInput data={data} setData={setData} source={source} label={label} choices={choices} helperText={helperText} />
+  );
+
   return (
-    <SimpleForm defaultValues={{ status: 'Active', type: 'Device', metadata: { lifecycle: 'in_service', operationalStatus: 'healthy', criticality: 'medium', environment: 'production' } }}>
+    <Box component="form" onSubmit={submit}>
+      {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
       <Typography variant="h6" className="form-section">Identity and classification</Typography>
-      <Grid container spacing={2} sx={{
-        width: "100%"
-      }}>
-        <Grid size={{ xs: 12, md: 6 }}><TextInput source="name" fullWidth required /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="type" choices={types} fullWidth required /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="status" choices={statuses} fullWidth required /></Grid>
+      <Grid container spacing={2} sx={{ width: '100%' }}>
+        <Grid size={{ xs: 12, md: 6 }}><AssetTextInput data={data} setData={setData} source="name" label="Name" required /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><AssetSelectInput data={data} setData={setData} source="type" label="Type" choices={types} required /></Grid>
+        <Grid size={{ xs: 12, md: 3 }}><AssetSelectInput data={data} setData={setData} source="status" label="Status" choices={statuses} required /></Grid>
       </Grid>
       <Typography variant="h6" className="form-section">Lifecycle and service health</Typography>
-      <Grid container spacing={2} sx={{
-        width: "100%"
-      }}>
-        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.lifecycle" choices={lifecycle} fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.operationalStatus" label="Operational status" choices={operational} fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.criticality" choices={criticality} fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.environment" choices={environments} fullWidth /></Grid>
+      <Grid container spacing={2} sx={{ width: '100%' }}>
+        <Grid size={{ xs: 12, md: 3 }}>{select('metadata.lifecycle', 'Lifecycle', lifecycle)}</Grid>
+        <Grid size={{ xs: 12, md: 3 }}>{select('metadata.operationalStatus', 'Operational status', operational)}</Grid>
+        <Grid size={{ xs: 12, md: 3 }}>{select('metadata.criticality', 'Criticality', criticality)}</Grid>
+        <Grid size={{ xs: 12, md: 3 }}>{select('metadata.environment', 'Environment', environments)}</Grid>
       </Grid>
       <Typography variant="h6" className="form-section">Ownership and location</Typography>
-      <Grid container spacing={2} sx={{
-        width: "100%"
-      }}>
-        <FormDataConsumer>{({ formData }) => <ContactOwnershipInputs businessSystem={formData?.type === 'Business system'} />}</FormDataConsumer>
-        <Grid size={{ xs: 12, md: 6 }}><TextInput source="metadata.site" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.vendor" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.model" fullWidth /></Grid>
+      <Grid container spacing={2} sx={{ width: '100%' }}>
+        <ContactOwnershipInputs businessSystem={data.type === 'Business system'} data={data} setData={setData} />
+        <Grid size={{ xs: 12, md: 6 }}>{text('metadata.site', 'Site')}</Grid>
+        <Grid size={{ xs: 12, md: 3 }}>{text('metadata.vendor', 'Vendor')}</Grid>
+        <Grid size={{ xs: 12, md: 3 }}>{text('metadata.model', 'Model')}</Grid>
       </Grid>
       <Typography variant="h6" className="form-section">Relationship display</Typography>
-      <Grid container spacing={2} sx={{
-        width: "100%"
-      }}>
-        <Grid size={{ xs: 12, md: 4 }}><SelectInput source="metadata.displayLayer" label="Display layer" choices={displayLayers} helperText="Leave automatic unless this CI belongs in another full-stack lane." fullWidth /></Grid>
+      <Grid container spacing={2} sx={{ width: '100%' }}>
+        <Grid size={{ xs: 12, md: 4 }}>{select('metadata.displayLayer', 'Display layer', displayLayers, 'Leave automatic unless this CI belongs in another full-stack lane.')}</Grid>
       </Grid>
-      <FormDataConsumer>{({ formData }) => networkTypes.has(formData?.type) ? <Box sx={{
-        width: "100%"
-      }}>
+      {networkTypes.has(data.type) && <Box sx={{ width: '100%' }}>
         <Typography variant="h6" className="form-section">Network placement</Typography>
-        <Grid container spacing={2} sx={{
-          width: "100%"
-        }}>
-          <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.networkZone" label="Zone" helperText="For example WAN, Edge, Core, Access or Finance." fullWidth /></Grid>
-          <Grid size={{ xs: 12, md: 3 }}><TextInput source="metadata.networkRole" label="Network role" fullWidth /></Grid>
-          <Grid size={{ xs: 6, md: 2 }}><TextInput source="metadata.vlanId" label="VLAN" fullWidth /></Grid>
-          <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.subnet" label="Subnet / prefix" fullWidth /></Grid>
-          <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.ipAddress" label="Management / primary IP" fullWidth /></Grid>
-          <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.redundancyGroup" label="Redundancy group" fullWidth /></Grid>
-          <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.redundancyRole" label="Redundancy role" helperText="For example active, passive or member 1." fullWidth /></Grid>
+        <Grid container spacing={2} sx={{ width: '100%' }}>
+          <Grid size={{ xs: 12, md: 3 }}>{text('metadata.networkZone', 'Zone', 'For example WAN, Edge, Core, Access or Finance.')}</Grid>
+          <Grid size={{ xs: 12, md: 3 }}>{text('metadata.networkRole', 'Network role')}</Grid>
+          <Grid size={{ xs: 6, md: 2 }}>{text('metadata.vlanId', 'VLAN')}</Grid>
+          <Grid size={{ xs: 12, md: 4 }}>{text('metadata.subnet', 'Subnet / prefix')}</Grid>
+          <Grid size={{ xs: 12, md: 4 }}>{text('metadata.ipAddress', 'Management / primary IP')}</Grid>
+          <Grid size={{ xs: 12, md: 4 }}>{text('metadata.redundancyGroup', 'Redundancy group')}</Grid>
+          <Grid size={{ xs: 12, md: 4 }}>{text('metadata.redundancyRole', 'Redundancy role', 'For example active, passive or member 1.')}</Grid>
         </Grid>
-      </Box> : null}</FormDataConsumer>
+      </Box>}
       <Typography variant="h6" className="form-section">Commercial and review dates</Typography>
-      <Grid container spacing={2} sx={{
-        width: "100%"
-      }}>
-        <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.purchaseDate" label="Purchase date" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.warrantyEnd" label="Warranty end" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.renewalDate" label="Renewal date" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.endOfLifeDate" label="End-of-life date" fullWidth /></Grid>
-        <Grid size={{ xs: 12, md: 3 }}><DateInput source="metadata.reviewDate" label="Review date" fullWidth /></Grid>
+      <Grid container spacing={2} sx={{ width: '100%' }}>
+        <Grid size={{ xs: 12, md: 3 }}>{text('metadata.purchaseDate', 'Purchase date', undefined, 'date')}</Grid>
+        <Grid size={{ xs: 12, md: 3 }}>{text('metadata.warrantyEnd', 'Warranty end', undefined, 'date')}</Grid>
+        <Grid size={{ xs: 12, md: 3 }}>{text('metadata.renewalDate', 'Renewal date', undefined, 'date')}</Grid>
+        <Grid size={{ xs: 12, md: 3 }}>{text('metadata.endOfLifeDate', 'End-of-life date', undefined, 'date')}</Grid>
+        <Grid size={{ xs: 12, md: 3 }}>{text('metadata.reviewDate', 'Review date', undefined, 'date')}</Grid>
       </Grid>
-      <FormDataConsumer>{({ formData }) => virtualizationTypes.has(formData?.type) ? <Box sx={{
-        width: "100%"
-      }}>
+      {virtualizationTypes.has(data.type) && <Box sx={{ width: '100%' }}>
         <Typography variant="h6" className="form-section">Virtualization and resilience</Typography>
-        <Grid container spacing={2} sx={{
-          width: "100%"
-        }}>
-          <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.virtualizationPlatform" label="Platform" helperText="For example VMware vSphere, Hyper-V or Azure." fullWidth /></Grid>
-          <Grid size={{ xs: 12, md: 4 }}><TextInput source="metadata.clusterName" label="Cluster" fullWidth /></Grid>
-          <Grid size={{ xs: 12, md: 4 }}><SelectInput source="metadata.powerState" label="Power state" choices={powerStates} fullWidth /></Grid>
-          <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.haEnabled" label="HA enabled" choices={[{ id: 'yes', name: 'Yes' }, { id: 'no', name: 'No' }]} fullWidth /></Grid>
-          <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.protectionStatus" label="Protection" choices={protectionStates} fullWidth /></Grid>
-          <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.mobility" label="Mobility" choices={mobilityStates} fullWidth /></Grid>
-          <Grid size={{ xs: 12, md: 3 }}><SelectInput source="metadata.capacityStatus" label="Failover capacity" choices={capacityStates} fullWidth /></Grid>
-          <Grid size={{ xs: 6, md: 3 }}><TextInput source="metadata.minimumHosts" label="Minimum surviving hosts" fullWidth /></Grid>
-          <Grid size={{ xs: 6, md: 3 }}><SelectInput source="metadata.maintenanceMode" label="Maintenance mode" choices={[{ id: 'yes', name: 'Yes' }, { id: 'no', name: 'No' }]} fullWidth /></Grid>
-          <Grid size={{ xs: 12, md: 6 }}><TextInput source="metadata.guestOs" label="Guest operating system" fullWidth /></Grid>
-          <Grid size={{ xs: 4 }}><TextInput source="metadata.cpuCount" label="vCPU" fullWidth /></Grid>
-          <Grid size={{ xs: 4 }}><TextInput source="metadata.memoryGb" label="Memory (GB)" fullWidth /></Grid>
-          <Grid size={{ xs: 4 }}><TextInput source="metadata.storageGb" label="Storage (GB)" fullWidth /></Grid>
+        <Grid container spacing={2} sx={{ width: '100%' }}>
+          <Grid size={{ xs: 12, md: 4 }}>{text('metadata.virtualizationPlatform', 'Platform', 'For example VMware vSphere, Hyper-V or Azure.')}</Grid>
+          <Grid size={{ xs: 12, md: 4 }}>{text('metadata.clusterName', 'Cluster')}</Grid>
+          <Grid size={{ xs: 12, md: 4 }}>{select('metadata.powerState', 'Power state', powerStates)}</Grid>
+          <Grid size={{ xs: 12, md: 3 }}>{select('metadata.haEnabled', 'HA enabled', [{ id: 'yes', name: 'Yes' }, { id: 'no', name: 'No' }])}</Grid>
+          <Grid size={{ xs: 12, md: 3 }}>{select('metadata.protectionStatus', 'Protection', protectionStates)}</Grid>
+          <Grid size={{ xs: 12, md: 3 }}>{select('metadata.mobility', 'Mobility', mobilityStates)}</Grid>
+          <Grid size={{ xs: 12, md: 3 }}>{select('metadata.capacityStatus', 'Failover capacity', capacityStates)}</Grid>
+          <Grid size={{ xs: 6, md: 3 }}>{text('metadata.minimumHosts', 'Minimum surviving hosts')}</Grid>
+          <Grid size={{ xs: 6, md: 3 }}>{select('metadata.maintenanceMode', 'Maintenance mode', [{ id: 'yes', name: 'Yes' }, { id: 'no', name: 'No' }])}</Grid>
+          <Grid size={{ xs: 12, md: 6 }}>{text('metadata.guestOs', 'Guest operating system')}</Grid>
+          <Grid size={{ xs: 4 }}>{text('metadata.cpuCount', 'vCPU')}</Grid>
+          <Grid size={{ xs: 4 }}>{text('metadata.memoryGb', 'Memory (GB)')}</Grid>
+          <Grid size={{ xs: 4 }}>{text('metadata.storageGb', 'Storage (GB)')}</Grid>
         </Grid>
-      </Box> : null}</FormDataConsumer>
-    </SimpleForm>
+      </Box>}
+      <Stack direction="row" spacing={1} sx={{ justifyContent: 'flex-end', mt: 3 }}>
+        <Button type="button" color="inherit" onClick={() => navigate(-1)}>Cancel</Button>
+        <Button type="submit" variant="contained" disabled={saving || !data.name.trim()}>{saving ? 'Saving…' : submitLabel}</Button>
+      </Stack>
+    </Box>
   );
 }
 
-export function AssetCreate() { return <Create redirect="list"><AssetForm /></Create>; }
-export function AssetEdit() { return <Edit mutationMode="pessimistic"><AssetForm /></Edit>; }
+export function AssetCreate() {
+  const workspace = useWorkspace();
+  const navigate = useNavigate();
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const canEdit = !workspace.isRoot && ['platform_admin', 'msp_operator'].includes(getSession()?.user.role || '');
+  if (!canEdit) return <Alert severity="warning">Select a customer workspace with asset management access before creating a configuration item.</Alert>;
+  const save = async (data: AssetFormData) => {
+    setSaving(true);
+    setError('');
+    try {
+      const created = await apiFetch<Asset>('/api/assets', {
+        method: 'POST',
+        body: JSON.stringify({ ...assetPayload(data), companyId: workspace.companyId }),
+      });
+      navigate(`/assets/${created.id}/show`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'The asset could not be created.');
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <Box><Title title="Add configuration item" /><Typography variant="overline" color="primary">Configuration management</Typography><Typography variant="h3">Add asset</Typography><AssetForm initial={assetFormData()} saving={saving} error={error} submitLabel="Create asset" onSubmit={save} /></Box>;
+}
 
-function AssetShowContent() {
-  const asset = useRecordContext<Asset>();
+export function AssetEdit() {
+  const { assetId = '' } = useParams();
+  const workspace = useWorkspace();
+  const navigate = useNavigate();
+  const [asset, setAsset] = useState<Asset | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const canEdit = !workspace.isRoot && ['platform_admin', 'msp_operator'].includes(getSession()?.user.role || '');
+  useEffect(() => {
+    setLoading(true);
+    apiFetch<Asset>(`/api/v2/assets/${encodeURIComponent(assetId)}`)
+      .then(setAsset)
+      .catch(reason => setError(reason instanceof Error ? reason.message : 'The asset could not be loaded.'))
+      .finally(() => setLoading(false));
+  }, [assetId]);
+  if (!canEdit) return <Alert severity="warning">Asset editing requires a customer workspace and asset management access.</Alert>;
+  if (loading) return <Stack sx={{ alignItems: 'center', py: 8 }}><CircularProgress /></Stack>;
+  if (!asset) return <Alert severity="error">{error || 'Asset not found.'}</Alert>;
+  const save = async (data: AssetFormData) => {
+    setSaving(true);
+    setError('');
+    try {
+      await apiFetch<Asset>(`/api/assets/${encodeURIComponent(asset.id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(assetPayload(data)),
+      });
+      navigate(`/assets/${asset.id}/show`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'The asset could not be updated.');
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <Box><Title title={`Edit ${asset.name}`} /><Typography variant="overline" color="primary">Configuration management</Typography><Typography variant="h3">Edit {asset.name}</Typography><AssetForm initial={assetFormData(asset)} saving={saving} error={error} submitLabel="Save changes" onSubmit={save} /></Box>;
+}
+
+function AssetShowContent({ asset }: { asset: Asset }) {
   const workspace = useWorkspace();
   const navigate = useNavigate();
   const canEdit = !workspace.isRoot && ['platform_admin', 'msp_operator'].includes(getSession()?.user.role || '');
@@ -416,7 +624,6 @@ function AssetShowContent() {
   const [changesLoading, setChangesLoading] = useState(false);
   const [changesError, setChangesError] = useState('');
   useEffect(() => {
-    if (!asset) return;
     let active = true;
     const loadContext = async () => {
       setChangesLoading(true);
@@ -445,8 +652,7 @@ function AssetShowContent() {
     };
     void loadContext();
     return () => { active = false; };
-  }, [asset?.id, workspace.companyId, workspace.isRoot]);
-  if (!asset) return null;
+  }, [asset.id, workspace.companyId, workspace.isRoot]);
   const layer = displayLayer(asset); const health = asset.metadata?.operationalStatus || 'unknown'; const owner = primaryOwner(asset);
   const orderedChanges = [...changes].sort((left, right) => {
     const leftInactive = inactiveChangeStatuses.has(left.status) ? 1 : 0;
@@ -559,4 +765,20 @@ function AssetShowContent() {
   );
 }
 
-export function AssetShow() { return <Show actions={false}><AssetShowContent /></Show>; }
+export function AssetShow() {
+  const { assetId = '' } = useParams();
+  const [asset, setAsset] = useState<Asset | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    setLoading(true);
+    setError('');
+    apiFetch<Asset>(`/api/v2/assets/${encodeURIComponent(assetId)}`)
+      .then(setAsset)
+      .catch(reason => setError(reason instanceof Error ? reason.message : 'The asset could not be loaded.'))
+      .finally(() => setLoading(false));
+  }, [assetId]);
+  if (loading) return <Stack sx={{ alignItems: 'center', py: 8 }}><CircularProgress /><Typography color="text.secondary">Loading asset…</Typography></Stack>;
+  if (!asset) return <Alert severity="error">{error || 'Asset not found.'}</Alert>;
+  return <><Title title={asset.name} /><AssetShowContent asset={asset} /></>;
+}

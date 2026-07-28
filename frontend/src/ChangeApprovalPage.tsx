@@ -5,6 +5,7 @@ import {
   Divider, Grid, Stack, TextField, ThemeProvider, Typography, createTheme,
 } from '@mui/material';
 import { useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router';
 import { BrandLogo, useMspBranding } from './branding';
 import { apiFetch } from './session';
 
@@ -32,13 +33,14 @@ const displayDate = (value: string) => {
 
 export function ChangeApprovalPage() {
   const { brand } = useMspBranding();
+  const [searchParams] = useSearchParams();
   const [approval, setApproval] = useState<ApprovalPackage | null>(null);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [comments, setComments] = useState('');
   const [error, setError] = useState('');
   const [complete, setComplete] = useState<{ decision: string; message: string } | null>(null);
-  const token = useMemo(() => new URLSearchParams(window.location.hash.split('?')[1] || '').get('token') || '', []);
+  const token = searchParams.get('token') || '';
   const theme = useMemo(() => createTheme({
     palette: {
       mode: 'dark', primary: { main: brand.accent }, secondary: { main: brand.secondaryAccent },

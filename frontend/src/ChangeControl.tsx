@@ -21,10 +21,10 @@ import {
   Dialog, DialogActions, DialogContent, DialogTitle, IconButton, InputLabel, MenuItem, Paper, Select, Stack, Step, StepLabel, Stepper, Table, TableBody, TableCell,
   TableContainer, TableHead, TableRow, TextField, Typography,
 } from '@mui/material';
-import { useEffect, useMemo, useState } from 'react';
-import { Title } from 'react-admin';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router';
 import { apiDownload, apiFetch, getSession } from './session';
+import { Title } from './ui';
 import type { Asset, ChangeApprovalRequest, ChangeClosureAssessment, ChangeClosureFollowUp, ChangeClosureTest, ChangeImpactItem, ChangeImpactPreview, ChangePackage, ChangeTemplate, ChangeTemplateParameter, User } from './types';
 import { useWorkspace } from './workspace';
 
@@ -293,19 +293,19 @@ export function ChangeControlPage() {
   const [notice, setNotice] = useState<{ severity: 'success' | 'error' | 'info'; message: string } | null>(null);
   const canCreate = ['platform_admin', 'msp_operator'].includes(getSession()?.user.role || '');
 
-  const changesUrl = () => {
+  const changesUrl = useCallback(() => {
     const query = new URLSearchParams({ companyId: workspace.companyId });
     if (affectedAssetId) query.set('assetId', affectedAssetId);
     return `/api/changes?${query.toString()}`;
-  };
+  }, [affectedAssetId, workspace.companyId]);
 
-  const loadChanges = async () => {
+  const loadChanges = useCallback(async () => {
     if (workspace.isRoot) return [];
     const records = await apiFetch<ChangePackage[]>(changesUrl());
     setChanges(records);
     setSelectedChange(current => current ? records.find(item => item.id === current.id) || null : null);
     return records;
-  };
+  }, [changesUrl, workspace.isRoot]);
 
   useEffect(() => {
     setAssets([]); setChanges([]); setTechnicians([]); setTemplates([]); setScopeAssets([]); setSelectedTemplate(null); setTemplateParameters({}); setTemplateApplied(false); setPreview(null); setSaved(null); setEditing(null); setSelectedChange(null); setTransitionTarget(null); setClosureData(null); setClosureStep(0); setAssignmentOpen(false); setAssignmentFilter('all'); setActiveStep(0); setForm(emptyForm()); setNotice(null);
@@ -317,7 +317,7 @@ export function ChangeControlPage() {
       canCreate ? apiFetch<ChangeTemplate[]>(`/api/change-templates?companyId=${encodeURIComponent(workspace.companyId)}`) : Promise.resolve([] as ChangeTemplate[]),
     ]).then(([assetRecords, changeRecords, technicianRecords, templateRecords]) => { setAssets(assetRecords); setChanges(changeRecords); setTechnicians(technicianRecords); setTemplates(templateRecords); })
       .catch(error => setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Change control could not be loaded.' }));
-  }, [workspace.companyId, workspace.isRoot, affectedAssetId, canCreate]);
+  }, [workspace.companyId, workspace.isRoot, canCreate, changesUrl]);
 
   useEffect(() => {
     const assetId = searchParams.get('assetId');
@@ -357,7 +357,7 @@ export function ChangeControlPage() {
       .catch(error => { if (active) setNotice({ severity: 'error', message: error instanceof Error ? error.message : 'Approval history could not be loaded.' }); })
       .finally(() => { if (active) setApprovalsLoading(false); });
     return () => { active = false; };
-  }, [selectedChange?.id, selectedChange?.status, canCreate]);
+  }, [selectedChange, canCreate]);
 
   useEffect(() => {
     let active = true;
@@ -498,17 +498,17 @@ export function ChangeControlPage() {
     setClosureData(current => current ? { ...current, [key]: value } : current);
   };
 
-  const updateClosureTest = (index: number, changes: Partial<ChangeClosureTest>) => {
+  const updateClosureTest = (index: number, updates: Partial<ChangeClosureTest>) => {
     setClosureData(current => current ? {
       ...current,
-      tests: current.tests.map((test, position) => position === index ? { ...test, ...changes } : test),
+      tests: current.tests.map((test, position) => position === index ? { ...test, ...updates } : test),
     } : current);
   };
 
-  const updateFollowUp = (index: number, changes: Partial<ChangeClosureFollowUp>) => {
+  const updateFollowUp = (index: number, updates: Partial<ChangeClosureFollowUp>) => {
     setClosureData(current => current ? {
       ...current,
-      followUpActions: current.followUpActions.map((action, position) => position === index ? { ...action, ...changes } : action),
+      followUpActions: current.followUpActions.map((action, position) => position === index ? { ...action, ...updates } : action),
     } : current);
   };
 
@@ -593,7 +593,7 @@ export function ChangeControlPage() {
     if (activeStep === 1) return Boolean(preview && form.businessImpact.trim());
     if (activeStep === 2) return Boolean(form.reason.trim() && form.implementationPlan.trim() && form.validationPlan.trim() && form.rollbackPlan.trim());
     return true;
-  }, [activeStep, form, preview, scopeAssets.length]);
+  }, [activeStep, form, preview, scopeAssets.length, selectedTemplate, templateApplied]);
 
   const saveAndDownload = async () => {
     if (!preview) return;

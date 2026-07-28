@@ -16,10 +16,16 @@ Follow [docs/LOCAL_DEVELOPMENT.md](docs/LOCAL_DEVELOPMENT.md). The normal valida
 ```powershell
 python -m unittest discover -s test -v
 npm test
+npm run lint
 npm run typecheck
 npm run build
 docker build --tag ipt-cmdb:local .
 ```
+
+`npm test` runs the Node policy check and the Vitest component/regression suite.
+`npm run lint` enforces TypeScript correctness, React Hook dependencies and JSX
+accessibility with Oxlint. Add focused tests beside the frontend module using
+the `*.test.ts` or `*.test.tsx` suffix.
 
 Schema changes must also pass:
 
@@ -44,7 +50,7 @@ python scripts/verify_postgres_upgrade.py --admin-url postgresql://postgres:post
 
 | Path | Responsibility |
 |---|---|
-| `frontend/src` | React Admin application, workspace UI and topology |
+| `frontend/src` | React Router/MUI application, workspace UI and topology |
 | `backend/main.py` | FastAPI routes, authentication and API authorization |
 | `app.py` | Domain helpers and first-start/local support |
 | `src/cmdb` | Repository, migrations, reconciliation and change reports |
