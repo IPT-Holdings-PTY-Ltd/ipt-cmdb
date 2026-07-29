@@ -10855,6 +10855,62 @@ class PostgresCmdbRepository(StateRepository):
             )
         return self.get_ci_sync_policy(kind, company_id, provider_parent_id)
 
+    def _ci_sync_policy_from_row(self, row: tuple) -> dict:
+        """Build the public CI policy representation from a canonical query row."""
+
+        normalized = normalize_ci_policy(
+            {
+                **(row[5] or {}),
+                "syncMode": row[6],
+                "intervalMinutes": row[7],
+                "enabled": row[8],
+            }
+        )
+        failures = int(row[15] or 0)
+        return {
+            "id": str(row[0]),
+            "provider": PROVIDER_FROM_DB.get(row[1], row[1]),
+            "companyId": row[2],
+            "companyName": row[3],
+            "providerParentId": row[4],
+            **normalized,
+            "revision": int(row[9]),
+            "updatedAt": self._timestamp(row[10]),
+            "nextRunAt": self._timestamp(row[11]) or None,
+            "lastRunAt": self._timestamp(row[12]) or None,
+            "lastSuccessAt": self._timestamp(row[13]) or None,
+            "lastError": row[14] or "",
+            "consecutiveFailures": failures,
+            "backoffActive": failures > 0,
+            "retryDelayMinutes": ci_sync_retry_delay_minutes(failures) if failures else 0,
+            "leaseOwner": row[16] or None,
+            "leaseUntil": self._timestamp(row[17]) or None,
+        }
+
+    def _get_ci_sync_policy_by_id(self, policy_id: str) -> dict | None:
+        """Return one canonical CI policy without scanning the complete policy set."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT policy.id, integration.provider, company.slug, company.name,
+                       policy.external_parent_id, policy.filter_policy, policy.sync_mode,
+                       policy.interval_minutes, policy.enabled, policy.revision,
+                       policy.updated_at, policy.next_run_at, policy.last_run_at,
+                       policy.last_success_at, policy.last_error,
+                       policy.consecutive_failures, policy.lease_owner, policy.lease_until
+                FROM integration_ci_policies policy
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = policy.company_id
+                WHERE policy.id = %s::uuid
+                  AND policy.external_object_type = 'configuration'
+                """,
+                (policy_id,),
+            )
+            row = cursor.fetchone()
+        return self._ci_sync_policy_from_row(row) if row else None
+
     def list_ci_sync_policies(self, kind: str | None = None) -> list[dict]:
         """Return canonical CI policies and worker scheduling health."""
 
@@ -10878,39 +10934,7 @@ class PostgresCmdbRepository(StateRepository):
                 (provider, provider),
             )
             rows = cursor.fetchall()
-        policies = []
-        for row in rows:
-            normalized = normalize_ci_policy(
-                {
-                    **(row[5] or {}),
-                    "syncMode": row[6],
-                    "intervalMinutes": row[7],
-                    "enabled": row[8],
-                }
-            )
-            failures = int(row[15] or 0)
-            policies.append(
-                {
-                    "id": str(row[0]),
-                    "provider": PROVIDER_FROM_DB.get(row[1], row[1]),
-                    "companyId": row[2],
-                    "companyName": row[3],
-                    "providerParentId": row[4],
-                    **normalized,
-                    "revision": int(row[9]),
-                    "updatedAt": self._timestamp(row[10]),
-                    "nextRunAt": self._timestamp(row[11]) or None,
-                    "lastRunAt": self._timestamp(row[12]) or None,
-                    "lastSuccessAt": self._timestamp(row[13]) or None,
-                    "lastError": row[14] or "",
-                    "consecutiveFailures": failures,
-                    "backoffActive": failures > 0,
-                    "retryDelayMinutes": (ci_sync_retry_delay_minutes(failures) if failures else 0),
-                    "leaseOwner": row[16] or None,
-                    "leaseUntil": self._timestamp(row[17]) or None,
-                }
-            )
-        return policies
+        return [self._ci_sync_policy_from_row(row) for row in rows]
 
     def claim_due_ci_sync_policy(
         self, kind: str, worker_id: str, lease_seconds: int = 300
@@ -10962,31 +10986,7 @@ class PostgresCmdbRepository(StateRepository):
             row = cursor.fetchone()
         if not row:
             return None
-        normalized = normalize_ci_policy(
-            {
-                **(row[5] or {}),
-                "syncMode": row[6],
-                "intervalMinutes": row[7],
-                "enabled": row[8],
-            }
-        )
-        return {
-            "id": str(row[0]),
-            "provider": PROVIDER_FROM_DB.get(row[1], row[1]),
-            "companyId": row[2],
-            "companyName": row[3],
-            "providerParentId": row[4],
-            **normalized,
-            "revision": int(row[9]),
-            "updatedAt": self._timestamp(row[10]),
-            "nextRunAt": self._timestamp(row[11]) or None,
-            "lastRunAt": self._timestamp(row[12]) or None,
-            "lastSuccessAt": self._timestamp(row[13]) or None,
-            "lastError": row[14] or "",
-            "consecutiveFailures": int(row[15] or 0),
-            "leaseOwner": row[16] or None,
-            "leaseUntil": self._timestamp(row[17]) or None,
-        }
+        return self._ci_sync_policy_from_row(row)
 
     def claim_ci_sync_policy_now(
         self, policy_id: str, worker_id: str, lease_seconds: int = 300
@@ -11028,31 +11028,7 @@ class PostgresCmdbRepository(StateRepository):
             row = cursor.fetchone()
         if not row:
             return None
-        normalized = normalize_ci_policy(
-            {
-                **(row[5] or {}),
-                "syncMode": row[6],
-                "intervalMinutes": row[7],
-                "enabled": row[8],
-            }
-        )
-        return {
-            "id": str(row[0]),
-            "provider": PROVIDER_FROM_DB.get(row[1], row[1]),
-            "companyId": row[2],
-            "companyName": row[3],
-            "providerParentId": row[4],
-            **normalized,
-            "revision": int(row[9]),
-            "updatedAt": self._timestamp(row[10]),
-            "nextRunAt": self._timestamp(row[11]) or None,
-            "lastRunAt": self._timestamp(row[12]) or None,
-            "lastSuccessAt": self._timestamp(row[13]) or None,
-            "lastError": row[14] or "",
-            "consecutiveFailures": int(row[15] or 0),
-            "leaseOwner": row[16] or None,
-            "leaseUntil": self._timestamp(row[17]) or None,
-        }
+        return self._ci_sync_policy_from_row(row)
 
     def complete_ci_sync_policy_run(
         self,
@@ -11100,10 +11076,7 @@ class PostgresCmdbRepository(StateRepository):
             row = cursor.fetchone()
         if not row:
             return None
-        return next(
-            (item for item in self.list_ci_sync_policies() if item["id"] == policy_id),
-            None,
-        )
+        return self._get_ci_sync_policy_by_id(policy_id)
 
     def renew_ci_sync_policy_run(
         self,
@@ -11132,10 +11105,7 @@ class PostgresCmdbRepository(StateRepository):
             renewed = cursor.fetchone()
         if not renewed:
             return None
-        return next(
-            (item for item in self.list_ci_sync_policies() if item["id"] == policy_id),
-            None,
-        )
+        return self._get_ci_sync_policy_by_id(policy_id)
 
     def _insert_ci_policy_preview_run_with_cursor(
         self,
@@ -11376,10 +11346,7 @@ class PostgresCmdbRepository(StateRepository):
                 trigger=str(attributes.get("trigger") or ""),
                 success=True,
             )
-        policy = next(
-            (item for item in self.list_ci_sync_policies() if item["id"] == policy_id),
-            None,
-        )
+        policy = self._get_ci_sync_policy_by_id(policy_id)
         return {
             "run": _public_sync_run(stored),
             "queueSummary": queue_summary,
@@ -11452,10 +11419,7 @@ class PostgresCmdbRepository(StateRepository):
                 success=False,
                 error=str(error)[:1000],
             )
-        policy = next(
-            (item for item in self.list_ci_sync_policies() if item["id"] == policy_id),
-            None,
-        )
+        policy = self._get_ci_sync_policy_by_id(policy_id)
         return {"run": _public_sync_run(stored), "policy": policy}
 
     def _replace_ci_review_items_with_cursor(

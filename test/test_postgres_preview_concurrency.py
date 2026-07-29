@@ -628,11 +628,24 @@ class PostgresPreviewConcurrencyTests(unittest.TestCase):
             )
         )
         self.assertEqual(self._policy_lease()[0], "worker-b")
-        completed = self.repository.complete_ci_sync_policy_run(
-            self.policy["id"],
-            lease_owner="worker-b",
-            success=True,
-        )
+        with patch.object(
+            self.repository,
+            "list_ci_sync_policies",
+            side_effect=AssertionError("single-policy operations must use a targeted lookup"),
+        ):
+            renewed = self.repository.renew_ci_sync_policy_run(
+                self.policy["id"],
+                "worker-b",
+                lease_seconds=120,
+            )
+            completed = self.repository.complete_ci_sync_policy_run(
+                self.policy["id"],
+                lease_owner="worker-b",
+                success=True,
+            )
+        self.assertIsNotNone(renewed)
+        assert renewed is not None
+        self.assertEqual(renewed["id"], self.policy["id"])
         self.assertIsNotNone(completed)
         self.assertEqual(self._policy_lease()[:2], (None, None))
 
@@ -697,14 +710,19 @@ class PostgresPreviewConcurrencyTests(unittest.TestCase):
         )
         self.assertIsNotNone(claimed)
         successful_run_id = "00000000-0000-0000-0000-000000000951"
-        published = self.repository.publish_and_complete_ci_policy_preview(
-            "ncentral",
-            self.policy["id"],
-            "worker-a",
-            _direct_run(self.policy["id"], successful_run_id),
-            [_review_item("direct-current")],
-            None,
-        )
+        with patch.object(
+            self.repository,
+            "list_ci_sync_policies",
+            side_effect=AssertionError("single-policy operations must use a targeted lookup"),
+        ):
+            published = self.repository.publish_and_complete_ci_policy_preview(
+                "ncentral",
+                self.policy["id"],
+                "worker-a",
+                _direct_run(self.policy["id"], successful_run_id),
+                [_review_item("direct-current")],
+                None,
+            )
 
         self.assertIsNotNone(published)
         assert published is not None
@@ -765,14 +783,19 @@ class PostgresPreviewConcurrencyTests(unittest.TestCase):
         self.assertEqual(self._policy_lease()[0], "worker-b")
 
         current_failure_id = "00000000-0000-0000-0000-000000000955"
-        current_failure = self.repository.fail_and_complete_ci_policy_preview(
-            "ncentral",
-            self.policy["id"],
-            "worker-b",
-            _direct_run(self.policy["id"], current_failure_id, "failed"),
-            "Provider unavailable",
-            None,
-        )
+        with patch.object(
+            self.repository,
+            "list_ci_sync_policies",
+            side_effect=AssertionError("single-policy operations must use a targeted lookup"),
+        ):
+            current_failure = self.repository.fail_and_complete_ci_policy_preview(
+                "ncentral",
+                self.policy["id"],
+                "worker-b",
+                _direct_run(self.policy["id"], current_failure_id, "failed"),
+                "Provider unavailable",
+                None,
+            )
         self.assertIsNotNone(current_failure)
         self.assertEqual(self._run_row(current_failure_id)[0], "failed")
         self.assertEqual(self._policy_lease()[:2], (None, None))
