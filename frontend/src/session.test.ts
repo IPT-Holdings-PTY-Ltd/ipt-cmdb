@@ -93,7 +93,7 @@ describe('API requests', () => {
 
   it('uses the same body-aware header behavior for downloads', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(new Blob(['content']), {
+      new Response('content', {
         status: 200,
         headers: { 'content-disposition': 'attachment; filename="result.bin"' },
       }),
