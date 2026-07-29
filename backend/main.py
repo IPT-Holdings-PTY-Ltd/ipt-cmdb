@@ -701,11 +701,6 @@ def current_user(request: Request) -> dict:
 
     user_id = REPOSITORY.authenticate_session(opaque_token_hash(bearer)) if bearer else None
     if not user_id:
-        session = core.SESSIONS.get(bearer)
-        if session and session["expiresAt"] > datetime.now(UTC):
-            user_id = session["userId"]
-    if not user_id:
-        core.SESSIONS.pop(bearer, None)
         raise HTTPException(401, "Sign in required")
     user = next((item for item in users if item["id"] == user_id), None)
     if not user:
@@ -1513,8 +1508,6 @@ def _issue_session(user: dict, *, mfa_method: str = "none") -> dict:
     expires_at = datetime.now(UTC) + timedelta(seconds=core.SESSION_TTL_SECONDS)
     expires_text = expires_at.isoformat().replace("+00:00", "Z")
     REPOSITORY.create_session(opaque_token_hash(token), user["id"], expires_text)
-    # Kept as a compatibility mirror for the lightweight local repository.
-    core.SESSIONS[token] = {"userId": user["id"], "expiresAt": expires_at}
     REPOSITORY.record_user_login(user["id"])
     REPOSITORY.complete_local_login(_login_identifier_hash(user["email"]))
     REPOSITORY.record_audit_event(
@@ -1660,6 +1653,8 @@ def _login_identifier_hash(email: str) -> str:
     """Return a domain-separated login identifier hash without retaining email."""
 
     normalized = email.strip().casefold()
+    # This is a normalized email rate-limit key, not a password or password verifier.
+    # codeql[py/weak-sensitive-data-hashing]
     return hashlib.sha256(f"local-auth-identifier:v1:{normalized}".encode()).hexdigest()
 
 
@@ -2018,18 +2013,15 @@ def auth_config() -> dict:
 @api.post("/api/logout", status_code=204, tags=["authentication"])
 def logout(request: Request) -> Response:
     bearer = request.headers.get("authorization", "").removeprefix("Bearer ")
-    session = core.SESSIONS.get(bearer)
     persisted_user_id = (
         REPOSITORY.authenticate_session(opaque_token_hash(bearer)) if bearer else None
     )
     user = None
-    user_id = session["userId"] if session else persisted_user_id
-    if user_id:
+    if persisted_user_id:
         user = next(
-            (item for item in REPOSITORY.list_users() if item["id"] == user_id),
+            (item for item in REPOSITORY.list_users() if item["id"] == persisted_user_id),
             None,
         )
-    core.SESSIONS.pop(bearer, None)
     if bearer:
         REPOSITORY.revoke_session(opaque_token_hash(bearer))
     if user:
@@ -2787,11 +2779,7 @@ def _active_platform_admin_count() -> int:
 
 
 def _revoke_user_sessions(user_id: str) -> int:
-    tokens = [token for token, session in core.SESSIONS.items() if session.get("userId") == user_id]
-    for token in tokens:
-        core.SESSIONS.pop(token, None)
-    persisted = REPOSITORY.revoke_user_sessions(user_id)
-    return max(len(tokens), persisted)
+    return REPOSITORY.revoke_user_sessions(user_id)
 
 
 def _validate_user_scope(payload: UserUpdateRequest, actor: dict) -> dict:
@@ -4128,7 +4116,7 @@ def list_assets(request: Request, companyId: str | None = None) -> list[dict]:
     ]
 
 
-@api.get("/api/v2/assets/{asset_id}", tags=["assets"])
+@api.get("/api/v2/assets/{asset_id}", tags=["assets"], include_in_schema=False)
 @api.get("/api/assets/{asset_id}", tags=["assets"])
 def get_asset(asset_id: str, request: Request) -> dict:
     return core.asset_view(_asset_for_user(asset_id, current_user(request)))

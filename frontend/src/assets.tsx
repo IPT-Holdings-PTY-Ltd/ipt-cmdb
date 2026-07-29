@@ -577,6 +577,10 @@ export function AssetCreate() {
   return <Box><Title title="Add configuration item" /><Typography variant="overline" color="primary">Configuration management</Typography><Typography variant="h3">Add asset</Typography><AssetForm initial={assetFormData()} saving={saving} error={error} submitLabel="Create asset" onSubmit={save} /></Box>;
 }
 
+function assetResourcePath(assetId: string) {
+  return `/api/assets/${encodeURIComponent(assetId)}`;
+}
+
 export function AssetEdit() {
   const { assetId = '' } = useParams();
   const workspace = useWorkspace();
@@ -588,7 +592,7 @@ export function AssetEdit() {
   const canEdit = !workspace.isRoot && ['platform_admin', 'msp_operator'].includes(getSession()?.user.role || '');
   useEffect(() => {
     setLoading(true);
-    apiFetch<Asset>(`/api/v2/assets/${encodeURIComponent(assetId)}`)
+    apiFetch<Asset>(assetResourcePath(assetId))
       .then(setAsset)
       .catch(reason => setError(reason instanceof Error ? reason.message : 'The asset could not be loaded.'))
       .finally(() => setLoading(false));
@@ -600,7 +604,7 @@ export function AssetEdit() {
     setSaving(true);
     setError('');
     try {
-      await apiFetch<Asset>(`/api/assets/${encodeURIComponent(asset.id)}`, {
+      await apiFetch<Asset>(assetResourcePath(asset.id), {
         method: 'PATCH',
         body: JSON.stringify(assetPayload(data)),
       });
@@ -773,7 +777,7 @@ export function AssetShow() {
   useEffect(() => {
     setLoading(true);
     setError('');
-    apiFetch<Asset>(`/api/v2/assets/${encodeURIComponent(assetId)}`)
+    apiFetch<Asset>(assetResourcePath(assetId))
       .then(setAsset)
       .catch(reason => setError(reason instanceof Error ? reason.message : 'The asset could not be loaded.'))
       .finally(() => setLoading(false));

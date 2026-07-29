@@ -39,7 +39,7 @@ class RepositoryTests(unittest.TestCase):
             "relationships": [],
         }
         self.saved = []
-        self.repository = StateRepository(self.state, lambda value: self.saved.append(value))
+        self.repository = StateRepository(self.state, self.saved.append)
 
     def test_string_ids_migrate_to_stable_canonical_uuids(self):
         first = canonical_uuid("configuration_item", "asset-1")
@@ -190,6 +190,37 @@ class RepositoryTests(unittest.TestCase):
 
         self.assertTrue(self.repository.consume_login_challenge("challenge-token"))
         self.assertFalse(self.repository.consume_login_challenge("challenge-token"))
+
+    def test_login_challenge_attempts_report_the_persisted_count_at_the_limit(self):
+        self.repository.create_login_challenge(
+            {
+                "tokenHash": "limited-challenge",
+                "userId": "admin",
+                "purpose": "verify",
+                "attempts": 0,
+                "maxAttempts": 2,
+                "expiresAt": "2999-01-01T00:00:00Z",
+            }
+        )
+
+        self.assertEqual(self.repository.record_login_challenge_attempt("limited-challenge"), 1)
+        self.assertEqual(self.repository.record_login_challenge_attempt("limited-challenge"), 2)
+        self.assertEqual(self.repository.record_login_challenge_attempt("limited-challenge"), 2)
+        self.assertEqual(self.repository.record_login_challenge_attempt("missing-challenge"), 0)
+
+        self.repository.create_login_challenge(
+            {
+                "tokenHash": "consumed-challenge",
+                "userId": "admin",
+                "purpose": "verify",
+                "attempts": 0,
+                "maxAttempts": 2,
+                "expiresAt": "2999-01-01T00:00:00Z",
+            }
+        )
+        self.assertEqual(self.repository.record_login_challenge_attempt("consumed-challenge"), 1)
+        self.assertTrue(self.repository.consume_login_challenge("consumed-challenge"))
+        self.assertEqual(self.repository.record_login_challenge_attempt("consumed-challenge"), 1)
 
     def test_created_user_only_stores_a_password_hash(self):
         created = self.repository.create_user(

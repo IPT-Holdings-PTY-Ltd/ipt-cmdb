@@ -68,7 +68,19 @@ class PostgresAuthenticationConcurrencyTests(unittest.TestCase):
 
     def setUp(self):
         with self.connection_factory() as connection, connection.cursor() as cursor:
-            cursor.execute("TRUNCATE auth_login_attempts")
+            cursor.execute("TRUNCATE auth_login_challenges, auth_login_attempts")
+            cursor.execute(
+                """
+                INSERT INTO users (id, email, display_name, status)
+                VALUES (
+                    'a63861ef-f3c0-4f18-bb6e-83e4267232cf',
+                    'concurrency@example.com',
+                    'Concurrency Test',
+                    'active'
+                )
+                ON CONFLICT (id) DO NOTHING
+                """
+            )
 
     def repository(self) -> PostgresCmdbRepository:
         """Return one repository instance representing an independent replica."""
@@ -144,6 +156,35 @@ class PostgresAuthenticationConcurrencyTests(unittest.TestCase):
         )
         self.assertTrue(identifier_released["allowed"])
         self.assertFalse(source_preserved["allowed"])
+
+    def test_mfa_attempt_count_does_not_fall_back_to_zero_at_the_limit(self):
+        workers = 5
+        barrier = threading.Barrier(workers)
+        token_hash = "a" * 64
+        self.repository().create_login_challenge(
+            {
+                "tokenHash": token_hash,
+                "userId": "a63861ef-f3c0-4f18-bb6e-83e4267232cf",
+                "purpose": "verify",
+                "maxAttempts": 2,
+                "expiresAt": "2099-01-01T00:00:00Z",
+            }
+        )
+
+        def fail_challenge(_index: int) -> int:
+            barrier.wait()
+            return self.repository().record_login_challenge_attempt(token_hash)
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = list(executor.map(fail_challenge, range(workers)))
+
+        self.assertEqual(sorted(results), [1, 2, 2, 2, 2])
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT attempts FROM auth_login_challenges WHERE token_hash = %s",
+                (token_hash,),
+            )
+            self.assertEqual(cursor.fetchone()[0], 2)
 
 
 if __name__ == "__main__":

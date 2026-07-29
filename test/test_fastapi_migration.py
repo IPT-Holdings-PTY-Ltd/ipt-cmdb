@@ -96,11 +96,10 @@ class FastApiMigrationTests(unittest.TestCase):
             ],
             "syncRuns": [],
         }
-        core.SESSIONS.clear()
         self.save_patcher = patch.object(core, "save_db")
         self.save_patcher.start()
         self.original_repository = backend_main.REPOSITORY
-        backend_main.REPOSITORY = StateRepository(core.DB, lambda state: core.save_db(state))
+        backend_main.REPOSITORY = StateRepository(core.DB, core.save_db)
         self.client = TestClient(api)
 
     def tearDown(self):
@@ -108,7 +107,6 @@ class FastApiMigrationTests(unittest.TestCase):
         backend_main.REPOSITORY = self.original_repository
         core.DB = self.original_db
         core.DATABASE_MODE = self.original_database_mode
-        core.SESSIONS.clear()
 
     def _login(self, email: str, password: str = "ChangeMe!") -> str:
         response = self.client.post("/api/login", json={"email": email, "password": password})
@@ -1433,6 +1431,16 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertTrue(expected.issubset(paths))
         self.assertNotIn("/api/{path:path}", paths)
 
+    def test_legacy_v2_asset_read_alias_matches_the_canonical_resource(self):
+        headers = self._headers("admin@example.com")
+
+        canonical = self.client.get("/api/assets/asset-1", headers=headers)
+        compatibility = self.client.get("/api/v2/assets/asset-1", headers=headers)
+
+        self.assertEqual(canonical.status_code, 200)
+        self.assertEqual(compatibility.status_code, 200)
+        self.assertEqual(compatibility.json(), canonical.json())
+
     def test_dashboard_is_role_and_customer_scoped(self):
         client_token = self._login("client@acme.example")
         client_headers = {"Authorization": f"Bearer {client_token}"}
@@ -1537,6 +1545,7 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(schema["info"]["title"], "CMDB Hub API")
         self.assertEqual(schema["info"]["version"], "0.4.0")
         self.assertIn("/api/assets", schema["paths"])
+        self.assertNotIn("/api/v2/assets/{asset_id}", schema["paths"])
         self.assertIn("/api/contacts", schema["paths"])
         self.assertIn("/api/relationships", schema["paths"])
         self.assertIn("/api/changes/{change_id}/pdf", schema["paths"])

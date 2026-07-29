@@ -96,13 +96,6 @@ OWNER_RESPONSIBILITY_ROLES = {
 _DUMMY_PASSWORD_HASH = (
     "pbkdf2_sha256$310000$Y21kYi1sb2dpbi1kdW1teQ==$xMuEeu90JGuMJzKANciKVeEkYTk3jjOl1qiV2EV5DOs="
 )
-_LOGIN_ATTEMPT_OUTCOMES = {
-    "pending",
-    "password_failed",
-    "password_verified",
-    "succeeded",
-    "throttled",
-}
 
 
 def default_company_branding(name: str) -> dict:
@@ -1235,26 +1228,27 @@ class StateRepository:
         return deepcopy(challenge) if challenge else None
 
     def record_login_challenge_attempt(self, token_hash: str) -> int:
-        """Increment the failed-or-consumed verification attempt count."""
+        """Increment a live challenge, or return the token's current attempt count."""
 
         with self._authentication_lock:
             challenge = next(
-                (
-                    item
-                    for item in self.state["loginChallenges"]
-                    if item["tokenHash"] == token_hash
-                    and not item.get("consumedAt")
-                    and (parse_timestamp(item.get("expiresAt")) or datetime.min.replace(tzinfo=UTC))
-                    > datetime.now(UTC)
-                    and item.get("attempts", 0) < item.get("maxAttempts", 5)
-                ),
+                (item for item in self.state["loginChallenges"] if item["tokenHash"] == token_hash),
                 None,
             )
             if not challenge:
                 return 0
-            challenge["attempts"] = challenge.get("attempts", 0) + 1
-            self.save_state(self.state)
-            return challenge["attempts"]
+            attempts = int(challenge.get("attempts", 0))
+            expires_at = parse_timestamp(challenge.get("expiresAt"))
+            if (
+                not challenge.get("consumedAt")
+                and expires_at
+                and expires_at > datetime.now(UTC)
+                and attempts < int(challenge.get("maxAttempts", 5))
+            ):
+                attempts += 1
+                challenge["attempts"] = attempts
+                self.save_state(self.state)
+            return attempts
 
     def consume_login_challenge(self, token_hash: str) -> bool:
         """Mark a successful login transaction as single-use."""
@@ -8083,8 +8077,8 @@ class PostgresCmdbRepository(StateRepository):
                     FROM auth_login_attempts
                     WHERE created_at < now() - interval '30 days'
                     ORDER BY created_at
-                    LIMIT 500
                     FOR UPDATE SKIP LOCKED
+                    LIMIT 500
                 )
                 """
             )
@@ -8751,7 +8745,7 @@ class PostgresCmdbRepository(StateRepository):
         }
 
     def record_login_challenge_attempt(self, token_hash: str) -> int:
-        """Increment the failed-or-consumed verification attempt count."""
+        """Increment a live challenge, or return the token's current attempt count."""
 
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -8767,7 +8761,14 @@ class PostgresCmdbRepository(StateRepository):
                 (token_hash,),
             )
             row = cursor.fetchone()
-            return int(row[0]) if row else 0
+            if row:
+                return int(row[0])
+            cursor.execute(
+                "SELECT attempts FROM auth_login_challenges WHERE token_hash = %s",
+                (token_hash,),
+            )
+            existing = cursor.fetchone()
+            return int(existing[0]) if existing else 0
 
     def consume_login_challenge(self, token_hash: str) -> bool:
         """Mark a successful login transaction as single-use."""
