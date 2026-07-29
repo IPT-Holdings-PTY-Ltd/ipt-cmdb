@@ -38,7 +38,6 @@ DATABASE_SOURCE = "not configured"
 DATABASE_ERROR: str | None = None
 DATABASE_MODE = "local development state"
 CANONICAL_DATABASE_INITIALIZED = False
-SESSIONS: dict[str, dict] = {}
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "28800"))
 LOCK = threading.Lock()
 SCHEMA_VERSION = latest_schema_version(ROOT)

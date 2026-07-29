@@ -1,8 +1,8 @@
 import base64
 import json
 import os
+import tempfile
 import unittest
-import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,19 +24,17 @@ class DatabaseConfigurationSecurityTests(unittest.TestCase):
         self.key_bytes = bytes(range(32))
         self.encoded_key = base64.urlsafe_b64encode(self.key_bytes).decode("ascii")
         self.database_url = "postgresql://unit-user:" + "credential-value@db/cmdb"
-        self.temp_root = Path(__file__).resolve().parents[1] / "tmp"
-        self.temp_root.mkdir(exist_ok=True)
-        self.test_paths: list[Path] = []
-
-    def tearDown(self):
-        for path in self.test_paths:
-            path.unlink(missing_ok=True)
-            path.with_suffix(f"{path.suffix}.tmp").unlink(missing_ok=True)
+        temporary_base = Path(__file__).resolve().parents[1] / "tmp"
+        temporary_base.mkdir(exist_ok=True)
+        self.temp_directory = tempfile.TemporaryDirectory(
+            prefix="cmdb-security-",
+            dir=temporary_base,
+        )
+        self.addCleanup(self.temp_directory.cleanup)
+        self.temp_root = Path(self.temp_directory.name)
 
     def temporary_path(self, name: str) -> Path:
-        path = self.temp_root / f"security-{uuid.uuid4()}-{name}"
-        self.test_paths.append(path)
-        return path
+        return self.temp_root / name
 
     def test_encrypted_configuration_round_trip_contains_no_plaintext_credentials(self):
         path = self.temporary_path("database-config.json")
@@ -159,23 +157,30 @@ class ApiExposureSecurityTests(unittest.TestCase):
     def test_static_file_mount_rejects_encoded_parent_traversal(self):
         temporary_base = Path(__file__).resolve().parents[1] / "tmp"
         temporary_base.mkdir(exist_ok=True)
-        root = temporary_base / f"static-files-{uuid.uuid4()}"
-        frontend_dist = root / "dist"
-        index_path = frontend_dist / "index.html"
-        source_path = root / "app.py"
-        frontend_dist.mkdir(parents=True)
-        try:
+        with tempfile.TemporaryDirectory(
+            prefix="cmdb-static-files-",
+            dir=temporary_base,
+        ) as temp_dir:
+            root = Path(temp_dir)
+            frontend_dist = root / "dist"
+            index_path = frontend_dist / "index.html"
+            source_path = root / "app.py"
+            frontend_dist.mkdir()
             index_path.write_text("<h1>CMDB Hub</h1>", encoding="utf-8")
             source_path.write_text("CMDB Hub transitional state", encoding="utf-8")
             isolated_api = FastAPI()
             backend_main.mount_frontend(isolated_api, frontend_dist)
 
-            response = TestClient(isolated_api).get("/%2e%2e/app.py")
-        finally:
-            index_path.unlink(missing_ok=True)
-            source_path.unlink(missing_ok=True)
-            frontend_dist.rmdir()
-            root.rmdir()
+            with TestClient(isolated_api) as client:
+                response = client.get("/%2e%2e/app.py")
 
         self.assertEqual(response.status_code, 404)
         self.assertNotIn("CMDB Hub transitional state", response.text)
+
+    def test_login_identifier_hash_is_normalized_stable_and_opaque(self):
+        first = backend_main._login_identifier_hash(" ADMIN@Example.com ")
+        second = backend_main._login_identifier_hash("admin@example.com")
+
+        self.assertEqual(first, second)
+        self.assertNotIn("admin@example.com", first)
+        self.assertEqual(len(first), 64)

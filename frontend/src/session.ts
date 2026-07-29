@@ -10,10 +10,41 @@ export class ApiError extends Error {
     message: string,
     public status: number,
     public body: unknown,
+    public retryAfterSeconds: number | null = null,
   ) {
     super(message);
     this.name = 'ApiError';
   }
+}
+
+function responseRetryAfterSeconds(response: Response): number | null {
+  const value = response.headers.get('retry-after')?.trim();
+  if (!value) return null;
+  if (/^\d+$/.test(value)) return Math.max(1, Number.parseInt(value, 10));
+  const retryAt = Date.parse(value);
+  if (Number.isNaN(retryAt)) return null;
+  return Math.max(1, Math.ceil((retryAt - Date.now()) / 1000));
+}
+
+function isJsonText(body: BodyInit | null | undefined): body is string {
+  if (typeof body !== 'string') return false;
+  try {
+    JSON.parse(body);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function requestHeaders(init: RequestInit, session: Session | null): Headers {
+  const headers = new Headers(init.headers);
+  if (isJsonText(init.body) && !headers.has('content-type')) {
+    headers.set('content-type', 'application/json');
+  }
+  if (session && !headers.has('authorization')) {
+    headers.set('authorization', `Bearer ${session.token}`);
+  }
+  return headers;
 }
 
 export function getSession(): Session | null {
@@ -40,16 +71,17 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
   const session = getSession();
   const response = await fetch(path, {
     ...init,
-    headers: {
-      ...(init.body ? { 'content-type': 'application/json' } : {}),
-      ...(session ? { Authorization: `Bearer ${session.token}` } : {}),
-      ...init.headers,
-    },
+    headers: requestHeaders(init, session),
   });
   const payload = response.status === 204 ? {} : await response.json().catch(() => ({}));
   if (!response.ok) {
     if (response.status === 401) setSession(null);
-    throw new ApiError(payload.error || payload.detail || response.statusText, response.status, payload);
+    throw new ApiError(
+      payload.error || payload.detail || response.statusText,
+      response.status,
+      payload,
+      responseRetryAfterSeconds(response),
+    );
   }
   return payload as T;
 }
@@ -58,16 +90,17 @@ export async function apiDownload(path: string, init: RequestInit = {}): Promise
   const session = getSession();
   const response = await fetch(path, {
     ...init,
-    headers: {
-      ...(init.body ? { 'content-type': 'application/json' } : {}),
-      ...(session ? { Authorization: `Bearer ${session.token}` } : {}),
-      ...init.headers,
-    },
+    headers: requestHeaders(init, session),
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     if (response.status === 401) setSession(null);
-    throw new ApiError(payload.error || payload.detail || response.statusText, response.status, payload);
+    throw new ApiError(
+      payload.error || payload.detail || response.statusText,
+      response.status,
+      payload,
+      responseRetryAfterSeconds(response),
+    );
   }
   const disposition = response.headers.get('content-disposition') || '';
   const match = disposition.match(/filename="?([^";]+)"?/i);

@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import secrets
+import threading
 import uuid
 from collections.abc import Callable, Iterable
 from copy import deepcopy
@@ -92,6 +93,9 @@ OWNER_RESPONSIBILITY_ROLES = {
     "signoff_delegate",
     "support_contact",
 }
+_DUMMY_PASSWORD_HASH = (
+    "pbkdf2_sha256$310000$Y21kYi1sb2dpbi1kdW1teQ==$xMuEeu90JGuMJzKANciKVeEkYTk3jjOl1qiV2EV5DOs="
+)
 
 
 def default_company_branding(name: str) -> dict:
@@ -512,6 +516,7 @@ class StateRepository:
     def __init__(self, state: dict, save_state: Callable[[dict], None]):
         self.state = state
         self.save_state = save_state
+        self._authentication_lock = threading.RLock()
         self.state.setdefault("auditEvents", [])
         self.state.setdefault("dataQualityExceptions", [])
         self.state.setdefault("reconciliationCandidates", [])
@@ -523,6 +528,7 @@ class StateRepository:
         self.state.setdefault("mfaCredentials", [])
         self.state.setdefault("mfaRecoveryCodes", [])
         self.state.setdefault("loginChallenges", [])
+        self.state.setdefault("loginAttempts", [])
         self.state.setdefault("sessions", [])
         self.state.setdefault("passwordResets", [])
         self.state.setdefault("emailConnection", deepcopy(DEFAULT_EMAIL_CONNECTION))
@@ -696,20 +702,196 @@ class StateRepository:
             (item for item in self.state["users"] if item["email"].lower() == email.lower()),
             None,
         )
-        if not user:
-            return None
-        if user.get("status", "active") != "active":
+        if not user or user.get("status", "active") != "active":
+            verify_password(password, _DUMMY_PASSWORD_HASH)
             return None
         password_hash = user.get("passwordHash")
-        if password_hash and verify_password(password, password_hash):
-            return self._effective_user(user)
+        if password_hash:
+            return self._effective_user(user) if verify_password(password, password_hash) else None
         plaintext = user.get("password")
-        if plaintext and hmac.compare_digest(plaintext, password):
-            user["passwordHash"] = hash_password(password)
-            user.pop("password", None)
-            self.save_state(self.state)
-            return self._effective_user(user)
+        if plaintext:
+            # Legacy JSON state still receives one PBKDF2 operation so it does
+            # not create a materially faster password-enumeration path.
+            verify_password(password, _DUMMY_PASSWORD_HASH)
+            if hmac.compare_digest(plaintext, password):
+                user["passwordHash"] = hash_password(password)
+                user.pop("password", None)
+                self.save_state(self.state)
+                return self._effective_user(user)
+            return None
+        verify_password(password, _DUMMY_PASSWORD_HASH)
         return None
+
+    def reserve_local_login_attempt(
+        self,
+        identifier_hash: str,
+        requester_hash: str,
+        *,
+        source_limit: int = 20,
+        source_window_seconds: int = 900,
+        identifier_limit: int = 5,
+        identifier_window_seconds: int = 900,
+        pending_ttl_seconds: int = 120,
+        audit_window_seconds: int = 300,
+    ) -> dict:
+        """Atomically reserve local-login capacity in the development repository."""
+
+        now = datetime.now(UTC)
+        source_window = timedelta(seconds=max(1, source_window_seconds))
+        identifier_window = timedelta(seconds=max(1, identifier_window_seconds))
+        pending_window = timedelta(seconds=max(1, pending_ttl_seconds))
+        audit_window = timedelta(seconds=max(1, audit_window_seconds))
+        with self._authentication_lock:
+            retained = [
+                item
+                for item in self.state.get("loginAttempts", [])
+                if (parse_timestamp(item.get("createdAt")) or datetime.min.replace(tzinfo=UTC))
+                >= now - timedelta(days=30)
+            ]
+
+            def active_expirations(kind: str) -> list[datetime]:
+                expirations: list[datetime] = []
+                for item in retained:
+                    created_at = parse_timestamp(item.get("createdAt"))
+                    if not created_at:
+                        continue
+                    outcome = item.get("outcome")
+                    if outcome == "pending":
+                        expiration = created_at + pending_window
+                    elif outcome == "password_failed":
+                        if kind == "identifier" and item.get("identifierClearedAt"):
+                            continue
+                        expiration = created_at + (
+                            identifier_window if kind == "identifier" else source_window
+                        )
+                    else:
+                        continue
+                    matches = (
+                        item.get("identifierHash") == identifier_hash
+                        if kind == "identifier"
+                        else item.get("requesterHash") == requester_hash
+                    )
+                    if matches and expiration > now:
+                        expirations.append(expiration)
+                return sorted(expirations)
+
+            source_expirations = active_expirations("source")
+            identifier_expirations = active_expirations("identifier")
+            source_blocked = len(source_expirations) >= max(1, source_limit)
+            identifier_blocked = len(identifier_expirations) >= max(1, identifier_limit)
+            if source_blocked or identifier_blocked:
+                limited_by = "source" if source_blocked else "identifier"
+                expirations = source_expirations if source_blocked else identifier_expirations
+                limit = max(1, source_limit if source_blocked else identifier_limit)
+                release_at = expirations[max(0, len(expirations) - limit)]
+                retry_after = max(1, int((release_at - now).total_seconds() + 0.999))
+                recent_audit = any(
+                    item.get("outcome") == "throttled"
+                    and item.get("throttleReason") == limited_by
+                    and (
+                        item.get("requesterHash") == requester_hash
+                        if limited_by == "source"
+                        else item.get("identifierHash") == identifier_hash
+                    )
+                    and (parse_timestamp(item.get("createdAt")) or datetime.min.replace(tzinfo=UTC))
+                    >= now - audit_window
+                    for item in retained
+                )
+                if not recent_audit:
+                    retained.insert(
+                        0,
+                        {
+                            "id": str(uuid.uuid4()),
+                            "identifierHash": identifier_hash,
+                            "requesterHash": requester_hash,
+                            "outcome": "throttled",
+                            "throttleReason": limited_by,
+                            "completedAt": utc_now(),
+                            "createdAt": utc_now(),
+                        },
+                    )
+                self.state["loginAttempts"] = retained[:5000]
+                self.save_state(self.state)
+                return {
+                    "allowed": False,
+                    "attemptId": None,
+                    "retryAfterSeconds": retry_after,
+                    "auditRequired": not recent_audit,
+                }
+
+            attempt = {
+                "id": str(uuid.uuid4()),
+                "identifierHash": identifier_hash,
+                "requesterHash": requester_hash,
+                "outcome": "pending",
+                "completedAt": None,
+                "identifierClearedAt": None,
+                "createdAt": utc_now(),
+            }
+            self.state["loginAttempts"] = [attempt, *retained][:5000]
+            self.save_state(self.state)
+            return {
+                "allowed": True,
+                "attemptId": attempt["id"],
+                "retryAfterSeconds": 0,
+                "auditRequired": False,
+            }
+
+    def finish_local_login_attempt(self, attempt_id: str, outcome: str) -> bool:
+        """Finalize a reserved password step exactly once."""
+
+        if outcome not in {"password_failed", "password_verified"}:
+            raise ValueError("Unsupported local-login attempt outcome")
+        with self._authentication_lock:
+            attempt = next(
+                (
+                    item
+                    for item in self.state.get("loginAttempts", [])
+                    if item.get("id") == attempt_id and item.get("outcome") == "pending"
+                ),
+                None,
+            )
+            if not attempt:
+                return False
+            attempt["outcome"] = outcome
+            attempt["completedAt"] = utc_now()
+            self.save_state(self.state)
+            return True
+
+    def clear_local_login_failures(self, identifier_hash: str) -> int:
+        """Clear identifier failures after recovery or a governed account update."""
+
+        cleared = 0
+        completed_at = utc_now()
+        with self._authentication_lock:
+            for attempt in self.state.get("loginAttempts", []):
+                if (
+                    attempt.get("identifierHash") == identifier_hash
+                    and attempt.get("outcome") == "password_failed"
+                    and not attempt.get("identifierClearedAt")
+                ):
+                    attempt["identifierClearedAt"] = completed_at
+                    cleared += 1
+            if cleared:
+                self.save_state(self.state)
+        return cleared
+
+    def complete_local_login(self, identifier_hash: str) -> int:
+        """Record full authentication and clear only the identifier failure bucket."""
+
+        with self._authentication_lock:
+            changed = False
+            for attempt in self.state.get("loginAttempts", []):
+                if (
+                    attempt.get("identifierHash") == identifier_hash
+                    and attempt.get("outcome") == "password_verified"
+                ):
+                    attempt["outcome"] = "succeeded"
+                    changed = True
+            cleared = self.clear_local_login_failures(identifier_hash)
+            if changed and not cleared:
+                self.save_state(self.state)
+            return cleared
 
     def create_user(self, user: dict, password: str, actor_id: str | None = None) -> dict:
         stored = {
@@ -1004,8 +1186,30 @@ class StateRepository:
     def create_login_challenge(self, challenge: dict) -> None:
         """Persist a password-verified, short-lived MFA login transaction."""
 
-        self.state["loginChallenges"].append(deepcopy(challenge))
-        self.save_state(self.state)
+        with self._authentication_lock:
+            now = datetime.now(UTC)
+            retained = [
+                item
+                for item in self.state["loginChallenges"]
+                if (parse_timestamp(item.get("expiresAt")) or datetime.min.replace(tzinfo=UTC))
+                > now - timedelta(days=1)
+            ]
+            live_for_user = [
+                item
+                for item in retained
+                if item.get("userId") == challenge["userId"]
+                and not item.get("consumedAt")
+                and (parse_timestamp(item.get("expiresAt")) or datetime.min.replace(tzinfo=UTC))
+                > now
+            ]
+            for stale in sorted(
+                live_for_user,
+                key=lambda item: str(item.get("expiresAt") or ""),
+                reverse=True,
+            )[4:]:
+                stale["consumedAt"] = utc_now()
+            self.state["loginChallenges"] = [deepcopy(challenge), *retained]
+            self.save_state(self.state)
 
     def get_login_challenge(self, token_hash: str) -> dict | None:
         """Return a live, unconsumed login challenge."""
@@ -1024,28 +1228,49 @@ class StateRepository:
         return deepcopy(challenge) if challenge else None
 
     def record_login_challenge_attempt(self, token_hash: str) -> int:
-        """Increment the failed-or-consumed verification attempt count."""
+        """Increment a live challenge, or return the token's current attempt count."""
 
-        challenge = next(
-            (item for item in self.state["loginChallenges"] if item["tokenHash"] == token_hash),
-            None,
-        )
-        if not challenge:
-            return 0
-        challenge["attempts"] = challenge.get("attempts", 0) + 1
-        self.save_state(self.state)
-        return challenge["attempts"]
+        with self._authentication_lock:
+            challenge = next(
+                (item for item in self.state["loginChallenges"] if item["tokenHash"] == token_hash),
+                None,
+            )
+            if not challenge:
+                return 0
+            attempts = int(challenge.get("attempts", 0))
+            expires_at = parse_timestamp(challenge.get("expiresAt"))
+            if (
+                not challenge.get("consumedAt")
+                and expires_at
+                and expires_at > datetime.now(UTC)
+                and attempts < int(challenge.get("maxAttempts", 5))
+            ):
+                attempts += 1
+                challenge["attempts"] = attempts
+                self.save_state(self.state)
+            return attempts
 
-    def consume_login_challenge(self, token_hash: str) -> None:
+    def consume_login_challenge(self, token_hash: str) -> bool:
         """Mark a successful login transaction as single-use."""
 
-        challenge = next(
-            (item for item in self.state["loginChallenges"] if item["tokenHash"] == token_hash),
-            None,
-        )
-        if challenge:
+        with self._authentication_lock:
+            challenge = next(
+                (
+                    item
+                    for item in self.state["loginChallenges"]
+                    if item["tokenHash"] == token_hash
+                    and not item.get("consumedAt")
+                    and (parse_timestamp(item.get("expiresAt")) or datetime.min.replace(tzinfo=UTC))
+                    > datetime.now(UTC)
+                    and item.get("attempts", 0) < item.get("maxAttempts", 5)
+                ),
+                None,
+            )
+            if not challenge:
+                return False
             challenge["consumedAt"] = utc_now()
             self.save_state(self.state)
+            return True
 
     def create_session(self, token_hash: str, user_id: str, expires_at: str) -> None:
         """Persist a hashed browser session token."""
@@ -6302,7 +6527,7 @@ class StateRepository:
             "companyId": company_id,
             "actorUserId": actor_id,
             "actorLabel": actor.get("email") if actor else (actor_id if actor_id else "System"),
-            "actorType": actor_type if actor_id else "system",
+            "actorType": actor_type if actor_id or actor_type != "user" else "system",
             "sourceSystem": source_system or context.source_system,
             "category": event_category(entity_type, action),
             "entityType": entity_type,
@@ -7815,10 +8040,236 @@ class PostgresCmdbRepository(StateRepository):
                 (email,),
             )
             row = cursor.fetchone()
-        if not row or not verify_password(password, row[1]):
+        password_hash = row[1] if row else _DUMMY_PASSWORD_HASH
+        password_matches = verify_password(password, password_hash)
+        if not row or not password_matches:
             return None
         user_id = str(row[0])
         return next((item for item in self.list_users() if item["id"] == user_id), None)
+
+    def reserve_local_login_attempt(
+        self,
+        identifier_hash: str,
+        requester_hash: str,
+        *,
+        source_limit: int = 20,
+        source_window_seconds: int = 900,
+        identifier_limit: int = 5,
+        identifier_window_seconds: int = 900,
+        pending_ttl_seconds: int = 120,
+        audit_window_seconds: int = 300,
+    ) -> dict:
+        """Reserve local-login capacity across every PostgreSQL-backed replica."""
+
+        source_limit = max(1, source_limit)
+        identifier_limit = max(1, identifier_limit)
+        source_window_seconds = max(1, source_window_seconds)
+        identifier_window_seconds = max(1, identifier_window_seconds)
+        pending_ttl_seconds = max(1, pending_ttl_seconds)
+        audit_window_seconds = max(1, audit_window_seconds)
+        attempt_id = str(uuid.uuid4())
+        with self.connection_factory() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM auth_login_attempts
+                WHERE id IN (
+                    SELECT id
+                    FROM auth_login_attempts
+                    WHERE created_at < now() - interval '30 days'
+                    ORDER BY created_at
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 500
+                )
+                """
+            )
+            lock_keys = sorted(
+                (
+                    f"auth-login:identifier:{identifier_hash}",
+                    f"auth-login:requester:{requester_hash}",
+                )
+            )
+            for lock_key in lock_keys:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (lock_key,),
+                )
+            cursor.execute(
+                """
+                SELECT outcome, created_at, identifier_hash, requester_hash,
+                       identifier_cleared_at, now()
+                FROM auth_login_attempts
+                WHERE outcome IN ('pending', 'password_failed')
+                  AND (
+                    (
+                        identifier_hash = %s
+                        AND created_at >= now() - make_interval(secs => %s)
+                    )
+                    OR
+                    (
+                        requester_hash = %s
+                        AND created_at >= now() - make_interval(secs => %s)
+                    )
+                  )
+                """,
+                (
+                    identifier_hash,
+                    max(identifier_window_seconds, pending_ttl_seconds),
+                    requester_hash,
+                    max(source_window_seconds, pending_ttl_seconds),
+                ),
+            )
+            rows = cursor.fetchall()
+            now = rows[0][5] if rows else None
+            if now is None:
+                cursor.execute("SELECT now()")
+                now = cursor.fetchone()[0]
+
+            source_expirations: list[datetime] = []
+            identifier_expirations: list[datetime] = []
+            for outcome, created_at, stored_identifier, stored_requester, cleared_at, _ in rows:
+                pending = outcome == "pending"
+                if stored_requester == requester_hash:
+                    source_expiration = created_at + timedelta(
+                        seconds=pending_ttl_seconds if pending else source_window_seconds
+                    )
+                    if source_expiration > now:
+                        source_expirations.append(source_expiration)
+                if stored_identifier == identifier_hash and (pending or not cleared_at):
+                    identifier_expiration = created_at + timedelta(
+                        seconds=(pending_ttl_seconds if pending else identifier_window_seconds)
+                    )
+                    if identifier_expiration > now:
+                        identifier_expirations.append(identifier_expiration)
+            source_expirations.sort()
+            identifier_expirations.sort()
+            source_blocked = len(source_expirations) >= source_limit
+            identifier_blocked = len(identifier_expirations) >= identifier_limit
+            if source_blocked or identifier_blocked:
+                limited_by = "source" if source_blocked else "identifier"
+                expirations = source_expirations if source_blocked else identifier_expirations
+                limit = source_limit if source_blocked else identifier_limit
+                release_at = expirations[max(0, len(expirations) - limit)]
+                retry_after = max(1, int((release_at - now).total_seconds() + 0.999))
+                cursor.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM auth_login_attempts
+                        WHERE outcome = 'throttled'
+                          AND throttle_reason = %s
+                          AND created_at >= now() - make_interval(secs => %s)
+                          AND (
+                            (%s = 'source' AND requester_hash = %s)
+                            OR
+                            (%s = 'identifier' AND identifier_hash = %s)
+                          )
+                    )
+                    """,
+                    (
+                        limited_by,
+                        audit_window_seconds,
+                        limited_by,
+                        requester_hash,
+                        limited_by,
+                        identifier_hash,
+                    ),
+                )
+                recent_audit = bool(cursor.fetchone()[0])
+                if not recent_audit:
+                    cursor.execute(
+                        """
+                        INSERT INTO auth_login_attempts (
+                            id, identifier_hash, requester_hash, outcome,
+                            throttle_reason, completed_at
+                        ) VALUES (%s::uuid, %s, %s, 'throttled', %s, now())
+                        """,
+                        (
+                            attempt_id,
+                            identifier_hash,
+                            requester_hash,
+                            limited_by,
+                        ),
+                    )
+                return {
+                    "allowed": False,
+                    "attemptId": None,
+                    "retryAfterSeconds": retry_after,
+                    "auditRequired": not recent_audit,
+                }
+
+            cursor.execute(
+                """
+                INSERT INTO auth_login_attempts (
+                    id, identifier_hash, requester_hash, outcome
+                ) VALUES (%s::uuid, %s, %s, 'pending')
+                """,
+                (attempt_id, identifier_hash, requester_hash),
+            )
+            return {
+                "allowed": True,
+                "attemptId": attempt_id,
+                "retryAfterSeconds": 0,
+                "auditRequired": False,
+            }
+
+    def finish_local_login_attempt(self, attempt_id: str, outcome: str) -> bool:
+        """Finalize a PostgreSQL login reservation exactly once."""
+
+        if outcome not in {"password_failed", "password_verified"}:
+            raise ValueError("Unsupported local-login attempt outcome")
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE auth_login_attempts
+                SET outcome = %s, completed_at = now()
+                WHERE id = %s::uuid AND outcome = 'pending'
+                """,
+                (outcome, attempt_id),
+            )
+            return cursor.rowcount == 1
+
+    def clear_local_login_failures(self, identifier_hash: str) -> int:
+        """Clear identifier failures after a governed recovery or account update."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE auth_login_attempts
+                SET identifier_cleared_at = COALESCE(identifier_cleared_at, now())
+                WHERE identifier_hash = %s
+                  AND outcome = 'password_failed'
+                  AND identifier_cleared_at IS NULL
+                """,
+                (identifier_hash,),
+            )
+            return cursor.rowcount
+
+    def complete_local_login(self, identifier_hash: str) -> int:
+        """Record full authentication while preserving the broader source bucket."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE auth_login_attempts
+                SET identifier_cleared_at = COALESCE(identifier_cleared_at, now())
+                WHERE identifier_hash = %s
+                  AND outcome = 'password_failed'
+                  AND identifier_cleared_at IS NULL
+                """,
+                (identifier_hash,),
+            )
+            cleared = cursor.rowcount
+            cursor.execute(
+                """
+                UPDATE auth_login_attempts
+                SET outcome = 'succeeded'
+                WHERE identifier_hash = %s
+                  AND outcome = 'password_verified'
+                  AND created_at >= now() - interval '1 day'
+                """,
+                (identifier_hash,),
+            )
+            return cleared
 
     def create_user(self, user: dict, password: str, actor_id: str | None = None) -> dict:
         user_uuid = canonical_uuid("user", user["id"])
@@ -8227,6 +8678,33 @@ class PostgresCmdbRepository(StateRepository):
 
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"auth-login-challenge:{challenge['userId']}",),
+            )
+            cursor.execute(
+                """
+                DELETE FROM auth_login_challenges
+                WHERE expires_at < now() - interval '1 day'
+                   OR consumed_at < now() - interval '1 day'
+                """
+            )
+            cursor.execute(
+                """
+                UPDATE auth_login_challenges
+                SET consumed_at = now()
+                WHERE token_hash IN (
+                    SELECT token_hash
+                    FROM auth_login_challenges
+                    WHERE user_id = %s::uuid
+                      AND consumed_at IS NULL
+                      AND expires_at > now()
+                    ORDER BY created_at DESC
+                    OFFSET 4
+                )
+                """,
+                (challenge["userId"],),
+            )
+            cursor.execute(
                 """
                 INSERT INTO auth_login_challenges (
                     token_hash, user_id, purpose, attempts, max_attempts, expires_at
@@ -8267,24 +8745,47 @@ class PostgresCmdbRepository(StateRepository):
         }
 
     def record_login_challenge_attempt(self, token_hash: str) -> int:
-        """Increment the failed-or-consumed verification attempt count."""
+        """Increment a live challenge, or return the token's current attempt count."""
 
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
-                "UPDATE auth_login_challenges SET attempts = attempts + 1 WHERE token_hash = %s RETURNING attempts",
+                """
+                UPDATE auth_login_challenges
+                SET attempts = attempts + 1
+                WHERE token_hash = %s
+                  AND consumed_at IS NULL
+                  AND expires_at > now()
+                  AND attempts < max_attempts
+                RETURNING attempts
+                """,
                 (token_hash,),
             )
             row = cursor.fetchone()
-            return int(row[0]) if row else 0
+            if row:
+                return int(row[0])
+            cursor.execute(
+                "SELECT attempts FROM auth_login_challenges WHERE token_hash = %s",
+                (token_hash,),
+            )
+            existing = cursor.fetchone()
+            return int(existing[0]) if existing else 0
 
-    def consume_login_challenge(self, token_hash: str) -> None:
+    def consume_login_challenge(self, token_hash: str) -> bool:
         """Mark a successful login transaction as single-use."""
 
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
-                "UPDATE auth_login_challenges SET consumed_at = now() WHERE token_hash = %s AND consumed_at IS NULL",
+                """
+                UPDATE auth_login_challenges
+                SET consumed_at = now()
+                WHERE token_hash = %s
+                  AND consumed_at IS NULL
+                  AND expires_at > now()
+                  AND attempts < max_attempts
+                """,
                 (token_hash,),
             )
+            return cursor.rowcount == 1
 
     def create_session(self, token_hash: str, user_id: str, expires_at: str) -> None:
         """Persist a hashed browser session token."""
@@ -15138,7 +15639,7 @@ class PostgresCmdbRepository(StateRepository):
                 event_id,
                 company_uuid,
                 actor_uuid,
-                actor_type if actor_uuid else "system",
+                actor_type if actor_uuid or actor_type != "user" else "system",
                 actor_label,
                 source_system or context.source_system,
                 event_category(entity_type, action),

@@ -42,6 +42,8 @@ and mounts only a small runtime volume and temporary filesystem.
 | `DATABASE_URL` or `DATABASE_URL_FILE` | PostgreSQL URL with TLS, normally `sslmode=require` |
 | `DATABASE_SEED_MODE` | `empty` |
 | `AUTH_MODE` | `easy_auth` behind a trusted identity boundary |
+| `FORWARDED_ALLOW_IPS` | Exact immediate reverse-proxy IPs/CIDRs; blank for direct access; never `*` |
+| `LOCAL_LOGIN_*` | Reviewed identifier/source limits shared by every web replica |
 | `PUBLIC_BASE_URL` | Exact external HTTPS origin used in local-account recovery links |
 | `MFA_ENCRYPTION_KEY` or `MFA_ENCRYPTION_KEY_FILE` | Stable URL-safe base64 encoding of 32 random bytes |
 | `ALLOW_UI_DATABASE_CONFIG` | `false` |
@@ -64,6 +66,12 @@ must provide an equivalent OIDC-aware reverse proxy.
 External authentication does not replace application authorization. The Entra email
 must map to an enabled CMDB user, and customer/group/RBAC scope is still enforced by
 the API. Unmapped identities are denied.
+
+The container starts Uvicorn's maintained proxy-header middleware, but it honors
+forwarding headers only when the socket peer matches `FORWARDED_ALLOW_IPS`. Trusted
+chains are evaluated from the right. This is also the source used for local-login and
+password-recovery throttles; changing the proxy topology therefore requires a reviewed
+environment update and a spoofing regression check.
 
 ## Database lifecycle
 

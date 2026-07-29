@@ -727,9 +727,28 @@ class PostgresRepositoryContractTests(unittest.TestCase):
             }
         )
         self.assertEqual(repository.get_login_challenge(challenge_hash)["purpose"], "verify")
-        self.assertEqual(repository.record_login_challenge_attempt(challenge_hash), 1)
+        for expected_attempt in range(1, 6):
+            self.assertEqual(
+                repository.record_login_challenge_attempt(challenge_hash),
+                expected_attempt,
+            )
+        self.assertEqual(repository.record_login_challenge_attempt(challenge_hash), 5)
+        self.assertEqual(repository.record_login_challenge_attempt("missing-challenge"), 0)
         repository.consume_login_challenge(challenge_hash)
         self.assertIsNone(repository.get_login_challenge(challenge_hash))
+        consumed_hash = "d" * 64
+        repository.create_login_challenge(
+            {
+                "tokenHash": consumed_hash,
+                "userId": operator["id"],
+                "purpose": "verify",
+                "maxAttempts": 5,
+                "expiresAt": "2099-01-01T00:00:00Z",
+            }
+        )
+        self.assertEqual(repository.record_login_challenge_attempt(consumed_hash), 1)
+        self.assertTrue(repository.consume_login_challenge(consumed_hash))
+        self.assertEqual(repository.record_login_challenge_attempt(consumed_hash), 1)
         session_hash = "c" * 64
         repository.create_session(session_hash, operator["id"], "2099-01-01T00:00:00Z")
         self.assertEqual(repository.authenticate_session(session_hash), operator["id"])

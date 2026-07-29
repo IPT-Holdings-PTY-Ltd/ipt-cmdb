@@ -679,7 +679,6 @@ class NcentralPreviewQueueRouteTests(unittest.TestCase):
         }
         core.DATABASE_MODE = "local development state"
         core.DB = self.state
-        core.SESSIONS.clear()
         backend_main.REPOSITORY = StateRepository(self.state, lambda _value: None)
         self.policy = backend_main.REPOSITORY.update_ci_sync_policy(
             "ncentral",
@@ -689,17 +688,16 @@ class NcentralPreviewQueueRouteTests(unittest.TestCase):
             actor_id="acme-operator",
         )
         expires = datetime.now(UTC) + timedelta(hours=1)
-        core.SESSIONS.update(
-            {
-                "acme-token": {
-                    "userId": "acme-operator",
-                    "expiresAt": expires,
-                },
-                "northwind-token": {
-                    "userId": "northwind-operator",
-                    "expiresAt": expires,
-                },
-            }
+        expires_at = expires.isoformat().replace("+00:00", "Z")
+        backend_main.REPOSITORY.create_session(
+            backend_main.opaque_token_hash("acme-token"),
+            "acme-operator",
+            expires_at,
+        )
+        backend_main.REPOSITORY.create_session(
+            backend_main.opaque_token_hash("northwind-token"),
+            "northwind-operator",
+            expires_at,
         )
         self.client = TestClient(backend_main.api)
 
@@ -707,7 +705,6 @@ class NcentralPreviewQueueRouteTests(unittest.TestCase):
         backend_main.REPOSITORY = self.original_repository
         core.DB = self.original_db
         core.DATABASE_MODE = self.original_database_mode
-        core.SESSIONS.clear()
 
     @staticmethod
     def _headers(token: str) -> dict[str, str]:

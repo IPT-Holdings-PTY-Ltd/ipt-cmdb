@@ -13,6 +13,15 @@ NCENTRAL_ENVIRONMENT = {
     "NCENTRAL_API_TOKEN": "${NCENTRAL_API_TOKEN:-}",
     "NCENTRAL_PAGE_SIZE": "${NCENTRAL_PAGE_SIZE:-250}",
 }
+LOCAL_LOGIN_ENVIRONMENT = {
+    "FORWARDED_ALLOW_IPS": "${FORWARDED_ALLOW_IPS:-}",
+    "LOCAL_LOGIN_IDENTIFIER_LIMIT": "${LOCAL_LOGIN_IDENTIFIER_LIMIT:-5}",
+    "LOCAL_LOGIN_IDENTIFIER_WINDOW_SECONDS": ("${LOCAL_LOGIN_IDENTIFIER_WINDOW_SECONDS:-900}"),
+    "LOCAL_LOGIN_SOURCE_LIMIT": "${LOCAL_LOGIN_SOURCE_LIMIT:-20}",
+    "LOCAL_LOGIN_SOURCE_WINDOW_SECONDS": "${LOCAL_LOGIN_SOURCE_WINDOW_SECONDS:-900}",
+    "LOCAL_LOGIN_PENDING_TTL_SECONDS": "${LOCAL_LOGIN_PENDING_TTL_SECONDS:-120}",
+    "LOCAL_LOGIN_THROTTLE_AUDIT_SECONDS": ("${LOCAL_LOGIN_THROTTLE_AUDIT_SECONDS:-300}"),
+}
 
 
 def service_environment(path: Path, service: str) -> dict[str, str]:
@@ -91,6 +100,38 @@ class ComposeNcentralEnvironmentTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertIn(key, values)
                 self.assertEqual(values[key], "")
+
+
+class AuthenticationDeploymentContractTests(unittest.TestCase):
+    """Keep local-login protection explicit in every HTTP deployment profile."""
+
+    def test_login_security_environment_is_forwarded_to_web_services(self) -> None:
+        deployments = (
+            ("docker-compose.yml", "cmdb"),
+            ("compose.production.yml", "cmdb"),
+            ("compose.appliance.yml", "cmdb"),
+        )
+
+        for filename, service in deployments:
+            with self.subTest(filename=filename):
+                environment = service_environment(ROOT / filename, service)
+                for key, expected in LOCAL_LOGIN_ENVIRONMENT.items():
+                    self.assertEqual(environment.get(key), expected)
+
+    def test_environment_examples_never_enable_unbounded_proxy_trust(self) -> None:
+        for filename in (".env.example", ".env.production.example"):
+            with self.subTest(filename=filename):
+                values = dotenv_values(ROOT / filename)
+                self.assertIn("FORWARDED_ALLOW_IPS", values)
+                self.assertNotIn(values["FORWARDED_ALLOW_IPS"], {"*", "0.0.0.0/0", "::/0"})
+                for key in LOCAL_LOGIN_ENVIRONMENT:
+                    self.assertIn(key, values)
+
+    def test_container_enables_maintained_proxy_middleware_without_wildcard(self) -> None:
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+        self.assertIn('"--proxy-headers"', dockerfile)
+        self.assertNotIn("FORWARDED_ALLOW_IPS=*", dockerfile)
 
 
 if __name__ == "__main__":

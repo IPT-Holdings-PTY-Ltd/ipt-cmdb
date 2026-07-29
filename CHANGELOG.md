@@ -26,6 +26,9 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
   read-only detail requests without retaining complete provider payloads in run history.
 - Provider-neutral reviewed import and linking controls so ConnectWise and N-central
   observations can converge on one canonical CI without provider-side writes.
+- Cross-replica local-password reservations with identifier/source cooldowns,
+  `Retry-After` guidance and bounded authentication audit evidence.
+- Trusted-proxy deployment contracts for Docker and Azure Container Apps.
 
 ### Fixed
 
@@ -33,6 +36,29 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
   atomically, preventing a first-use `Integration connection not found` response.
 - Forwarded the documented N-central environment contract and compatibility token alias
   through development, production, appliance and split-worker Compose services.
+- Removed production demo credentials from the local sign-in screen and made MFA
+  challenge consumption single-use under concurrent requests.
+- Standardized asset detail/edit requests on the canonical asset resource while keeping
+  the legacy v2 read alias hidden for compatibility.
+- Made API request headers body-aware so multipart, form, text and binary payloads are
+  not mislabeled as JSON, including download requests.
+- Replaced brittle test-file cleanup with isolated temporary directories.
+- Standardized PostgreSQL row-lock clause ordering and retained the persisted MFA
+  attempt count when concurrent requests reach or consume a challenge limit.
+
+### Security
+
+- Stopped trusting caller-supplied `X-Forwarded-For` values unless the immediate peer
+  is an explicitly configured proxy.
+- Added dummy PBKDF2 work for unknown, disabled and non-local identities to reduce
+  password-step account enumeration.
+- Removed the duplicate raw bearer-token compatibility cache; all local sessions now
+  resolve, revoke and expire through the repository's hashed-token store.
+- Documented and narrowly suppressed a CodeQL password-taint false positive on the
+  deterministic email rate-limit key; local passwords remain protected by the
+  salted PBKDF2 password KDF.
+- Made Python dependency auditing blocking and added Compose/Bicep deployment validation
+  to CI.
 
 ## [0.3.0] - 2026-07-28
 

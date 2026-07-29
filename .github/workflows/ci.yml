@@ -68,6 +68,21 @@ jobs:
         run: python scripts/verify_blank_postgres.py --admin-url postgresql://postgres:postgres@localhost:5432/postgres
       - name: Verify forward-only PostgreSQL upgrade
         run: python scripts/verify_postgres_upgrade.py --admin-url postgresql://postgres:postgres@localhost:5432/postgres
+      - name: Validate Compose deployment models
+        env:
+          CMDB_IMAGE: ipt-cmdb:ci
+          PUBLIC_BASE_URL: https://cmdb.example.test
+          BOOTSTRAP_ADMIN_EMAIL: admin@example.test
+          DATABASE_URL_SECRET_FILE: /tmp/database-url.txt
+          MFA_ENCRYPTION_KEY_SECRET_FILE: /tmp/mfa-encryption-key.txt
+          BOOTSTRAP_ADMIN_PASSWORD_SECRET_FILE: /tmp/bootstrap-admin-password.txt
+          CMDB_SECRET_DIRECTORY: /tmp/cmdb-secrets
+          CMDB_BACKUP_DIRECTORY: /tmp/cmdb-backups
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f compose.production.yml config --quiet
+          docker compose -f compose.appliance.yml config --quiet
+          docker compose -f compose.production.yml -f compose.worker.yml config --quiet
 
       - name: Install frontend dependencies
         run: npm ci
@@ -95,6 +110,14 @@ jobs:
           ref: ${{ inputs.test_ref || github.sha }}
       - name: Lint GitHub Actions workflows
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12
+      - name: Validate Azure Bicep
+        run: >-
+          docker run --rm
+          -v "$PWD:/workspace"
+          -w /workspace
+          mcr.microsoft.com/azure-cli:2.77.0
+          az bicep build --file infra/main.bicep --stdout
+          > /dev/null
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
@@ -105,5 +128,4 @@ jobs:
       - name: Scan Python code
         run: python -m bandit -r app.py backend src scripts -ll -ii
       - name: Audit production dependencies
-        continue-on-error: true
         run: python -m pip_audit --requirement requirements.txt
