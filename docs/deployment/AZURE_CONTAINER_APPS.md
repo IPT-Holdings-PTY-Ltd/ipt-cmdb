@@ -92,6 +92,13 @@ break-glass accounts can receive safe recovery links. When a custom domain becom
 canonical entry point, supply that exact HTTPS origin through the optional
 `publicBaseUrl` Bicep parameter and reprovision.
 
+The Bicep baseline sets `FORWARDED_ALLOW_IPS` to its dedicated Container Apps
+infrastructure subnet (`10.42.0.0/23`). Uvicorn therefore evaluates Azure's
+right-most appended client address without trusting arbitrary direct callers. If the
+network ranges in `infra/main.bicep` are changed, update `forwardedAllowIps` to the
+new smallest infrastructure-proxy range in the same reviewed deployment. Never set it
+to `*` or an all-address CIDR.
+
 Scheduled ConnectWise and N-central previews and integration alert delivery are opt-in
 Bicep parameters. After Microsoft 365 email is verified in the root workspace, set
 `enableIntegrationWorker=true` and `enableNotificationWorker=true`. Optionally set
@@ -135,6 +142,8 @@ Then verify:
 4. tenant switching respects customer/group assignments;
 5. an asset read and branded PDF report succeed;
 6. Container Apps logs contain request IDs but no secrets.
+7. a forged left-most `X-Forwarded-For` value does not change the resolved client
+   shown in audit evidence.
 
 ## Security and operations notes
 
@@ -152,6 +161,8 @@ Then verify:
 - Add a custom domain and managed certificate before production launch.
 - Entra users receive MFA through Conditional Access. Application TOTP is for explicitly
   governed local break-glass accounts only.
+- PostgreSQL coordinates local-password identifier and source limits across replicas;
+  an external WAF/ingress rate limit remains recommended for volumetric attacks.
 
 ## IaC validation without deployment
 

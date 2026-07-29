@@ -46,6 +46,20 @@ Local accounts support RFC 6238 TOTP. TOTP seeds are encrypted with AES-256-GCM 
 
 Browser sessions and password-verified MFA challenges are stored in PostgreSQL using SHA-256 token hashes. Challenges expire after five minutes and five attempts. Accepted TOTP time steps are persisted to prevent replay. Recovery codes are high-entropy, one-use values stored only as salted PBKDF2 hashes. Administrative MFA reset is restricted to platform administrators, requires explicit target-email confirmation, and requires local administrators to repeat their password plus an enrolled MFA factor. The reset reason, optional ticket reference, verification method and session revocation are audited without retaining credentials or codes.
 
+Local password attempts are reserved in PostgreSQL before password verification so
+identifier and requester limits remain consistent across application replicas. The
+repository stores only domain-separated hashes, performs equivalent PBKDF2 work for
+unknown, disabled and credential-less users, returns a generic temporary `429`, and
+does not permanently lock an account. A full password-plus-MFA login clears only that
+identifier's failures; requester history remains until its window expires so one known
+credential cannot reset a password-spraying source.
+
+`X-Forwarded-For` is accepted only from immediate peers listed in
+`FORWARDED_ALLOW_IPS`. Configure exact reverse-proxy addresses or CIDRs, keep it blank
+for direct access, and never use `*`, `0.0.0.0/0` or `::/0`. Uvicorn evaluates a
+trusted chain from right to left. The application never reads the raw forwarding
+header and canonicalizes the resolved address before audit and throttle hashing.
+
 ### Personal API tokens
 
 Personal tokens are intended for bounded CMDB automation, not interactive administration. Keep API access disabled unless required, grant the minimum read/write and customer scope, use short expiries and revoke unused tokens. Raw token values are returned once; only SHA-256 hashes are persisted. Personal tokens cannot access platform-administration APIs and are deliberately omitted from portable backup files.
@@ -56,6 +70,7 @@ Personal tokens are intended for bounded CMDB automation, not interactive admini
 - Prefer `DATABASE_URL_FILE` for container secret mounts. If the first-start UI must persist a
   connection, provide a separate `DATABASE_CONFIG_ENCRYPTION_KEY`; never reuse the MFA key.
 - Keep `MFA_ENCRYPTION_KEY` in Key Vault and use the same value across every application replica.
+- Keep local-login limits and `FORWARDED_ALLOW_IPS` consistent across every web replica.
 - Never expose secrets through frontend configuration, logs, API responses or portable exports.
 - Use dedicated, least-privilege provider identities.
 - Rotate any secret that is accidentally committed or shown in an issue; deleting it from the latest commit is not sufficient.

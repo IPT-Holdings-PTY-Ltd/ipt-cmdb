@@ -118,6 +118,14 @@ For Entra ID, place the appliance behind a trusted OIDC-aware reverse proxy, set
 header produced by that proxy. The proxy must remove client-supplied identity headers.
 See [Self-hosted container deployment](SELF_HOSTED.md#4-configure-the-identity-proxy).
 
+The generated environment keeps `FORWARDED_ALLOW_IPS` blank, so a direct container
+connection cannot spoof its address with `X-Forwarded-For`. When the HTTPS proxy is
+enabled, set this value to its exact address or smallest container-network CIDR as
+observed by CMDB. Never use `*` or an all-address CIDR. The appliance also writes the
+reviewed local-login defaults (five identifier failures and twenty source failures
+over fifteen minutes); PostgreSQL enforces them even if the application is later
+scaled to multiple replicas.
+
 ## Backups
 
 Create and immediately verify a custom-format PostgreSQL backup:

@@ -40,6 +40,9 @@ param bootstrapImage string = 'mcr.microsoft.com/azuredocs/containerapps-hellowo
 @description('Optional external HTTPS origin. Set this when using a custom domain.')
 param publicBaseUrl string = ''
 
+@description('Exact Container Apps ingress proxy IPs/CIDRs trusted to append X-Forwarded-For.')
+param forwardedAllowIps string = '10.42.0.0/23'
+
 @description('Enable the durable Microsoft Graph notification worker.')
 param enableNotificationWorker bool = false
 
@@ -433,6 +436,34 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
             {
               name: 'AUTH_MODE'
               value: enableEntraAuth ? 'easy_auth' : 'local'
+            }
+            {
+              name: 'FORWARDED_ALLOW_IPS'
+              value: forwardedAllowIps
+            }
+            {
+              name: 'LOCAL_LOGIN_IDENTIFIER_LIMIT'
+              value: '5'
+            }
+            {
+              name: 'LOCAL_LOGIN_IDENTIFIER_WINDOW_SECONDS'
+              value: '900'
+            }
+            {
+              name: 'LOCAL_LOGIN_SOURCE_LIMIT'
+              value: '20'
+            }
+            {
+              name: 'LOCAL_LOGIN_SOURCE_WINDOW_SECONDS'
+              value: '900'
+            }
+            {
+              name: 'LOCAL_LOGIN_PENDING_TTL_SECONDS'
+              value: '120'
+            }
+            {
+              name: 'LOCAL_LOGIN_THROTTLE_AUDIT_SECONDS'
+              value: '300'
             }
             {
               name: 'PUBLIC_BASE_URL'

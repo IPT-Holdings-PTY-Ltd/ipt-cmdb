@@ -1599,6 +1599,78 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(event["outcome"], "failed")
         self.assertNotIn("incorrect-secret", json.dumps(event))
 
+    def test_local_login_identifier_throttle_is_generic_and_audit_bounded(self):
+        settings = {
+            "LOCAL_LOGIN_IDENTIFIER_LIMIT": "2",
+            "LOCAL_LOGIN_IDENTIFIER_WINDOW_SECONDS": "900",
+            "LOCAL_LOGIN_SOURCE_LIMIT": "20",
+            "LOCAL_LOGIN_SOURCE_WINDOW_SECONDS": "900",
+        }
+        with patch.dict(os.environ, settings):
+            failures = [
+                self.client.post(
+                    "/api/login",
+                    json={"email": "admin@example.com", "password": "incorrect-secret"},
+                )
+                for _ in range(2)
+            ]
+            limited = self.client.post(
+                "/api/login",
+                json={"email": "admin@example.com", "password": "incorrect-secret"},
+            )
+            repeated = self.client.post(
+                "/api/login",
+                json={"email": "admin@example.com", "password": "incorrect-secret"},
+            )
+
+        self.assertTrue(all(response.status_code == 401 for response in failures))
+        self.assertEqual(
+            {response.json()["detail"] for response in failures},
+            {"Invalid credentials"},
+        )
+        self.assertEqual(limited.status_code, 429)
+        self.assertEqual(
+            limited.json()["detail"],
+            "Too many sign-in attempts. Try again later.",
+        )
+        self.assertGreaterEqual(int(limited.headers["Retry-After"]), 1)
+        self.assertEqual(repeated.status_code, 429)
+        throttle_events = [
+            event for event in core.DB["auditEvents"] if event["action"] == "login_throttled"
+        ]
+        self.assertEqual(len(throttle_events), 1)
+        self.assertEqual(throttle_events[0]["actorType"], "anonymous")
+        self.assertNotIn("admin@example.com", json.dumps(core.DB["loginAttempts"]))
+        self.assertNotIn("admin@example.com", json.dumps(throttle_events))
+
+    def test_forwarded_header_cannot_evade_source_throttle_without_trusted_peer(self):
+        settings = {
+            "LOCAL_LOGIN_IDENTIFIER_LIMIT": "100",
+            "LOCAL_LOGIN_SOURCE_LIMIT": "3",
+            "LOCAL_LOGIN_SOURCE_WINDOW_SECONDS": "900",
+        }
+        responses = []
+        with patch.dict(os.environ, settings):
+            for index in range(4):
+                responses.append(
+                    self.client.post(
+                        "/api/login",
+                        headers={"X-Forwarded-For": f"198.51.100.{index + 1}"},
+                        json={
+                            "email": f"missing-{index}@example.com",
+                            "password": "incorrect-secret",
+                        },
+                    )
+                )
+
+        self.assertEqual([response.status_code for response in responses], [401, 401, 401, 429])
+        requester_hashes = {
+            item["requesterHash"]
+            for item in core.DB["loginAttempts"]
+            if item["outcome"] != "throttled"
+        }
+        self.assertEqual(len(requester_hashes), 1)
+
     def test_local_totp_enrollment_recovery_replay_and_admin_reset(self):
         mfa_key = base64.urlsafe_b64encode(bytes(range(32))).decode("ascii")
         with patch.dict(

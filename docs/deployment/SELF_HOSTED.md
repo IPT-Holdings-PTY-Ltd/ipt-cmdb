@@ -53,6 +53,14 @@ The default bind address is `127.0.0.1`, intentionally preventing direct remote
 access. If the reverse proxy runs on another host or container network, bind only to
 the required private interface and restrict the port with a firewall.
 
+Set `FORWARDED_ALLOW_IPS` to the exact address or smallest CIDR used by the immediate
+reverse proxy as seen from the application container. Leave it blank when clients
+connect directly. Never use `*` or an all-address CIDR: untrusted forwarding headers
+would otherwise let callers evade requester throttling and falsify audit evidence.
+The local-login defaults are five failures per identifier and twenty per resolved
+source over fifteen minutes; adjust the `LOCAL_LOGIN_*` values only after reviewing
+NAT/shared-office traffic and alert volume.
+
 Validate the rendered model before starting it:
 
 ```powershell
@@ -97,6 +105,7 @@ The proxy must:
 4. set a verified email header;
 5. proxy only authenticated traffic to port 3000;
 6. terminate HTTPS and set forwarded host/protocol headers.
+7. append (rather than copy blindly) the client address in `X-Forwarded-For`.
 
 If the proxy emits `X-Forwarded-Email`, set this in `.env.production`:
 
@@ -106,6 +115,11 @@ ENTRA_PRINCIPAL_NAME_HEADER=x-forwarded-email
 
 Do not expose `AUTH_MODE=easy_auth` directly to users. A forged header would otherwise
 be treated as an authenticated identity.
+
+After proxy configuration, submit two safe failed logins through the public route and
+confirm their audit events show the same canonical proxy-resolved client address. A
+request sent directly to the bound application port with a forged forwarding header
+must not change that address.
 
 ## 5. Verify
 

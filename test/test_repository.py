@@ -1,6 +1,6 @@
 import unittest
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.cmdb.repository import (
     PostgresCmdbRepository,
@@ -88,6 +88,108 @@ class RepositoryTests(unittest.TestCase):
         self.assertIsNotNone(user)
         self.assertNotIn("password", self.state["users"][0])
         self.assertTrue(verify_password("ChangeMe!", self.state["users"][0]["passwordHash"]))
+
+    def test_unknown_and_disabled_users_receive_dummy_password_verification(self):
+        with patch(
+            "src.cmdb.repository.verify_password",
+            wraps=verify_password,
+        ) as verifier:
+            self.assertIsNone(self.repository.authenticate("missing@example.com", "wrong"))
+            self.assertEqual(verifier.call_count, 1)
+
+            self.state["users"][0]["status"] = "disabled"
+            self.assertIsNone(self.repository.authenticate("admin@example.com", "wrong"))
+            self.assertEqual(verifier.call_count, 2)
+
+    def test_local_login_reservations_enforce_both_dimensions_and_dedupe_audit(self):
+        first = self.repository.reserve_local_login_attempt(
+            "identifier-a",
+            "source-a",
+            identifier_limit=2,
+            source_limit=10,
+        )
+        second = self.repository.reserve_local_login_attempt(
+            "identifier-a",
+            "source-b",
+            identifier_limit=2,
+            source_limit=10,
+        )
+        self.assertTrue(first["allowed"])
+        self.assertTrue(second["allowed"])
+        self.repository.finish_local_login_attempt(first["attemptId"], "password_failed")
+        self.repository.finish_local_login_attempt(second["attemptId"], "password_failed")
+
+        limited = self.repository.reserve_local_login_attempt(
+            "identifier-a",
+            "source-c",
+            identifier_limit=2,
+            source_limit=10,
+        )
+        repeated = self.repository.reserve_local_login_attempt(
+            "identifier-a",
+            "source-d",
+            identifier_limit=2,
+            source_limit=10,
+        )
+        self.assertFalse(limited["allowed"])
+        self.assertGreaterEqual(limited["retryAfterSeconds"], 1)
+        self.assertTrue(limited["auditRequired"])
+        self.assertFalse(repeated["auditRequired"])
+
+        source_one = self.repository.reserve_local_login_attempt(
+            "identifier-b",
+            "shared-source",
+            identifier_limit=10,
+            source_limit=1,
+        )
+        self.repository.finish_local_login_attempt(source_one["attemptId"], "password_failed")
+        source_limited = self.repository.reserve_local_login_attempt(
+            "identifier-c",
+            "shared-source",
+            identifier_limit=10,
+            source_limit=1,
+        )
+        self.assertFalse(source_limited["allowed"])
+
+    def test_completed_login_clears_identifier_but_preserves_source_failures(self):
+        failed = self.repository.reserve_local_login_attempt(
+            "identifier-a",
+            "source-a",
+            identifier_limit=1,
+            source_limit=1,
+        )
+        self.repository.finish_local_login_attempt(failed["attemptId"], "password_failed")
+        self.assertEqual(self.repository.clear_local_login_failures("identifier-a"), 1)
+
+        identifier_released = self.repository.reserve_local_login_attempt(
+            "identifier-a",
+            "source-b",
+            identifier_limit=1,
+            source_limit=1,
+        )
+        source_preserved = self.repository.reserve_local_login_attempt(
+            "identifier-b",
+            "source-a",
+            identifier_limit=10,
+            source_limit=1,
+        )
+        self.assertTrue(identifier_released["allowed"])
+        self.assertFalse(source_preserved["allowed"])
+
+    def test_login_challenge_can_only_be_consumed_once(self):
+        self.repository.create_login_challenge(
+            {
+                "tokenHash": "challenge-token",
+                "userId": "admin",
+                "purpose": "verify",
+                "attempts": 0,
+                "maxAttempts": 5,
+                "expiresAt": "2999-01-01T00:00:00Z",
+            }
+        )
+
+        self.assertTrue(self.repository.consume_login_challenge("challenge-token"))
+        self.assertFalse(self.repository.consume_login_challenge("challenge-token"))
 
     def test_created_user_only_stores_a_password_hash(self):
         created = self.repository.create_user(

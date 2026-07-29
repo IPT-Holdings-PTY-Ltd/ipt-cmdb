@@ -11,6 +11,7 @@ import asyncio
 import base64
 import hashlib
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -129,6 +130,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST", ROOT / "frontend" / "dist"))
 LOGGER = logging.getLogger("cmdb.api")
 EMAIL_SENDER = GraphEmailSender()
+_SAFE_CONTEXT_ID = re.compile(r"[A-Za-z0-9._:-]{1,100}")
+_PUBLIC_AUTH_PATH_PREFIXES = ("/api/login", "/api/password-reset")
 
 
 def _notification_worker_interval() -> int:
@@ -151,6 +154,66 @@ def _integration_worker_interval() -> int:
         LOGGER.warning("Invalid INTEGRATION_WORKER_INTERVAL_SECONDS; using 2 seconds")
         configured = 2
     return max(1, min(configured, 3600))
+
+
+def _bounded_environment_integer(
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Return a bounded integer without letting invalid deployment input disable controls."""
+
+    try:
+        configured = int(os.getenv(name, str(default)))
+    except ValueError:
+        LOGGER.warning("Invalid %s; using %s", name, default)
+        configured = default
+    return max(minimum, min(configured, maximum))
+
+
+def _local_login_throttle_settings() -> dict[str, int]:
+    """Return bounded local-password throttle settings for all repositories."""
+
+    return {
+        "source_limit": _bounded_environment_integer("LOCAL_LOGIN_SOURCE_LIMIT", 20, 3, 1000),
+        "source_window_seconds": _bounded_environment_integer(
+            "LOCAL_LOGIN_SOURCE_WINDOW_SECONDS", 900, 60, 86400
+        ),
+        "identifier_limit": _bounded_environment_integer("LOCAL_LOGIN_IDENTIFIER_LIMIT", 5, 2, 100),
+        "identifier_window_seconds": _bounded_environment_integer(
+            "LOCAL_LOGIN_IDENTIFIER_WINDOW_SECONDS", 900, 60, 86400
+        ),
+        "pending_ttl_seconds": _bounded_environment_integer(
+            "LOCAL_LOGIN_PENDING_TTL_SECONDS", 120, 15, 900
+        ),
+        "audit_window_seconds": _bounded_environment_integer(
+            "LOCAL_LOGIN_THROTTLE_AUDIT_SECONDS", 300, 60, 86400
+        ),
+    }
+
+
+def _validate_forwarded_proxy_trust() -> None:
+    """Reject proxy settings that would let arbitrary callers control client identity."""
+
+    configured = os.getenv("FORWARDED_ALLOW_IPS", "").strip()
+    if not configured:
+        return
+    entries = [item.strip() for item in configured.split(",") if item.strip()]
+    if "*" in entries:
+        raise RuntimeError("FORWARDED_ALLOW_IPS must contain explicit proxy IPs or CIDRs, not '*'")
+    for entry in entries:
+        try:
+            if "/" in entry:
+                network = ipaddress.ip_network(entry, strict=False)
+                if network.prefixlen == 0:
+                    raise ValueError("all-address networks are unsafe")
+            else:
+                ipaddress.ip_address(entry)
+        except ValueError as error:
+            raise RuntimeError(
+                f"FORWARDED_ALLOW_IPS contains an invalid or unsafe entry: {entry!r}"
+            ) from error
 
 
 def _integration_alert_recipients() -> list[str]:
@@ -382,6 +445,7 @@ async def _integration_worker_loop() -> None:
 async def application_lifespan(_application: FastAPI):
     """Run optional durable workers and stop them cleanly on shutdown."""
 
+    _validate_forwarded_proxy_trust()
     tasks: list[asyncio.Task[None]] = []
     workers_embedded = process_role() == "combined"
     if workers_embedded and _worker_flag("NOTIFICATION_WORKER_ENABLED"):
@@ -419,20 +483,22 @@ async def audit_and_correlation_context(request: Request, call_next):
     """Correlate diagnostics and audit evidence without logging credentials."""
     requested_id = request.headers.get("x-request-id", "").strip()
     request_id = (
-        requested_id[:100]
-        if re.fullmatch(r"[A-Za-z0-9._:-]{1,100}", requested_id)
-        else str(uuid.uuid4())
+        requested_id[:100] if _SAFE_CONTEXT_ID.fullmatch(requested_id) else str(uuid.uuid4())
     )
-    correlation = request.headers.get("x-correlation-id", "").strip()[:100] or request_id
-    forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
-    client_address = forwarded or (request.client.host if request.client else "")
-    request.state.client_address = client_address[:120]
+    requested_correlation = request.headers.get("x-correlation-id", "").strip()
+    correlation = (
+        requested_correlation[:100]
+        if _SAFE_CONTEXT_ID.fullmatch(requested_correlation)
+        else request_id
+    )
+    client_address = _canonical_client_address(request)
+    request.state.client_address = client_address
     token = set_audit_context(
         AuditContext(
             request_id=request_id,
             correlation_id=correlation,
-            source_system=request.headers.get("x-cmdb-source", "web")[:80] or "web",
-            client_address=client_address[:120],
+            source_system="web",
+            client_address=client_address,
             user_agent=request.headers.get("user-agent", "")[:500],
         )
     )
@@ -445,7 +511,7 @@ async def audit_and_correlation_context(request: Request, call_next):
         if (
             request.url.path.startswith("/api/")
             and response.status_code in {401, 403}
-            and request.url.path != "/api/login"
+            and not request.url.path.startswith(_PUBLIC_AUTH_PATH_PREFIXES)
         ):
             actor = getattr(request.state, "current_user", None)
             try:
@@ -1450,6 +1516,7 @@ def _issue_session(user: dict, *, mfa_method: str = "none") -> dict:
     # Kept as a compatibility mirror for the lightweight local repository.
     core.SESSIONS[token] = {"userId": user["id"], "expiresAt": expires_at}
     REPOSITORY.record_user_login(user["id"])
+    REPOSITORY.complete_local_login(_login_identifier_hash(user["email"]))
     REPOSITORY.record_audit_event(
         None,
         user["id"],
@@ -1565,7 +1632,35 @@ def _requester_hash(request: Request) -> str:
     """Hash the request source so throttling does not retain a plain IP address."""
 
     address = str(getattr(request.state, "client_address", "") or "unknown")
-    return hashlib.sha256(address.encode("utf-8")).hexdigest()
+    try:
+        parsed = ipaddress.ip_address(address)
+        if isinstance(parsed, ipaddress.IPv6Address):
+            address = str(ipaddress.ip_network(f"{parsed}/64", strict=False))
+        else:
+            address = parsed.compressed
+    except ValueError:
+        address = "unknown"
+    return hashlib.sha256(f"local-auth-source:v1:{address}".encode()).hexdigest()
+
+
+def _canonical_client_address(request: Request) -> str:
+    """Return the canonical peer address already resolved by Uvicorn proxy trust."""
+
+    host = str(request.client.host if request.client else "").strip()
+    try:
+        parsed = ipaddress.ip_address(host)
+    except ValueError:
+        return "unknown"
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
+        return parsed.ipv4_mapped.compressed
+    return parsed.compressed
+
+
+def _login_identifier_hash(email: str) -> str:
+    """Return a domain-separated login identifier hash without retaining email."""
+
+    normalized = email.strip().casefold()
+    return hashlib.sha256(f"local-auth-identifier:v1:{normalized}".encode()).hexdigest()
 
 
 def _password_reset_message(user: dict, raw_token: str) -> dict:
@@ -1665,7 +1760,7 @@ def _process_password_reset_request(email: str, requester_hash: str) -> None:
             {
                 "tokenHash": opaque_token_hash(raw_token),
                 "userId": user["id"] if user else None,
-                "identifierHash": hashlib.sha256(email.encode("utf-8")).hexdigest(),
+                "identifierHash": _login_identifier_hash(email),
                 "requesterHash": requester_hash,
                 "expiresAt": expires_at.isoformat().replace("+00:00", "Z"),
             }
@@ -1770,6 +1865,7 @@ def complete_password_reset(
         raise HTTPException(400, str(error)) from error
     if not completed:
         raise HTTPException(400, "Reset link is invalid or expired")
+    REPOSITORY.clear_local_login_failures(_login_identifier_hash(completed["email"]))
     revoked_sessions = _revoke_user_sessions(completed["userId"])
     _queue_password_changed_email(completed["email"], background_tasks)
     return {
@@ -1783,21 +1879,52 @@ def complete_password_reset(
 def login(payload: LoginRequest, request: Request) -> dict:
     if not _local_login_enabled():
         raise HTTPException(403, "Local password login is disabled; use Microsoft sign-in")
-    email = payload.email.strip().lower()
-    user = REPOSITORY.authenticate(email, payload.password)
+    email = payload.email.strip().casefold()
+    identifier_hash = _login_identifier_hash(email)
+    reservation = REPOSITORY.reserve_local_login_attempt(
+        identifier_hash,
+        _requester_hash(request),
+        **_local_login_throttle_settings(),
+    )
+    if not reservation["allowed"]:
+        if reservation["auditRequired"]:
+            REPOSITORY.record_audit_event(
+                None,
+                None,
+                "authentication",
+                canonical_uuid("authentication", f"login-throttle:{identifier_hash}"),
+                "login_throttled",
+                outcome="denied",
+                severity="warning",
+                actor_type="anonymous",
+                metadata={"mode": "local"},
+            )
+        raise HTTPException(
+            429,
+            "Too many sign-in attempts. Try again later.",
+            headers={"Retry-After": str(reservation["retryAfterSeconds"])},
+        )
+    attempt_id = str(reservation["attemptId"])
+    try:
+        user = REPOSITORY.authenticate(email, payload.password)
+    except Exception:
+        REPOSITORY.finish_local_login_attempt(attempt_id, "password_failed")
+        raise
     if not user:
+        REPOSITORY.finish_local_login_attempt(attempt_id, "password_failed")
         REPOSITORY.record_audit_event(
             None,
             None,
             "authentication",
-            canonical_uuid("authentication", email),
+            canonical_uuid("authentication", f"login:{identifier_hash}"),
             "login_failed",
             outcome="failed",
             severity="warning",
             actor_type="anonymous",
-            metadata={"email": email, "mode": "local"},
+            metadata={"mode": "local"},
         )
         raise HTTPException(401, "Invalid credentials")
+    REPOSITORY.finish_local_login_attempt(attempt_id, "password_verified")
     request.state.current_user = user
     credential = REPOSITORY.get_mfa_credential(user["id"])
     if credential and credential.get("status") == "enabled":
@@ -1850,8 +1977,8 @@ def complete_mfa_login(payload: MfaLoginRequest, request: Request) -> dict:
             _mfa_failure(user, token_hash, "mfa_challenge_failed")
             raise HTTPException(401, "Authenticator or recovery code was not accepted")
         codes = []
-    REPOSITORY.record_login_challenge_attempt(token_hash)
-    REPOSITORY.consume_login_challenge(token_hash)
+    if not REPOSITORY.consume_login_challenge(token_hash):
+        raise HTTPException(401, "MFA challenge is invalid or expired")
     request.state.current_user = user
     result = _issue_session(user, mfa_method=method)
     if codes:
@@ -1960,6 +2087,7 @@ def change_my_password(
         )
     if not changed:
         raise HTTPException(409, "Password could not be changed")
+    REPOSITORY.clear_local_login_failures(_login_identifier_hash(user["email"]))
     revoked_sessions = _revoke_user_sessions(user["id"])
     _queue_password_changed_email(user["email"], background_tasks)
     return {
@@ -2758,6 +2886,9 @@ def update_user(user_id: str, payload: UserUpdateRequest, request: Request) -> d
             REPOSITORY.revoke_user_api_tokens(user_id, actor["id"])
     if not stored:
         raise HTTPException(404, "User not found")
+    if current["email"].casefold() != stored["email"].casefold():
+        REPOSITORY.clear_local_login_failures(_login_identifier_hash(current["email"]))
+        REPOSITORY.clear_local_login_failures(_login_identifier_hash(stored["email"]))
     revoked_sessions = _revoke_user_sessions(user_id) if changed_access else 0
     return {**core.visible_user(stored), "revokedSessions": revoked_sessions}
 
@@ -2782,6 +2913,8 @@ def update_user_status(user_id: str, payload: UserStatusRequest, request: Reques
             REPOSITORY.revoke_user_api_tokens(user_id, actor["id"])
     if not updated:
         raise HTTPException(404, "User not found")
+    if payload.status == "active":
+        REPOSITORY.clear_local_login_failures(_login_identifier_hash(target["email"]))
     revoked_sessions = _revoke_user_sessions(user_id) if payload.status == "disabled" else 0
     stored = _managed_user(user_id, actor)
     return {**core.visible_user(stored), "revokedSessions": revoked_sessions}
@@ -2819,6 +2952,7 @@ def reset_user_password(user_id: str, payload: UserPasswordRequest, request: Req
         changed = REPOSITORY.set_user_password(user_id, payload.password, actor["id"])
     if not changed:
         raise HTTPException(404, "User not found")
+    REPOSITORY.clear_local_login_failures(_login_identifier_hash(target["email"]))
     _revoke_user_sessions(user_id)
     return Response(status_code=204)
 

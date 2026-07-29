@@ -13,7 +13,7 @@ import {
   type MfaEnrollment,
   type MfaLoginResult,
 } from './authProvider';
-import { apiFetch, setSession } from './session';
+import { ApiError, apiFetch, setSession } from './session';
 
 type LoginMode = 'login' | 'request-reset' | 'reset-password';
 
@@ -24,7 +24,7 @@ export function LoginPage() {
   const passwordChanged = searchParams.has('passwordChanged');
   const initialToken = routedResetToken;
   const [mode, setMode] = useState<LoginMode>(initialToken ? 'reset-password' : 'login');
-  const [username, setUsername] = useState('admin@example.com');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState(passwordChanged ? 'Password changed. Sign in again with your new password.' : '');
@@ -39,6 +39,7 @@ export function LoginPage() {
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [revokeApiTokens, setRevokeApiTokens] = useState(true);
+  const [retrySeconds, setRetrySeconds] = useState(0);
 
   useEffect(() => {
     getAuthConfiguration().then(setConfiguration).catch(reason => setError(reason instanceof Error ? reason.message : 'Unable to load sign-in configuration'));
@@ -62,6 +63,15 @@ export function LoginPage() {
       .then(result => setResetValid(result.valid))
       .catch(() => setResetValid(false));
   }, [mode, resetToken]);
+
+  useEffect(() => {
+    if (retrySeconds <= 0) return;
+    const timer = window.setInterval(
+      () => setRetrySeconds(current => Math.max(0, current - 1)),
+      1000,
+    );
+    return () => window.clearInterval(timer);
+  }, [retrySeconds]);
 
   function returnToLogin(message = '') {
     setSearchParams({}, { replace: true });
@@ -88,7 +98,12 @@ export function LoginPage() {
           try { setEnrollment(await startLoginMfaEnrollment(reason.challenge.challengeToken)); }
           catch (enrollmentError) { setError(enrollmentError instanceof Error ? enrollmentError.message : 'Unable to start authenticator setup'); }
         }
-      } else setError(reason instanceof Error ? reason.message : 'Unable to sign in');
+      } else {
+        if (reason instanceof ApiError && reason.status === 429) {
+          setRetrySeconds(reason.retryAfterSeconds ?? 60);
+        }
+        setError(reason instanceof Error ? reason.message : 'Unable to sign in');
+      }
     }
     finally { setBusy(false); }
   }
@@ -191,12 +206,13 @@ export function LoginPage() {
               {configuration.external && <Typography variant="caption" sx={{ color: 'text.secondary', textAlign: 'center' }}>Break-glass administrator</Typography>}
               <TextField label="Email address" value={username} onChange={event => setUsername(event.target.value)} autoComplete="username" required />
               <TextField label="Password" type="password" value={password} onChange={event => setPassword(event.target.value)} autoComplete="current-password" required />
-              <Button type="submit" variant={configuration.external ? 'outlined' : 'contained'} size="large" disabled={busy}>{busy ? 'Signing in…' : 'Open CMDB'}</Button>
+              <Button type="submit" variant={configuration.external ? 'outlined' : 'contained'} size="large" disabled={busy || retrySeconds > 0}>
+                {busy ? 'Signing in…' : retrySeconds > 0 ? `Try again in ${retrySeconds}s` : 'Open CMDB'}
+              </Button>
               {configuration.passwordResetAvailable && <Button type="button" onClick={() => { setMode('request-reset'); setError(''); setNotice(''); }}>Forgot password?</Button>}
             </>}
           </>}
         </Stack>
-        {!challenge && !pendingSession && mode === 'login' && configuration?.mode === 'local' && <Typography variant="caption" sx={{ color: 'text.secondary', mt: 3, display: 'block' }}>Local development account: admin@example.com / ChangeMe!</Typography>}
       </Paper>
     </Box>
   );
