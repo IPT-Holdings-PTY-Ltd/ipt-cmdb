@@ -2679,6 +2679,43 @@ class FastApiMigrationTests(unittest.TestCase):
             self.assertEqual(linked.json()["assetName"], "ACME-DC01")
             self.assertEqual(len(device_discovery_calls), calls_before_link)
 
+    def test_ncentral_policy_installs_missing_root_connection(self):
+        """Allow first-use policy storage before credentials have been saved."""
+
+        headers = self._headers("admin@example.com")
+        self.assertIsNone(backend_main.REPOSITORY.get_integration_connection("ncentral"))
+        environment = {
+            "NCENTRAL_BASE_URL": "",
+            "NCENTRAL_USER_API_TOKEN": "",
+            "NCENTRAL_USER_API_TOKEN_FILE": "",
+            "NCENTRAL_API_TOKEN": "",
+            "NCENTRAL_PAGE_SIZE": "",
+        }
+
+        with patch.dict(os.environ, environment):
+            response = self.client.put(
+                "/api/integrations/ncentral/policy",
+                headers=headers,
+                json={"excludedExternalIds": ["202", " 101 ", "202"]},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["discoveryPolicy"]["excludedExternalIds"],
+            ["101", "202"],
+        )
+        stored = backend_main.REPOSITORY.get_integration_connection("ncentral")
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertEqual(
+            stored["configuration"]["discoveryPolicy"]["excludedExternalIds"],
+            ["101", "202"],
+        )
+        self.assertEqual(
+            sum(item.get("type") == "ncentral" for item in core.DB["integrations"]),
+            1,
+        )
+
     def test_ncentral_active_but_disabled_connection_reports_the_recovery_action(self):
         """Do not mislabel a disabled connection as active in provider-call errors."""
 

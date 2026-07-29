@@ -27,6 +27,13 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Provider-neutral reviewed import and linking controls so ConnectWise and N-central
   observations can converge on one canonical CI without provider-side writes.
 
+### Fixed
+
+- Made the first N-central discovery-policy save install its root connection record
+  atomically, preventing a first-use `Integration connection not found` response.
+- Forwarded the documented N-central environment contract and compatibility token alias
+  through development, production, appliance and split-worker Compose services.
+
 ## [0.3.0] - 2026-07-28
 
 ### Added

@@ -5407,7 +5407,6 @@ def update_ncentral_discovery_policy(
 
     user = current_user(request)
     _require_role(user, {"platform_admin"}, "Platform administrator access required")
-    current = REPOSITORY.get_integration_connection("ncentral") or {}
     policy = {
         "excludedExternalIds": sorted(
             {
@@ -5419,13 +5418,11 @@ def update_ncentral_discovery_policy(
     }
     try:
         with core.LOCK:
+            REPOSITORY.ensure_integration_connection("ncentral", "N-central", user["id"])
             REPOSITORY.update_integration_connection(
                 "ncentral",
                 {
                     "configuration": {"discoveryPolicy": policy},
-                    "enabled": bool(current.get("enabled")),
-                    "connectionStatus": current.get("connectionStatus", "not_configured"),
-                    "lastError": current.get("lastError", ""),
                 },
                 user["id"],
             )

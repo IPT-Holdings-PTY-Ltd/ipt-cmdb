@@ -52,6 +52,11 @@ NCENTRAL_PAGE_SIZE=250
 
 `NCENTRAL_API_TOKEN` remains a compatibility alias for older deployments. New deployments should use `NCENTRAL_USER_API_TOKEN` or `NCENTRAL_USER_API_TOKEN_FILE`. Do not configure both a direct token and a token file. The supported page size is 25 to 1,000.
 
+The supplied Compose files forward the same variable names to combined, web and worker
+processes. A `_FILE` value must be a container-visible path; mount that read-only secret
+at the same path in both services when using the split-worker overlay. Compose does not
+mount a host file merely because its path is present in an environment variable.
+
 Environment or secret-file settings take precedence over database settings and appear read-only in the wizard. In Azure Container Apps, use a Key Vault-backed secret reference. The integration lifecycle switch still blocks all provider requests when the connection is paused, disabled or removed.
 
 ## Customer boundaries
