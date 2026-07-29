@@ -5897,17 +5897,55 @@ def _ncentral_preview_run_response(run: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
+class _IntegrationPreviewLeaseLost(RuntimeError):
+    """Stop work when another worker legitimately owns an integration preview."""
+
+
+def _integration_preview_lease_conflict(_error: Exception) -> HTTPException:
+    """Return a stable conflict response after discarding stale preview work."""
+
+    return HTTPException(
+        409,
+        "Preview lease expired or was reclaimed; no results were published. Retry the preview.",
+    )
+
+
 def _execute_ncentral_device_preview(
     company_id: str,
     provider_company_id: str,
     *,
     actor_id: str | None,
     trigger: str,
+    policy_id: str,
+    lease_owner: str,
 ) -> dict[str, Any]:
-    """Execute one read-only device preview and refresh the review queue."""
+    """Execute and atomically publish one exclusively leased device preview."""
 
     started_at = core.now()
-    preview = _ncentral_device_preview(company_id, provider_company_id)
+    last_renewed_at = 0.0
+
+    def renew_policy_lease(
+        _progress: dict[str, Any] | None = None,
+        *,
+        force: bool = False,
+    ) -> None:
+        nonlocal last_renewed_at
+        now = time.monotonic()
+        if not force and now - last_renewed_at < 30:
+            return
+        with core.LOCK:
+            renewed = REPOSITORY.renew_ci_sync_policy_run(policy_id, lease_owner)
+        if not renewed:
+            raise _IntegrationPreviewLeaseLost("N-central preview lease is no longer owned")
+        last_renewed_at = now
+
+    renew_policy_lease(force=True)
+    preview = _ncentral_device_preview(
+        company_id,
+        provider_company_id,
+        progress_callback=renew_policy_lease,
+    )
+    renew_policy_lease(force=True)
     counts = preview["counts"]
     message = (
         f"Read {preview['discovered']} N-central devices for "
@@ -5932,7 +5970,7 @@ def _execute_ncentral_device_preview(
             "trigger": trigger,
             "companyId": company_id,
             "providerCompanyId": provider_company_id,
-            "policyId": preview["appliedPolicy"].get("id") or None,
+            "policyId": policy_id,
             "policyRevision": preview["appliedPolicy"].get("revision", 0),
             "providerFilterId": preview["appliedPolicy"].get("providerFilterId", ""),
             "included": preview["included"],
@@ -5941,23 +5979,20 @@ def _execute_ncentral_device_preview(
         },
     }
     previous_failures = int(preview["appliedPolicy"].get("consecutiveFailures") or 0)
-    completed_policy = None
     with core.LOCK:
-        stored_run = REPOSITORY.record_sync_run("ncentral", run, True, actor_id)
-        policy_id = str(preview["appliedPolicy"].get("id") or "")
-        queue_summary = (
-            REPOSITORY.replace_ci_review_items(
-                policy_id,
-                company_id,
-                stored_run["id"],
-                preview["items"],
-                actor_id,
-            )
-            if policy_id
-            else {"pending": 0, "created": 0, "updated": 0, "resolved": 0}
+        published = REPOSITORY.publish_and_complete_ci_policy_preview(
+            "ncentral",
+            policy_id,
+            lease_owner,
+            run,
+            preview["items"],
+            actor_id,
         )
-        if policy_id:
-            completed_policy = REPOSITORY.complete_ci_sync_policy_run(policy_id, success=True)
+    if not published:
+        raise _IntegrationPreviewLeaseLost("N-central preview lease expired before publication")
+    stored_run = published["run"]
+    queue_summary = published["queueSummary"]
+    completed_policy = published["policy"]
     if completed_policy and previous_failures and trigger == "continuous_preview":
         _queue_integration_alert(
             {**preview["appliedPolicy"], "lastRunAt": stored_run.get("finishedAt")},
@@ -5979,10 +6014,15 @@ def _record_ncentral_device_preview_failure(
     *,
     trigger: str = "continuous_preview",
     actor_id: str | None = None,
+    lease_owner: str,
 ) -> dict:
     """Persist a sanitized N-central preview failure and release its lease."""
 
-    label = "Sync now" if trigger == "manual_sync" else "Continuous preview"
+    label = {
+        "manual_preview": "Preview",
+        "manual_sync": "Sync now",
+        "continuous_preview": "Continuous preview",
+    }.get(trigger, "Preview")
     if isinstance(error, (NcentralConfigurationError, NcentralRequestError)):
         detail = _ncentral_public_failure(error, "device preview")
     else:
@@ -6012,10 +6052,20 @@ def _record_ncentral_device_preview_failure(
         },
     }
     with core.LOCK:
-        stored_run = REPOSITORY.record_sync_run("ncentral", run, True, actor_id)
-        completed_policy = REPOSITORY.complete_ci_sync_policy_run(
-            policy["id"], success=False, error=detail
+        failed = REPOSITORY.fail_and_complete_ci_policy_preview(
+            "ncentral",
+            policy["id"],
+            lease_owner,
+            run,
+            detail,
+            actor_id,
         )
+    if not failed:
+        raise _IntegrationPreviewLeaseLost(
+            "N-central preview lease expired before failure publication"
+        )
+    stored_run = failed["run"]
+    completed_policy = failed["policy"]
     failures = int((completed_policy or {}).get("consecutiveFailures") or 0)
     if trigger == "continuous_preview" and failures:
         _queue_integration_alert(
@@ -6283,17 +6333,45 @@ def preview_ncentral_devices(payload: NcentralDevicePreviewRequest, request: Req
 
     user = current_user(request)
     _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
-    _company_for_user(payload.companyId, user)
+    policy = _ncentral_preview_policy(
+        payload.companyId,
+        payload.providerCompanyId,
+        user,
+    )
+    lease_owner = f"manual:{user['id']}:{uuid.uuid4()}"
+    with core.LOCK:
+        claimed = REPOSITORY.claim_ci_sync_policy_now(policy["id"], lease_owner)
+    if not claimed:
+        raise HTTPException(409, "This policy is already running; refresh and retry")
     try:
         return _execute_ncentral_device_preview(
-            payload.companyId,
-            payload.providerCompanyId,
+            claimed["companyId"],
+            claimed["providerParentId"],
             actor_id=user["id"],
-            trigger="manual",
+            trigger="manual_preview",
+            policy_id=claimed["id"],
+            lease_owner=lease_owner,
         )
-    except (NcentralConfigurationError, NcentralRequestError) as error:
+    except _IntegrationPreviewLeaseLost as error:
+        raise _integration_preview_lease_conflict(error) from error
+    except Exception as error:
+        try:
+            _record_ncentral_device_preview_failure(
+                claimed,
+                error,
+                trigger="manual_preview",
+                actor_id=user["id"],
+                lease_owner=lease_owner,
+            )
+        except _IntegrationPreviewLeaseLost as lease_error:
+            raise _integration_preview_lease_conflict(lease_error) from error
         raise HTTPException(
-            502, _ncentral_public_failure(error, "device reconciliation preview")
+            502,
+            (
+                _ncentral_public_failure(error, "device reconciliation preview")
+                if isinstance(error, (NcentralConfigurationError, NcentralRequestError))
+                else "Unexpected integration sync failure"
+            ),
         ) from error
 
 
@@ -6314,7 +6392,8 @@ def sync_ncentral_device_policy_now(policy_id: str, request: Request) -> dict:
     if not policy:
         raise HTTPException(404, "N-central device policy not found")
     _company_for_user(policy["companyId"], user)
-    claimed = REPOSITORY.claim_ci_sync_policy_now(policy_id, f"manual:{user['id']}:{uuid.uuid4()}")
+    lease_owner = f"manual:{user['id']}:{uuid.uuid4()}"
+    claimed = REPOSITORY.claim_ci_sync_policy_now(policy_id, lease_owner)
     if not claimed:
         raise HTTPException(409, "This policy is already running; refresh and retry")
     try:
@@ -6323,11 +6402,22 @@ def sync_ncentral_device_policy_now(policy_id: str, request: Request) -> dict:
             claimed["providerParentId"],
             actor_id=user["id"],
             trigger="manual_sync",
+            policy_id=claimed["id"],
+            lease_owner=lease_owner,
         )
+    except _IntegrationPreviewLeaseLost as error:
+        raise _integration_preview_lease_conflict(error) from error
     except Exception as error:
-        _record_ncentral_device_preview_failure(
-            claimed, error, trigger="manual_sync", actor_id=user["id"]
-        )
+        try:
+            _record_ncentral_device_preview_failure(
+                claimed,
+                error,
+                trigger="manual_sync",
+                actor_id=user["id"],
+                lease_owner=lease_owner,
+            )
+        except _IntegrationPreviewLeaseLost as lease_error:
+            raise _integration_preview_lease_conflict(lease_error) from error
         raise HTTPException(
             502,
             (
@@ -6835,23 +6925,53 @@ def _connectwise_mapped_company(company_id: str, provider_company_id: str) -> di
     return mapped
 
 
+def _connectwise_preview_policy(
+    company_id: str,
+    provider_company_id: str,
+    user: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve one authorized saved policy before taking an exclusive preview lease."""
+
+    _require_integration_active("connectwise")
+    _company_for_user(company_id, user)
+    _connectwise_mapped_company(company_id, provider_company_id)
+    policy = REPOSITORY.get_ci_sync_policy("connectwise", company_id, provider_company_id)
+    if not policy.get("id"):
+        raise HTTPException(409, "Save the ConnectWise CI policy before starting a preview")
+    return policy
+
+
 def _connectwise_configuration_context(
-    company_id: str, provider_company_id: str
+    company_id: str,
+    provider_company_id: str,
+    *,
+    lease_heartbeat: Callable[[], None] | None = None,
 ) -> tuple[dict, list[dict], str, dict]:
     """Validate a company mapping and read its sanitized provider configurations."""
 
     mapped = _connectwise_mapped_company(company_id, provider_company_id)
     configuration, source = _connectwise_effective_configuration()
+    if lease_heartbeat:
+        lease_heartbeat()
     records = _connectwise_client(configuration).discover_configurations(provider_company_id)
+    if lease_heartbeat:
+        lease_heartbeat()
     policy = REPOSITORY.get_ci_sync_policy("connectwise", company_id, provider_company_id)
     return mapped, records, source, policy
 
 
-def _connectwise_configuration_preview(company_id: str, provider_company_id: str) -> dict[str, Any]:
+def _connectwise_configuration_preview(
+    company_id: str,
+    provider_company_id: str,
+    *,
+    lease_heartbeat: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     """Read, filter and classify CIs for one explicit customer mapping."""
 
     mapped, records, source, policy = _connectwise_configuration_context(
-        company_id, provider_company_id
+        company_id,
+        provider_company_id,
+        lease_heartbeat=lease_heartbeat,
     )
     catalogue = configuration_catalogue(records)
     included_records, exclusion_reasons = apply_ci_policy(records, policy)
@@ -6866,6 +6986,8 @@ def _connectwise_configuration_preview(company_id: str, provider_company_id: str
         field_authority=REPOSITORY.list_field_authority(company_id),
         provider="connectwise",
     )
+    if lease_heartbeat:
+        lease_heartbeat()
     counts = {
         action: sum(item["action"] == action for item in items)
         for action in ("create", "update", "link", "unchanged", "conflict")
@@ -6897,11 +7019,32 @@ def _execute_connectwise_ci_preview(
     *,
     actor_id: str | None,
     trigger: str,
+    policy_id: str,
+    lease_owner: str,
 ) -> dict[str, Any]:
-    """Execute one read-only preview and persist its current review observations."""
+    """Execute and atomically publish one exclusively leased CI preview."""
 
     started_at = core.now()
-    preview = _connectwise_configuration_preview(company_id, provider_company_id)
+    last_renewed_at = 0.0
+
+    def renew_policy_lease(*, force: bool = False) -> None:
+        nonlocal last_renewed_at
+        now = time.monotonic()
+        if not force and now - last_renewed_at < 30:
+            return
+        with core.LOCK:
+            renewed = REPOSITORY.renew_ci_sync_policy_run(policy_id, lease_owner)
+        if not renewed:
+            raise _IntegrationPreviewLeaseLost("ConnectWise preview lease is no longer owned")
+        last_renewed_at = now
+
+    renew_policy_lease(force=True)
+    preview = _connectwise_configuration_preview(
+        company_id,
+        provider_company_id,
+        lease_heartbeat=renew_policy_lease,
+    )
+    renew_policy_lease(force=True)
     counts = preview["counts"]
     message = (
         f"Read {preview['discovered']} ConnectWise configuration items for "
@@ -6926,7 +7069,7 @@ def _execute_connectwise_ci_preview(
             "trigger": trigger,
             "companyId": company_id,
             "providerCompanyId": provider_company_id,
-            "policyId": preview["appliedPolicy"].get("id") or None,
+            "policyId": policy_id,
             "policyRevision": preview["appliedPolicy"].get("revision", 0),
             "included": preview["included"],
             "excluded": preview["excluded"],
@@ -6934,23 +7077,20 @@ def _execute_connectwise_ci_preview(
         },
     }
     previous_failures = int(preview["appliedPolicy"].get("consecutiveFailures") or 0)
-    completed_policy = None
     with core.LOCK:
-        stored_run = REPOSITORY.record_sync_run("connectwise", run, True, actor_id)
-        policy_id = str(preview["appliedPolicy"].get("id") or "")
-        queue_summary = (
-            REPOSITORY.replace_ci_review_items(
-                policy_id,
-                company_id,
-                stored_run["id"],
-                preview["items"],
-                actor_id,
-            )
-            if policy_id
-            else {"pending": 0, "created": 0, "updated": 0, "resolved": 0}
+        published = REPOSITORY.publish_and_complete_ci_policy_preview(
+            "connectwise",
+            policy_id,
+            lease_owner,
+            run,
+            preview["items"],
+            actor_id,
         )
-        if policy_id:
-            completed_policy = REPOSITORY.complete_ci_sync_policy_run(policy_id, success=True)
+    if not published:
+        raise _IntegrationPreviewLeaseLost("ConnectWise preview lease expired before publication")
+    stored_run = published["run"]
+    queue_summary = published["queueSummary"]
+    completed_policy = published["policy"]
     if completed_policy and previous_failures and trigger == "continuous_preview":
         _queue_integration_alert(
             {
@@ -6975,6 +7115,7 @@ def _record_connectwise_ci_preview_failure(
     *,
     trigger: str = "continuous_preview",
     actor_id: str | None = None,
+    lease_owner: str,
 ) -> dict:
     """Persist a sanitized scheduled or operator-triggered failure and release its lease."""
 
@@ -7015,10 +7156,20 @@ def _record_connectwise_ci_preview_failure(
         },
     }
     with core.LOCK:
-        stored_run = REPOSITORY.record_sync_run("connectwise", run, True, actor_id)
-        completed_policy = REPOSITORY.complete_ci_sync_policy_run(
-            policy["id"], success=False, error=detail
+        failed = REPOSITORY.fail_and_complete_ci_policy_preview(
+            "connectwise",
+            policy["id"],
+            lease_owner,
+            run,
+            detail,
+            actor_id,
         )
+    if not failed:
+        raise _IntegrationPreviewLeaseLost(
+            "ConnectWise preview lease expired before failure publication"
+        )
+    stored_run = failed["run"]
+    completed_policy = failed["policy"]
     failures = int((completed_policy or {}).get("consecutiveFailures") or 0)
     if trigger == "continuous_preview" and failures:
         _queue_integration_alert(
@@ -7035,10 +7186,6 @@ def _record_connectwise_ci_preview_failure(
             ),
         )
     return stored_run
-
-
-class _IntegrationPreviewLeaseLost(RuntimeError):
-    """Stop work when another worker legitimately owns a recovered preview."""
 
 
 def _queued_ncentral_preview_message(preview: dict[str, Any]) -> str:
@@ -7062,9 +7209,7 @@ def _execute_queued_ncentral_preview(run: dict[str, Any], worker_id: str) -> Non
     run_id = str(run["id"])
     company_id = str(run.get("companyId") or "")
     provider_company_id = str(run.get("providerCompanyId") or "")
-    policy_id = str(run.get("policyId") or "")
     actor_id = run.get("requestedByUserId")
-    trigger = str(run.get("trigger") or "manual_preview")
     last_progress_at = 0.0
     last_phase = ""
     cancel_checked_at = 0.0
@@ -7141,24 +7286,16 @@ def _execute_queued_ncentral_preview(run: dict[str, Any], worker_id: str) -> Non
         raise NcentralOperationCancelled("N-central preview was cancelled")
     message = _queued_ncentral_preview_message(preview)
     with core.LOCK:
-        if REPOSITORY.is_sync_run_cancel_requested(run_id, worker_id):
-            raise NcentralOperationCancelled("N-central preview was cancelled")
-        queue_summary = REPOSITORY.replace_ci_review_items(
-            policy_id,
-            company_id,
-            run_id,
-            preview["items"],
-            actor_id,
-        )
         summary = {
             key: deepcopy(value)
             for key, value in preview.items()
             if key not in {"items", "credentialSource"}
         }
-        summary.update(queueSummary=queue_summary, message=message)
-        completed = REPOSITORY.complete_ci_preview_run(
+        summary["message"] = message
+        completed = REPOSITORY.publish_and_complete_ci_preview_run(
             run_id,
             worker_id,
+            preview["items"],
             summary,
             actor_id,
         )
@@ -7166,10 +7303,6 @@ def _execute_queued_ncentral_preview(run: dict[str, Any], worker_id: str) -> Non
             raise _IntegrationPreviewLeaseLost("Preview lease expired before completion")
         if completed.get("status") == "cancelled":
             raise NcentralOperationCancelled("N-central preview was cancelled")
-        if trigger == "manual_sync":
-            REPOSITORY.complete_ci_sync_policy_run(policy_id, success=True)
-        else:
-            REPOSITORY.release_ci_sync_policy_lease(policy_id)
 
 
 def _process_queued_integration_previews(
@@ -7202,15 +7335,13 @@ def _process_queued_integration_previews(
             LOGGER.warning("Stopped N-central preview %s after losing its lease", run["id"])
         except NcentralOperationCancelled:
             with core.LOCK:
-                cancelled = REPOSITORY.fail_ci_preview_run(
+                REPOSITORY.fail_ci_preview_run(
                     run["id"],
                     worker_id,
                     "N-central preview cancelled by an operator.",
                     run.get("requestedByUserId"),
                     cancelled=True,
                 )
-                if cancelled:
-                    REPOSITORY.release_ci_sync_policy_lease(str(run.get("policyId") or ""))
         except Exception as error:  # Worker boundaries must finish owned runs.
             failed += 1
             if isinstance(error, (NcentralConfigurationError, NcentralRequestError)):
@@ -7219,20 +7350,12 @@ def _process_queued_integration_previews(
                 LOGGER.exception("Unexpected queued N-central preview failure")
                 detail = "Unexpected integration preview failure"
             with core.LOCK:
-                failed_run = REPOSITORY.fail_ci_preview_run(
+                REPOSITORY.fail_ci_preview_run(
                     run["id"],
                     worker_id,
                     detail,
                     run.get("requestedByUserId"),
                 )
-                if failed_run and run.get("trigger") == "manual_sync":
-                    REPOSITORY.complete_ci_sync_policy_run(
-                        str(run.get("policyId") or ""),
-                        success=False,
-                        error=detail,
-                    )
-                elif failed_run:
-                    REPOSITORY.release_ci_sync_policy_lease(str(run.get("policyId") or ""))
         finally:
             reset_audit_context(token)
     return {"processed": processed, "succeeded": succeeded, "failed": failed}
@@ -7275,6 +7398,8 @@ def _run_due_integration_previews(limit: int = 5) -> dict[str, int]:
                     policy["providerParentId"],
                     actor_id=None,
                     trigger="continuous_preview",
+                    policy_id=policy["id"],
+                    lease_owner=worker_id,
                 )
             else:
                 _execute_connectwise_ci_preview(
@@ -7282,23 +7407,50 @@ def _run_due_integration_previews(limit: int = 5) -> dict[str, int]:
                     policy["providerParentId"],
                     actor_id=None,
                     trigger="continuous_preview",
+                    policy_id=policy["id"],
+                    lease_owner=worker_id,
                 )
             succeeded += 1
+        except _IntegrationPreviewLeaseLost:
+            LOGGER.info(
+                "Continuous %s preview lease was reclaimed for policy %s; discarded stale results",
+                provider,
+                policy["id"],
+            )
         except Exception as error:  # Worker boundaries must release leases for every failure.
-            failed += 1
             LOGGER.exception("Continuous %s preview failed for policy %s", provider, policy["id"])
             try:
                 if provider == "ncentral":
-                    _record_ncentral_device_preview_failure(policy, error)
+                    _record_ncentral_device_preview_failure(
+                        policy,
+                        error,
+                        lease_owner=worker_id,
+                    )
                 else:
-                    _record_connectwise_ci_preview_failure(policy, error)
+                    _record_connectwise_ci_preview_failure(
+                        policy,
+                        error,
+                        lease_owner=worker_id,
+                    )
+            except _IntegrationPreviewLeaseLost:
+                LOGGER.info(
+                    "Continuous %s preview failure was not recorded because policy %s "
+                    "is owned by another worker",
+                    provider,
+                    policy["id"],
+                )
+                continue
             except Exception:
                 LOGGER.exception(
                     "Could not persist integration worker failure for %s", policy["id"]
                 )
                 REPOSITORY.complete_ci_sync_policy_run(
-                    policy["id"], success=False, error="Worker failure could not be persisted"
+                    policy["id"],
+                    lease_owner=worker_id,
+                    success=False,
+                    error="Worker failure could not be persisted",
                 )
+            failed += 1
         finally:
             reset_audit_context(token)
     return {"processed": processed, "succeeded": succeeded, "failed": failed}
@@ -7377,17 +7529,45 @@ def preview_connectwise_configurations(
 
     user = current_user(request)
     _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
-    _company_for_user(payload.companyId, user)
+    policy = _connectwise_preview_policy(
+        payload.companyId,
+        payload.providerCompanyId,
+        user,
+    )
+    lease_owner = f"manual:{user['id']}:{uuid.uuid4()}"
+    with core.LOCK:
+        claimed = REPOSITORY.claim_ci_sync_policy_now(policy["id"], lease_owner)
+    if not claimed:
+        raise HTTPException(409, "This policy is already running; refresh and retry")
     try:
         return _execute_connectwise_ci_preview(
-            payload.companyId,
-            payload.providerCompanyId,
+            claimed["companyId"],
+            claimed["providerParentId"],
             actor_id=user["id"],
-            trigger="manual",
+            trigger="manual_preview",
+            policy_id=claimed["id"],
+            lease_owner=lease_owner,
         )
-    except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
+    except _IntegrationPreviewLeaseLost as error:
+        raise _integration_preview_lease_conflict(error) from error
+    except Exception as error:
+        try:
+            _record_connectwise_ci_preview_failure(
+                claimed,
+                error,
+                trigger="manual_preview",
+                actor_id=user["id"],
+                lease_owner=lease_owner,
+            )
+        except _IntegrationPreviewLeaseLost as lease_error:
+            raise _integration_preview_lease_conflict(lease_error) from error
         raise HTTPException(
-            502, _connectwise_public_failure(error, "configuration preview")
+            502,
+            (
+                _connectwise_public_failure(error, "configuration preview")
+                if isinstance(error, (ConnectWiseConfigurationError, ConnectWiseRequestError))
+                else "Unexpected integration sync failure"
+            ),
         ) from error
 
 
@@ -7412,10 +7592,8 @@ def sync_connectwise_ci_policy_now(policy_id: str, request: Request) -> dict:
     if not policy:
         raise HTTPException(404, "ConnectWise CI policy not found")
     _company_for_user(policy["companyId"], user)
-    claimed = REPOSITORY.claim_ci_sync_policy_now(
-        policy_id,
-        f"manual:{user['id']}:{uuid.uuid4()}",
-    )
+    lease_owner = f"manual:{user['id']}:{uuid.uuid4()}"
+    claimed = REPOSITORY.claim_ci_sync_policy_now(policy_id, lease_owner)
     if not claimed:
         raise HTTPException(409, "This policy is already running; refresh its status and retry")
     try:
@@ -7424,14 +7602,22 @@ def sync_connectwise_ci_policy_now(policy_id: str, request: Request) -> dict:
             claimed["providerParentId"],
             actor_id=user["id"],
             trigger="manual_sync",
+            policy_id=claimed["id"],
+            lease_owner=lease_owner,
         )
+    except _IntegrationPreviewLeaseLost as error:
+        raise _integration_preview_lease_conflict(error) from error
     except Exception as error:
-        _record_connectwise_ci_preview_failure(
-            claimed,
-            error,
-            trigger="manual_sync",
-            actor_id=user["id"],
-        )
+        try:
+            _record_connectwise_ci_preview_failure(
+                claimed,
+                error,
+                trigger="manual_sync",
+                actor_id=user["id"],
+                lease_owner=lease_owner,
+            )
+        except _IntegrationPreviewLeaseLost as lease_error:
+            raise _integration_preview_lease_conflict(lease_error) from error
         if isinstance(error, ConnectWiseConfigurationError):
             detail = (
                 "ConnectWise configuration is invalid or incomplete. "

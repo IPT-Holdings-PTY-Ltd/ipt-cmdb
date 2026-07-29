@@ -401,7 +401,11 @@ class RepositoryTests(unittest.TestCase):
             self.repository.list_ci_review_items("connectwise", "acme")[0]["state"],
             "pending",
         )
-        completed = self.repository.complete_ci_sync_policy_run(policy["id"], success=True)
+        completed = self.repository.complete_ci_sync_policy_run(
+            policy["id"],
+            lease_owner="worker-a",
+            success=True,
+        )
         self.assertEqual(completed["consecutiveFailures"], 0)
         self.assertIsNotNone(completed["nextRunAt"])
         self.assertIsNone(completed.get("leaseOwner"))
@@ -414,7 +418,10 @@ class RepositoryTests(unittest.TestCase):
             self.repository.claim_ci_sync_policy_now(policy["id"], "operator-b", lease_seconds=120)
         )
         first_failure = self.repository.complete_ci_sync_policy_run(
-            policy["id"], success=False, error="Provider unavailable"
+            policy["id"],
+            lease_owner="operator-a",
+            success=False,
+            error="Provider unavailable",
         )
         self.assertTrue(first_failure["backoffActive"])
         self.assertEqual(first_failure["consecutiveFailures"], 1)
@@ -425,7 +432,10 @@ class RepositoryTests(unittest.TestCase):
             self.repository.claim_ci_sync_policy_now(policy["id"], "operator-b", lease_seconds=120)
         )
         second_failure = self.repository.complete_ci_sync_policy_run(
-            policy["id"], success=False, error="Provider still unavailable"
+            policy["id"],
+            lease_owner="operator-b",
+            success=False,
+            error="Provider still unavailable",
         )
         self.assertEqual(second_failure["consecutiveFailures"], 2)
         self.assertEqual(second_failure["retryDelayMinutes"], 30)
@@ -444,7 +454,10 @@ class RepositoryTests(unittest.TestCase):
             )
         )
         manual_completed = self.repository.complete_ci_sync_policy_run(
-            manual_policy["id"], success=False, error="Manual preview failed"
+            manual_policy["id"],
+            lease_owner="operator-c",
+            success=False,
+            error="Manual preview failed",
         )
         self.assertIsNone(manual_completed["nextRunAt"])
 

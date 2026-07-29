@@ -357,6 +357,7 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         )
         first_failure = repository.complete_ci_sync_policy_run(
             ci_policy["id"],
+            lease_owner="contract-worker-a",
             success=False,
             error="Provider unavailable",
         )
@@ -371,6 +372,7 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         )
         second_failure = repository.complete_ci_sync_policy_run(
             ci_policy["id"],
+            lease_owner="contract-worker-b",
             success=False,
             error="Provider still unavailable",
         )
@@ -385,6 +387,7 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         )
         recovered_policy = repository.complete_ci_sync_policy_run(
             ci_policy["id"],
+            lease_owner="contract-worker-c",
             success=True,
         )
         self.assertFalse(recovered_policy["backoffActive"])

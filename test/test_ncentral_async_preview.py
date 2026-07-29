@@ -12,7 +12,11 @@ import backend.main as backend_main
 from src.cmdb.repository import StateRepository
 
 
-def _policy_input(*, enrichment_mode: str = "balanced") -> dict:
+def _policy_input(
+    *,
+    enrichment_mode: str = "balanced",
+    continuous: bool = False,
+) -> dict:
     """Return one safe manual-preview policy used by repository tests."""
 
     return {
@@ -25,9 +29,9 @@ def _policy_input(*, enrichment_mode: str = "balanced") -> dict:
         "includedStatusIds": [],
         "excludedExternalIds": [],
         "enrichmentMode": enrichment_mode,
-        "syncMode": "manual",
+        "syncMode": "continuous_preview" if continuous else "manual",
         "intervalMinutes": 360,
-        "enabled": False,
+        "enabled": continuous,
     }
 
 
@@ -223,6 +227,45 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
         self.assertIsNone(stored_policy.get("leaseUntil"))
         self.assertIsNone(self.repository.claim_ci_preview_run("worker-a"))
 
+    def test_queued_cancel_does_not_clear_a_newer_policy_owner(self) -> None:
+        queued = self._queue()
+        raw_policy = next(
+            item for item in self.state["integrationCiPolicies"] if item["id"] == self.policy["id"]
+        )
+        raw_policy["leaseOwner"] = "current-worker"
+        raw_policy["leaseUntil"] = (
+            (datetime.now(UTC) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+        )
+
+        cancelled = self.repository.request_sync_run_cancel(queued["id"], "admin")
+
+        self.assertIsNotNone(cancelled)
+        self.assertEqual(raw_policy["leaseOwner"], "current-worker")
+        self.assertIsNotNone(raw_policy["leaseUntil"])
+
+    def test_exhausted_run_cleanup_does_not_clear_a_newer_policy_owner(self) -> None:
+        queued = self._queue()
+        self.repository.claim_ci_preview_run("stale-worker")
+        raw_run = next(item for item in self.state["syncRuns"] if item["id"] == queued["id"])
+        raw_run["attemptCount"] = raw_run["maxAttempts"]
+        raw_run["leaseUntil"] = (
+            (datetime.now(UTC) - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+        )
+        raw_policy = next(
+            item for item in self.state["integrationCiPolicies"] if item["id"] == self.policy["id"]
+        )
+        raw_policy["leaseOwner"] = "current-worker"
+        raw_policy["leaseUntil"] = (
+            (datetime.now(UTC) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+        )
+
+        claimed = self.repository.claim_ci_preview_run("cleanup-worker")
+
+        self.assertIsNone(claimed)
+        self.assertEqual(raw_run["status"], "failed")
+        self.assertEqual(raw_policy["leaseOwner"], "current-worker")
+        self.assertIsNotNone(raw_policy["leaseUntil"])
+
     def test_running_cancel_is_cooperative_and_wins_completion_race(self) -> None:
         queued = self._queue()
         self.repository.claim_ci_preview_run("worker-a")
@@ -249,6 +292,89 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
         self.assertEqual(terminal["status"], "cancelled")
         self.assertEqual(terminal["phase"], "cancelled")
         self.assertIsNone(terminal["previewSummary"])
+
+    def test_cancelled_atomic_publication_does_not_change_review_queue(self) -> None:
+        queued = self._queue()
+        self.repository.claim_ci_preview_run("worker-a")
+        self.repository.request_sync_run_cancel(queued["id"], "admin")
+
+        terminal = self.repository.publish_and_complete_ci_preview_run(
+            queued["id"],
+            "worker-a",
+            [_review_item("should-not-publish")],
+            {"discovered": 1, "included": 1, "counts": {"create": 1}},
+        )
+
+        self.assertIsNotNone(terminal)
+        assert terminal is not None
+        self.assertEqual(terminal["status"], "cancelled")
+        self.assertEqual(
+            self.repository.list_ci_review_items_for_run(
+                "ncentral",
+                queued["id"],
+                "acme",
+            ),
+            [],
+        )
+        self.assertNotIn(
+            "review_queue_refreshed",
+            [
+                item["action"]
+                for item in self.state["auditEvents"]
+                if item["entityId"] == self.policy["id"]
+                and item.get("metadata", {}).get("syncRunId") == queued["id"]
+            ],
+        )
+
+    def test_atomic_publication_rejects_wrong_or_expired_worker_lease(self) -> None:
+        queued = self._queue()
+        self.repository.claim_ci_preview_run("worker-a")
+
+        denied = self.repository.publish_and_complete_ci_preview_run(
+            queued["id"],
+            "worker-b",
+            [_review_item("wrong-owner")],
+            {"discovered": 1, "included": 1, "counts": {"create": 1}},
+        )
+        raw_run = next(item for item in self.state["syncRuns"] if item["id"] == queued["id"])
+        raw_run["leaseUntil"] = (
+            (datetime.now(UTC) - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+        )
+        expired = self.repository.publish_and_complete_ci_preview_run(
+            queued["id"],
+            "worker-a",
+            [_review_item("expired-owner")],
+            {"discovered": 1, "included": 1, "counts": {"create": 1}},
+        )
+
+        self.assertIsNone(denied)
+        self.assertIsNone(expired)
+        self.assertEqual(self.repository.list_ci_review_items("ncentral", "acme"), [])
+        self.assertEqual(raw_run["status"], "running")
+
+    def test_policy_edit_preserves_active_preview_lease_and_snapshot(self) -> None:
+        queued = self._queue()
+        self.repository.claim_ci_preview_run("worker-a")
+
+        changed = self.repository.update_ci_sync_policy(
+            "ncentral",
+            "acme",
+            "101",
+            _policy_input(enrichment_mode="full"),
+            expected_revision=self.policy["revision"],
+            actor_id="admin",
+        )
+
+        self.assertEqual(changed["leaseOwner"], "worker-a")
+        self.assertIsNotNone(changed["leaseUntil"])
+        self.assertIsNone(
+            self.repository.claim_ci_sync_policy_now(
+                self.policy["id"],
+                "worker-b",
+            )
+        )
+        claimed_run = self.repository.get_sync_run(queued["id"])
+        self.assertEqual(claimed_run["status"], "running")
 
     def test_retry_uses_immutable_original_policy_snapshot(self) -> None:
         queued = self._queue()
@@ -277,6 +403,46 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
             claimed["policySnapshot"]["revision"],
             self.policy["revision"],
         )
+
+    def test_retry_preserves_manual_sync_schedule_bookkeeping(self) -> None:
+        self.policy = self.repository.update_ci_sync_policy(
+            "ncentral",
+            "acme",
+            "101",
+            _policy_input(continuous=True),
+            expected_revision=self.policy["revision"],
+            actor_id="admin",
+        )
+        queued = self._queue(trigger="manual_sync")
+        self.repository.claim_ci_preview_run("worker-failure")
+        self.repository.fail_ci_preview_run(
+            queued["id"],
+            "worker-failure",
+            "Temporary provider failure",
+        )
+        failed_policy = self.repository.get_ci_sync_policy("ncentral", "acme", "101")
+        self.assertEqual(failed_policy["consecutiveFailures"], 1)
+        self.assertIsNotNone(failed_policy["nextRunAt"])
+
+        retry = self.repository.retry_ci_preview_run(queued["id"], "operator")
+        claimed = self.repository.claim_ci_preview_run("worker-retry")
+        self.assertIsNotNone(claimed)
+        terminal = self.repository.publish_and_complete_ci_preview_run(
+            retry["id"],
+            "worker-retry",
+            [],
+            {"discovered": 0, "included": 0, "counts": {}},
+        )
+
+        self.assertEqual(retry["trigger"], "retry")
+        self.assertIsNotNone(terminal)
+        recovered_policy = self.repository.get_ci_sync_policy("ncentral", "acme", "101")
+        self.assertEqual(recovered_policy["consecutiveFailures"], 0)
+        self.assertIsNotNone(recovered_policy["lastSuccessAt"])
+        self.assertFalse(recovered_policy["lastError"])
+        self.assertIsNotNone(recovered_policy["nextRunAt"])
+        raw_retry = next(item for item in self.state["syncRuns"] if item["id"] == retry["id"])
+        self.assertEqual(raw_retry["attributes"]["scheduleTrigger"], "manual_sync")
 
     def test_worker_executes_queued_snapshot_after_live_policy_changes(self) -> None:
         queued = self._queue()
@@ -362,16 +528,10 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
     def test_terminal_result_is_aggregate_only_and_review_items_are_run_scoped(self) -> None:
         first = self._queue()
         self.repository.claim_ci_preview_run("worker-1")
-        first_queue = self.repository.replace_ci_review_items(
-            self.policy["id"],
-            "acme",
-            first["id"],
-            [_review_item("7001")],
-            actor_id=None,
-        )
-        first_terminal = self.repository.complete_ci_preview_run(
+        first_terminal = self.repository.publish_and_complete_ci_preview_run(
             first["id"],
             "worker-1",
+            [_review_item("7001")],
             {
                 "discovered": 2,
                 "included": 1,
@@ -383,7 +543,6 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
                     "unchanged": 0,
                     "conflict": 0,
                 },
-                "queueSummary": first_queue,
                 "items": [{"token": "secret-provider-payload"}],
                 "accessToken": "secret-provider-token",
                 "message": "Preview completed without writes.",
@@ -403,21 +562,14 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
 
         second = self._queue()
         self.repository.claim_ci_preview_run("worker-2")
-        second_queue = self.repository.replace_ci_review_items(
-            self.policy["id"],
-            "acme",
-            second["id"],
-            [_review_item("7002", action="conflict")],
-            actor_id=None,
-        )
-        self.repository.complete_ci_preview_run(
+        self.repository.publish_and_complete_ci_preview_run(
             second["id"],
             "worker-2",
+            [_review_item("7002", action="conflict")],
             {
                 "discovered": 1,
                 "included": 1,
                 "counts": {"conflict": 1},
-                "queueSummary": second_queue,
             },
         )
 
