@@ -472,7 +472,7 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
             }
             {
               name: 'INTEGRATION_WORKER_INTERVAL_SECONDS'
-              value: '60'
+              value: '2'
             }
             {
               name: 'INTEGRATION_ALERT_RECIPIENTS'
@@ -617,7 +617,7 @@ resource workerApp 'Microsoft.App/containerApps@2025-01-01' = {
             }
             {
               name: 'INTEGRATION_WORKER_INTERVAL_SECONDS'
-              value: '60'
+              value: '2'
             }
             {
               name: 'INTEGRATION_ALERT_RECIPIENTS'

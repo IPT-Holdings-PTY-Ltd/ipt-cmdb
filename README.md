@@ -31,7 +31,7 @@ IPT CMDB combines a tenant-aware asset inventory, business-system modelling, int
 | Governance | Append-only attributable audit ledger, request correlation, tenant-aware Audit Center and CI activity timelines |
 | Data quality | MSP/customer quality scores, prioritized findings, audited exceptions, provider-neutral reconciliation workbench and enforced per-customer field authority |
 | Reports | Controlled MSP/customer report catalogue with branded PDF, filterable XLSX and UTF-8 CSV exports |
-| Integrations | Capability-driven provider registry; guided ConnectWise setup, immutable-ID filters, explicit customer mapping, lease-safe continuous previews and Sync now, exponential retry/failure alerts, customer-aware run history, scalable review workbench and authority-governed imports |
+| Integrations | Capability-driven provider registry; guided ConnectWise and N-central setup, encrypted/environment credentials, immutable-ID filters and customer mapping, restart-safe queued previews, provider-neutral review queues and authority-governed imports |
 | Email | Root-managed Microsoft Graph sender, Azure managed identity or app credentials, Exchange mailbox scoping, audited outbox and test delivery |
 
 Passportal passwords, secure notes and credential values are explicitly out of scope. Only approved metadata associations should enter the CMDB.
@@ -129,7 +129,9 @@ flowchart LR
     API --> PG[(PostgreSQL)]
     API --> PDF[Change PDF generator]
     ENTRA[Microsoft Entra ID / Easy Auth] --> API
-    CW[ConnectWise Manage] --> WORKERS[Read-only sync workers]
+    API --> RUNS[Durable preview runs]
+    RUNS --> WORKERS[Read-only sync workers]
+    CW[ConnectWise Manage] --> WORKERS
     NC[N-central] --> WORKERS
     PP[Passportal metadata] --> WORKERS
     API -->|Application Mail.Send| GRAPH[Microsoft Graph / Exchange Online]
@@ -139,6 +141,11 @@ flowchart LR
 ```
 
 Canonical CI UUIDs remain stable when provider names change. Provider IDs are stored as mappings and observations; ambiguous matches must enter a review workflow rather than silently creating or overwriting records.
+
+Manual N-central previews are durable jobs rather than long-running browser requests.
+The combined process consumes them automatically; a split web deployment must keep a
+dedicated worker running. Scheduled continuous-preview policies remain separately
+opt-in.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime, tenancy, identity and reconciliation design.
 
@@ -151,6 +158,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime, tenancy, identity and re
 - [Data quality and reconciliation](docs/DATA_QUALITY.md)
 - [Integration design and provider boundaries](docs/INTEGRATIONS.md)
 - [ConnectWise company discovery setup](docs/CONNECTWISE.md)
+- [N-central customer and device inventory](docs/NCENTRAL.md)
 - [Microsoft 365 email delivery](docs/MICROSOFT_365_EMAIL.md)
 - [Local account password recovery](docs/LOCAL_ACCOUNT_RECOVERY.md)
 - [Notification rules, ownership routing and delivery](docs/NOTIFICATIONS.md)
@@ -172,10 +180,10 @@ Interactive API documentation is available at `/docs` while the API is running.
 
 ## Near-term roadmap
 
-1. Add N-central and Passportal adapters through the provider registry, persistent review queue and canonical identity mapping layer.
-2. Bulk ownership, relationship-layer and lifecycle correction actions from data-quality findings.
-3. Expand change approval with reusable policies, escalation reminders and ConnectWise ticket publishing.
-4. Explicitly approved ConnectWise change-ticket publishing with PDF attachment and idempotency.
+1. Add the Passportal metadata adapter through the provider registry and canonical identity layer.
+2. Expand N-central operational-state evidence beyond the current selectable fast, balanced and full inventory profiles.
+3. Bulk ownership, relationship-layer and lifecycle correction actions from data-quality findings.
+4. Expand change approval with reusable policies, escalation reminders and ConnectWise ticket publishing.
 5. Add governed workflow triggers and outputs through the provider-neutral worker boundary.
 
 External provider writes remain disabled until a reviewable, auditable workflow is implemented.

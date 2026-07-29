@@ -14,6 +14,25 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
   integration and notification administration screens.
 - Sanitized ConnectWise HTTP/rate-limit telemetry that retains status, quota headers and
   request path only, without provider payloads, query strings or credentials.
+- Guided read-only N-central setup using the documented User-API token exchange,
+  bounded connection tests, customer organization discovery and explicit tenant mapping.
+- Native N-central device-filter, class and status policies with immutable provider IDs,
+  reviewed dry-run reconciliation, manual identity linking and lease-safe continuous
+  previews.
+- Restart-safe asynchronous N-central previews backed by durable `sync_runs`, with
+  progress polling, lease heartbeats, stale-run recovery, cooperative cancellation and
+  attributable retry lineage.
+- Selectable fast, balanced and full N-central enrichment profiles, using bounded
+  read-only detail requests without retaining complete provider payloads in run history.
+- Provider-neutral reviewed import and linking controls so ConnectWise and N-central
+  observations can converge on one canonical CI without provider-side writes.
+
+### Fixed
+
+- Made the first N-central discovery-policy save install its root connection record
+  atomically, preventing a first-use `Integration connection not found` response.
+- Forwarded the documented N-central environment contract and compatibility token alias
+  through development, production, appliance and split-worker Compose services.
 
 ## [0.3.0] - 2026-07-28
 

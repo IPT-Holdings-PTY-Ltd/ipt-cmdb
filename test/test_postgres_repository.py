@@ -276,6 +276,10 @@ class PostgresRepositoryContractTests(unittest.TestCase):
             actor_id,
         )
         self.assertEqual(configured["connectionStatus"], "configured")
+        failed_test = repository.mark_integration_test(
+            "connectwise", "error", "Provider rejected the credentials", actor_id
+        )
+        self.assertEqual(failed_test["connectionStatus"], "error")
         impact = repository.integration_lifecycle_impact("connectwise")
         self.assertEqual(impact["syncRuns"], 1)
         paused = repository.change_integration_lifecycle(

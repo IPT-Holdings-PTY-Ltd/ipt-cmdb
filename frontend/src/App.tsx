@@ -31,6 +31,7 @@ const UsersPage = lazy(() => import('./RootAdmin').then(module => ({ default: mo
 const RbacPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.RbacPage })));
 const IntegrationsPage = lazy(() => import('./Integrations').then(module => ({ default: module.IntegrationsPage })));
 const ConnectWiseIntegrationPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.ConnectWiseIntegrationPage })));
+const NcentralIntegrationPage = lazy(() => import('./NcentralIntegration').then(module => ({ default: module.NcentralIntegrationPage })));
 const EmailPage = lazy(() => import('./EmailSetup').then(module => ({ default: module.EmailPage })));
 const NotificationsPage = lazy(() => import('./Notifications').then(module => ({ default: module.NotificationsPage })));
 const BrandingPage = lazy(() => import('./RootAdmin').then(module => ({ default: module.BrandingPage })));
@@ -107,6 +108,7 @@ function ApplicationRoutes() {
           <Route path="/admin/rbac" element={<RbacPage />} />
           <Route path="/admin/integrations" element={<IntegrationsPage />} />
           <Route path="/admin/integrations/connectwise" element={<ConnectWiseIntegrationPage />} />
+          <Route path="/admin/integrations/ncentral" element={<NcentralIntegrationPage />} />
           <Route path="/admin/reconciliation" element={<ReconciliationPage />} />
           <Route path="/admin/email" element={<EmailPage />} />
           <Route path="/admin/notifications" element={<NotificationsPage />} />

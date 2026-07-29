@@ -239,6 +239,60 @@ export type ConnectWiseConnection = {
   discoveryPolicy: ConnectWiseDiscoveryPolicy;
 };
 
+export type NcentralConnection = {
+  id: string;
+  enabled: boolean;
+  baseUrl: string;
+  pageSize: number;
+  configured: boolean;
+  hasCredentials: boolean;
+  credentialSource: 'environment' | 'encrypted_database' | 'not_configured';
+  managedByEnvironment: boolean;
+  connectionStatus: 'not_configured' | 'configured' | 'verified' | 'error';
+  lastTestAt?: string | null;
+  lastError?: string;
+  revision: number;
+  lifecycleStatus: 'active' | 'paused' | 'disabled' | 'removed';
+  lifecycleReason?: string;
+  lifecycleChangedAt?: string | null;
+  lifecycleChangedBy?: string | null;
+  discoveryPolicy: { excludedExternalIds: string[] };
+};
+
+export type NcentralDiscoveryPreview = {
+  readOnly: boolean;
+  writesAttempted: boolean;
+  appliedPolicy: { excludedExternalIds: string[] };
+  discovered: number;
+  included: number;
+  excluded: number;
+  truncated: boolean;
+  sampleIncluded: ProviderCompany[];
+  sampleExcluded: Array<{ externalId: string; name: string; reason: string }>;
+  credentialSource: string;
+  message: string;
+};
+
+export type NcentralDeviceFilter = {
+  id: string;
+  name: string;
+  description: string;
+};
+
+export type NcentralDeviceOptions = {
+  companyId: string;
+  providerCompanyId: string;
+  providerCompanyName: string;
+  credentialSource: string;
+  readOnly: boolean;
+  writesAttempted: boolean;
+  discovered: number;
+  deviceFilters: NcentralDeviceFilter[];
+  availableTypes: ProviderFilterOption[];
+  availableStatuses: ProviderFilterOption[];
+  policy: ConnectWiseCiPolicy;
+};
+
 export type IntegrationLifecycleImpact = {
   provider: Integration['type'];
   lifecycleStatus: Integration['lifecycleStatus'];
@@ -374,6 +428,33 @@ export type ConfigurationReconciliationPreview = {
   queueSummary?: { pending: number; created: number; updated: number; resolved: number };
 };
 
+export type NcentralPreviewRun = {
+  id: string;
+  companyId: string;
+  providerCompanyId: string;
+  policyId?: string | null;
+  policyRevision?: number;
+  status: 'queued' | 'running' | 'success' | 'failed' | 'cancelled';
+  phase: string;
+  progress: {
+    current: number;
+    total: number;
+    percent: number;
+    discovered: number;
+    enriched: number;
+    reviewed: number;
+  };
+  message: string;
+  error?: string;
+  startedAt?: string | null;
+  updatedAt?: string | null;
+  finishedAt?: string | null;
+  canCancel: boolean;
+  canRetry: boolean;
+  cancelRequested: boolean;
+  result?: ConfigurationReconciliationPreview | null;
+};
+
 export type ProviderFilterOption = { id: string; name: string; count: number };
 
 export type ConnectWiseCiPolicy = {
@@ -385,9 +466,11 @@ export type ConnectWiseCiPolicy = {
   includedTypeIds: string[];
   typeMappings: Record<string, string>;
   blockUnmappedTypes: boolean;
+  enrichmentMode?: 'fast' | 'balanced' | 'full';
   statusMode: 'all' | 'selected';
   includedStatusIds: string[];
   excludedExternalIds: string[];
+  providerFilterId?: string;
   syncMode: 'manual' | 'continuous_preview';
   intervalMinutes: number;
   enabled: boolean;
@@ -410,10 +493,12 @@ export type IntegrationPreviewStatus = {
   workerEnabled: boolean;
   workerHealthy: boolean;
   workerIntervalSeconds: number;
+  scheduledPoliciesEnabled: boolean;
   executionMode: 'embedded' | 'dedicated' | 'one_shot';
   heartbeatAgeSeconds?: number | null;
   runtime?: WorkerRuntimeStatus | null;
   providerRateLimit?: ProviderRateLimitStatus | null;
+  providerRateLimits?: Record<string, ProviderRateLimitStatus | null>;
   notificationWorkerEnabled: boolean;
   alertDeliveryConfigured: boolean;
   alertRecipientCount: number;

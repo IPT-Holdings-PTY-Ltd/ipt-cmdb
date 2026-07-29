@@ -84,8 +84,11 @@ export function ReconciliationPage() {
     () => queue.items.filter(item => selected.includes(item.id)),
     [queue.items, selected],
   );
+  const importProvider = selectedItems[0]?.provider || '';
+  const reviewedImportProviders = new Set(['connectwise', 'ncentral']);
   const importableSelection = selectedItems.length > 0
-    && selectedItems.every(item => item.provider === 'connectwise' && item.action !== 'conflict')
+    && reviewedImportProviders.has(importProvider)
+    && selectedItems.every(item => item.provider === importProvider && item.action !== 'conflict')
     && new Set(selectedItems.map(item => item.policyId)).size === 1;
   const ignorableSelection = selectedItems.length > 0
     && new Set(selectedItems.map(item => item.policyId)).size === 1;
@@ -177,9 +180,16 @@ export function ReconciliationPage() {
         });
         setNotice(`${selectedItems.length} provider configuration(s) will remain ignored until restored.`);
       } else {
-        if (!importableSelection) throw new Error('Import selections must be non-conflicting ConnectWise items from one customer policy.');
+        if (!importableSelection) {
+          throw new Error(
+            'Import selections must be non-conflicting items from one supported provider and customer policy.',
+          );
+        }
         const first = selectedItems[0];
-        await apiFetch('/api/integrations/connectwise/configurations/import', {
+        const importPath = first.provider === 'ncentral'
+          ? '/api/integrations/ncentral/devices/import'
+          : '/api/integrations/connectwise/configurations/import';
+        await apiFetch(importPath, {
           method: 'POST',
           body: JSON.stringify({
             companyId: first.companyId,
@@ -188,7 +198,9 @@ export function ReconciliationPage() {
             decisionNotes: decisionNotes.trim(),
           }),
         });
-        setNotice(`${selectedItems.length} reviewed ConnectWise item(s) were applied to the canonical CMDB.`);
+        setNotice(
+          `${selectedItems.length} reviewed ${words(first.provider)} item(s) were applied to the canonical CMDB.`,
+        );
       }
       setSelected([]); setBulkAction(null); setDecisionNotes('');
       await Promise.all([loadQueue(), loadSuppressions()]);
@@ -224,10 +236,13 @@ export function ReconciliationPage() {
   }
 
   async function saveLink() {
-    if (!linkItem || !linkAsset || linkItem.provider !== 'connectwise') return;
+    if (!linkItem || !linkAsset || !reviewedImportProviders.has(linkItem.provider)) return;
     setBusy('link'); setError('');
     try {
-      await apiFetch('/api/integrations/connectwise/configurations/link', {
+      const linkPath = linkItem.provider === 'ncentral'
+        ? '/api/integrations/ncentral/devices/link'
+        : '/api/integrations/connectwise/configurations/link';
+      await apiFetch(linkPath, {
         method: 'POST',
         body: JSON.stringify({
           companyId: linkItem.companyId,
@@ -334,7 +349,7 @@ export function ReconciliationPage() {
           <TableCell>{item.assetName || 'New canonical CI'}</TableCell>
           <TableCell><Stack direction="row" spacing={.5} useFlexGap sx={{ flexWrap: 'wrap' }}>{item.changedFields?.slice(0, 3).map(field => <Chip key={field} size="small" variant="outlined" color="success" label={field} />)}{item.blockedFields?.slice(0, 2).map(field => <Chip key={field} size="small" variant="outlined" color="warning" label={`${field} protected`} />)}{!item.changedFields?.length && !item.blockedFields?.length && <Typography variant="caption" color="text.secondary">Identity decision only</Typography>}</Stack></TableCell>
           <TableCell>{new Date(item.lastSeenAt).toLocaleString()}</TableCell>
-          <TableCell align="right"><Stack direction="row" spacing={.5} sx={{ justifyContent: 'flex-end' }}><Button size="small" onClick={() => void openDetail(item)}>Compare</Button>{canManage && item.provider === 'connectwise' && <Button size="small" startIcon={<LinkOutlined />} onClick={() => void openLink(item)}>Link CI</Button>}</Stack></TableCell>
+          <TableCell align="right"><Stack direction="row" spacing={.5} sx={{ justifyContent: 'flex-end' }}><Button size="small" onClick={() => void openDetail(item)}>Compare</Button>{canManage && reviewedImportProviders.has(item.provider) && <Button size="small" startIcon={<LinkOutlined />} onClick={() => void openLink(item)}>Link CI</Button>}</Stack></TableCell>
         </TableRow>)}</TableBody></Table></TableContainer>}
         {!queue.items.length && busy !== 'queue' && <Alert severity="success" sx={{ m: 2 }}>No review observations match these filters.</Alert>}
         <TablePagination component="div" count={queue.total} page={page} rowsPerPage={rowsPerPage} rowsPerPageOptions={[10, 25, 50, 100]} onPageChange={(_, value) => { setPage(value); setSelected([]); }} onRowsPerPageChange={event => { setRowsPerPage(Number(event.target.value)); setPage(0); setSelected([]); }} />
@@ -385,7 +400,7 @@ export function ReconciliationPage() {
       })}</TableBody></Table></TableContainer> : <Alert severity="info">This row requires an identity decision rather than a field update.</Alert>}
     </Stack>}</DialogContent><DialogActions><Button onClick={() => setDetail(null)}>Close</Button></DialogActions></Dialog>
 
-    <Dialog open={Boolean(bulkAction)} onClose={() => setBulkAction(null)} maxWidth="sm" fullWidth><DialogTitle>{bulkAction === 'import' ? 'Approve canonical import' : bulkAction === 'ignore' ? 'Ignore provider configurations' : 'Dismiss review observations'}</DialogTitle><DialogContent><Stack spacing={2} sx={{ mt: 1 }}><Alert severity={bulkAction === 'import' || bulkAction === 'ignore' ? 'warning' : 'info'}>{bulkAction === 'import' ? `The provider will be re-read before ${selectedItems.length} selected change(s) are applied. ConnectWise remains read-only.` : bulkAction === 'ignore' ? `${selectedItems.length} immutable provider ID(s) will be excluded from future previews and reconciliation until restored. Existing canonical CIs and provider records will not be deleted or unlinked.` : `Dismiss ${selectedItems.length} observation(s). Changed provider evidence will reopen them automatically.`}</Alert><TextField label={bulkAction === 'ignore' ? 'Ignore reason' : 'Decision notes'} required multiline minRows={3} value={decisionNotes} onChange={event => setDecisionNotes(event.target.value)} helperText="Stored with the governed decision evidence" /></Stack></DialogContent><DialogActions><Button onClick={() => setBulkAction(null)}>Cancel</Button><Button variant="contained" color={bulkAction === 'ignore' ? 'warning' : 'primary'} startIcon={bulkAction === 'ignore' ? <VisibilityOffOutlined /> : <CheckCircleOutlined />} disabled={decisionNotes.trim().length < 4 || busy.startsWith('bulk-')} onClick={() => void runBulkAction()}>{bulkAction === 'import' ? 'Approve and import' : bulkAction === 'ignore' ? 'Ignore configurations' : 'Dismiss selected'}</Button></DialogActions></Dialog>
+    <Dialog open={Boolean(bulkAction)} onClose={() => setBulkAction(null)} maxWidth="sm" fullWidth><DialogTitle>{bulkAction === 'import' ? 'Approve canonical import' : bulkAction === 'ignore' ? 'Ignore provider configurations' : 'Dismiss review observations'}</DialogTitle><DialogContent><Stack spacing={2} sx={{ mt: 1 }}><Alert severity={bulkAction === 'import' || bulkAction === 'ignore' ? 'warning' : 'info'}>{bulkAction === 'import' ? `The provider will be re-read before ${selectedItems.length} selected change(s) are applied. ${words(importProvider)} remains read-only.` : bulkAction === 'ignore' ? `${selectedItems.length} immutable provider ID(s) will be excluded from future previews and reconciliation until restored. Existing canonical CIs and provider records will not be deleted or unlinked.` : `Dismiss ${selectedItems.length} observation(s). Changed provider evidence will reopen them automatically.`}</Alert><TextField label={bulkAction === 'ignore' ? 'Ignore reason' : 'Decision notes'} required multiline minRows={3} value={decisionNotes} onChange={event => setDecisionNotes(event.target.value)} helperText="Stored with the governed decision evidence" /></Stack></DialogContent><DialogActions><Button onClick={() => setBulkAction(null)}>Cancel</Button><Button variant="contained" color={bulkAction === 'ignore' ? 'warning' : 'primary'} startIcon={bulkAction === 'ignore' ? <VisibilityOffOutlined /> : <CheckCircleOutlined />} disabled={decisionNotes.trim().length < 4 || busy.startsWith('bulk-')} onClick={() => void runBulkAction()}>{bulkAction === 'import' ? 'Approve and import' : bulkAction === 'ignore' ? 'Ignore configurations' : 'Dismiss selected'}</Button></DialogActions></Dialog>
 
     <Dialog open={Boolean(restoreItem)} onClose={() => setRestoreItem(null)} maxWidth="sm" fullWidth><DialogTitle>Restore provider configuration</DialogTitle><DialogContent><Stack spacing={2} sx={{ mt: 1 }}><Alert severity="info">{restoreItem?.externalName} will be allowed into the next reconciliation preview. Restoring it does not immediately import or change a canonical CI.</Alert><TextField label="Restore reason" required multiline minRows={3} value={decisionNotes} onChange={event => setDecisionNotes(event.target.value)} helperText="Stored in the audit trail" /></Stack></DialogContent><DialogActions><Button onClick={() => setRestoreItem(null)}>Cancel</Button><Button variant="contained" startIcon={<RestoreOutlined />} disabled={decisionNotes.trim().length < 4 || busy === 'restore'} onClick={() => void restoreSuppression()}>Restore configuration</Button></DialogActions></Dialog>
 

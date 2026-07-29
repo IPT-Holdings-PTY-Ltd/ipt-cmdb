@@ -18,6 +18,7 @@ import re
 import secrets
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -79,6 +80,7 @@ from src.cmdb.integrations.providers.connectwise import (
     ConnectWiseProvider,
     normalized_policy,
 )
+from src.cmdb.integrations.providers.ncentral import NcentralProvider
 from src.cmdb.mfa import (
     MfaConfigurationError,
     decrypt_secret,
@@ -90,6 +92,15 @@ from src.cmdb.mfa import (
     qr_data_uri,
     recovery_codes,
     verify_totp,
+)
+from src.cmdb.ncentral import (
+    NcentralClient,
+    NcentralConfigurationError,
+    NcentralOperationCancelled,
+    NcentralRequestError,
+)
+from src.cmdb.ncentral import (
+    normalize_base_url as normalize_ncentral_base_url,
 )
 from src.cmdb.notifications import (
     notification_candidates,
@@ -132,14 +143,14 @@ def _notification_worker_interval() -> int:
 
 
 def _integration_worker_interval() -> int:
-    """Return the bounded polling interval for due integration policies."""
+    """Return the bounded polling interval for preview jobs and due policies."""
 
     try:
-        configured = int(os.getenv("INTEGRATION_WORKER_INTERVAL_SECONDS", "60"))
+        configured = int(os.getenv("INTEGRATION_WORKER_INTERVAL_SECONDS", "2"))
     except ValueError:
-        LOGGER.warning("Invalid INTEGRATION_WORKER_INTERVAL_SECONDS; using 60 seconds")
-        configured = 60
-    return max(15, min(configured, 3600))
+        LOGGER.warning("Invalid INTEGRATION_WORKER_INTERVAL_SECONDS; using 2 seconds")
+        configured = 2
+    return max(1, min(configured, 3600))
 
 
 def _integration_alert_recipients() -> list[str]:
@@ -375,7 +386,10 @@ async def application_lifespan(_application: FastAPI):
     workers_embedded = process_role() == "combined"
     if workers_embedded and _worker_flag("NOTIFICATION_WORKER_ENABLED"):
         tasks.append(asyncio.create_task(_notification_worker_loop()))
-    if workers_embedded and _worker_flag("INTEGRATION_WORKER_ENABLED"):
+    # Operator-triggered previews use the durable integration queue even when
+    # scheduled policy execution is disabled. In split deployments the
+    # dedicated worker owns this consumer instead.
+    if workers_embedded:
         tasks.append(asyncio.create_task(_integration_worker_loop()))
     try:
         yield
@@ -1059,6 +1073,67 @@ class ConnectWiseReviewDismissRequest(BaseModel):
     """Record why one unchanged CI review observation can be ignored."""
 
     notes: str = Field(min_length=4, max_length=1000)
+
+
+class NcentralConfigurationRequest(BaseModel):
+    """Validate root-managed N-central connection settings."""
+
+    enabled: bool = True
+    baseUrl: str = Field(min_length=8, max_length=500)
+    userApiToken: str = Field(default="", max_length=12000)
+    pageSize: int = Field(default=250, ge=25, le=1000)
+    expectedRevision: int | None = Field(default=None, ge=1)
+
+
+class NcentralOrganizationMappingRequest(BaseModel):
+    """Validate an explicit N-central customer to CMDB-customer mapping."""
+
+    companyId: str = Field(min_length=1, max_length=100)
+
+
+class NcentralOrganizationDiscoveryRequest(BaseModel):
+    """Validate immutable organization exclusions for discovery."""
+
+    excludedExternalIds: list[str] = Field(default_factory=list, max_length=1000)
+
+
+class NcentralDevicePreviewRequest(BaseModel):
+    """Select one mapped N-central customer for a read-only device preview."""
+
+    companyId: str = Field(min_length=1, max_length=100)
+    providerCompanyId: str = Field(min_length=1, max_length=160)
+
+
+class NcentralDevicePolicyRequest(NcentralDevicePreviewRequest):
+    """Validate device filters, type mappings and continuous preview settings."""
+
+    providerFilterId: str = Field(default="", max_length=160)
+    typeMode: str = Field(default="all", pattern="^(all|selected)$")
+    includedTypeIds: list[str] = Field(default_factory=list, max_length=500)
+    typeMappings: dict[str, str] = Field(default_factory=dict, max_length=500)
+    blockUnmappedTypes: bool = False
+    statusMode: str = Field(default="all", pattern="^(all|selected)$")
+    includedStatusIds: list[str] = Field(default_factory=list, max_length=500)
+    excludedExternalIds: list[str] = Field(default_factory=list, max_length=1000)
+    enrichmentMode: str = Field(default="balanced", pattern="^(fast|balanced|full)$")
+    syncMode: str = Field(default="manual", pattern="^(manual|continuous_preview)$")
+    intervalMinutes: int = Field(default=360, ge=15, le=10080)
+    enabled: bool = False
+    expectedRevision: int | None = Field(default=None, ge=0)
+
+
+class NcentralDeviceImportRequest(NcentralDevicePreviewRequest):
+    """Approve selected N-central devices for canonical import."""
+
+    externalIds: list[str] = Field(min_length=1, max_length=1000)
+    decisionNotes: str = Field(default="", max_length=2000)
+
+
+class NcentralDeviceLinkRequest(NcentralDevicePreviewRequest):
+    """Explicitly map one immutable N-central device identity to a canonical CI."""
+
+    externalId: str = Field(min_length=1, max_length=160)
+    assetId: str = Field(min_length=1, max_length=100)
 
 
 class BrandingRequest(BaseModel):
@@ -4553,11 +4628,17 @@ def _require_integration_active(kind: str) -> dict:
 
     connection = _integration_connection(kind)
     lifecycle = connection.get("lifecycleStatus", "active")
-    if lifecycle != "active" or not connection.get("enabled"):
+    if lifecycle != "active":
         label = lifecycle.replace("_", " ")
         raise HTTPException(
             409,
             f"{connection.get('name') or kind} is {label}. Re-enable the integration "
+            "before making provider requests.",
+        )
+    if not connection.get("enabled"):
+        raise HTTPException(
+            409,
+            f"{connection.get('name') or kind} is disabled. Save and enable the connection "
             "before making provider requests.",
         )
     return connection
@@ -4575,9 +4656,14 @@ def list_integrations(request: Request) -> list[dict]:
     for item in REPOSITORY.list_integrations():
         if item.get("scope", "msp") != "msp":
             continue
+        configured_by_provider = {
+            "connectwise": _connectwise_connection_public,
+            "ncentral": _ncentral_connection_public,
+        }
+        public_getter = configured_by_provider.get(item["type"])
         configured = (
-            _connectwise_connection_public().get("configured", False)
-            if item["type"] == "connectwise"
+            public_getter().get("configured", False)
+            if public_getter
             else core.configured(item["type"])
         )
         lifecycle = item.get("lifecycleStatus", "active")
@@ -4612,8 +4698,12 @@ def integration_lifecycle_impact(kind: str, request: Request) -> dict:
         impact = REPOSITORY.integration_lifecycle_impact(kind)
     except ValueError as error:
         raise HTTPException(404, str(error)) from error
-    if kind == "connectwise":
-        public = _connectwise_connection_public()
+    public_getters = {
+        "connectwise": _connectwise_connection_public,
+        "ncentral": _ncentral_connection_public,
+    }
+    if kind in public_getters:
+        public = public_getters[kind]()
         impact["managedByEnvironment"] = public.get("managedByEnvironment", False)
         impact["credentialSource"] = public.get("credentialSource", "not_configured")
     else:
@@ -4648,10 +4738,11 @@ def change_integration_lifecycle(
         )
     if current == "removed":
         try:
-            environment_configuration = (
-                _connectwise_environment_configuration() if kind == "connectwise" else None
-            )
-        except ConnectWiseConfigurationError as error:
+            environment_configuration = {
+                "connectwise": _connectwise_environment_configuration,
+                "ncentral": _ncentral_environment_configuration,
+            }.get(kind, lambda: None)()
+        except (ConnectWiseConfigurationError, NcentralConfigurationError) as error:
             raise HTTPException(409, str(error)) from error
         if not environment_configuration:
             raise HTTPException(
@@ -4660,10 +4751,12 @@ def change_integration_lifecycle(
                 "credentials before they can be installed again.",
             )
     elif target == "active":
+        public_getter = {
+            "connectwise": _connectwise_connection_public,
+            "ncentral": _ncentral_connection_public,
+        }.get(kind)
         configured = (
-            _connectwise_connection_public().get("configured", False)
-            if kind == "connectwise"
-            else core.configured(kind)
+            public_getter().get("configured", False) if public_getter else core.configured(kind)
         )
         if not configured:
             raise HTTPException(409, "Configure integration credentials before re-enabling it")
@@ -4938,6 +5031,260 @@ def _run_connectwise_company_discovery(user: dict) -> dict:
         return REPOSITORY.record_company_discovery("connectwise", run, companies, user["id"])
 
 
+def _ncentral_environment_token() -> str:
+    """Read the permanent token from one environment value or Docker secret file."""
+
+    direct = str(
+        os.getenv("NCENTRAL_USER_API_TOKEN") or os.getenv("NCENTRAL_API_TOKEN") or ""
+    ).strip()
+    token_file = str(os.getenv("NCENTRAL_USER_API_TOKEN_FILE") or "").strip()
+    if direct and token_file:
+        raise NcentralConfigurationError(
+            "Configure either NCENTRAL_USER_API_TOKEN or NCENTRAL_USER_API_TOKEN_FILE, not both"
+        )
+    if not token_file:
+        return direct
+    path = Path(token_file)
+    try:
+        if path.stat().st_size > 12000:
+            raise NcentralConfigurationError("N-central token secret file is too large")
+        return path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise NcentralConfigurationError(
+            "N-central token secret file cannot be read by this container"
+        ) from error
+
+
+def _ncentral_environment_configuration() -> dict | None:
+    """Return an all-or-nothing environment-managed N-central connection."""
+
+    base_url = str(os.getenv("NCENTRAL_BASE_URL") or "").strip()
+    token = _ncentral_environment_token()
+    if not base_url and not token:
+        return None
+    if not base_url or not token:
+        raise NcentralConfigurationError(
+            "N-central environment configuration requires NCENTRAL_BASE_URL and a User-API token"
+        )
+    try:
+        page_size = int(os.getenv("NCENTRAL_PAGE_SIZE", "250"))
+    except ValueError as error:
+        raise NcentralConfigurationError("NCENTRAL_PAGE_SIZE must be a number") from error
+    return {
+        "baseUrl": normalize_ncentral_base_url(base_url),
+        "userApiToken": token,
+        "pageSize": page_size,
+    }
+
+
+def _ncentral_stored_configuration() -> tuple[dict, dict]:
+    """Decrypt the permanent User-API token only inside the provider boundary."""
+
+    connection = REPOSITORY.get_integration_connection("ncentral")
+    if not connection:
+        raise NcentralConfigurationError("N-central integration connection is unavailable")
+    configuration = deepcopy(connection.get("configuration") or {})
+    encrypted = str(connection.get("credentialsEncrypted") or "")
+    nonce = str(connection.get("credentialsNonce") or "")
+    if not encrypted or not nonce:
+        raise NcentralConfigurationError("N-central User-API token is not configured")
+    try:
+        credentials = json.loads(decrypt_secret(encrypted, nonce, "integration:ncentral"))
+    except (MfaConfigurationError, json.JSONDecodeError) as error:
+        raise NcentralConfigurationError(
+            "Stored N-central credentials cannot be decrypted by this installation"
+        ) from error
+    if not isinstance(credentials, dict):
+        raise NcentralConfigurationError("Stored N-central credentials are invalid")
+    return connection, {**configuration, **credentials}
+
+
+def _ncentral_effective_configuration() -> tuple[dict, str]:
+    """Prefer container settings, otherwise use the encrypted database token."""
+
+    _require_integration_active("ncentral")
+    environment = _ncentral_environment_configuration()
+    if environment:
+        return environment, "environment"
+    _connection, stored = _ncentral_stored_configuration()
+    return stored, "encrypted_database"
+
+
+def _ncentral_public_failure(error: Exception, operation: str) -> str:
+    """Log diagnostic type only and return a stable token-safe message."""
+
+    LOGGER.exception("N-central %s failed (%s)", operation, type(error).__name__)
+    if isinstance(error, NcentralConfigurationError):
+        return (
+            "N-central configuration is invalid or incomplete. "
+            "Review the server URL, User-API token and container settings."
+        )
+    if isinstance(error, NcentralRequestError) and error.status_code in {401, 403}:
+        return (
+            "N-central rejected the saved User-API token or its access scope. "
+            "Generate or verify the token, save the connection, and retry."
+        )
+    return (
+        "N-central could not complete the requested read operation. "
+        "Verify connectivity, token validity, access groups and API permissions."
+    )
+
+
+def _ncentral_connection_public() -> dict:
+    """Expose connection metadata without returning the permanent or access token."""
+
+    connection = REPOSITORY.get_integration_connection("ncentral") or {
+        "id": "ncentral",
+        "revision": 1,
+        "enabled": False,
+        "connectionStatus": "not_configured",
+        "configuration": {},
+    }
+    configuration = connection.get("configuration") or {}
+    try:
+        environment = _ncentral_environment_configuration()
+    except NcentralConfigurationError:
+        LOGGER.exception("N-central environment configuration is invalid")
+        environment = None
+        environment_error = (
+            "N-central environment configuration is invalid. "
+            "Review the container environment or secret-file settings."
+        )
+    else:
+        environment_error = ""
+    public_configuration = {**configuration, **(environment or {})}
+    has_stored = bool(connection.get("credentialsEncrypted"))
+    configured = bool(environment) or has_stored
+    lifecycle = connection.get("lifecycleStatus", "active")
+    discovery_policy = configuration.get("discoveryPolicy") or {}
+    return {
+        "id": connection.get("id", "ncentral"),
+        "enabled": bool(connection.get("enabled")) and lifecycle == "active",
+        "baseUrl": str(public_configuration.get("baseUrl") or ""),
+        "pageSize": int(public_configuration.get("pageSize") or 250),
+        "discoveryPolicy": {
+            "excludedExternalIds": sorted(
+                {
+                    str(value).strip()[:160]
+                    for value in discovery_policy.get("excludedExternalIds", [])
+                    if str(value).strip()
+                }
+            )
+        },
+        "configured": configured,
+        "hasCredentials": configured,
+        "credentialSource": ("environment" if environment else "encrypted_database")
+        if configured
+        else "not_configured",
+        "managedByEnvironment": bool(environment) or bool(environment_error),
+        "connectionStatus": (
+            "error" if environment_error else connection.get("connectionStatus", "not_configured")
+        ),
+        "lastTestAt": connection.get("lastTestAt"),
+        "lastError": environment_error or connection.get("lastError", ""),
+        "revision": int(connection.get("revision") or 1),
+        "lifecycleStatus": lifecycle,
+        "lifecycleReason": connection.get("lifecycleReason", ""),
+        "lifecycleChangedAt": connection.get("lifecycleChangedAt"),
+        "lifecycleChangedBy": connection.get("lifecycleChangedBy"),
+    }
+
+
+def _ncentral_client(configuration: dict[str, Any]) -> NcentralClient:
+    """Build a client that emits sanitized concurrency-limit evidence."""
+
+    client = NcentralClient(configuration)
+    client.telemetry_callback = lambda observation: REPOSITORY.record_provider_rate_limit(
+        "ncentral", observation
+    )
+    return client
+
+
+def _ncentral_adapter() -> NcentralProvider:
+    """Build the N-central provider adapter with the monitored HTTP client."""
+
+    return NcentralProvider(client_factory=_ncentral_client)
+
+
+def _ncentral_company_rows(company_ids: set[str] | None = None) -> list[dict]:
+    """Add non-binding exact-match suggestions to organization observations."""
+
+    companies = [
+        company
+        for company in REPOSITORY.list_companies()
+        if company_ids is None or company["id"] in company_ids
+    ]
+    by_name: dict[str, list[dict]] = {}
+    by_external_id: dict[str, dict] = {}
+    for company in companies:
+        by_name.setdefault(str(company.get("name") or "").casefold().strip(), []).append(company)
+        for key, value in (company.get("externalIds") or {}).items():
+            if "ncentral" in str(key).casefold() and value:
+                by_external_id[str(value)] = company
+    rows = []
+    for item in REPOSITORY.list_provider_companies("ncentral"):
+        if company_ids is not None and item.get("mappedCompanyId") not in company_ids:
+            continue
+        suggestion = None
+        reason = ""
+        if not item.get("mappedCompanyId"):
+            suggestion = by_external_id.get(str(item.get("externalId") or ""))
+            if suggestion:
+                reason = "Existing N-central external ID"
+            else:
+                exact = by_name.get(str(item.get("name") or "").casefold().strip(), [])
+                if len(exact) == 1:
+                    suggestion = exact[0]
+                    reason = "Exact name; operator review required"
+        rows.append(
+            {
+                **item,
+                "suggestedCompanyId": suggestion.get("id") if suggestion else None,
+                "suggestedCompanyName": suggestion.get("name") if suggestion else "",
+                "suggestionReason": reason,
+            }
+        )
+    return rows
+
+
+def _run_ncentral_company_discovery(user: dict) -> dict:
+    """Persist filtered organization observations without canonical writes."""
+
+    started_at = core.now()
+    configuration, _source = _ncentral_effective_configuration()
+    adapter = _ncentral_adapter()
+    discovered = adapter.discover(configuration)
+    policy = _ncentral_connection_public()["discoveryPolicy"]
+    companies, excluded = adapter.apply_filters(discovered, policy)
+    mapped_ids = {
+        item["externalId"]
+        for item in REPOSITORY.list_provider_companies("ncentral")
+        if item.get("mappedCompanyId")
+    }
+    review_count = sum(item["externalId"] not in mapped_ids for item in companies)
+    run = {
+        "id": str(uuid.uuid4()),
+        "type": "ncentral",
+        "startedAt": started_at,
+        "finishedAt": core.now(),
+        "status": "review_required" if review_count else "success",
+        "discovered": len(companies),
+        "imported": 0,
+        "updated": 0,
+        "review": review_count,
+        "message": (
+            f"Read {len(discovered)} N-central customer organizations; included "
+            f"{len(companies)}, excluded {len(excluded)}, and {review_count} require explicit "
+            "mapping. No data was written to N-central."
+        ),
+        "rawDiscovered": len(discovered),
+        "excluded": len(excluded),
+        "attributes": {"operation": "organization_discovery", "readOnly": True},
+    }
+    with core.LOCK:
+        return REPOSITORY.record_company_discovery("ncentral", run, companies, user["id"])
+
+
 @api.get("/api/integration-providers", tags=["integrations"])
 def list_integration_providers(request: Request) -> list[dict]:
     """Return reviewed provider manifests used by setup and workflow surfaces."""
@@ -4945,6 +5292,1288 @@ def list_integration_providers(request: Request) -> list[dict]:
     user = current_user(request)
     _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
     return provider_registry.manifests()
+
+
+@api.get("/api/integrations/ncentral/config", tags=["integrations"])
+def get_ncentral_configuration(request: Request) -> dict:
+    """Return token-safe N-central connection metadata to root operators."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    return _ncentral_connection_public()
+
+
+@api.put("/api/integrations/ncentral/config", tags=["integrations"])
+def update_ncentral_configuration(payload: NcentralConfigurationRequest, request: Request) -> dict:
+    """Encrypt the permanent token; never store temporary access tokens."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    public = _ncentral_connection_public()
+    if public.get("managedByEnvironment"):
+        raise HTTPException(409, "N-central settings are managed by container configuration")
+    try:
+        base_url = normalize_ncentral_base_url(payload.baseUrl)
+    except NcentralConfigurationError as error:
+        raise HTTPException(400, str(error)) from error
+    with core.LOCK:
+        REPOSITORY.ensure_integration_connection("ncentral", "N-central", user["id"])
+    current = REPOSITORY.get_integration_connection("ncentral") or {}
+    reinstalling = current.get("lifecycleStatus", "active") == "removed"
+    encrypted = str(current.get("credentialsEncrypted") or "")
+    nonce = str(current.get("credentialsNonce") or "")
+    if payload.userApiToken:
+        try:
+            encryption_key()
+            encrypted, nonce = encrypt_secret(
+                json.dumps({"userApiToken": payload.userApiToken.strip()}),
+                "integration:ncentral",
+            )
+        except MfaConfigurationError as error:
+            raise HTTPException(
+                503, "Configure MFA_ENCRYPTION_KEY before storing integration credentials"
+            ) from error
+    if not encrypted:
+        raise HTTPException(400, "Enter the N-central User-API token")
+    try:
+        with core.LOCK:
+            REPOSITORY.update_integration_connection(
+                "ncentral",
+                {
+                    "configuration": {
+                        "baseUrl": base_url,
+                        "pageSize": payload.pageSize,
+                        "discoveryPolicy": (
+                            (current.get("configuration") or {}).get("discoveryPolicy")
+                            or {"excludedExternalIds": []}
+                        ),
+                    },
+                    "credentialsEncrypted": encrypted,
+                    "credentialsNonce": nonce,
+                    "enabled": payload.enabled
+                    and (reinstalling or current.get("lifecycleStatus", "active") == "active"),
+                    "lifecycleStatus": (
+                        "active" if reinstalling else current.get("lifecycleStatus", "active")
+                    ),
+                    "lifecycleReason": (
+                        "Integration reinstalled with a new token"
+                        if reinstalling
+                        else current.get("lifecycleReason", "")
+                    ),
+                    "connectionStatus": "configured",
+                    "lastError": "",
+                    "expectedRevision": payload.expectedRevision,
+                },
+                user["id"],
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return _ncentral_connection_public()
+
+
+@api.post("/api/integrations/ncentral/test", tags=["integrations"])
+def test_ncentral_connection(request: Request) -> dict:
+    """Test token exchange, validation and organization read without retaining tokens."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    try:
+        configuration, source = _ncentral_effective_configuration()
+        result = _ncentral_adapter().test_connection(configuration)
+    except (NcentralConfigurationError, NcentralRequestError) as error:
+        detail = _ncentral_public_failure(error, "connection test")
+        with core.LOCK:
+            REPOSITORY.mark_integration_test("ncentral", "error", detail, user["id"])
+        raise HTTPException(502, detail) from error
+    with core.LOCK:
+        REPOSITORY.mark_integration_test(
+            "ncentral",
+            "verified",
+            "Token exchange and organization read permission verified",
+            user["id"],
+        )
+    return {
+        **result,
+        "credentialSource": source,
+        "message": "Token exchange and organization read permission verified",
+    }
+
+
+@api.put("/api/integrations/ncentral/policy", tags=["integrations"])
+def update_ncentral_discovery_policy(
+    payload: NcentralOrganizationDiscoveryRequest, request: Request
+) -> dict:
+    """Store immutable organization exclusions independently from credentials."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    policy = {
+        "excludedExternalIds": sorted(
+            {
+                str(value).strip()[:160]
+                for value in payload.excludedExternalIds
+                if str(value).strip()
+            }
+        )
+    }
+    try:
+        with core.LOCK:
+            REPOSITORY.ensure_integration_connection("ncentral", "N-central", user["id"])
+            REPOSITORY.update_integration_connection(
+                "ncentral",
+                {
+                    "configuration": {"discoveryPolicy": policy},
+                },
+                user["id"],
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return _ncentral_connection_public()
+
+
+@api.post("/api/integrations/ncentral/discovery-preview", tags=["integrations"])
+def preview_ncentral_discovery(request: Request) -> dict:
+    """Read accessible CUSTOMER organizations without persisting observations."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    started_at = core.now()
+    try:
+        configuration, source = _ncentral_effective_configuration()
+        preview = _ncentral_adapter().preview(
+            configuration, _ncentral_connection_public()["discoveryPolicy"]
+        )
+    except (NcentralConfigurationError, NcentralRequestError) as error:
+        raise HTTPException(
+            502, _ncentral_public_failure(error, "organization discovery preview")
+        ) from error
+    message = (
+        f"Dry-run preview read {preview['discovered']} customer organizations: "
+        f"{preview['included']} included and {preview['excluded']} excluded. "
+        "No observations, mappings, CMDB records or N-central records were changed."
+    )
+    with core.LOCK:
+        REPOSITORY.record_sync_run(
+            "ncentral",
+            {
+                "id": str(uuid.uuid4()),
+                "type": "ncentral",
+                "status": "success",
+                "startedAt": started_at,
+                "finishedAt": core.now(),
+                "discovered": preview["discovered"],
+                "imported": 0,
+                "updated": 0,
+                "review": preview["included"],
+                "message": message,
+                "attributes": {"operation": "organization_preview", "readOnly": True},
+            },
+            True,
+            user["id"],
+        )
+    if user.get("role") != "platform_admin":
+        preview = {**preview, "sampleIncluded": [], "sampleExcluded": []}
+    return {**preview, "credentialSource": source, "message": message}
+
+
+@api.post("/api/integrations/ncentral/discover", tags=["integrations"])
+def discover_ncentral_organizations(request: Request) -> dict:
+    """Persist a filtered organization snapshot for explicit mapping review."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    try:
+        return _run_ncentral_company_discovery(user)
+    except (NcentralConfigurationError, NcentralRequestError) as error:
+        raise HTTPException(
+            502, _ncentral_public_failure(error, "organization discovery")
+        ) from error
+
+
+@api.get("/api/integrations/ncentral/organizations", tags=["integrations"])
+def list_ncentral_organizations(request: Request) -> list[dict]:
+    """List sanitized organization observations and non-binding suggestions."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    return _ncentral_company_rows(_permitted_company_ids(user))
+
+
+@api.put(
+    "/api/integrations/ncentral/organizations/{external_id}/mapping",
+    tags=["integrations"],
+)
+def map_ncentral_organization(
+    external_id: str, payload: NcentralOrganizationMappingRequest, request: Request
+) -> dict:
+    """Apply an explicit N-central organization to CMDB-customer mapping."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    if not any(item["id"] == payload.companyId for item in REPOSITORY.list_companies()):
+        raise HTTPException(404, "CMDB customer not found")
+    try:
+        with core.LOCK:
+            return REPOSITORY.map_provider_company(
+                "ncentral", external_id, payload.companyId, user["id"]
+            )
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@api.delete(
+    "/api/integrations/ncentral/organizations/{external_id}/mapping",
+    tags=["integrations"],
+)
+def unmap_ncentral_organization(external_id: str, request: Request) -> dict:
+    """Deactivate an organization mapping while retaining audit evidence."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    with core.LOCK:
+        removed = REPOSITORY.unmap_provider_company("ncentral", external_id, user["id"])
+    if not removed:
+        raise HTTPException(404, "Active N-central organization mapping not found")
+    return {"unmapped": True}
+
+
+def _ncentral_mapped_company(company_id: str, provider_company_id: str) -> dict:
+    """Return one active explicit N-central customer mapping."""
+
+    mapped = next(
+        (
+            item
+            for item in REPOSITORY.list_provider_companies("ncentral")
+            if item.get("externalId") == provider_company_id
+            and item.get("mappedCompanyId") == company_id
+            and item.get("active", True)
+        ),
+        None,
+    )
+    if not mapped:
+        raise HTTPException(
+            409,
+            "Choose an N-central customer explicitly mapped to this CMDB customer",
+        )
+    return mapped
+
+
+def _ncentral_device_context(
+    company_id: str,
+    provider_company_id: str,
+    *,
+    enrich_limit: int | None = 0,
+    include_filters: bool = True,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+    policy_override: dict[str, Any] | None = None,
+) -> tuple[dict, list[dict], str, dict, list[dict]]:
+    """Validate mapping and read a saved, provider-filtered device scope."""
+
+    mapped = _ncentral_mapped_company(company_id, provider_company_id)
+    configuration, source = _ncentral_effective_configuration()
+    client = _ncentral_client(configuration)
+    saved_policy = REPOSITORY.get_ci_sync_policy(
+        "ncentral",
+        company_id,
+        provider_company_id,
+    )
+    policy = (
+        {
+            **saved_policy,
+            **deepcopy(policy_override),
+            **normalize_ci_policy(policy_override),
+        }
+        if policy_override
+        else saved_policy
+    )
+    selected_enrichment = (
+        {
+            "fast": 0,
+            "balanced": 25,
+            "full": 250,
+        }.get(str(policy.get("enrichmentMode") or "balanced"), 25)
+        if enrich_limit is None
+        else enrich_limit
+    )
+    discovery_options: dict[str, Any] = {
+        "filter_id": str(policy.get("providerFilterId") or ""),
+        "enrich_limit": selected_enrichment,
+    }
+    if progress_callback is not None:
+        discovery_options["progress_callback"] = progress_callback
+    if cancel_requested is not None:
+        discovery_options["cancel_requested"] = cancel_requested
+    records = client.discover_devices(provider_company_id, **discovery_options)
+    filters = client.list_device_filters() if include_filters else []
+    return mapped, records, source, policy, filters
+
+
+def _ncentral_device_preview(
+    company_id: str,
+    provider_company_id: str,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+    policy_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read, filter and classify N-central devices for one customer."""
+
+    mapped, records, source, policy, _filters = _ncentral_device_context(
+        company_id,
+        provider_company_id,
+        enrich_limit=None,
+        include_filters=False,
+        progress_callback=progress_callback,
+        cancel_requested=cancel_requested,
+        policy_override=policy_override,
+    )
+    if cancel_requested and cancel_requested():
+        raise NcentralOperationCancelled("N-central preview was cancelled")
+    if progress_callback:
+        progress_callback(
+            {
+                "phase": "reconciling",
+                "current": 0,
+                "total": len(records),
+                "discovered": len(records),
+                "enriched": min(
+                    len(records),
+                    {"fast": 0, "balanced": 25, "full": 250}.get(
+                        str(policy.get("enrichmentMode") or "balanced"),
+                        25,
+                    ),
+                ),
+            }
+        )
+    catalogue = configuration_catalogue(records)
+    included_records, exclusion_reasons = apply_ci_policy(records, policy)
+    mapped_records, type_mapping_summary = apply_ci_type_mappings(included_records, policy)
+    assets = [item for item in REPOSITORY.list_assets() if item["companyId"] == company_id]
+    mappings = REPOSITORY.list_provider_ci_mappings("ncentral", company_id)
+    items = reconcile_configuration_items(
+        connection_id="ncentral",
+        records=mapped_records,
+        assets=assets,
+        mappings=mappings,
+        field_authority=REPOSITORY.list_field_authority(company_id),
+        provider="ncentral",
+    )
+    counts = {
+        action: sum(item["action"] == action for item in items)
+        for action in ("create", "update", "link", "unchanged", "conflict")
+    }
+    if progress_callback:
+        progress_callback(
+            {
+                "phase": "persisting",
+                "current": len(items),
+                "total": len(items),
+                "discovered": len(records),
+                "enriched": min(
+                    len(records),
+                    {"fast": 0, "balanced": 25, "full": 250}.get(
+                        str(policy.get("enrichmentMode") or "balanced"),
+                        25,
+                    ),
+                ),
+                "reviewed": (
+                    counts["create"] + counts["update"] + counts["link"] + counts["conflict"]
+                ),
+            }
+        )
+    return {
+        "companyId": company_id,
+        "companyName": mapped.get("mappedCompanyName") or company_id,
+        "providerCompanyId": provider_company_id,
+        "providerCompanyName": mapped.get("name") or provider_company_id,
+        "credentialSource": source,
+        "readOnly": True,
+        "writesAttempted": False,
+        "discovered": len(records),
+        "included": len(included_records),
+        "excluded": len(records) - len(included_records),
+        "exclusionReasons": exclusion_reasons,
+        "availableTypes": catalogue["types"],
+        "availableStatuses": catalogue["statuses"],
+        "typeMappingSummary": type_mapping_summary,
+        "appliedPolicy": policy,
+        "counts": counts,
+        "items": items,
+        "enrichment": {
+            "mode": policy.get("enrichmentMode", "balanced"),
+            "assetDetailsRequested": min(
+                len(records),
+                {"fast": 0, "balanced": 25, "full": 250}.get(
+                    str(policy.get("enrichmentMode") or "balanced"),
+                    25,
+                ),
+            ),
+            "bounded": True,
+            "reason": (
+                "Deep hardware and network evidence follows the saved enrichment profile "
+                "and uses bounded provider concurrency"
+            ),
+        },
+    }
+
+
+def _ncentral_preview_queue_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild one UI-safe reconciliation row from durable review evidence."""
+
+    record = deepcopy(item.get("providerRecord") or item.get("record") or {})
+    external_id = str(item.get("externalId") or record.get("externalId") or "")
+    name = str(item.get("externalName") or record.get("name") or external_id)
+    provider_type = str(
+        item.get("providerTypeName") or record.get("providerTypeName") or record.get("type") or ""
+    )
+    provider_status = str(
+        item.get("providerStatusName")
+        or record.get("providerStatusName")
+        or record.get("status")
+        or ""
+    )
+    record.setdefault("externalId", external_id)
+    record.setdefault("name", name)
+    record.setdefault("type", provider_type)
+    record.setdefault("status", provider_status)
+    record.setdefault("providerTypeId", str(record.get("providerTypeId") or provider_type))
+    record.setdefault("providerTypeName", provider_type)
+    record.setdefault("providerStatusId", str(record.get("providerStatusId") or provider_status))
+    record.setdefault("providerStatusName", provider_status)
+    record.setdefault("fields", {})
+    record.setdefault("metadata", {})
+    return {
+        "externalId": external_id,
+        "name": name,
+        "type": provider_type,
+        "status": provider_status,
+        "action": item.get("action") or "conflict",
+        "reason": str(item.get("reason") or ""),
+        "confidence": float(item.get("confidence") or 0),
+        "assetId": item.get("assetId"),
+        "assetName": str(item.get("assetName") or ""),
+        "changedFields": list(item.get("changedFields") or []),
+        "record": record,
+    }
+
+
+def _ncentral_preview_result(run: dict[str, Any]) -> dict[str, Any] | None:
+    """Assemble one completed preview without persisting full provider payloads."""
+
+    if run.get("status") not in {"success", "succeeded", "review_required"}:
+        return None
+    raw_attributes = run.get("attributes")
+    attributes: dict[str, Any] = raw_attributes if isinstance(raw_attributes, dict) else {}
+    summary = (
+        run.get("previewSummary")
+        if isinstance(run.get("previewSummary"), dict)
+        else attributes.get("previewSummary") or attributes.get("resultSummary")
+    )
+    summary = summary if isinstance(summary, dict) else {}
+    company_id = str(run.get("companyId") or attributes.get("companyId") or "")
+    provider_company_id = str(
+        run.get("providerCompanyId") or attributes.get("providerCompanyId") or ""
+    )
+    policy_id = str(run.get("policyId") or attributes.get("policyId") or "")
+    policy_snapshot = summary.get("appliedPolicy") or attributes.get("policySnapshot")
+    policy = (
+        deepcopy(policy_snapshot)
+        if isinstance(policy_snapshot, dict)
+        else REPOSITORY.get_ci_sync_policy("ncentral", company_id, provider_company_id)
+    )
+    company = next(
+        (item for item in REPOSITORY.list_companies() if item.get("id") == company_id),
+        {},
+    )
+    provider_company = next(
+        (
+            item
+            for item in REPOSITORY.list_provider_companies("ncentral")
+            if item.get("externalId") == provider_company_id
+        ),
+        {},
+    )
+    items = (
+        REPOSITORY.list_ci_review_items_for_run("ncentral", run["id"], company_id)
+        if policy_id
+        else []
+    )
+    counts = {
+        key: max(0, int((summary.get("counts") or {}).get(key) or 0))
+        for key in ("create", "update", "link", "unchanged", "conflict")
+    }
+    return {
+        "companyId": company_id,
+        "companyName": company.get("name") or company_id,
+        "providerCompanyId": provider_company_id,
+        "providerCompanyName": provider_company.get("name") or provider_company_id,
+        "credentialSource": "configured",
+        "readOnly": True,
+        "writesAttempted": False,
+        "discovered": max(0, int(summary.get("discovered") or run.get("discovered") or 0)),
+        "included": max(0, int(summary.get("included") or 0)),
+        "excluded": max(0, int(summary.get("excluded") or 0)),
+        "exclusionReasons": deepcopy(summary.get("exclusionReasons") or {}),
+        "availableTypes": [],
+        "availableStatuses": [],
+        "typeMappingSummary": deepcopy(
+            summary.get("typeMappingSummary")
+            or {"mapped": 0, "unmapped": 0, "blocked": 0, "unmappedTypes": []}
+        ),
+        "appliedPolicy": policy,
+        "counts": counts,
+        "items": [_ncentral_preview_queue_item(item) for item in items],
+        "message": str(run.get("message") or "N-central preview completed."),
+        "syncRunId": run["id"],
+        "queueSummary": deepcopy(summary.get("queueSummary") or {}),
+        "enrichment": deepcopy(summary.get("enrichment") or {}),
+    }
+
+
+def _ncentral_preview_run_response(run: dict[str, Any]) -> dict[str, Any]:
+    """Return the stable, tenant-safe progress contract consumed by the wizard."""
+
+    raw_attributes = run.get("attributes")
+    attributes: dict[str, Any] = raw_attributes if isinstance(raw_attributes, dict) else {}
+    stored_progress = run.get("progress")
+    raw_progress: dict[str, Any] = stored_progress if isinstance(stored_progress, dict) else {}
+    status = (
+        "success"
+        if run.get("status") in {"succeeded", "review_required"}
+        else str(run.get("status") or "failed")
+    )
+    discovered = max(
+        0,
+        int(
+            raw_progress.get("discovered")
+            or raw_progress.get("devicesDiscovered")
+            or run.get("discovered")
+            or 0
+        ),
+    )
+    enriched = max(
+        0,
+        int(raw_progress.get("enriched") or raw_progress.get("devicesEnriched") or 0),
+    )
+    reviewed = max(0, int(raw_progress.get("reviewed") or run.get("review") or 0))
+    current = max(0, int(raw_progress.get("current") or discovered or 0))
+    total = max(0, int(raw_progress.get("total") or discovered or 0))
+    percent = raw_progress.get("percent")
+    if percent is None:
+        percent = round(min(100, current * 100 / total), 1) if total else 0
+    progress = {
+        "current": current,
+        "total": total,
+        "percent": max(0, min(100, float(percent))),
+        "discovered": discovered,
+        "enriched": enriched,
+        "reviewed": reviewed,
+    }
+    response = {
+        "id": run["id"],
+        "companyId": str(run.get("companyId") or attributes.get("companyId") or ""),
+        "providerCompanyId": str(
+            run.get("providerCompanyId") or attributes.get("providerCompanyId") or ""
+        ),
+        "policyId": run.get("policyId") or attributes.get("policyId"),
+        "policyRevision": int(attributes.get("policyRevision") or 0),
+        "status": status,
+        "phase": str(run.get("phase") or raw_progress.get("phase") or status),
+        "progress": progress,
+        "message": str(run.get("message") or ""),
+        "startedAt": run.get("startedAt"),
+        "updatedAt": run.get("updatedAt") or run.get("heartbeatAt"),
+        "finishedAt": run.get("finishedAt"),
+        "canCancel": bool(run.get("canCancel", status in {"queued", "running"})),
+        "canRetry": bool(run.get("canRetry", status in {"failed", "cancelled"})),
+        "cancelRequested": bool(run.get("cancelRequested") or run.get("cancelRequestedAt")),
+    }
+    if status == "failed":
+        response["error"] = str(run.get("error") or run.get("message") or "Preview failed.")
+    result = _ncentral_preview_result(run)
+    if result is not None:
+        response["result"] = result
+    return response
+
+
+def _execute_ncentral_device_preview(
+    company_id: str,
+    provider_company_id: str,
+    *,
+    actor_id: str | None,
+    trigger: str,
+) -> dict[str, Any]:
+    """Execute one read-only device preview and refresh the review queue."""
+
+    started_at = core.now()
+    preview = _ncentral_device_preview(company_id, provider_company_id)
+    counts = preview["counts"]
+    message = (
+        f"Read {preview['discovered']} N-central devices for "
+        f"{preview['providerCompanyName']}; the saved policy included {preview['included']} and "
+        f"excluded {preview['excluded']}: {counts['create']} new, {counts['update']} changed, "
+        f"{counts['link']} identity links, {counts['unchanged']} unchanged and "
+        f"{counts['conflict']} requiring review. No CMDB or N-central records were changed."
+    )
+    run = {
+        "id": str(uuid.uuid4()),
+        "type": "ncentral",
+        "status": "success",
+        "startedAt": started_at,
+        "finishedAt": core.now(),
+        "discovered": preview["discovered"],
+        "imported": 0,
+        "updated": 0,
+        "review": counts["create"] + counts["update"] + counts["link"] + counts["conflict"],
+        "message": message,
+        "attributes": {
+            "operation": "device_preview",
+            "trigger": trigger,
+            "companyId": company_id,
+            "providerCompanyId": provider_company_id,
+            "policyId": preview["appliedPolicy"].get("id") or None,
+            "policyRevision": preview["appliedPolicy"].get("revision", 0),
+            "providerFilterId": preview["appliedPolicy"].get("providerFilterId", ""),
+            "included": preview["included"],
+            "excluded": preview["excluded"],
+            "readOnly": True,
+        },
+    }
+    previous_failures = int(preview["appliedPolicy"].get("consecutiveFailures") or 0)
+    completed_policy = None
+    with core.LOCK:
+        stored_run = REPOSITORY.record_sync_run("ncentral", run, True, actor_id)
+        policy_id = str(preview["appliedPolicy"].get("id") or "")
+        queue_summary = (
+            REPOSITORY.replace_ci_review_items(
+                policy_id,
+                company_id,
+                stored_run["id"],
+                preview["items"],
+                actor_id,
+            )
+            if policy_id
+            else {"pending": 0, "created": 0, "updated": 0, "resolved": 0}
+        )
+        if policy_id:
+            completed_policy = REPOSITORY.complete_ci_sync_policy_run(policy_id, success=True)
+    if completed_policy and previous_failures and trigger == "continuous_preview":
+        _queue_integration_alert(
+            {**preview["appliedPolicy"], "lastRunAt": stored_run.get("finishedAt")},
+            event="recovered",
+            detail="The latest N-central continuous preview completed successfully.",
+            consecutive_failures=previous_failures,
+        )
+    return {
+        **preview,
+        "message": message,
+        "syncRunId": stored_run["id"],
+        "queueSummary": queue_summary,
+    }
+
+
+def _record_ncentral_device_preview_failure(
+    policy: dict,
+    error: Exception,
+    *,
+    trigger: str = "continuous_preview",
+    actor_id: str | None = None,
+) -> dict:
+    """Persist a sanitized N-central preview failure and release its lease."""
+
+    label = "Sync now" if trigger == "manual_sync" else "Continuous preview"
+    if isinstance(error, (NcentralConfigurationError, NcentralRequestError)):
+        detail = _ncentral_public_failure(error, "device preview")
+    else:
+        LOGGER.exception("Unexpected N-central device preview failure")
+        detail = "Unexpected integration sync failure"
+    now = core.now()
+    run = {
+        "id": str(uuid.uuid4()),
+        "type": "ncentral",
+        "status": "failed",
+        "startedAt": now,
+        "finishedAt": now,
+        "discovered": 0,
+        "imported": 0,
+        "updated": 0,
+        "review": 0,
+        "message": (
+            f"{label} failed for {policy.get('companyName') or policy['companyId']}: {detail}"
+        ),
+        "attributes": {
+            "operation": "device_preview",
+            "trigger": trigger,
+            "companyId": policy["companyId"],
+            "providerCompanyId": policy["providerParentId"],
+            "policyId": policy["id"],
+            "readOnly": True,
+        },
+    }
+    with core.LOCK:
+        stored_run = REPOSITORY.record_sync_run("ncentral", run, True, actor_id)
+        completed_policy = REPOSITORY.complete_ci_sync_policy_run(
+            policy["id"], success=False, error=detail
+        )
+    failures = int((completed_policy or {}).get("consecutiveFailures") or 0)
+    if trigger == "continuous_preview" and failures:
+        _queue_integration_alert(
+            {**policy, "lastRunAt": stored_run.get("finishedAt")},
+            event="failed",
+            detail=detail,
+            consecutive_failures=failures,
+            retry_delay_minutes=int(
+                (completed_policy or {}).get("retryDelayMinutes")
+                or ci_sync_retry_delay_minutes(failures)
+            ),
+        )
+    return stored_run
+
+
+@api.post("/api/integrations/ncentral/devices/options", tags=["integrations"])
+def get_ncentral_device_options(payload: NcentralDevicePreviewRequest, request: Request) -> dict:
+    """Load device filters and immutable type/status choices for a mapping."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _company_for_user(payload.companyId, user)
+    try:
+        mapped, records, source, policy, filters = _ncentral_device_context(
+            payload.companyId, payload.providerCompanyId
+        )
+    except (NcentralConfigurationError, NcentralRequestError) as error:
+        raise HTTPException(
+            502, _ncentral_public_failure(error, "device discovery options")
+        ) from error
+    catalogue = configuration_catalogue(records)
+    return {
+        "companyId": payload.companyId,
+        "providerCompanyId": payload.providerCompanyId,
+        "providerCompanyName": mapped.get("name") or payload.providerCompanyId,
+        "credentialSource": source,
+        "readOnly": True,
+        "writesAttempted": False,
+        "discovered": len(records),
+        "deviceFilters": filters,
+        "availableTypes": catalogue["types"],
+        "availableStatuses": catalogue["statuses"],
+        "policy": policy,
+    }
+
+
+@api.get("/api/integrations/ncentral/devices/policy", tags=["integrations"])
+def get_ncentral_device_policy(request: Request, companyId: str, providerCompanyId: str) -> dict:
+    """Return a saved N-central device policy for one mapped customer."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _company_for_user(companyId, user)
+    _ncentral_mapped_company(companyId, providerCompanyId)
+    return REPOSITORY.get_ci_sync_policy("ncentral", companyId, providerCompanyId)
+
+
+@api.put("/api/integrations/ncentral/devices/policy", tags=["integrations"])
+def update_ncentral_device_policy(payload: NcentralDevicePolicyRequest, request: Request) -> dict:
+    """Persist an audited, immutable-ID N-central device policy."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    _company_for_user(payload.companyId, user, require_manage=True)
+    _ncentral_mapped_company(payload.companyId, payload.providerCompanyId)
+    try:
+        with core.LOCK:
+            return REPOSITORY.update_ci_sync_policy(
+                "ncentral",
+                payload.companyId,
+                payload.providerCompanyId,
+                normalize_ci_policy(payload.model_dump()),
+                payload.expectedRevision,
+                user["id"],
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+def _ncentral_preview_policy(
+    company_id: str,
+    provider_company_id: str,
+    user: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve one authorized saved policy that can be queued safely."""
+
+    _require_integration_active("ncentral")
+    _company_for_user(company_id, user)
+    _ncentral_mapped_company(company_id, provider_company_id)
+    policy = REPOSITORY.get_ci_sync_policy("ncentral", company_id, provider_company_id)
+    if not policy.get("id"):
+        raise HTTPException(409, "Save the N-central device policy before starting a preview")
+    return policy
+
+
+def _ncentral_preview_run_for_user(run_id: str, user: dict[str, Any]) -> dict[str, Any]:
+    """Return one N-central preview run after tenant and operation checks."""
+
+    run = REPOSITORY.get_sync_run(run_id, company_ids=_permitted_company_ids(user))
+    raw_attributes = run.get("attributes") if run else None
+    attributes: dict[str, Any] = raw_attributes if isinstance(raw_attributes, dict) else {}
+    if not run or run.get("type") != "ncentral" or attributes.get("operation") != "device_preview":
+        raise HTTPException(404, "N-central preview run not found")
+    _company_for_user(
+        str(run.get("companyId") or attributes.get("companyId") or ""),
+        user,
+    )
+    return run
+
+
+@api.post(
+    "/api/integrations/ncentral/devices/preview-runs",
+    status_code=202,
+    tags=["integrations"],
+)
+def queue_ncentral_device_preview(
+    payload: NcentralDevicePreviewRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Queue a restart-safe read-only preview for one mapped N-central customer."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    policy = _ncentral_preview_policy(
+        payload.companyId,
+        payload.providerCompanyId,
+        user,
+    )
+    try:
+        with core.LOCK:
+            run = REPOSITORY.create_ci_preview_run(
+                "ncentral",
+                payload.companyId,
+                payload.providerCompanyId,
+                policy["id"],
+                "manual_preview",
+                user["id"],
+                policy,
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return _ncentral_preview_run_response(run)
+
+
+@api.post(
+    "/api/integrations/ncentral/devices/policies/{policy_id}/preview-runs",
+    status_code=202,
+    tags=["integrations"],
+)
+def queue_ncentral_device_policy_preview(
+    policy_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Queue one saved N-central policy without holding the browser request open."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    policy = next(
+        (
+            item
+            for item in REPOSITORY.list_ci_sync_policies("ncentral")
+            if item.get("id") == policy_id
+        ),
+        None,
+    )
+    if not policy:
+        raise HTTPException(404, "N-central device policy not found")
+    policy = _ncentral_preview_policy(
+        str(policy["companyId"]),
+        str(policy["providerParentId"]),
+        user,
+    )
+    try:
+        with core.LOCK:
+            run = REPOSITORY.create_ci_preview_run(
+                "ncentral",
+                policy["companyId"],
+                policy["providerParentId"],
+                policy["id"],
+                "manual_sync",
+                user["id"],
+                policy,
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return _ncentral_preview_run_response(run)
+
+
+@api.get(
+    "/api/integrations/ncentral/devices/preview-runs/latest",
+    tags=["integrations"],
+)
+def latest_ncentral_device_preview_run(
+    request: Request,
+    companyId: str,
+    providerCompanyId: str,
+) -> dict[str, Any] | None:
+    """Restore the newest preview state for one authorized wizard scope."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _company_for_user(companyId, user)
+    run = REPOSITORY.get_latest_ci_preview_run(
+        "ncentral",
+        companyId,
+        providerCompanyId,
+    )
+    return _ncentral_preview_run_response(run) if run else None
+
+
+@api.get(
+    "/api/integrations/ncentral/devices/preview-runs/{run_id}",
+    tags=["integrations"],
+)
+def get_ncentral_device_preview_run(run_id: str, request: Request) -> dict[str, Any]:
+    """Poll one tenant-scoped durable preview run."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    return _ncentral_preview_run_response(_ncentral_preview_run_for_user(run_id, user))
+
+
+@api.post(
+    "/api/integrations/ncentral/devices/preview-runs/{run_id}/cancel",
+    tags=["integrations"],
+)
+def cancel_ncentral_device_preview_run(run_id: str, request: Request) -> dict[str, Any]:
+    """Request cooperative cancellation without publishing partial observations."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _ncentral_preview_run_for_user(run_id, user)
+    with core.LOCK:
+        run = REPOSITORY.request_sync_run_cancel(run_id, user["id"])
+    if not run:
+        raise HTTPException(404, "N-central preview run not found")
+    return _ncentral_preview_run_response(run)
+
+
+@api.post(
+    "/api/integrations/ncentral/devices/preview-runs/{run_id}/retry",
+    status_code=202,
+    tags=["integrations"],
+)
+def retry_ncentral_device_preview_run(run_id: str, request: Request) -> dict[str, Any]:
+    """Queue an immutable retry of a failed or cancelled preview."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _require_integration_active("ncentral")
+    _ncentral_preview_run_for_user(run_id, user)
+    try:
+        with core.LOCK:
+            run = REPOSITORY.retry_ci_preview_run(run_id, user["id"])
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    if not run:
+        raise HTTPException(404, "N-central preview run not found")
+    return _ncentral_preview_run_response(run)
+
+
+@api.post("/api/integrations/ncentral/devices/preview", tags=["integrations"])
+def preview_ncentral_devices(payload: NcentralDevicePreviewRequest, request: Request) -> dict:
+    """Preview device reconciliation and refresh its durable review queue."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _company_for_user(payload.companyId, user)
+    try:
+        return _execute_ncentral_device_preview(
+            payload.companyId,
+            payload.providerCompanyId,
+            actor_id=user["id"],
+            trigger="manual",
+        )
+    except (NcentralConfigurationError, NcentralRequestError) as error:
+        raise HTTPException(
+            502, _ncentral_public_failure(error, "device reconciliation preview")
+        ) from error
+
+
+@api.post(
+    "/api/integrations/ncentral/devices/policies/{policy_id}/sync-now",
+    tags=["integrations"],
+)
+def sync_ncentral_device_policy_now(policy_id: str, request: Request) -> dict:
+    """Run a saved N-central policy under the continuous-worker lease."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _require_integration_active("ncentral")
+    policy = next(
+        (item for item in REPOSITORY.list_ci_sync_policies("ncentral") if item["id"] == policy_id),
+        None,
+    )
+    if not policy:
+        raise HTTPException(404, "N-central device policy not found")
+    _company_for_user(policy["companyId"], user)
+    claimed = REPOSITORY.claim_ci_sync_policy_now(policy_id, f"manual:{user['id']}:{uuid.uuid4()}")
+    if not claimed:
+        raise HTTPException(409, "This policy is already running; refresh and retry")
+    try:
+        return _execute_ncentral_device_preview(
+            claimed["companyId"],
+            claimed["providerParentId"],
+            actor_id=user["id"],
+            trigger="manual_sync",
+        )
+    except Exception as error:
+        _record_ncentral_device_preview_failure(
+            claimed, error, trigger="manual_sync", actor_id=user["id"]
+        )
+        raise HTTPException(
+            502,
+            (
+                _ncentral_public_failure(error, "operator-triggered device preview")
+                if isinstance(error, (NcentralConfigurationError, NcentralRequestError))
+                else "Unexpected integration sync failure"
+            ),
+        ) from error
+
+
+@api.get("/api/integrations/ncentral/devices/review-queue", tags=["integrations"])
+def list_ncentral_device_review_queue(
+    request: Request,
+    companyId: str | None = None,
+    state: str = "pending",
+    limit: int = 250,
+) -> dict:
+    """Return current N-central device observations awaiting a decision."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    if state not in {"pending", "dismissed", "resolved", "all"}:
+        raise HTTPException(400, "Review state must be pending, dismissed, resolved or all")
+    if companyId:
+        _company_for_user(companyId, user)
+    selected_state = None if state == "all" else state
+    permitted_company_ids = None if companyId else _permitted_company_ids(user)
+    if companyId or permitted_company_ids is None:
+        return {
+            "items": REPOSITORY.list_ci_review_items(
+                "ncentral", companyId, selected_state, max(1, min(limit, 1000))
+            ),
+            "total": REPOSITORY.count_ci_review_items("ncentral", companyId, selected_state),
+        }
+    result = REPOSITORY.query_ci_review_items(
+        kind="ncentral",
+        company_ids=permitted_company_ids,
+        state=selected_state,
+        limit=max(1, min(limit, 1000)),
+    )
+    return {"items": result["items"], "total": result["total"]}
+
+
+@api.post(
+    "/api/integrations/ncentral/devices/review-queue/{item_id}/dismiss",
+    tags=["integrations"],
+)
+def dismiss_ncentral_device_review_item(
+    item_id: str, payload: ConnectWiseReviewDismissRequest, request: Request
+) -> dict:
+    """Dismiss unchanged N-central evidence until its payload changes."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    item = REPOSITORY.get_ci_review_item(item_id)
+    if not item or item.get("provider") != "ncentral":
+        raise HTTPException(404, "N-central review item not found")
+    _company_for_user(item["companyId"], user, require_manage=True)
+    with core.LOCK:
+        stored = REPOSITORY.dismiss_ci_review_item(item_id, payload.notes.strip(), user["id"])
+    if not stored:
+        raise HTTPException(404, "N-central review item not found")
+    return stored
+
+
+def _provider_field_sources(metadata: dict, fields: list[str], provider: str) -> dict:
+    """Record canonical field ownership for one reviewed provider import."""
+
+    stored = deepcopy(metadata)
+    sources = stored.get("fieldSources")
+    field_sources = deepcopy(sources) if isinstance(sources, dict) else {}
+    for field in fields:
+        field_sources[str(field)] = provider
+    stored["fieldSources"] = field_sources
+    return stored
+
+
+@api.post("/api/integrations/ncentral/devices/import", tags=["integrations"])
+def import_ncentral_devices(payload: NcentralDeviceImportRequest, request: Request) -> dict:
+    """Re-read and apply only selected, non-conflicting N-central devices."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    selected_ids = {str(value).strip() for value in payload.externalIds if str(value).strip()}
+    if len(selected_ids) != len(payload.externalIds):
+        raise HTTPException(400, "Device selections must be unique and non-empty")
+    started_at = core.now()
+    try:
+        preview = _ncentral_device_preview(payload.companyId, payload.providerCompanyId)
+    except (NcentralConfigurationError, NcentralRequestError) as error:
+        raise HTTPException(
+            502, _ncentral_public_failure(error, "device import preview")
+        ) from error
+    items_by_id = {item["externalId"]: item for item in preview["items"]}
+    invalid = sorted(
+        external_id
+        for external_id in selected_ids
+        if external_id not in items_by_id
+        or items_by_id[external_id]["action"] not in {"create", "update", "link"}
+    )
+    if invalid:
+        raise HTTPException(
+            409,
+            "The preview changed or contains conflicts. Refresh before importing: "
+            + ", ".join(invalid[:10]),
+        )
+    created = 0
+    updated = 0
+    linked = 0
+    with core.LOCK:
+        for external_id in selected_ids:
+            item = items_by_id[external_id]
+            record = item["record"]
+            asset_id = item.get("assetId")
+            applied_fields = item.get("appliedFields") or item.get("changedFields") or []
+            if item["action"] == "create":
+                asset = {
+                    "id": str(uuid.uuid4()),
+                    "companyId": payload.companyId,
+                    "name": record["name"],
+                    "type": record["type"],
+                    "status": record["status"],
+                    "source": "ncentral",
+                    "externalId": record["externalId"],
+                    "lastSeen": core.now(),
+                    "fields": record.get("fields") or {},
+                    "metadata": _provider_field_sources(
+                        core.normalise_metadata(record.get("metadata") or {}, record["status"]),
+                        applied_fields,
+                        "ncentral",
+                    ),
+                }
+                asset_id = REPOSITORY.create_asset(asset, user["id"])["id"]
+                created += 1
+            elif item["action"] == "update":
+                changes = {
+                    **item["changes"],
+                    "source": "ncentral",
+                    "externalId": record["externalId"],
+                    "lastSeen": core.now(),
+                }
+                current_asset = next(
+                    (asset for asset in REPOSITORY.list_assets() if asset["id"] == asset_id),
+                    None,
+                )
+                current_metadata = deepcopy((current_asset or {}).get("metadata") or {})
+                changes["metadata"] = _provider_field_sources(
+                    core.normalise_metadata(
+                        changes.get("metadata") or current_metadata,
+                        changes.get("status", record["status"]),
+                    ),
+                    applied_fields,
+                    "ncentral",
+                )
+                if not asset_id or not REPOSITORY.update_asset(asset_id, changes, user["id"]):
+                    raise HTTPException(409, "A selected device changed during import")
+                updated += 1
+            else:
+                linked += 1
+            if not asset_id:
+                raise HTTPException(409, "A selected device has no canonical target")
+            REPOSITORY.record_provider_ci_mapping(
+                "ncentral", payload.companyId, record, asset_id, user["id"]
+            )
+        remaining_review = sum(
+            item["action"] in {"create", "update", "link", "conflict"}
+            and item["externalId"] not in selected_ids
+            for item in preview["items"]
+        )
+        message = (
+            f"Imported {created} new, updated {updated} and linked {linked} N-central devices "
+            f"for {preview['companyName']}. {remaining_review} remain for review. "
+            "No data was written to N-central."
+        )
+        run = REPOSITORY.record_sync_run(
+            "ncentral",
+            {
+                "id": str(uuid.uuid4()),
+                "type": "ncentral",
+                "status": "review_required" if remaining_review else "success",
+                "startedAt": started_at,
+                "finishedAt": core.now(),
+                "discovered": preview["discovered"],
+                "imported": created + linked,
+                "updated": updated,
+                "review": remaining_review,
+                "message": message,
+                "attributes": {
+                    "operation": "device_import",
+                    "companyId": payload.companyId,
+                    "providerCompanyId": payload.providerCompanyId,
+                    "writesProvider": False,
+                    "decisionNotes": payload.decisionNotes.strip(),
+                },
+            },
+            True,
+            user["id"],
+        )
+        policy_id = str(preview["appliedPolicy"].get("id") or "")
+        if policy_id:
+            REPOSITORY.resolve_ci_review_items(policy_id, sorted(selected_ids), user["id"])
+    return {**run, "created": created, "updated": updated, "linked": linked}
+
+
+@api.post("/api/integrations/ncentral/devices/link", tags=["integrations"])
+def link_ncentral_device(payload: NcentralDeviceLinkRequest, request: Request) -> dict:
+    """Link one reviewed N-central identity without repeating provider discovery."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    target = _asset_for_user(payload.assetId, user, require_manage=True)
+    if target["companyId"] != payload.companyId:
+        raise HTTPException(409, "The target CI belongs to another customer")
+    _ncentral_mapped_company(payload.companyId, payload.providerCompanyId)
+    item = REPOSITORY.get_ci_review_item_by_identity(
+        "ncentral",
+        payload.companyId,
+        payload.providerCompanyId,
+        payload.externalId,
+        "pending",
+    )
+    record = item.get("providerRecord") if item else None
+    if not item or not isinstance(record, dict) or record.get("externalId") != payload.externalId:
+        raise HTTPException(
+            409,
+            "The reviewed N-central device is unavailable. Run preview again before linking.",
+        )
+    with core.LOCK:
+        mapping = REPOSITORY.record_provider_ci_mapping(
+            "ncentral", payload.companyId, record, target["id"], user["id"]
+        )
+        policy_id = str(item.get("policyId") or "")
+        if policy_id:
+            REPOSITORY.resolve_ci_review_items(policy_id, [payload.externalId], user["id"])
+    return {
+        "linked": True,
+        "externalId": payload.externalId,
+        "assetId": target["id"],
+        "assetName": target["name"],
+        "mapping": mapping,
+        "reviewItemId": item["id"],
+        "message": (
+            f"{item['externalName']} was linked to {target['name']} by immutable N-central "
+            "device ID. No provider request or provider write was made."
+        ),
+    }
 
 
 @api.get("/api/integrations/connectwise/config", tags=["integrations"])
@@ -5408,16 +7037,154 @@ def _record_connectwise_ci_preview_failure(
     return stored_run
 
 
-def _run_due_integration_previews(limit: int = 5) -> dict[str, int]:
-    """Drain a bounded number of leased read-only policies for this worker cycle."""
+class _IntegrationPreviewLeaseLost(RuntimeError):
+    """Stop work when another worker legitimately owns a recovered preview."""
 
-    worker_id = f"{os.getpid()}:{uuid.uuid4()}"
+
+def _queued_ncentral_preview_message(preview: dict[str, Any]) -> str:
+    """Describe a completed read-only preview using aggregate evidence only."""
+
+    counts = preview["counts"]
+    return (
+        f"Read {preview['discovered']} N-central devices for "
+        f"{preview['providerCompanyName']}; the saved policy included "
+        f"{preview['included']} and excluded {preview['excluded']}: "
+        f"{counts['create']} new, {counts['update']} changed, "
+        f"{counts['link']} identity links, {counts['unchanged']} unchanged and "
+        f"{counts['conflict']} requiring review. "
+        "No CMDB or N-central records were changed."
+    )
+
+
+def _execute_queued_ncentral_preview(run: dict[str, Any], worker_id: str) -> None:
+    """Execute one claimed preview with heartbeats and cooperative cancellation."""
+
+    run_id = str(run["id"])
+    company_id = str(run.get("companyId") or "")
+    provider_company_id = str(run.get("providerCompanyId") or "")
+    policy_id = str(run.get("policyId") or "")
+    actor_id = run.get("requestedByUserId")
+    trigger = str(run.get("trigger") or "manual_preview")
+    last_progress_at = 0.0
+    last_phase = ""
+    cancel_checked_at = 0.0
+    cached_cancelled = False
+
+    def cancel_requested() -> bool:
+        nonlocal cancel_checked_at, cached_cancelled
+        now = time.monotonic()
+        if now - cancel_checked_at >= 0.35:
+            with core.LOCK:
+                cached_cancelled = REPOSITORY.is_sync_run_cancel_requested(
+                    run_id,
+                    worker_id,
+                )
+            cancel_checked_at = now
+        return cached_cancelled
+
+    def publish_progress(progress: dict[str, Any], *, force: bool = False) -> None:
+        nonlocal last_progress_at, last_phase
+        now = time.monotonic()
+        phase = str(progress.get("phase") or "running")
+        terminal_count = bool(progress.get("total")) and (
+            int(progress.get("current") or 0) >= int(progress.get("total") or 0)
+        )
+        if (
+            not force
+            and phase == last_phase
+            and not terminal_count
+            and now - last_progress_at < 0.75
+        ):
+            return
+        messages = {
+            "starting": "Connecting to N-central with the saved read-only policy.",
+            "discovering": "Reading the filtered N-central device inventory.",
+            "enriching": "Reading bounded hardware and network detail.",
+            "reconciling": "Comparing immutable provider identities with CMDB assets.",
+            "persisting": "Publishing reviewable observations.",
+        }
+        with core.LOCK:
+            renewed = REPOSITORY.renew_ci_preview_run(
+                run_id,
+                worker_id,
+                progress,
+                messages.get(phase, "N-central preview is running."),
+            )
+        if not renewed:
+            raise _IntegrationPreviewLeaseLost("Preview lease is no longer owned")
+        last_progress_at = now
+        last_phase = phase
+
+    publish_progress(
+        {
+            "phase": "starting",
+            "current": 0,
+            "total": 0,
+            "discovered": 0,
+            "enriched": 0,
+            "reviewed": 0,
+        },
+        force=True,
+    )
+    if cancel_requested():
+        raise NcentralOperationCancelled("N-central preview was cancelled")
+    preview = _ncentral_device_preview(
+        company_id,
+        provider_company_id,
+        progress_callback=publish_progress,
+        cancel_requested=cancel_requested,
+        policy_override=(
+            run.get("policySnapshot") if isinstance(run.get("policySnapshot"), dict) else None
+        ),
+    )
+    if cancel_requested():
+        raise NcentralOperationCancelled("N-central preview was cancelled")
+    message = _queued_ncentral_preview_message(preview)
+    with core.LOCK:
+        if REPOSITORY.is_sync_run_cancel_requested(run_id, worker_id):
+            raise NcentralOperationCancelled("N-central preview was cancelled")
+        queue_summary = REPOSITORY.replace_ci_review_items(
+            policy_id,
+            company_id,
+            run_id,
+            preview["items"],
+            actor_id,
+        )
+        summary = {
+            key: deepcopy(value)
+            for key, value in preview.items()
+            if key not in {"items", "credentialSource"}
+        }
+        summary.update(queueSummary=queue_summary, message=message)
+        completed = REPOSITORY.complete_ci_preview_run(
+            run_id,
+            worker_id,
+            summary,
+            actor_id,
+        )
+        if not completed:
+            raise _IntegrationPreviewLeaseLost("Preview lease expired before completion")
+        if completed.get("status") == "cancelled":
+            raise NcentralOperationCancelled("N-central preview was cancelled")
+        if trigger == "manual_sync":
+            REPOSITORY.complete_ci_sync_policy_run(policy_id, success=True)
+        else:
+            REPOSITORY.release_ci_sync_policy_lease(policy_id)
+
+
+def _process_queued_integration_previews(
+    worker_id: str,
+    limit: int,
+) -> dict[str, int]:
+    """Drain operator-triggered durable jobs before scheduled preview policies."""
+
     processed = 0
     succeeded = 0
     failed = 0
-    for _index in range(max(1, min(limit, 25))):
-        policy = REPOSITORY.claim_due_ci_sync_policy("connectwise", worker_id)
-        if not policy:
+    for _index in range(max(0, min(limit, 25))):
+        with core.LOCK:
+            run = REPOSITORY.claim_ci_preview_run(worker_id, provider="ncentral")
+        if not run:
             break
         processed += 1
         token = set_audit_context(
@@ -5428,18 +7195,103 @@ def _run_due_integration_previews(limit: int = 5) -> dict[str, int]:
             )
         )
         try:
-            _execute_connectwise_ci_preview(
-                policy["companyId"],
-                policy["providerParentId"],
-                actor_id=None,
-                trigger="continuous_preview",
+            _execute_queued_ncentral_preview(run, worker_id)
+            succeeded += 1
+        except _IntegrationPreviewLeaseLost:
+            # A stale worker must never overwrite the worker that reclaimed it.
+            LOGGER.warning("Stopped N-central preview %s after losing its lease", run["id"])
+        except NcentralOperationCancelled:
+            with core.LOCK:
+                cancelled = REPOSITORY.fail_ci_preview_run(
+                    run["id"],
+                    worker_id,
+                    "N-central preview cancelled by an operator.",
+                    run.get("requestedByUserId"),
+                    cancelled=True,
+                )
+                if cancelled:
+                    REPOSITORY.release_ci_sync_policy_lease(str(run.get("policyId") or ""))
+        except Exception as error:  # Worker boundaries must finish owned runs.
+            failed += 1
+            if isinstance(error, (NcentralConfigurationError, NcentralRequestError)):
+                detail = _ncentral_public_failure(error, "device reconciliation preview")
+            else:
+                LOGGER.exception("Unexpected queued N-central preview failure")
+                detail = "Unexpected integration preview failure"
+            with core.LOCK:
+                failed_run = REPOSITORY.fail_ci_preview_run(
+                    run["id"],
+                    worker_id,
+                    detail,
+                    run.get("requestedByUserId"),
+                )
+                if failed_run and run.get("trigger") == "manual_sync":
+                    REPOSITORY.complete_ci_sync_policy_run(
+                        str(run.get("policyId") or ""),
+                        success=False,
+                        error=detail,
+                    )
+                elif failed_run:
+                    REPOSITORY.release_ci_sync_policy_lease(str(run.get("policyId") or ""))
+        finally:
+            reset_audit_context(token)
+    return {"processed": processed, "succeeded": succeeded, "failed": failed}
+
+
+def _run_due_integration_previews(limit: int = 5) -> dict[str, int]:
+    """Drain durable jobs, then optionally run due continuous-preview policies."""
+
+    worker_id = f"{os.getpid()}:{uuid.uuid4()}"
+    queued = _process_queued_integration_previews(worker_id, limit)
+    processed = queued["processed"]
+    succeeded = queued["succeeded"]
+    failed = queued["failed"]
+    if not _worker_flag("INTEGRATION_WORKER_ENABLED") or processed >= limit:
+        return {"processed": processed, "succeeded": succeeded, "failed": failed}
+    providers = ("connectwise", "ncentral")
+    for index in range(max(0, min(limit - processed, 25))):
+        provider = providers[index % len(providers)]
+        policy = REPOSITORY.claim_due_ci_sync_policy(provider, worker_id)
+        if not policy:
+            fallback = providers[(index + 1) % len(providers)]
+            policy = REPOSITORY.claim_due_ci_sync_policy(fallback, worker_id)
+            provider = fallback
+        if not policy:
+            if index >= len(providers) - 1:
+                break
+            continue
+        processed += 1
+        token = set_audit_context(
+            AuditContext(
+                request_id=str(uuid.uuid4()),
+                correlation_id=str(uuid.uuid4()),
+                source_system="integration_worker",
             )
+        )
+        try:
+            if provider == "ncentral":
+                _execute_ncentral_device_preview(
+                    policy["companyId"],
+                    policy["providerParentId"],
+                    actor_id=None,
+                    trigger="continuous_preview",
+                )
+            else:
+                _execute_connectwise_ci_preview(
+                    policy["companyId"],
+                    policy["providerParentId"],
+                    actor_id=None,
+                    trigger="continuous_preview",
+                )
             succeeded += 1
         except Exception as error:  # Worker boundaries must release leases for every failure.
             failed += 1
-            LOGGER.exception("Continuous ConnectWise preview failed for policy %s", policy["id"])
+            LOGGER.exception("Continuous %s preview failed for policy %s", provider, policy["id"])
             try:
-                _record_connectwise_ci_preview_failure(policy, error)
+                if provider == "ncentral":
+                    _record_ncentral_device_preview_failure(policy, error)
+                else:
+                    _record_connectwise_ci_preview_failure(policy, error)
             except Exception:
                 LOGGER.exception(
                     "Could not persist integration worker failure for %s", policy["id"]
@@ -5604,34 +7456,45 @@ def continuous_preview_status(request: Request) -> dict:
     permitted_company_ids = _permitted_company_ids(user)
     policies = [
         item
-        for item in REPOSITORY.list_ci_sync_policies("connectwise")
+        for kind in ("connectwise", "ncentral")
+        for item in REPOSITORY.list_ci_sync_policies(kind)
         if permitted_company_ids is None or item.get("companyId") in permitted_company_ids
     ]
-    pending_reviews = REPOSITORY.query_ci_review_items(
-        kind="connectwise",
-        company_ids=permitted_company_ids,
-        state="pending",
-        limit=1,
-    )["total"]
-    connection_enabled = bool(_connectwise_connection_public().get("enabled"))
+    pending_reviews = sum(
+        REPOSITORY.query_ci_review_items(
+            kind=kind,
+            company_ids=permitted_company_ids,
+            state="pending",
+            limit=1,
+        )["total"]
+        for kind in ("connectwise", "ncentral")
+    )
+    enabled_connections = {
+        "connectwise": bool(_connectwise_connection_public().get("enabled")),
+        "ncentral": bool(_ncentral_connection_public().get("enabled")),
+    }
     runtime = _worker_runtime_summary(
         "integrations",
-        _worker_flag("INTEGRATION_WORKER_ENABLED"),
+        True,
         _integration_worker_interval(),
     )
     return {
         **runtime,
         "workerIntervalSeconds": _integration_worker_interval(),
+        "scheduledPoliciesEnabled": _worker_flag("INTEGRATION_WORKER_ENABLED"),
         "notificationWorkerEnabled": _worker_flag("NOTIFICATION_WORKER_ENABLED"),
         "alertDeliveryConfigured": _integration_alert_delivery_ready(),
         "alertRecipientCount": len(_integration_alert_recipients()),
         "providerRateLimit": REPOSITORY.get_provider_rate_limit("connectwise"),
+        "providerRateLimits": {
+            kind: REPOSITORY.get_provider_rate_limit(kind) for kind in ("connectwise", "ncentral")
+        },
         "enabledPolicies": sum(
-            item.get("enabled") and item.get("syncMode") == "continuous_preview"
+            item.get("enabled")
+            and item.get("syncMode") == "continuous_preview"
+            and enabled_connections.get(str(item.get("provider")), False)
             for item in policies
-        )
-        if connection_enabled
-        else 0,
+        ),
         "pendingReviews": pending_reviews,
         "policies": policies,
     }
@@ -5916,6 +7779,13 @@ def run_integration_sync(kind: str, request: Request) -> dict:
             raise HTTPException(
                 502, _connectwise_public_failure(error, "company discovery")
             ) from error
+    if kind == "ncentral":
+        try:
+            return _run_ncentral_company_discovery(user)
+        except (NcentralConfigurationError, NcentralRequestError) as error:
+            raise HTTPException(
+                502, _ncentral_public_failure(error, "organization discovery")
+            ) from error
     run = core.execute_sync(kind)
     with core.LOCK:
         return REPOSITORY.record_sync_run(kind, run, core.configured(kind), user["id"])
@@ -5940,7 +7810,15 @@ def list_sync_runs(
     )
     if provider and provider not in SUPPORTED_INTEGRATION_KINDS:
         raise HTTPException(400, "Choose a supported integration provider")
-    allowed_statuses = {"success", "review_required", "blocked", "failed"}
+    allowed_statuses = {
+        "queued",
+        "running",
+        "success",
+        "review_required",
+        "blocked",
+        "failed",
+        "cancelled",
+    }
     if status and status not in allowed_statuses:
         raise HTTPException(400, "Choose a valid sync status")
     if operation and not re.fullmatch(r"[a-z][a-z0-9_]{1,79}", operation):

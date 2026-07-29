@@ -33,6 +33,21 @@ def record(external_id: str, name: str, serial: str = "") -> dict:
 class IntegrationReconciliationTests(unittest.TestCase):
     """Keep provider IDs authoritative and mutable names review-only."""
 
+    def test_enrichment_mode_is_explicit_and_invalid_values_use_balanced(self):
+        self.assertEqual(normalize_ci_policy(None)["enrichmentMode"], "balanced")
+        for mode in ("fast", "balanced", "full"):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    normalize_ci_policy({"enrichmentMode": mode})["enrichmentMode"],
+                    mode,
+                )
+        for invalid in ("", "everything", "FULL", 42):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(
+                    normalize_ci_policy({"enrichmentMode": invalid})["enrichmentMode"],
+                    "balanced",
+                )
+
     def test_continuous_sync_retry_delay_is_exponential_and_bounded(self):
         """Worker retries should slow repeated failures without going silent."""
 

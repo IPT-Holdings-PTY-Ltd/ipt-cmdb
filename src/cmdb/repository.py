@@ -44,7 +44,10 @@ PROVIDER_TO_DB = {
 PROVIDER_FROM_DB = {value: key for key, value in PROVIDER_TO_DB.items()}
 CREDENTIAL_REFERENCES = {
     "connectwise": "env://CW_BASE_URL,CW_COMPANY_ID,CW_PUBLIC_KEY,CW_PRIVATE_KEY,CW_CLIENT_ID",
-    "ncentral": "env://NCENTRAL_BASE_URL,NCENTRAL_API_TOKEN",
+    "ncentral": (
+        "env://NCENTRAL_BASE_URL,"
+        "NCENTRAL_USER_API_TOKEN|NCENTRAL_USER_API_TOKEN_FILE|NCENTRAL_API_TOKEN"
+    ),
     "passportal": "env://PASSPORTAL_BASE_URL,PASSPORTAL_API_TOKEN",
 }
 DEFAULT_MSP_BRANDING = {
@@ -146,6 +149,211 @@ def parse_timestamp(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+ACTIVE_CI_PREVIEW_RUN_STATUSES = {"queued", "running"}
+RETRYABLE_CI_PREVIEW_RUN_STATUSES = {"failed", "cancelled"}
+
+
+def _ci_preview_dedupe_key(
+    kind: str,
+    company_id: str,
+    provider_parent_id: str,
+    policy_id: str | None,
+) -> str:
+    """Return a stable, non-secret key that prevents concurrent scope previews."""
+
+    scope = str(policy_id or f"{company_id}:{provider_parent_id}").strip()
+    return hashlib.sha256(f"{kind}:ci_preview:{scope}".encode()).hexdigest()
+
+
+def _ci_preview_operation(kind: str) -> str:
+    """Return the provider-neutral history operation for a CI preview."""
+
+    return "device_preview" if kind == "ncentral" else "configuration_preview"
+
+
+def _bounded_preview_progress(value: Any, *, fallback_phase: str = "") -> dict[str, Any]:
+    """Return a small JSON-safe progress document without provider record payloads."""
+
+    source = value if isinstance(value, dict) else {}
+    counts = source.get("counts") if isinstance(source.get("counts"), dict) else {}
+    progress = {
+        key: deepcopy(source[key])
+        for key in (
+            "phase",
+            "pagesCompleted",
+            "devicesDiscovered",
+            "devicesEnriched",
+            "discovered",
+            "enriched",
+            "reviewed",
+            "current",
+            "total",
+            "percent",
+            "included",
+            "excluded",
+        )
+        if key in source
+    }
+    discovered = source.get("discovered", source.get("devicesDiscovered"))
+    enriched = source.get("enriched", source.get("devicesEnriched"))
+    if discovered is not None:
+        progress["discovered"] = max(0, int(discovered or 0))
+    if enriched is not None:
+        progress["enriched"] = max(0, int(enriched or 0))
+    if "current" in progress:
+        progress["current"] = max(0, int(progress["current"] or 0))
+    if "total" in progress:
+        progress["total"] = max(0, int(progress["total"] or 0))
+    if "reviewed" in progress:
+        progress["reviewed"] = max(0, int(progress["reviewed"] or 0))
+    if "percent" in progress:
+        progress["percent"] = max(0, min(float(progress["percent"] or 0), 100))
+    if counts:
+        progress["counts"] = {
+            key: max(0, int(counts.get(key) or 0))
+            for key in ("create", "update", "link", "unchanged", "conflict")
+        }
+    phase = str(progress.get("phase") or fallback_phase or "")[:80]
+    if phase:
+        progress["phase"] = phase
+    else:
+        progress.pop("phase", None)
+    return progress
+
+
+def _sanitized_preview_summary(value: Any) -> dict[str, Any]:
+    """Retain aggregate preview evidence while excluding full provider records."""
+
+    source: dict[str, Any] = value if isinstance(value, dict) else {}
+    raw_counts = source.get("counts")
+    counts: dict[str, Any] = raw_counts if isinstance(raw_counts, dict) else {}
+    raw_queue = source.get("queueSummary")
+    queue: dict[str, Any] = raw_queue if isinstance(raw_queue, dict) else {}
+    raw_policy = source.get("appliedPolicy")
+    policy: dict[str, Any] = raw_policy if isinstance(raw_policy, dict) else {}
+    raw_exclusions = source.get("exclusionReasons")
+    exclusions: dict[str, Any] = raw_exclusions if isinstance(raw_exclusions, dict) else {}
+    raw_mapping = source.get("typeMappingSummary")
+    mapping: dict[str, Any] = raw_mapping if isinstance(raw_mapping, dict) else {}
+    raw_unmapped = mapping.get("unmappedTypes")
+    unmapped = raw_unmapped if isinstance(raw_unmapped, list) else []
+    raw_enrichment = source.get("enrichment")
+    enrichment: dict[str, Any] = raw_enrichment if isinstance(raw_enrichment, dict) else {}
+    applied_policy: dict[str, Any] = {}
+    if policy:
+        for key in (
+            "id",
+            "provider",
+            "companyId",
+            "providerParentId",
+            "revision",
+        ):
+            if key in policy:
+                applied_policy[key] = deepcopy(policy[key])
+        applied_policy.update(normalize_ci_policy(policy))
+    return {
+        "discovered": max(0, int(source.get("discovered") or 0)),
+        "included": max(0, int(source.get("included") or 0)),
+        "excluded": max(0, int(source.get("excluded") or 0)),
+        "exclusionReasons": {
+            str(key)[:120]: max(0, int(exclusions[key] or 0))
+            for key in sorted(exclusions, key=str)[:50]
+        },
+        "counts": {
+            key: max(0, int(counts.get(key) or 0))
+            for key in ("create", "update", "link", "unchanged", "conflict")
+        },
+        "queueSummary": {
+            key: max(0, int(queue.get(key) or 0))
+            for key in ("pending", "created", "updated", "resolved")
+        },
+        "typeMappingSummary": {
+            key: max(0, int(mapping.get(key) or 0)) for key in ("mapped", "unmapped", "blocked")
+        }
+        | {
+            "unmappedTypes": [
+                {
+                    "id": str(item.get("id") or "")[:160],
+                    "name": str(item.get("name") or "")[:240],
+                    "count": max(0, int(item.get("count") or 0)),
+                }
+                for item in unmapped[:100]
+                if isinstance(item, dict)
+            ]
+        },
+        "appliedPolicy": applied_policy,
+        "enrichment": {
+            "mode": (
+                str(enrichment.get("mode"))
+                if str(enrichment.get("mode")) in {"fast", "balanced", "full"}
+                else "balanced"
+            ),
+            "assetDetailsRequested": max(
+                0,
+                min(int(enrichment.get("assetDetailsRequested") or 0), 250),
+            ),
+            "bounded": bool(enrichment.get("bounded", True)),
+            "reason": str(enrichment.get("reason") or "")[:240],
+        },
+    }
+
+
+def _public_sync_run(
+    value: dict[str, Any],
+    *,
+    include_internal: bool = False,
+) -> dict[str, Any]:
+    """Return a worker-safe run without exposing internal ownership or dedupe state."""
+
+    run = deepcopy(value)
+    for key in ("leaseOwner", "leaseUntil", "dedupeKey"):
+        run.pop(key, None)
+    if run.get("status") == "succeeded":
+        run["status"] = "success"
+    status = str(run.get("status") or "")
+    progress = _bounded_preview_progress(
+        run.get("progress"),
+        fallback_phase=(
+            "completed"
+            if status in {"success", "review_required"}
+            else ("cancelled" if status == "cancelled" else status)
+        ),
+    )
+    run["progress"] = progress
+    run["phase"] = progress.get("phase") or status
+    run["cancelRequested"] = bool(run.get("cancelRequestedAt"))
+    run["canCancel"] = status in ACTIVE_CI_PREVIEW_RUN_STATUSES and not bool(
+        run.get("cancelRequestedAt")
+    )
+    run["canRetry"] = status in RETRYABLE_CI_PREVIEW_RUN_STATUSES
+    raw_attributes = run.get("attributes")
+    attributes: dict[str, Any] = raw_attributes if isinstance(raw_attributes, dict) else {}
+    run.setdefault("providerCompanyId", attributes.get("providerCompanyId"))
+    run.setdefault("policyId", attributes.get("policyId"))
+    run.setdefault("trigger", attributes.get("trigger", ""))
+    run.setdefault("requestedByUserId", run.pop("requestedBy", None))
+    summary = _sanitized_preview_summary(attributes.get("resultSummary") or {})
+    run["previewSummary"] = summary if attributes.get("resultSummary") else None
+    if include_internal:
+        run["attributes"] = attributes
+        run["policySnapshot"] = deepcopy(attributes.get("policySnapshot") or {})
+    else:
+        run["attributes"] = {
+            key: deepcopy(attributes[key])
+            for key in (
+                "operation",
+                "trigger",
+                "companyId",
+                "providerCompanyId",
+                "policyId",
+                "policyRevision",
+                "readOnly",
+            )
+            if key in attributes
+        }
+    return run
 
 
 def updated_worker_runtime(
@@ -2965,6 +3173,50 @@ class StateRepository:
             **deepcopy(record),
         }
 
+    def ensure_integration_connection(
+        self, kind: str, name: str, actor_id: str | None = None
+    ) -> dict:
+        """Install a supported root provider row before its first configuration save."""
+
+        existing = self.get_integration_connection(kind)
+        if existing:
+            return existing
+        if kind not in CREDENTIAL_REFERENCES:
+            raise ValueError("Unsupported integration provider")
+        record = {
+            "id": kind,
+            "name": name[:160],
+            "type": kind,
+            "enabled": False,
+            "mode": "configured_in_application",
+            "lastSync": None,
+            "status": "Not configured",
+            "scope": "msp",
+            "configuration": {"scope": "msp", "mode": "configured_in_application"},
+            "credentialsEncrypted": "",
+            "credentialsNonce": "",
+            "connectionStatus": "not_configured",
+            "lastTestAt": None,
+            "lastError": "",
+            "revision": 1,
+            "lifecycleStatus": "active",
+            "lifecycleReason": "",
+            "createdAt": utc_now(),
+            "updatedAt": utc_now(),
+        }
+        self.state.setdefault("integrations", []).append(record)
+        self._audit(
+            None,
+            actor_id,
+            "integration_connection",
+            kind,
+            "installed",
+            None,
+            integration_connection_audit_value(record),
+        )
+        self.save_state(self.state)
+        return self.get_integration_connection(kind) or deepcopy(record)
+
     def update_integration_connection(
         self, kind: str, changes: dict, actor_id: str | None = None
     ) -> dict:
@@ -3129,7 +3381,7 @@ class StateRepository:
             "connection_tested",
             before,
             after,
-            outcome="success" if status == "verified" else "failure",
+            outcome="success" if status == "verified" else "failed",
             reason=message,
         )
         self.save_state(self.state)
@@ -3439,6 +3691,12 @@ class StateRepository:
                 continue
             if not policy.get("enabled") or policy.get("syncMode") != "continuous_preview":
                 continue
+            if any(
+                run.get("policyId") == policy.get("id")
+                and run.get("status") in ACTIVE_CI_PREVIEW_RUN_STATUSES
+                for run in self.state.get("syncRuns", [])
+            ):
+                continue
             next_run = parse_timestamp(policy.get("nextRunAt"))
             lease_until = parse_timestamp(policy.get("leaseUntil"))
             if next_run and next_run > now:
@@ -3474,6 +3732,11 @@ class StateRepository:
             None,
         )
         if not policy:
+            return None
+        if any(
+            run.get("policyId") == policy_id and run.get("status") in ACTIVE_CI_PREVIEW_RUN_STATUSES
+            for run in self.state.get("syncRuns", [])
+        ):
             return None
         connection = self.get_integration_connection(str(policy.get("provider") or ""))
         if (
@@ -3790,6 +4053,35 @@ class StateRepository:
             "blockedFields": deepcopy(evidence.get("blockedFields") or []),
             "fieldDecisions": deepcopy(evidence.get("fieldDecisions") or []),
         }
+
+    def get_ci_review_item_by_identity(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        external_id: str,
+        state: str | None = "pending",
+    ) -> dict | None:
+        """Return one exact provider observation without depending on queue pagination."""
+
+        policy_ids = {
+            item["id"]
+            for item in self.state.get("integrationCiPolicies", [])
+            if item.get("provider") == kind
+            and item.get("companyId") == company_id
+            and item.get("providerParentId") == provider_parent_id
+        }
+        raw = next(
+            (
+                item
+                for item in self.state.get("integrationCiReviewItems", [])
+                if item.get("policyId") in policy_ids
+                and item.get("externalId") == external_id
+                and (state is None or item.get("state") == state)
+            ),
+            None,
+        )
+        return self.get_ci_review_item(str(raw["id"])) if raw else None
 
     def dismiss_ci_review_item(self, item_id: str, notes: str, actor_id: str) -> dict | None:
         """Dismiss one unchanged review observation with audited notes."""
@@ -4189,6 +4481,615 @@ class StateRepository:
         self.save_state(self.state)
         return deepcopy(mapping)
 
+    def _retain_sync_runs(self) -> None:
+        """Bound local history without ever discarding active preview work."""
+
+        retained: list[dict] = []
+        terminal_count = 0
+        ordered = sorted(
+            self.state.get("syncRuns", []),
+            key=lambda item: (
+                item.get("requestedAt") or item.get("startedAt") or "",
+                item.get("id") or "",
+            ),
+            reverse=True,
+        )
+        for run in ordered:
+            if run.get("status") in ACTIVE_CI_PREVIEW_RUN_STATUSES:
+                retained.append(run)
+            elif terminal_count < 250:
+                retained.append(run)
+                terminal_count += 1
+        self.state["syncRuns"] = retained
+
+    def _clear_state_policy_lease(self, policy_id: str | None) -> None:
+        """Clear one local policy lease without creating a second state write."""
+
+        if not policy_id:
+            return
+        policy = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("id") == policy_id
+            ),
+            None,
+        )
+        if policy:
+            policy["leaseOwner"] = None
+            policy["leaseUntil"] = None
+
+    def create_ci_preview_run(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        policy_id: str,
+        trigger: str,
+        actor_id: str | None,
+        policy_snapshot: dict,
+        retry_of_id: str | None = None,
+    ) -> dict:
+        """Queue one immutable preview request and deduplicate its active scope."""
+
+        dedupe_key = _ci_preview_dedupe_key(
+            kind,
+            company_id,
+            provider_parent_id,
+            policy_id,
+        )
+        active = next(
+            (
+                item
+                for item in self.state.get("syncRuns", [])
+                if item.get("dedupeKey") == dedupe_key
+                and item.get("status") in ACTIVE_CI_PREVIEW_RUN_STATUSES
+            ),
+            None,
+        )
+        if active:
+            return _public_sync_run(active)
+        timestamp = utc_now()
+        snapshot = deepcopy(policy_snapshot or {})
+        selected_trigger = str(trigger or "manual_preview")[:80]
+        policy = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("id") == policy_id
+                and item.get("provider") == kind
+                and item.get("companyId") == company_id
+                and item.get("providerParentId") == provider_parent_id
+            ),
+            None,
+        )
+        if not policy:
+            raise ValueError("CI preview policy not found")
+        lease_until = parse_timestamp(policy.get("leaseUntil"))
+        if lease_until and lease_until > datetime.now(UTC):
+            raise ValueError("This policy is already running; refresh and retry")
+        run_id = str(uuid.uuid4())
+        run: dict[str, Any] = {
+            "id": run_id,
+            "type": kind,
+            "status": "queued",
+            "message": "Preview queued for background processing.",
+            "startedAt": None,
+            "finishedAt": None,
+            "discovered": 0,
+            "imported": 0,
+            "updated": 0,
+            "review": 0,
+            "companyId": company_id,
+            "providerCompanyId": provider_parent_id,
+            "policyId": policy_id or None,
+            "trigger": selected_trigger,
+            "requestedBy": actor_id,
+            "requestedAt": timestamp,
+            "availableAt": timestamp,
+            "attemptCount": 0,
+            "maxAttempts": 3,
+            "leaseOwner": None,
+            "leaseUntil": None,
+            "heartbeatAt": None,
+            "cancelRequestedAt": None,
+            "cancelledAt": None,
+            "retryOfId": retry_of_id,
+            "dedupeKey": dedupe_key,
+            "progress": {"phase": "queued"},
+            "updatedAt": timestamp,
+            "attributes": {
+                "operation": _ci_preview_operation(kind),
+                "trigger": selected_trigger,
+                "companyId": company_id,
+                "providerCompanyId": provider_parent_id,
+                "policyId": policy_id or None,
+                "policyRevision": int(snapshot.get("revision") or 0),
+                "policySnapshot": snapshot,
+                "readOnly": True,
+            },
+        }
+        policy["leaseOwner"] = f"queued:{run_id}"[:120]
+        policy["leaseUntil"] = (
+            (datetime.now(UTC) + timedelta(seconds=3600)).isoformat().replace("+00:00", "Z")
+        )
+        self.state.setdefault("syncRuns", []).insert(0, run)
+        self._retain_sync_runs()
+        self._audit(
+            company_id,
+            actor_id,
+            "sync_run",
+            run["id"],
+            "queued",
+            None,
+            _public_sync_run(run),
+            metadata={
+                "provider": kind,
+                "policyId": policy_id or None,
+                "retryOfId": retry_of_id,
+            },
+        )
+        self.save_state(self.state)
+        return _public_sync_run(run)
+
+    def claim_ci_preview_run(
+        self,
+        worker_id: str,
+        provider: str | None = None,
+        lease_seconds: int = 180,
+    ) -> dict | None:
+        """Claim queued or stale preview work in the local development repository."""
+
+        now = datetime.now(UTC)
+        lease_duration = max(30, min(int(lease_seconds), 3600))
+        eligible: list[dict] = []
+        changed = False
+        for run in self.state.get("syncRuns", []):
+            if provider and run.get("type") != provider:
+                continue
+            status = run.get("status")
+            available_at = parse_timestamp(run.get("availableAt"))
+            lease_until = parse_timestamp(run.get("leaseUntil"))
+            due = status == "queued" and (available_at is None or available_at <= now)
+            stale = status == "running" and (lease_until is None or lease_until <= now)
+            if not (due or stale):
+                continue
+            if int(run.get("attemptCount") or 0) >= int(run.get("maxAttempts") or 3):
+                cancelled = bool(run.get("cancelRequestedAt"))
+                timestamp = utc_now()
+                run.update(
+                    status="cancelled" if cancelled else "failed",
+                    message=(
+                        "Preview cancelled."
+                        if cancelled
+                        else "Preview failed after the maximum number of attempts."
+                    ),
+                    finishedAt=timestamp,
+                    cancelledAt=timestamp if cancelled else None,
+                    leaseOwner=None,
+                    leaseUntil=None,
+                    heartbeatAt=timestamp,
+                    progress={"phase": "cancelled" if cancelled else "failed"},
+                    updatedAt=timestamp,
+                )
+                self._clear_state_policy_lease(run.get("policyId"))
+                changed = True
+                continue
+            eligible.append(run)
+        if not eligible:
+            if changed:
+                self._retain_sync_runs()
+                self.save_state(self.state)
+            return None
+        run = min(
+            eligible,
+            key=lambda item: (
+                parse_timestamp(item.get("availableAt"))
+                or parse_timestamp(item.get("requestedAt"))
+                or now,
+                str(item.get("id") or ""),
+            ),
+        )
+        timestamp = utc_now()
+        claimed_lease_until = (
+            (now + timedelta(seconds=lease_duration)).isoformat().replace("+00:00", "Z")
+        )
+        run.update(
+            status="running",
+            startedAt=run.get("startedAt") or timestamp,
+            attemptCount=int(run.get("attemptCount") or 0) + 1,
+            leaseOwner=str(worker_id)[:160],
+            leaseUntil=claimed_lease_until,
+            heartbeatAt=timestamp,
+            progress={
+                **_bounded_preview_progress(run.get("progress")),
+                "phase": "cancelling" if run.get("cancelRequestedAt") else "starting",
+            },
+            updatedAt=timestamp,
+        )
+        policy = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("id") == run.get("policyId")
+            ),
+            None,
+        )
+        if policy:
+            policy["leaseOwner"] = str(worker_id)[:120]
+            policy["leaseUntil"] = claimed_lease_until
+        self._audit(
+            run.get("companyId"),
+            None,
+            "sync_run",
+            run["id"],
+            "claimed",
+            None,
+            {"status": "running", "attemptCount": run["attemptCount"]},
+            metadata={"provider": run.get("type"), "worker": True},
+            actor_type="system",
+            source_system="integration_worker",
+        )
+        self.save_state(self.state)
+        return _public_sync_run(run, include_internal=True)
+
+    def renew_ci_preview_run(
+        self,
+        run_id: str,
+        worker_id: str,
+        progress: dict,
+        message: str = "",
+        lease_seconds: int = 180,
+    ) -> dict | None:
+        """Renew an owned local job lease and publish bounded progress."""
+
+        run = next(
+            (item for item in self.state.get("syncRuns", []) if item.get("id") == run_id),
+            None,
+        )
+        if (
+            not run
+            or run.get("status") != "running"
+            or run.get("leaseOwner") != str(worker_id)[:160]
+        ):
+            return None
+        now = datetime.now(UTC)
+        timestamp = now.isoformat().replace("+00:00", "Z")
+        run.update(
+            heartbeatAt=timestamp,
+            leaseUntil=(now + timedelta(seconds=max(30, min(int(lease_seconds), 3600))))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            progress={
+                **_bounded_preview_progress(run.get("progress")),
+                **_bounded_preview_progress(progress),
+            },
+            updatedAt=timestamp,
+        )
+        if message:
+            run["message"] = str(message)[:1000]
+        policy = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("id") == run.get("policyId")
+            ),
+            None,
+        )
+        if policy:
+            policy["leaseOwner"] = str(worker_id)[:120]
+            policy["leaseUntil"] = run["leaseUntil"]
+        self.save_state(self.state)
+        return _public_sync_run(run)
+
+    def get_sync_run(
+        self,
+        run_id: str,
+        company_ids: Iterable[str] | None = None,
+    ) -> dict | None:
+        """Return one scoped sync run."""
+
+        run = next(
+            (item for item in self.state.get("syncRuns", []) if item.get("id") == run_id),
+            None,
+        )
+        if not run:
+            return None
+        permitted = set(company_ids) if company_ids is not None else None
+        company_id = run.get("companyId") or (run.get("attributes") or {}).get("companyId")
+        if permitted is not None and company_id is not None and company_id not in permitted:
+            return None
+        return _public_sync_run(run)
+
+    def get_latest_ci_preview_run(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+    ) -> dict | None:
+        """Return the newest preview job for one provider/customer scope."""
+
+        matches = [
+            item
+            for item in self.state.get("syncRuns", [])
+            if item.get("type") == kind
+            and (item.get("companyId") or (item.get("attributes") or {}).get("companyId"))
+            == company_id
+            and (
+                item.get("providerCompanyId")
+                or (item.get("attributes") or {}).get("providerCompanyId")
+            )
+            == provider_parent_id
+            and (item.get("attributes") or {}).get("operation") == _ci_preview_operation(kind)
+        ]
+        if not matches:
+            return None
+        return _public_sync_run(
+            max(
+                matches,
+                key=lambda item: (
+                    item.get("requestedAt") or item.get("startedAt") or "",
+                    item.get("id") or "",
+                ),
+            )
+        )
+
+    def is_sync_run_cancel_requested(
+        self,
+        run_id: str,
+        worker_id: str | None = None,
+    ) -> bool:
+        """Return whether the current owner should cooperatively stop a run."""
+
+        run = next(
+            (item for item in self.state.get("syncRuns", []) if item.get("id") == run_id),
+            None,
+        )
+        if not run:
+            return False
+        if worker_id is not None and run.get("leaseOwner") != str(worker_id)[:160]:
+            return False
+        return bool(run.get("cancelRequestedAt") or run.get("status") == "cancelled")
+
+    def request_sync_run_cancel(
+        self,
+        run_id: str,
+        actor_id: str | None,
+    ) -> dict | None:
+        """Cancel queued work immediately or flag owned work for cooperative stop."""
+
+        run = next(
+            (item for item in self.state.get("syncRuns", []) if item.get("id") == run_id),
+            None,
+        )
+        if not run:
+            return None
+        before = _public_sync_run(run)
+        timestamp = utc_now()
+        if run.get("status") == "queued":
+            run.update(
+                status="cancelled",
+                message="Preview cancelled before execution.",
+                finishedAt=timestamp,
+                cancelRequestedAt=timestamp,
+                cancelledAt=timestamp,
+                progress={"phase": "cancelled"},
+                leaseOwner=None,
+                leaseUntil=None,
+                updatedAt=timestamp,
+            )
+            self._clear_state_policy_lease(run.get("policyId"))
+        elif run.get("status") == "running" and not run.get("cancelRequestedAt"):
+            run.update(
+                cancelRequestedAt=timestamp,
+                progress={
+                    **_bounded_preview_progress(run.get("progress")),
+                    "phase": "cancelling",
+                },
+                message="Cancellation requested; waiting for the current provider request.",
+                updatedAt=timestamp,
+            )
+        self._audit(
+            run.get("companyId"),
+            actor_id,
+            "sync_run",
+            run["id"],
+            "cancel_requested",
+            before,
+            _public_sync_run(run),
+        )
+        self._retain_sync_runs()
+        self.save_state(self.state)
+        return _public_sync_run(run)
+
+    def complete_ci_preview_run(
+        self,
+        run_id: str,
+        worker_id: str,
+        preview_summary: dict,
+        actor_id: str | None = None,
+    ) -> dict | None:
+        """Complete an owned preview while retaining only aggregate result evidence."""
+
+        run = next(
+            (item for item in self.state.get("syncRuns", []) if item.get("id") == run_id),
+            None,
+        )
+        if (
+            not run
+            or run.get("status") != "running"
+            or run.get("leaseOwner") != str(worker_id)[:160]
+        ):
+            return None
+        if run.get("cancelRequestedAt"):
+            return self.fail_ci_preview_run(
+                run_id,
+                worker_id,
+                "Preview cancelled.",
+                actor_id,
+                cancelled=True,
+            )
+        summary = _sanitized_preview_summary(preview_summary)
+        timestamp = utc_now()
+        message = str(preview_summary.get("message") or "Preview completed.")[:1000]
+        review_count = sum(
+            summary["counts"].get(key, 0) for key in ("create", "update", "link", "conflict")
+        )
+        previous_progress = _bounded_preview_progress(run.get("progress"))
+        run.update(
+            status="success",
+            message=message,
+            finishedAt=timestamp,
+            discovered=summary["discovered"],
+            review=review_count,
+            leaseOwner=None,
+            leaseUntil=None,
+            heartbeatAt=timestamp,
+            progress={
+                "phase": "completed",
+                "discovered": summary["discovered"],
+                "enriched": int(previous_progress.get("enriched") or 0),
+                "included": summary["included"],
+                "excluded": summary["excluded"],
+                "reviewed": review_count,
+                "current": summary["discovered"],
+                "total": summary["discovered"],
+                "percent": 100,
+                "counts": summary["counts"],
+            },
+            updatedAt=timestamp,
+        )
+        run.setdefault("attributes", {})["resultSummary"] = summary
+        self._clear_state_policy_lease(run.get("policyId"))
+        self._audit(
+            run.get("companyId"),
+            actor_id,
+            "sync_run",
+            run["id"],
+            "completed",
+            None,
+            _public_sync_run(run),
+            metadata={"provider": run.get("type")},
+            actor_type="system" if actor_id is None else "user",
+            source_system="integration_worker" if actor_id is None else "web",
+        )
+        self._retain_sync_runs()
+        self.save_state(self.state)
+        return _public_sync_run(run)
+
+    def fail_ci_preview_run(
+        self,
+        run_id: str,
+        worker_id: str,
+        error: Any,
+        actor_id: str | None = None,
+        cancelled: bool = False,
+    ) -> dict | None:
+        """Fail or cooperatively cancel an owned preview run."""
+
+        run = next(
+            (item for item in self.state.get("syncRuns", []) if item.get("id") == run_id),
+            None,
+        )
+        if (
+            not run
+            or run.get("status") != "running"
+            or run.get("leaseOwner") != str(worker_id)[:160]
+        ):
+            return None
+        was_cancelled = cancelled or bool(run.get("cancelRequestedAt"))
+        timestamp = utc_now()
+        detail = "Preview cancelled." if was_cancelled else str(error)[:1000]
+        run.update(
+            status="cancelled" if was_cancelled else "failed",
+            message=detail,
+            finishedAt=timestamp,
+            cancelledAt=timestamp if was_cancelled else None,
+            leaseOwner=None,
+            leaseUntil=None,
+            heartbeatAt=timestamp,
+            progress={"phase": "cancelled" if was_cancelled else "failed"},
+            updatedAt=timestamp,
+        )
+        self._clear_state_policy_lease(run.get("policyId"))
+        self._audit(
+            run.get("companyId"),
+            actor_id,
+            "sync_run",
+            run["id"],
+            "cancelled" if was_cancelled else "failed",
+            None,
+            _public_sync_run(run),
+            outcome="success" if was_cancelled else "failed",
+            severity="informational" if was_cancelled else "warning",
+            reason="" if was_cancelled else detail,
+            metadata={"provider": run.get("type")},
+            actor_type="system" if actor_id is None else "user",
+            source_system="integration_worker" if actor_id is None else "web",
+        )
+        self._retain_sync_runs()
+        self.save_state(self.state)
+        return _public_sync_run(run)
+
+    def retry_ci_preview_run(self, run_id: str, actor_id: str | None) -> dict:
+        """Queue a new immutable attempt for a retryable terminal preview."""
+
+        source = next(
+            (item for item in self.state.get("syncRuns", []) if item.get("id") == run_id),
+            None,
+        )
+        if not source:
+            raise ValueError("Sync run not found")
+        if source.get("status") not in RETRYABLE_CI_PREVIEW_RUN_STATUSES:
+            raise ValueError("Only failed or cancelled preview runs can be retried")
+        attributes = source.get("attributes") or {}
+        return self.create_ci_preview_run(
+            str(source.get("type") or ""),
+            str(source.get("companyId") or attributes.get("companyId") or ""),
+            str(source.get("providerCompanyId") or attributes.get("providerCompanyId") or ""),
+            str(source.get("policyId") or attributes.get("policyId") or ""),
+            "retry",
+            actor_id,
+            deepcopy(attributes.get("policySnapshot") or {}),
+            retry_of_id=source["id"],
+        )
+
+    def release_ci_sync_policy_lease(self, policy_id: str) -> dict | None:
+        """Release one local policy lease without changing its schedule."""
+
+        policy = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("id") == policy_id
+            ),
+            None,
+        )
+        if not policy:
+            return None
+        policy["leaseOwner"] = None
+        policy["leaseUntil"] = None
+        self.save_state(self.state)
+        return self.get_ci_sync_policy(
+            str(policy.get("provider") or ""),
+            str(policy.get("companyId") or ""),
+            str(policy.get("providerParentId") or ""),
+        )
+
+    def list_ci_review_items_for_run(
+        self,
+        kind: str,
+        run_id: str,
+        company_id: str,
+    ) -> list[dict]:
+        """Return reviewable observations produced by one completed local run."""
+
+        return [
+            item
+            for item in self.list_ci_review_items(kind, company_id, None, 1000)
+            if item.get("lastRunId") == run_id
+        ]
+
     def list_sync_runs(
         self,
         kind: str | None = None,
@@ -4221,7 +5122,7 @@ class StateRepository:
             ):
                 continue
             item["attributes"] = deepcopy(attributes)
-            records.append(item)
+            records.append(_public_sync_run(item))
         return records[: max(1, min(limit, 250))]
 
     def list_audit_events(
@@ -4336,7 +5237,8 @@ class StateRepository:
         actor_id: str | None = None,
     ) -> dict:
         stored = deepcopy(run)
-        self.state["syncRuns"] = [stored, *self.state.get("syncRuns", [])[:49]]
+        self.state["syncRuns"] = [stored, *self.state.get("syncRuns", [])]
+        self._retain_sync_runs()
         integration = next(
             (item for item in self.state.get("integrations", []) if item["type"] == kind),
             None,
@@ -4360,7 +5262,7 @@ class StateRepository:
                 integration,
             )
         self.save_state(self.state)
-        return deepcopy(stored)
+        return _public_sync_run(stored)
 
     def get_msp_branding(self) -> dict:
         return {**DEFAULT_MSP_BRANDING, **deepcopy(self.state.get("mspBranding") or {})}
@@ -8623,6 +9525,67 @@ class PostgresCmdbRepository(StateRepository):
             "lifecycleChangedBy": str(row[17]) if row[17] else None,
         }
 
+    def ensure_integration_connection(
+        self, kind: str, name: str, actor_id: str | None = None
+    ) -> dict:
+        """Install a supported root provider row before its first configuration save."""
+
+        existing = self.get_integration_connection(kind)
+        if existing:
+            return existing
+        if kind not in CREDENTIAL_REFERENCES:
+            raise ValueError("Unsupported integration provider")
+        connection_id = canonical_uuid("integration_connection", kind)
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        configuration = {"scope": "msp", "mode": "configured_in_application"}
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO integration_connections (
+                    id, slug, company_id, provider, name, credential_reference,
+                    configuration, enabled
+                ) VALUES (
+                    %s::uuid, %s, NULL, %s, %s, %s, %s::jsonb, false
+                )
+                ON CONFLICT (slug) DO NOTHING
+                RETURNING id
+                """,
+                (
+                    connection_id,
+                    kind,
+                    provider,
+                    name[:160],
+                    CREDENTIAL_REFERENCES[kind],
+                    json.dumps(configuration),
+                ),
+            )
+            inserted = cursor.fetchone()
+            if inserted:
+                self._insert_audit(
+                    cursor,
+                    None,
+                    actor_id,
+                    "integration_connection",
+                    str(inserted[0]),
+                    "installed",
+                    None,
+                    {
+                        "id": kind,
+                        "name": name[:160],
+                        "type": kind,
+                        "enabled": False,
+                        "scope": "msp",
+                        "configuration": configuration,
+                        "revision": 1,
+                        "lifecycleStatus": "active",
+                        "hasCredentials": False,
+                    },
+                )
+        installed = self.get_integration_connection(kind)
+        if not installed:
+            raise ValueError("Integration connection could not be installed")
+        return installed
+
     def update_integration_connection(
         self, kind: str, changes: dict, actor_id: str | None = None
     ) -> dict:
@@ -8652,7 +9615,7 @@ class PostgresCmdbRepository(StateRepository):
                     configuration = %s::jsonb,
                     credentials_encrypted = %s,
                     credentials_nonce = %s,
-                    credential_reference = 'encrypted://integration/connectwise',
+                    credential_reference = %s,
                     enabled = %s,
                     lifecycle_status = %s,
                     lifecycle_reason = CASE WHEN %s THEN %s ELSE lifecycle_reason END,
@@ -8671,6 +9634,7 @@ class PostgresCmdbRepository(StateRepository):
                     or before.get("credentialsEncrypted")
                     or None,
                     changes.get("credentialsNonce") or before.get("credentialsNonce") or None,
+                    f"encrypted://integration/{kind}",
                     enabled,
                     lifecycle_status,
                     lifecycle_changed,
@@ -8903,7 +9867,7 @@ class PostgresCmdbRepository(StateRepository):
                 "connection_tested",
                 integration_connection_audit_value(before),
                 integration_connection_audit_value(after),
-                outcome="success" if status == "verified" else "failure",
+                outcome="success" if status == "verified" else "failed",
                 reason=message,
             )
         return self.get_integration_connection(kind) or after
@@ -9317,6 +10281,7 @@ class PostgresCmdbRepository(StateRepository):
         filter_policy = {
             key: normalized[key]
             for key in (
+                "providerFilterId",
                 "typeMode",
                 "includedTypeIds",
                 "typeMappings",
@@ -9326,6 +10291,7 @@ class PostgresCmdbRepository(StateRepository):
                 "excludedExternalIds",
             )
         }
+        filter_policy["enrichmentMode"] = str(normalized.get("enrichmentMode") or "balanced")
         policy_uuid = canonical_uuid(
             "integration_ci_policy",
             f"{kind}:{company_id}:{provider_parent_id}:configuration",
@@ -9481,6 +10447,12 @@ class PostgresCmdbRepository(StateRepository):
                       AND policy.sync_mode = 'continuous_preview'
                       AND (policy.next_run_at IS NULL OR policy.next_run_at <= now())
                       AND (policy.lease_until IS NULL OR policy.lease_until < now())
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM sync_runs run
+                          WHERE run.policy_id = policy.id
+                            AND run.status IN ('queued', 'running')
+                      )
                     ORDER BY policy.next_run_at NULLS FIRST, policy.updated_at
                     FOR UPDATE OF policy SKIP LOCKED
                     LIMIT 1
@@ -9546,6 +10518,12 @@ class PostgresCmdbRepository(StateRepository):
                   AND integration.enabled = true
                   AND integration.lifecycle_status = 'active'
                   AND (policy.lease_until IS NULL OR policy.lease_until < now())
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM sync_runs run
+                      WHERE run.policy_id = policy.id
+                        AND run.status IN ('queued', 'running')
+                  )
                 RETURNING policy.id, integration.provider, company.slug, company.name,
                           policy.external_parent_id, policy.filter_policy, policy.sync_mode,
                           policy.interval_minutes, policy.enabled, policy.revision,
@@ -9963,6 +10941,52 @@ class PostgresCmdbRepository(StateRepository):
                 WHERE item.id = %s::uuid
                 """,
                 (parsed_id,),
+            )
+            row = cursor.fetchone()
+        return self._ci_review_from_row(row) if row else None
+
+    def get_ci_review_item_by_identity(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        external_id: str,
+        state: str | None = "pending",
+    ) -> dict | None:
+        """Return one exact provider observation without loading the review queue."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT item.id, integration.provider, policy.id, company.slug, company.name,
+                       policy.external_parent_id, item.external_id, item.external_name,
+                       item.decision, item.candidate_ci_id, ci.display_name, item.reason,
+                       item.provider_record, item.evidence, item.state,
+                       item.first_seen_at, item.last_seen_at, item.reviewed_at,
+                       item.review_notes
+                FROM integration_ci_review_items item
+                JOIN integration_ci_policies policy ON policy.id = item.policy_id
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = item.company_id
+                LEFT JOIN configuration_items ci ON ci.id = item.candidate_ci_id
+                WHERE integration.provider = %s
+                  AND company.slug = %s
+                  AND policy.external_parent_id = %s
+                  AND item.external_id = %s
+                  AND (%s::text IS NULL OR item.state = %s)
+                ORDER BY item.last_seen_at DESC
+                LIMIT 1
+                """,
+                (
+                    provider,
+                    company_id,
+                    provider_parent_id,
+                    external_id,
+                    state,
+                    state,
+                ),
             )
             row = cursor.fetchone()
         return self._ci_review_from_row(row) if row else None
@@ -11648,6 +12672,899 @@ class PostgresCmdbRepository(StateRepository):
         self.state.setdefault("auditEvents", [])
         return self.bootstrap()
 
+    @staticmethod
+    def _ci_preview_run_from_row(row: tuple) -> dict[str, Any]:
+        """Normalize one canonical sync-run row, retaining internal lease state."""
+
+        attributes = row[10] or {}
+        company_id = row[11] or attributes.get("companyId")
+        policy_id = str(row[12]) if row[12] else attributes.get("policyId")
+        return {
+            "id": str(row[0]),
+            "type": PROVIDER_FROM_DB.get(row[1], row[1]),
+            "status": "success" if row[2] == "succeeded" else row[2],
+            "message": row[3] or "",
+            "startedAt": PostgresCmdbRepository._timestamp(row[4]) or None,
+            "finishedAt": PostgresCmdbRepository._timestamp(row[5]) or None,
+            "discovered": int(row[6] or 0),
+            "imported": int(row[7] or 0),
+            "updated": int(row[8] or 0),
+            "review": int(row[9] or 0),
+            "attributes": attributes,
+            "companyId": company_id,
+            "providerCompanyId": attributes.get("providerCompanyId"),
+            "policyId": policy_id,
+            "trigger": attributes.get("trigger", ""),
+            "requestedBy": str(row[13]) if row[13] else None,
+            "requestedAt": PostgresCmdbRepository._timestamp(row[14]),
+            "availableAt": PostgresCmdbRepository._timestamp(row[15]),
+            "attemptCount": int(row[16] or 0),
+            "maxAttempts": int(row[17] or 3),
+            "leaseOwner": row[18] or None,
+            "leaseUntil": PostgresCmdbRepository._timestamp(row[19]) or None,
+            "heartbeatAt": PostgresCmdbRepository._timestamp(row[20]) or None,
+            "cancelRequestedAt": PostgresCmdbRepository._timestamp(row[21]) or None,
+            "cancelledAt": PostgresCmdbRepository._timestamp(row[22]) or None,
+            "retryOfId": str(row[23]) if row[23] else None,
+            "dedupeKey": row[24] or None,
+            "progress": row[25] or {},
+            "updatedAt": PostgresCmdbRepository._timestamp(row[26]),
+            "errorSummary": row[27] or "",
+        }
+
+    @staticmethod
+    def _select_ci_preview_run(
+        cursor: Any,
+        run_id: str,
+        *,
+        company_ids: Iterable[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Select one sync run with optional canonical customer scoping."""
+
+        restrict_companies = company_ids is not None
+        permitted_companies = sorted(set(company_ids or []))
+        cursor.execute(
+            """
+            SELECT run.id, integration.provider, run.status, run.message,
+                   run.started_at, run.finished_at, run.discovered_count,
+                   run.created_count, run.updated_count, run.review_count,
+                   run.attributes, company.slug, run.policy_id, run.requested_by,
+                   run.requested_at, run.available_at, run.attempt_count,
+                   run.max_attempts, run.lease_owner, run.lease_until,
+                   run.heartbeat_at, run.cancel_requested_at, run.cancelled_at,
+                   run.retry_of_id, run.dedupe_key, run.progress, run.updated_at,
+                   run.error_summary
+            FROM sync_runs run
+            JOIN integration_connections integration
+              ON integration.id = run.integration_connection_id
+            LEFT JOIN companies company ON company.id = run.company_id
+            WHERE run.id::text = %s
+              AND (
+                %s = false
+                OR COALESCE(company.slug, run.attributes ->> 'companyId') IS NULL
+                OR COALESCE(company.slug, run.attributes ->> 'companyId')
+                    = ANY(%s::text[])
+              )
+            """,
+            (run_id, restrict_companies, permitted_companies),
+        )
+        row = cursor.fetchone()
+        return PostgresCmdbRepository._ci_preview_run_from_row(row) if row else None
+
+    def create_ci_preview_run(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        policy_id: str,
+        trigger: str,
+        actor_id: str | None,
+        policy_snapshot: dict,
+        retry_of_id: str | None = None,
+    ) -> dict:
+        """Queue and reserve one policy-scoped preview in canonical PostgreSQL."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        run_id = str(uuid.uuid4())
+        dedupe_key = _ci_preview_dedupe_key(
+            kind,
+            company_id,
+            provider_parent_id,
+            policy_id,
+        )
+        selected_trigger = str(trigger or "manual_preview")[:80]
+        snapshot = deepcopy(policy_snapshot or {})
+        attributes = {
+            "operation": _ci_preview_operation(kind),
+            "trigger": selected_trigger,
+            "companyId": company_id,
+            "providerCompanyId": provider_parent_id,
+            "policyId": policy_id,
+            "policyRevision": int(snapshot.get("revision") or 0),
+            "policySnapshot": snapshot,
+            "readOnly": True,
+        }
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT integration.id, company.id, policy.id, policy.lease_until
+                FROM integration_ci_policies policy
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = policy.company_id
+                WHERE policy.id::text = %s
+                  AND integration.provider = %s
+                  AND integration.company_id IS NULL
+                  AND integration.enabled = true
+                  AND integration.lifecycle_status = 'active'
+                  AND company.slug = %s
+                  AND policy.external_parent_id = %s
+                FOR UPDATE OF policy
+                """,
+                (policy_id, provider, company_id, provider_parent_id),
+            )
+            policy_row = cursor.fetchone()
+            if not policy_row:
+                raise ValueError("CI preview policy not found or integration is inactive")
+            integration_id, company_uuid, canonical_policy_id, policy_lease_until = policy_row
+            cursor.execute(
+                """
+                SELECT id::text
+                FROM sync_runs
+                WHERE policy_id = %s::uuid
+                  AND status IN ('queued', 'running')
+                ORDER BY requested_at DESC
+                LIMIT 1
+                """,
+                (str(canonical_policy_id),),
+            )
+            active = cursor.fetchone()
+            if active:
+                existing = self._select_ci_preview_run(cursor, active[0])
+                if existing:
+                    return _public_sync_run(existing)
+            if policy_lease_until and policy_lease_until > datetime.now(UTC):
+                raise ValueError("This policy is already running; refresh and retry")
+            cursor.execute(
+                """
+                INSERT INTO sync_runs (
+                    id, integration_connection_id, company_id, policy_id,
+                    requested_by, retry_of_id, status, requested_at, available_at,
+                    started_at, finished_at, attempt_count, max_attempts,
+                    dedupe_key, progress, message, attributes, updated_at
+                ) VALUES (
+                    %s::uuid, %s::uuid, %s::uuid, %s::uuid,
+                    %s::uuid, %s::uuid, 'queued', now(), now(),
+                    NULL, NULL, 0, 3, %s, '{"phase":"queued"}'::jsonb,
+                    'Preview queued for background processing.', %s::jsonb, now()
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING id
+                """,
+                (
+                    run_id,
+                    str(integration_id),
+                    str(company_uuid),
+                    str(canonical_policy_id),
+                    actor_id,
+                    retry_of_id,
+                    dedupe_key,
+                    json.dumps(attributes),
+                ),
+            )
+            inserted = cursor.fetchone()
+            if not inserted:
+                cursor.execute(
+                    """
+                    SELECT id::text
+                    FROM sync_runs
+                    WHERE policy_id = %s::uuid
+                      AND status IN ('queued', 'running')
+                    ORDER BY requested_at DESC
+                    LIMIT 1
+                    """,
+                    (str(canonical_policy_id),),
+                )
+                active = cursor.fetchone()
+                if not active:
+                    raise ValueError("Could not queue the integration preview")
+                existing = self._select_ci_preview_run(cursor, active[0])
+                if not existing:
+                    raise ValueError("Could not load the active integration preview")
+                return _public_sync_run(existing)
+            cursor.execute(
+                """
+                UPDATE integration_ci_policies
+                SET lease_owner = %s,
+                    lease_until = now() + interval '1 hour'
+                WHERE id = %s::uuid
+                """,
+                (f"queued:{run_id}"[:120], str(canonical_policy_id)),
+            )
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "sync_run",
+                run_id,
+                "queued",
+                None,
+                {
+                    "status": "queued",
+                    "provider": kind,
+                    "policyId": str(canonical_policy_id),
+                    "retryOfId": retry_of_id,
+                },
+            )
+        stored = self.get_sync_run(run_id)
+        if not stored:
+            raise ValueError("Queued integration preview could not be loaded")
+        return stored
+
+    def get_sync_run(
+        self,
+        run_id: str,
+        company_ids: Iterable[str] | None = None,
+    ) -> dict | None:
+        """Return one canonical sync run using server-enforced customer scope."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            run = self._select_ci_preview_run(cursor, run_id, company_ids=company_ids)
+        return _public_sync_run(run) if run else None
+
+    def get_latest_ci_preview_run(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+    ) -> dict | None:
+        """Return the newest canonical preview for a provider/customer scope."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT run.id::text
+                FROM sync_runs run
+                JOIN integration_connections integration
+                  ON integration.id = run.integration_connection_id
+                JOIN companies company ON company.id = run.company_id
+                WHERE integration.provider = %s
+                  AND company.slug = %s
+                  AND run.attributes ->> 'providerCompanyId' = %s
+                  AND run.attributes ->> 'operation' = %s
+                ORDER BY run.requested_at DESC, run.id DESC
+                LIMIT 1
+                """,
+                (
+                    PROVIDER_TO_DB.get(kind, kind),
+                    company_id,
+                    provider_parent_id,
+                    _ci_preview_operation(kind),
+                ),
+            )
+            row = cursor.fetchone()
+            run = self._select_ci_preview_run(cursor, row[0]) if row else None
+        return _public_sync_run(run) if run else None
+
+    def claim_ci_preview_run(
+        self,
+        worker_id: str,
+        provider: str | None = None,
+        lease_seconds: int = 180,
+    ) -> dict | None:
+        """Atomically claim queued or stale work across PostgreSQL replicas."""
+
+        selected_provider = PROVIDER_TO_DB.get(provider, provider) if provider else None
+        bounded_lease = max(30, min(int(lease_seconds), 3600))
+        claimed_id: str | None = None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH exhausted AS (
+                    SELECT run.id
+                    FROM sync_runs run
+                    JOIN integration_connections integration
+                      ON integration.id = run.integration_connection_id
+                    WHERE (%s::text IS NULL OR integration.provider = %s)
+                      AND run.attempt_count >= run.max_attempts
+                      AND (
+                        (run.status = 'queued' AND run.available_at <= now())
+                        OR (
+                            run.status = 'running'
+                            AND COALESCE(run.lease_until, run.updated_at) <= now()
+                        )
+                      )
+                    FOR UPDATE OF run SKIP LOCKED
+                )
+                UPDATE sync_runs target
+                SET status = CASE
+                        WHEN target.cancel_requested_at IS NULL THEN 'failed'
+                        ELSE 'cancelled'
+                    END,
+                    message = CASE
+                        WHEN target.cancel_requested_at IS NULL
+                            THEN 'Preview failed after the maximum number of attempts.'
+                        ELSE 'Preview cancelled.'
+                    END,
+                    error_summary = CASE
+                        WHEN target.cancel_requested_at IS NULL
+                            THEN 'Maximum preview attempts reached'
+                        ELSE NULL
+                    END,
+                    finished_at = now(),
+                    cancelled_at = CASE
+                        WHEN target.cancel_requested_at IS NULL THEN NULL
+                        ELSE now()
+                    END,
+                    lease_owner = NULL,
+                    lease_until = NULL,
+                    heartbeat_at = now(),
+                    progress = jsonb_build_object(
+                        'phase',
+                        CASE
+                            WHEN target.cancel_requested_at IS NULL THEN 'failed'
+                            ELSE 'cancelled'
+                        END
+                    ),
+                    updated_at = now()
+                FROM exhausted
+                WHERE target.id = exhausted.id
+                RETURNING target.policy_id
+                """,
+                (selected_provider, selected_provider),
+            )
+            exhausted_policy_ids = [str(row[0]) for row in cursor.fetchall() if row[0]]
+            if exhausted_policy_ids:
+                cursor.execute(
+                    """
+                    UPDATE integration_ci_policies
+                    SET lease_owner = NULL, lease_until = NULL
+                    WHERE id = ANY(%s::uuid[])
+                    """,
+                    (exhausted_policy_ids,),
+                )
+            cursor.execute(
+                """
+                WITH candidate AS (
+                    SELECT run.id, company.slug AS company_slug,
+                           integration.provider, run.policy_id
+                    FROM sync_runs run
+                    JOIN integration_connections integration
+                      ON integration.id = run.integration_connection_id
+                    LEFT JOIN companies company ON company.id = run.company_id
+                    WHERE (%s::text IS NULL OR integration.provider = %s)
+                      AND integration.enabled = true
+                      AND integration.lifecycle_status = 'active'
+                      AND run.attempt_count < run.max_attempts
+                      AND (
+                        (run.status = 'queued' AND run.available_at <= now())
+                        OR (
+                            run.status = 'running'
+                            AND COALESCE(run.lease_until, run.updated_at) <= now()
+                        )
+                      )
+                    ORDER BY
+                        CASE WHEN run.status = 'queued' THEN 0 ELSE 1 END,
+                        run.available_at,
+                        run.requested_at,
+                        run.id
+                    FOR UPDATE OF run SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE sync_runs target
+                SET status = 'running',
+                    started_at = COALESCE(target.started_at, now()),
+                    attempt_count = target.attempt_count + 1,
+                    lease_owner = %s,
+                    lease_until = now() + (%s * interval '1 second'),
+                    heartbeat_at = now(),
+                    progress = target.progress || jsonb_build_object(
+                        'phase',
+                        CASE
+                            WHEN target.cancel_requested_at IS NULL THEN 'starting'
+                            ELSE 'cancelling'
+                        END
+                    ),
+                    updated_at = now()
+                FROM candidate
+                WHERE target.id = candidate.id
+                RETURNING target.id, target.policy_id, candidate.company_slug,
+                          candidate.provider, target.attempt_count
+                """,
+                (
+                    selected_provider,
+                    selected_provider,
+                    str(worker_id)[:160],
+                    bounded_lease,
+                ),
+            )
+            claimed = cursor.fetchone()
+            if not claimed:
+                return None
+            claimed_id = str(claimed[0])
+            claimed_policy_id = str(claimed[1]) if claimed[1] else None
+            if claimed_policy_id:
+                cursor.execute(
+                    """
+                    UPDATE integration_ci_policies
+                    SET lease_owner = %s,
+                        lease_until = now() + (%s * interval '1 second')
+                    WHERE id = %s::uuid
+                    """,
+                    (str(worker_id)[:120], bounded_lease, claimed_policy_id),
+                )
+            self._insert_audit(
+                cursor,
+                claimed[2],
+                None,
+                "sync_run",
+                claimed_id,
+                "claimed",
+                None,
+                {"status": "running", "attemptCount": int(claimed[4])},
+                metadata={
+                    "provider": PROVIDER_FROM_DB.get(claimed[3], claimed[3]),
+                    "worker": True,
+                },
+                actor_type="system",
+                source_system="integration_worker",
+            )
+            internal = self._select_ci_preview_run(cursor, claimed_id)
+        return _public_sync_run(internal, include_internal=True) if internal else None
+
+    def renew_ci_preview_run(
+        self,
+        run_id: str,
+        worker_id: str,
+        progress: dict,
+        message: str = "",
+        lease_seconds: int = 180,
+    ) -> dict | None:
+        """Renew an owned job and policy lease while persisting bounded progress."""
+
+        bounded_lease = max(30, min(int(lease_seconds), 3600))
+        safe_progress = _bounded_preview_progress(progress)
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE sync_runs
+                SET heartbeat_at = now(),
+                    lease_until = now() + (%s * interval '1 second'),
+                    progress = progress || %s::jsonb,
+                    message = CASE WHEN %s = '' THEN message ELSE %s END,
+                    updated_at = now()
+                WHERE id::text = %s
+                  AND status = 'running'
+                  AND lease_owner = %s
+                RETURNING policy_id
+                """,
+                (
+                    bounded_lease,
+                    json.dumps(safe_progress),
+                    str(message)[:1000],
+                    str(message)[:1000],
+                    run_id,
+                    str(worker_id)[:160],
+                ),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            if row[0]:
+                cursor.execute(
+                    """
+                    UPDATE integration_ci_policies
+                    SET lease_owner = %s,
+                        lease_until = now() + (%s * interval '1 second')
+                    WHERE id = %s::uuid
+                    """,
+                    (str(worker_id)[:120], bounded_lease, str(row[0])),
+                )
+            run = self._select_ci_preview_run(cursor, run_id)
+        return _public_sync_run(run) if run else None
+
+    def is_sync_run_cancel_requested(
+        self,
+        run_id: str,
+        worker_id: str | None = None,
+    ) -> bool:
+        """Return the cooperative-cancellation signal for an optional owner."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT cancel_requested_at IS NOT NULL OR status = 'cancelled'
+                FROM sync_runs
+                WHERE id::text = %s
+                  AND (%s::text IS NULL OR lease_owner = %s)
+                """,
+                (run_id, worker_id, str(worker_id)[:160] if worker_id else None),
+            )
+            row = cursor.fetchone()
+        return bool(row and row[0])
+
+    def request_sync_run_cancel(
+        self,
+        run_id: str,
+        actor_id: str | None,
+    ) -> dict | None:
+        """Cancel queued work immediately or request cooperative running cancellation."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT run.status, run.policy_id, company.slug
+                FROM sync_runs run
+                LEFT JOIN companies company ON company.id = run.company_id
+                WHERE run.id::text = %s
+                FOR UPDATE OF run
+                """,
+                (run_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            status, policy_id, company_id = row
+            if status == "queued":
+                cursor.execute(
+                    """
+                    UPDATE sync_runs
+                    SET status = 'cancelled',
+                        cancel_requested_at = COALESCE(cancel_requested_at, now()),
+                        cancelled_at = now(),
+                        finished_at = now(),
+                        lease_owner = NULL,
+                        lease_until = NULL,
+                        progress = '{"phase":"cancelled"}'::jsonb,
+                        message = 'Preview cancelled before execution.',
+                        updated_at = now()
+                    WHERE id::text = %s
+                    """,
+                    (run_id,),
+                )
+                if policy_id:
+                    cursor.execute(
+                        """
+                        UPDATE integration_ci_policies
+                        SET lease_owner = NULL, lease_until = NULL
+                        WHERE id = %s::uuid
+                        """,
+                        (str(policy_id),),
+                    )
+            elif status == "running":
+                cursor.execute(
+                    """
+                    UPDATE sync_runs
+                    SET cancel_requested_at = COALESCE(cancel_requested_at, now()),
+                        progress = progress || '{"phase":"cancelling"}'::jsonb,
+                        message = (
+                            'Cancellation requested; waiting for the current provider request.'
+                        ),
+                        updated_at = now()
+                    WHERE id::text = %s
+                    """,
+                    (run_id,),
+                )
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "sync_run",
+                run_id,
+                "cancel_requested",
+                {"status": status},
+                {"status": "cancelled" if status == "queued" else status},
+            )
+            run = self._select_ci_preview_run(cursor, run_id)
+        return _public_sync_run(run) if run else None
+
+    def complete_ci_preview_run(
+        self,
+        run_id: str,
+        worker_id: str,
+        preview_summary: dict,
+        actor_id: str | None = None,
+    ) -> dict | None:
+        """Complete an owned preview and release its policy lease atomically."""
+
+        summary = _sanitized_preview_summary(preview_summary)
+        counts = summary["counts"]
+        review_count = sum(counts.get(key, 0) for key in ("create", "update", "link", "conflict"))
+        message = str(preview_summary.get("message") or "Preview completed.")[:1000]
+        progress = {
+            "phase": "completed",
+            "discovered": summary["discovered"],
+            "included": summary["included"],
+            "excluded": summary["excluded"],
+            "reviewed": review_count,
+            "current": summary["discovered"],
+            "total": summary["discovered"],
+            "percent": 100,
+            "counts": counts,
+        }
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT cancel_requested_at, progress
+                FROM sync_runs
+                WHERE id::text = %s
+                  AND status = 'running'
+                  AND lease_owner = %s
+                FOR UPDATE
+                """,
+                (run_id, str(worker_id)[:160]),
+            )
+            owned = cursor.fetchone()
+            if not owned:
+                return None
+            if owned[0]:
+                cursor.execute(
+                    """
+                    UPDATE sync_runs
+                    SET status = 'cancelled', cancelled_at = now(), finished_at = now(),
+                        lease_owner = NULL, lease_until = NULL, heartbeat_at = now(),
+                        progress = '{"phase":"cancelled"}'::jsonb,
+                        message = 'Preview cancelled.', error_summary = NULL,
+                        updated_at = now()
+                    WHERE id::text = %s
+                    RETURNING policy_id, company_id
+                    """,
+                    (run_id,),
+                )
+            else:
+                progress["enriched"] = int(_bounded_preview_progress(owned[1]).get("enriched") or 0)
+                cursor.execute(
+                    """
+                    UPDATE sync_runs
+                    SET status = 'succeeded',
+                        finished_at = now(),
+                        discovered_count = %s,
+                        review_count = %s,
+                        lease_owner = NULL,
+                        lease_until = NULL,
+                        heartbeat_at = now(),
+                        progress = %s::jsonb,
+                        message = %s,
+                        error_summary = NULL,
+                        attributes = attributes || %s::jsonb,
+                        updated_at = now()
+                    WHERE id::text = %s
+                      AND status = 'running'
+                      AND lease_owner = %s
+                    RETURNING policy_id, company_id
+                    """,
+                    (
+                        summary["discovered"],
+                        review_count,
+                        json.dumps(progress),
+                        message,
+                        json.dumps({"resultSummary": summary}),
+                        run_id,
+                        str(worker_id)[:160],
+                    ),
+                )
+            completed = cursor.fetchone()
+            if not completed:
+                return None
+            policy_id, company_uuid = completed
+            if policy_id:
+                cursor.execute(
+                    """
+                    UPDATE integration_ci_policies
+                    SET lease_owner = NULL, lease_until = NULL
+                    WHERE id = %s::uuid
+                    """,
+                    (str(policy_id),),
+                )
+            company_id = None
+            if company_uuid:
+                cursor.execute(
+                    "SELECT slug FROM companies WHERE id = %s::uuid",
+                    (str(company_uuid),),
+                )
+                company_row = cursor.fetchone()
+                company_id = company_row[0] if company_row else None
+            was_cancelled = bool(owned[0])
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "sync_run",
+                run_id,
+                "cancelled" if was_cancelled else "completed",
+                None,
+                {
+                    "status": "cancelled" if was_cancelled else "success",
+                    "resultSummary": None if was_cancelled else summary,
+                },
+                actor_type="system" if actor_id is None else "user",
+                source_system="integration_worker" if actor_id is None else "web",
+            )
+            run = self._select_ci_preview_run(cursor, run_id)
+        return _public_sync_run(run) if run else None
+
+    def fail_ci_preview_run(
+        self,
+        run_id: str,
+        worker_id: str,
+        error: Any,
+        actor_id: str | None = None,
+        cancelled: bool = False,
+    ) -> dict | None:
+        """Fail or cancel an owned preview and release its policy lease atomically."""
+
+        detail = str(error)[:1000]
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE sync_runs
+                SET status = CASE
+                        WHEN %s OR cancel_requested_at IS NOT NULL
+                            THEN 'cancelled'
+                        ELSE 'failed'
+                    END,
+                    cancelled_at = CASE
+                        WHEN %s OR cancel_requested_at IS NOT NULL THEN now()
+                        ELSE NULL
+                    END,
+                    finished_at = now(),
+                    lease_owner = NULL,
+                    lease_until = NULL,
+                    heartbeat_at = now(),
+                    progress = jsonb_build_object(
+                        'phase',
+                        CASE
+                            WHEN %s OR cancel_requested_at IS NOT NULL
+                                THEN 'cancelled'
+                            ELSE 'failed'
+                        END
+                    ),
+                    message = CASE
+                        WHEN %s OR cancel_requested_at IS NOT NULL
+                            THEN 'Preview cancelled.'
+                        ELSE %s
+                    END,
+                    error_summary = CASE
+                        WHEN %s OR cancel_requested_at IS NOT NULL THEN NULL
+                        ELSE %s
+                    END,
+                    updated_at = now()
+                WHERE id::text = %s
+                  AND status = 'running'
+                  AND lease_owner = %s
+                RETURNING policy_id, company_id, status
+                """,
+                (
+                    cancelled,
+                    cancelled,
+                    cancelled,
+                    cancelled,
+                    detail,
+                    cancelled,
+                    detail,
+                    run_id,
+                    str(worker_id)[:160],
+                ),
+            )
+            failed = cursor.fetchone()
+            if not failed:
+                return None
+            policy_id, company_uuid, terminal_status = failed
+            if policy_id:
+                cursor.execute(
+                    """
+                    UPDATE integration_ci_policies
+                    SET lease_owner = NULL, lease_until = NULL
+                    WHERE id = %s::uuid
+                    """,
+                    (str(policy_id),),
+                )
+            company_id = None
+            if company_uuid:
+                cursor.execute(
+                    "SELECT slug FROM companies WHERE id = %s::uuid",
+                    (str(company_uuid),),
+                )
+                company_row = cursor.fetchone()
+                company_id = company_row[0] if company_row else None
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "sync_run",
+                run_id,
+                "cancelled" if terminal_status == "cancelled" else "failed",
+                None,
+                {"status": terminal_status},
+                outcome="success" if terminal_status == "cancelled" else "failed",
+                severity="informational" if terminal_status == "cancelled" else "warning",
+                reason="" if terminal_status == "cancelled" else detail,
+                actor_type="system" if actor_id is None else "user",
+                source_system="integration_worker" if actor_id is None else "web",
+            )
+            run = self._select_ci_preview_run(cursor, run_id)
+        return _public_sync_run(run) if run else None
+
+    def retry_ci_preview_run(self, run_id: str, actor_id: str | None) -> dict:
+        """Create a new immutable queued run linked to a retryable terminal run."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            source = self._select_ci_preview_run(cursor, run_id)
+        if not source:
+            raise ValueError("Sync run not found")
+        if source.get("status") not in RETRYABLE_CI_PREVIEW_RUN_STATUSES:
+            raise ValueError("Only failed or cancelled preview runs can be retried")
+        attributes = source.get("attributes") or {}
+        return self.create_ci_preview_run(
+            str(source.get("type") or ""),
+            str(source.get("companyId") or attributes.get("companyId") or ""),
+            str(source.get("providerCompanyId") or attributes.get("providerCompanyId") or ""),
+            str(source.get("policyId") or attributes.get("policyId") or ""),
+            "retry",
+            actor_id,
+            deepcopy(attributes.get("policySnapshot") or {}),
+            retry_of_id=source["id"],
+        )
+
+    def release_ci_sync_policy_lease(self, policy_id: str) -> dict | None:
+        """Release one canonical policy lease without altering its schedule."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_ci_policies policy
+                SET lease_owner = NULL, lease_until = NULL
+                FROM integration_connections integration, companies company
+                WHERE policy.id::text = %s
+                  AND integration.id = policy.integration_connection_id
+                  AND company.id = policy.company_id
+                RETURNING integration.provider, company.slug,
+                          policy.external_parent_id
+                """,
+                (policy_id,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return self.get_ci_sync_policy(
+            PROVIDER_FROM_DB.get(row[0], row[0]),
+            row[1],
+            row[2],
+        )
+
+    def list_ci_review_items_for_run(
+        self,
+        kind: str,
+        run_id: str,
+        company_id: str,
+    ) -> list[dict]:
+        """Return reviewable observations produced by one canonical preview run."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT item.id, integration.provider, policy.id, company.slug, company.name,
+                       policy.external_parent_id, item.external_id, item.external_name,
+                       item.decision, item.candidate_ci_id, ci.display_name, item.reason,
+                       item.provider_record, item.evidence, item.state,
+                       item.first_seen_at, item.last_seen_at, item.reviewed_at,
+                       item.review_notes
+                FROM integration_ci_review_items item
+                JOIN integration_ci_policies policy ON policy.id = item.policy_id
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                JOIN companies company ON company.id = item.company_id
+                LEFT JOIN configuration_items ci ON ci.id = item.candidate_ci_id
+                WHERE integration.provider = %s
+                  AND company.slug = %s
+                  AND item.last_sync_run_id::text = %s
+                ORDER BY item.last_seen_at DESC, item.external_name
+                """,
+                (PROVIDER_TO_DB.get(kind, kind), company_id, run_id),
+            )
+            rows = cursor.fetchall()
+        return [self._ci_review_from_row(row) for row in rows]
+
     def list_sync_runs(
         self,
         kind: str | None = None,
@@ -11669,16 +13586,27 @@ class PostgresCmdbRepository(StateRepository):
                 """
                 SELECT sr.id, ic.provider, sr.status, sr.message, sr.started_at,
                        sr.finished_at, sr.discovered_count, sr.created_count,
-                       sr.updated_count, sr.review_count, sr.attributes
+                       sr.updated_count, sr.review_count, sr.attributes,
+                       company.slug, sr.policy_id, sr.requested_by, sr.requested_at,
+                       sr.available_at, sr.attempt_count, sr.max_attempts,
+                       sr.lease_owner, sr.lease_until, sr.heartbeat_at,
+                       sr.cancel_requested_at, sr.cancelled_at, sr.retry_of_id,
+                       sr.dedupe_key, sr.progress, sr.updated_at, sr.error_summary
                 FROM sync_runs sr
                 JOIN integration_connections ic ON ic.id = sr.integration_connection_id
+                LEFT JOIN companies company ON company.id = sr.company_id
                 WHERE (%s::text IS NULL OR ic.provider = %s)
                   AND (%s::text IS NULL OR sr.status = %s)
                   AND (%s::text IS NULL OR sr.attributes ->> 'operation' = %s)
-                  AND (%s::text IS NULL OR sr.attributes ->> 'companyId' = %s)
-                  AND (%s = false OR sr.attributes ->> 'companyId' IS NULL
-                       OR sr.attributes ->> 'companyId' = ANY(%s::text[]))
-                ORDER BY sr.started_at DESC, sr.id DESC
+                  AND (%s::text IS NULL
+                       OR COALESCE(company.slug, sr.attributes ->> 'companyId') = %s)
+                  AND (
+                      %s = false
+                      OR COALESCE(company.slug, sr.attributes ->> 'companyId') IS NULL
+                      OR COALESCE(company.slug, sr.attributes ->> 'companyId')
+                          = ANY(%s::text[])
+                  )
+                ORDER BY sr.requested_at DESC, sr.id DESC
                 LIMIT %s
                 """,
                 (
@@ -11695,22 +13623,8 @@ class PostgresCmdbRepository(StateRepository):
                     max(1, min(limit, 250)),
                 ),
             )
-            status_labels = {"succeeded": "success"}
             return [
-                {
-                    "id": str(run_id),
-                    "type": PROVIDER_FROM_DB.get(provider, provider),
-                    "status": status_labels.get(status, status),
-                    "message": message or "",
-                    "startedAt": self._timestamp(started_at),
-                    "finishedAt": self._timestamp(finished_at),
-                    "discovered": discovered,
-                    "imported": created,
-                    "updated": updated,
-                    "review": review,
-                    "attributes": attributes or {},
-                }
-                for run_id, provider, status, message, started_at, finished_at, discovered, created, updated, review, attributes in cursor.fetchall()
+                _public_sync_run(self._ci_preview_run_from_row(row)) for row in cursor.fetchall()
             ]
 
     def record_sync_run(
@@ -11722,8 +13636,12 @@ class PostgresCmdbRepository(StateRepository):
     ) -> dict:
         status_to_db = {
             "success": "succeeded",
+            "queued": "queued",
+            "running": "running",
+            "review_required": "review_required",
             "blocked": "blocked",
             "failed": "failed",
+            "cancelled": "cancelled",
         }
         run_status = run.get("status")
         database_status = (

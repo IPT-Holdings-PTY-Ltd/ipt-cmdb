@@ -92,8 +92,8 @@ break-glass accounts can receive safe recovery links. When a custom domain becom
 canonical entry point, supply that exact HTTPS origin through the optional
 `publicBaseUrl` Bicep parameter and reprovision.
 
-Scheduled ConnectWise previews and integration alert delivery are opt-in Bicep
-parameters. After Microsoft 365 email is verified in the root workspace, set
+Scheduled ConnectWise and N-central previews and integration alert delivery are opt-in
+Bicep parameters. After Microsoft 365 email is verified in the root workspace, set
 `enableIntegrationWorker=true` and `enableNotificationWorker=true`. Optionally set
 `integrationAlertRecipients` to a comma-separated operations mailbox list; when blank,
 active platform-administrator email addresses receive alerts. The Container App receives

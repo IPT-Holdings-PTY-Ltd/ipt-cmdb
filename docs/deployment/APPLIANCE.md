@@ -75,7 +75,7 @@ docker compose --env-file $environment -f compose.appliance.yml ps
 ```
 
 Once Microsoft 365 email is verified, the same environment file can enable the
-read-only ConnectWise scheduler and alert delivery:
+read-only ConnectWise and N-central scheduler and alert delivery:
 
 ```text
 INTEGRATION_WORKER_ENABLED=true

@@ -101,6 +101,32 @@ def main() -> None:
         assert repository.migrate_legacy_company_branding() == 1
         assert repository.get_company_branding("acme")["name"] == "Acme Service Portal"
         assert repository.get_company_branding("acme")["accent"] == "#123456"
+        ncentral_connection = repository.ensure_integration_connection(
+            "ncentral", "N-central", user_id
+        )
+        assert ncentral_connection["type"] == "ncentral"
+        failed_test = repository.mark_integration_test(
+            "ncentral",
+            "error",
+            "Upgrade verification provider rejection",
+            user_id,
+        )
+        assert failed_test["connectionStatus"] == "error"
+        ncentral_policy = repository.update_ci_sync_policy(
+            "ncentral",
+            "acme",
+            "101",
+            {
+                "providerFilterId": "managed-servers",
+                "typeMode": "all",
+                "statusMode": "all",
+                "syncMode": "manual",
+                "enabled": False,
+            },
+            0,
+            user_id,
+        )
+        assert ncentral_policy["providerFilterId"] == "managed-servers"
         email_connection = repository.update_email_connection(
             {
                 "enabled": False,
@@ -238,7 +264,7 @@ def main() -> None:
             f"Upgrade verified: versions={','.join(versions)} "
             "customer_branding=preserved legacy_state=retired "
             "relationship_reconnect=verified email_outbox=verified "
-            "worker_telemetry=verified"
+            "worker_telemetry=verified ncentral_install=verified"
         )
     finally:
         with (
