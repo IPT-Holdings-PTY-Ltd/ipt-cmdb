@@ -247,7 +247,7 @@ export function IntegrationsPage() {
       </Stack>
 
       {error ? <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert> : null}
-      {previewStatus?.workerConfigured && !previewStatus.workerHealthy ? <Alert severity="warning" sx={{ mb: 2 }}>The {previewStatus.executionMode.replaceAll('_', ' ')} integration worker is configured but has no fresh heartbeat. Review the worker container or Container App logs before relying on scheduled discovery.</Alert> : null}
+      {previewStatus?.workerConfigured && !previewStatus.workerHealthy ? <Alert severity="warning" sx={{ mb: 2 }}>The {previewStatus.executionMode.replaceAll('_', ' ')} integration worker is configured but has no fresh heartbeat. Review the worker container or Container App logs before starting background previews.</Alert> : null}
       {loading ? <Card><CardContent><Stack direction="row" spacing={2} sx={{ alignItems: 'center' }}><CircularProgress size={22} /><Typography>Loading integration directory…</Typography></Stack></CardContent></Card> : <>
         <Grid container spacing={2} sx={{ mb: 3 }}>
           <Grid size={{ xs: 12, sm: 4 }}><Metric label="Installed" value={installed.length} detail="Configured provider connections" /></Grid>
@@ -287,6 +287,7 @@ export function IntegrationsPage() {
                     <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
                       {availableOperations.length ? availableOperations.map(operation => <Chip key={operation.key} size="small" variant="outlined" label={`${operation.label} · ${operation.direction}`} />) : <Chip size="small" variant="outlined" label="Provider capability" />}
                       {['connectwise', 'ncentral'].includes(entry.key) && previewStatus?.workerConfigured && <Chip size="small" color={previewStatus.workerHealthy ? 'success' : 'warning'} variant="outlined" label={`${previewStatus.executionMode.replaceAll('_', ' ')} worker ${previewStatus.workerHealthy ? 'healthy' : 'needs attention'}`} />}
+                      {['connectwise', 'ncentral'].includes(entry.key) && previewStatus && <Chip size="small" color={previewStatus.scheduledPoliciesEnabled ? 'info' : 'default'} variant="outlined" label={previewStatus.scheduledPoliciesEnabled ? 'Scheduled policies enabled' : 'Manual previews only'} />}
                       {previewStatus?.providerRateLimits?.[entry.key] && <Chip size="small" color={previewStatus.providerRateLimits[entry.key]?.limited ? 'error' : 'info'} variant="outlined" label={previewStatus.providerRateLimits[entry.key]?.limited ? 'Provider throttling observed' : `Last API response ${previewStatus.providerRateLimits[entry.key]?.httpStatus || 'observed'}`} />}
                     </Stack>
                     <Grid container spacing={1.5}>

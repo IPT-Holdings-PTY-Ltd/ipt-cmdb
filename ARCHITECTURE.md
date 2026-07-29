@@ -10,9 +10,11 @@ flowchart TB
     EDGE --> SPA[React SPA with MUI and React Router 8]
     EDGE --> API[FastAPI]
     SPA --> API
-    API --> PG[(PostgreSQL)]
+    API --> RUNS[Durable preview runs]
+    RUNS --> PG[(PostgreSQL)]
     API --> REPORTS[ReportLab PDF generation]
-    JOBS[Container Apps Jobs / workers] --> PROVIDERS[ConnectWise, N-central, Passportal]
+    JOBS[Embedded or dedicated workers] --> RUNS
+    JOBS --> PROVIDERS[ConnectWise, N-central, Passportal]
     JOBS --> PG
     JOBS --> QUEUE[Reconciliation review queue]
 ```
@@ -152,19 +154,32 @@ Provider observations enter a common reconciliation boundary. Adapters never wri
 trigger -> canonical event -> typed workflow -> approval -> idempotent action -> verification -> audit
 ```
 
-The current image can execute bounded manual discovery and opt-in background workers.
-`CMDB_PROCESS_ROLE=combined` keeps the low-cost API-plus-worker topology;
-`CMDB_PROCESS_ROLE=web` prevents the API process from starting loops; and the same image
-starts the isolated process with `python -m backend.worker`. `--once` provides a
-process-friendly scheduled-job boundary.
+The current image can execute bounded discovery and restart-safe background work.
+Operator-triggered N-central previews are inserted into `sync_runs`; the browser polls
+the run while a worker claims it, records progress and publishes a sanitized result.
+The full provider response is not stored in the run summary. Sanitized reconciliation
+observations that require review remain in `integration_ci_review_items`.
 
-Due policies and operator-triggered **Sync now** runs take the same atomic PostgreSQL
-lease, so duplicate execution is prevented across replicas. Failed unattended runs use
-bounded exponential backoff from 15 minutes to 24 hours and retain sanitized run
-evidence. When Microsoft 365 email and the notification worker are enabled, failures
-are rate-limited at power-of-two streaks and a recovery message closes the incident
-signal. The worker writes sync evidence and review observations only; canonical imports
-remain administrator-selected.
+`CMDB_PROCESS_ROLE=combined` keeps the low-cost API-plus-worker topology and always
+starts the durable integration-run consumer. `CMDB_PROCESS_ROLE=web` prevents the API
+process from starting loops, so that topology requires a continuously available
+`python -m backend.worker` service. A dedicated worker also always consumes queued
+manual runs. `INTEGRATION_WORKER_ENABLED` controls scheduled continuous-preview
+policies, not manual-run consumption. `INTEGRATION_WORKER_INTERVAL_SECONDS` controls
+the queue polling interval and defaults to two seconds. `--once` remains a
+process-friendly scheduled-job boundary, but it is not a substitute for a warm worker
+when operators expect prompt manual previews.
+
+Queued runs and due policies take atomic PostgreSQL leases, so duplicate execution is
+prevented across replicas. Run heartbeats allow an expired lease to be reclaimed after
+a process restart. Cancellation is cooperative: it stops at safe request/page or
+reconciliation boundaries, while an already-running provider request is allowed to
+finish. Retry creates a new attributable run linked to the failed or cancelled attempt.
+Failed unattended policies still use bounded exponential backoff from 15 minutes to 24
+hours. When Microsoft 365 email and the notification worker are enabled, failures are
+rate-limited at power-of-two streaks and a recovery message closes the incident signal.
+The worker writes sync evidence and review observations only; canonical imports remain
+administrator-selected and N-central operations remain read-only.
 
 Worker start, cycle, success, failure and stop events update a current PostgreSQL
 heartbeat. Provider request telemetry retains only HTTP/quota headers and a URL path;

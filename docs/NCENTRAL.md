@@ -27,8 +27,10 @@ The wizard:
 3. progressively tests token exchange, access-token validation and a one-record organization read;
 4. discovers only `CUSTOMER` organization units for explicit mapping;
 5. loads N-central device filters and the accessible device class/status catalogue for a mapped customer;
-6. saves native filter ID, class/status filters, canonical type mappings, exclusions and a manual or continuous-preview schedule;
-7. previews create, update, identity-link, unchanged and conflict decisions before a platform administrator selects imports.
+6. saves native filter ID, class/status filters, canonical type mappings, exclusions,
+   enrichment profile and a manual or continuous-preview schedule;
+7. queues a durable preview of create, update, identity-link, unchanged and conflict
+   decisions before a platform administrator selects imports.
 
 ### Container, Docker secret or Azure
 
@@ -62,7 +64,20 @@ The wizard can create a new isolated CMDB customer and immediately record the ex
 
 The selected N-central device filter ID is sent to `GET /api/org-units/{orgUnitId}/devices`, so broad estates are reduced by N-central before the CMDB applies saved class, status and explicit device-ID filters. Filter and type IDs—not display labels—are the durable policy values.
 
-The normalized device record retains the provider device ID, name, device class, license mode, OS label, customer/site references, last user/check-in information, and bounded inventory evidence. `GET /api/devices/{deviceId}/assets` is one request per device, so each preview enriches at most the first 25 devices with serial, model, manufacturer, IP and MAC evidence. Enrichment uses no more than four concurrent read-only requests, preserving response order while avoiding a long sequential wait. This prevents a large customer from producing thousands of detail calls or unbounded concurrency in one run.
+The normalized device record retains the provider device ID, name, device class,
+license mode, OS label, customer/site references, last user/check-in information, and
+bounded inventory evidence. Choose an enrichment profile according to the review:
+
+| Profile | Provider detail reads | Recommended use |
+|---|---:|---|
+| **Fast** | None | Quick name/type/status reconciliation across a large estate |
+| **Balanced** | First 25 matching devices | Normal preview with representative serial, model, manufacturer, IP and MAC evidence |
+| **Full** | Up to 250 matching devices | Controlled duplicate/link review where stronger hardware evidence is needed |
+
+`GET /api/devices/{deviceId}/assets` is one request per enriched device. Every profile
+uses no more than four concurrent read-only requests, preserves result order and obeys
+the saved provider/customer filters. The full profile is still bounded; it does not
+create unbounded detail traffic for a large estate.
 
 Identity precedence is:
 
@@ -75,22 +90,59 @@ Names never create an automatic identity link. This allows N-central and Connect
 
 Import re-reads N-central and recalculates the decision before applying selected IDs. Only non-conflicting create, update and identity-link rows are selectable. Successful import changes IPT CMDB and its audit/mapping evidence only.
 
-## Continuous preview
+## Durable previews
 
-Set the deployment worker flags after at least one saved policy has been reviewed:
+**Preview devices** and **Sync saved policy now** enqueue a durable `sync_runs` record
+and return immediately. The integration screen restores the latest run after a reload
+and polls its phase, count and message until it succeeds, fails or is cancelled.
+
+A worker claims each run with an expiring PostgreSQL lease and renews its heartbeat
+during discovery, enrichment and reconciliation. An interrupted run is therefore
+restart-safe: another worker can reclaim it after the lease expires. The following
+controls remain explicit:
+
+- **Cancel** requests cooperative cancellation. Pagination, enrichment scheduling and
+  reconciliation stop at a safe boundary; an already-running HTTPS request is allowed
+  to finish.
+- **Retry** creates a new attributable run linked to the earlier attempt. It does not
+  rewrite the original evidence.
+- only a sanitized count/decision/error summary is retained with the run; complete
+  N-central responses and device payloads are not stored there;
+- sanitized provider observations that require review remain in the reconciliation
+  queue until they are imported, linked, ignored or otherwise resolved.
+
+## Worker and continuous-preview configuration
+
+The durable manual-run consumer is always present in `combined` and dedicated `worker`
+processes. The polling interval defaults to two seconds:
+
+```text
+INTEGRATION_WORKER_INTERVAL_SECONDS=2
+```
+
+`INTEGRATION_WORKER_ENABLED` controls only scheduled continuous-preview policies. Set
+it after at least one saved policy has been reviewed:
 
 ```text
 INTEGRATION_WORKER_ENABLED=true
-INTEGRATION_WORKER_INTERVAL_SECONDS=60
 ```
 
-Each customer policy has its own 15-minute to seven-day interval. PostgreSQL leases make the worker multi-replica safe. Scheduled runs refresh the durable review queue, use bounded exponential retry after failures and never import canonical CIs automatically. **Sync saved policy now** takes the same lease and is safe during normal scheduler operation.
+Each customer policy has its own 15-minute to seven-day interval. Scheduled runs
+refresh the durable review queue, use bounded exponential retry after failures and
+never import canonical CIs automatically. Manual and scheduled runs share the same
+policy lease and are safe across replicas.
+
+A split deployment with `CMDB_PROCESS_ROLE=web` must run the dedicated worker service;
+otherwise manual runs remain queued. A periodic `--once` job is suitable for scheduled
+batch operation, but is not a substitute for a continuously available worker when
+operators expect prompt previews, progress, cancellation and retry.
 
 ## Security and operational behaviour
 
 - Provider requests are `POST /api/auth/authenticate` plus read-only `GET` operations.
 - Permanent and temporary tokens are excluded from public APIs, audit values, telemetry and provider error messages.
-- Provider response bodies are not exposed on failed requests.
+- Provider response bodies and complete device payloads are not retained in run
+  summaries or exposed on failed requests.
 - HTTP 429 responses record only sanitized status, retry delay and request path.
 - MSP operators may test and preview. Only platform administrators may store credentials, map customers, change policies, link identities or import devices.
 - Pausing or disabling stops provider access but retains configuration and evidence. Removal erases stored credentials and editable connection configuration while retaining canonical CIs, mappings, reviews, sync runs and audit history.
@@ -104,8 +156,10 @@ Each customer policy has its own 15-minute to seven-day interval. PostgreSQL lea
 | `HTTP 403` | User role and access-group scope for the requested customer/devices |
 | No customer organizations | The API user can see `CUSTOMER` organization units, not only sites |
 | Device filter returns no rows | Test the same filter and customer in N-central; saved filter IDs remain exact |
-| Many devices lack serial/MAC evidence | Detail enrichment is intentionally bounded to 25 per run; link important duplicates explicitly |
+| Many devices lack serial/MAC evidence | Select **Full** for a controlled review or link important duplicates explicitly; every profile remains bounded |
 | Stored token cannot be decrypted | Restore the stable `MFA_ENCRYPTION_KEY` used when it was saved |
-| Scheduled preview never runs | Enable the integration worker and the customer policy, then inspect worker health and sync history |
+| Manual preview remains queued | In a split deployment, start a dedicated worker; in combined mode, inspect worker health and sync history |
+| Scheduled preview never runs | Enable `INTEGRATION_WORKER_ENABLED` and the customer policy, then inspect worker health and sync history |
+| Cancellation is not immediate | An in-flight provider request completes before the cooperative cancellation boundary is reached |
 
 N-central and N-able are trademarks of their respective owners. IPT CMDB uses the documented API but is not endorsed or certified by N-able.

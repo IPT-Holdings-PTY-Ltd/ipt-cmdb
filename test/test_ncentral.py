@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 from src.cmdb.ncentral import (
     NcentralClient,
     NcentralConfigurationError,
+    NcentralOperationCancelled,
     NcentralRequestError,
     normalize_base_url,
     normalize_device,
@@ -264,6 +265,127 @@ class NcentralClientTests(unittest.TestCase):
             [record["fields"]["serialNumber"] for record in records],
             [f"SN-{index}" for index in range(1, 9)],
         )
+
+    def test_device_progress_is_ordered_and_counts_every_enrichment(self):
+        active_reads = 0
+        maximum_active_reads = 0
+        progress = []
+        lock = threading.Lock()
+
+        def opener(request, *, timeout):
+            nonlocal active_reads, maximum_active_reads
+            del timeout
+            path = urlparse(request.full_url).path
+            if path == "/api/auth/authenticate":
+                return FakeResponse(self.token_response())
+            if path == "/api/org-units/101/devices":
+                return FakeResponse(
+                    {
+                        "data": [
+                            {
+                                "deviceId": index,
+                                "longName": f"Device {index}",
+                                "deviceClass": "WindowsServer",
+                            }
+                            for index in range(1, 7)
+                        ],
+                        "pageNumber": 1,
+                        "pageSize": 25,
+                        "totalItems": 6,
+                        "totalPages": 1,
+                    }
+                )
+            if path.startswith("/api/devices/") and path.endswith("/assets"):
+                device_id = int(path.split("/")[3])
+                with lock:
+                    active_reads += 1
+                    maximum_active_reads = max(maximum_active_reads, active_reads)
+                time.sleep(0.005 * (7 - device_id))
+                with lock:
+                    active_reads -= 1
+                return FakeResponse(
+                    {"data": {"computersystem": {"serialnumber": f"SN-{device_id}"}}}
+                )
+            raise AssertionError(path)
+
+        records = NcentralClient(self.configuration, opener=opener).discover_devices(
+            "101",
+            enrich_limit=6,
+            progress_callback=progress.append,
+        )
+
+        self.assertLessEqual(maximum_active_reads, 4)
+        self.assertEqual(
+            [record["externalId"] for record in records],
+            [str(index) for index in range(1, 7)],
+        )
+        self.assertEqual(progress[0]["phase"], "discovering")
+        enriching = [event for event in progress if event["phase"] == "enriching"]
+        self.assertEqual([event["current"] for event in enriching], list(range(7)))
+        self.assertTrue(all(event["total"] == 6 for event in enriching))
+        self.assertTrue(all(event["discovered"] == 6 for event in enriching))
+        self.assertEqual(enriching[-1]["enriched"], 6)
+
+    def test_cancellation_stops_submitting_additional_enrichment_requests(self):
+        active_reads = 0
+        maximum_active_reads = 0
+        asset_requests = []
+        cancel = threading.Event()
+        lock = threading.Lock()
+
+        def opener(request, *, timeout):
+            nonlocal active_reads, maximum_active_reads
+            del timeout
+            path = urlparse(request.full_url).path
+            if path == "/api/auth/authenticate":
+                return FakeResponse(self.token_response())
+            if path == "/api/org-units/101/devices":
+                return FakeResponse(
+                    {
+                        "data": [
+                            {
+                                "deviceId": index,
+                                "longName": f"Device {index}",
+                                "deviceClass": "WindowsServer",
+                            }
+                            for index in range(1, 13)
+                        ],
+                        "pageNumber": 1,
+                        "pageSize": 25,
+                        "totalItems": 12,
+                        "totalPages": 1,
+                    }
+                )
+            if path.startswith("/api/devices/") and path.endswith("/assets"):
+                device_id = int(path.split("/")[3])
+                with lock:
+                    asset_requests.append(device_id)
+                    active_reads += 1
+                    maximum_active_reads = max(maximum_active_reads, active_reads)
+                time.sleep(0.01 if device_id == 1 else 0.05)
+                with lock:
+                    active_reads -= 1
+                return FakeResponse(
+                    {"data": {"computersystem": {"serialnumber": f"SN-{device_id}"}}}
+                )
+            raise AssertionError(path)
+
+        def on_progress(event):
+            if event["phase"] == "enriching" and event["current"] == 1:
+                cancel.set()
+
+        with self.assertRaises(NcentralOperationCancelled):
+            NcentralClient(self.configuration, opener=opener).discover_devices(
+                "101",
+                enrich_limit=12,
+                progress_callback=on_progress,
+                cancel_requested=cancel.is_set,
+            )
+
+        self.assertLessEqual(maximum_active_reads, 4)
+        self.assertGreaterEqual(len(asset_requests), 1)
+        self.assertLessEqual(len(asset_requests), 4)
+        self.assertTrue(set(asset_requests).issubset({1, 2, 3, 4}))
 
     def test_normalizer_accepts_documented_direct_asset_example(self):
         result = normalize_device(

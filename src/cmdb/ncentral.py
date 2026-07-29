@@ -7,7 +7,7 @@ import logging
 import math
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -30,6 +30,10 @@ class NcentralRequestError(RuntimeError):
 
         super().__init__(message)
         self.status_code = status_code
+
+
+class NcentralOperationCancelled(RuntimeError):
+    """Stop a read-only provider operation after an operator cancellation."""
 
 
 def normalize_base_url(value: str) -> str:
@@ -378,12 +382,16 @@ class NcentralClient:
         parameters: dict[str, Any] | None = None,
         *,
         max_pages: int = 100,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
         """Read a bounded collection using documented one-based pagination."""
 
         discovered: list[dict[str, Any]] = []
         seen: set[str] = set()
         for page in range(1, max(1, min(int(max_pages), 100)) + 1):
+            if cancel_requested and cancel_requested():
+                raise NcentralOperationCancelled("N-central preview was cancelled")
             payload = self._get(
                 path,
                 {
@@ -398,6 +406,18 @@ class NcentralClient:
                 if key not in seen:
                     seen.add(key)
                     discovered.append(row)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "discovering",
+                        "current": len(discovered),
+                        "total": max(len(discovered), int(metadata["totalItems"] or 0)),
+                        "page": page,
+                        "pages": max(page, int(metadata["totalPages"] or 0)),
+                        "discovered": len(discovered),
+                        "enriched": 0,
+                    }
+                )
             if (
                 page >= metadata["totalPages"]
                 or len(discovered) >= metadata["totalItems"]
@@ -451,6 +471,8 @@ class NcentralClient:
         *,
         filter_id: str = "",
         enrich_limit: int = 0,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
         """Return devices for one explicitly mapped organization unit."""
 
@@ -466,8 +488,15 @@ class NcentralClient:
             if not selected_filter.replace("-", "").replace("_", "").isalnum():
                 raise NcentralConfigurationError("Choose a valid N-central device filter ID")
             parameters["filterId"] = selected_filter
-        rows = self._paged(f"/api/org-units/{parent_id}/devices", parameters)
-        bounded_enrichment = max(0, min(int(enrich_limit), 50))
+        rows = self._paged(
+            f"/api/org-units/{parent_id}/devices",
+            parameters,
+            progress_callback=progress_callback,
+            cancel_requested=cancel_requested,
+        )
+        if cancel_requested and cancel_requested():
+            raise NcentralOperationCancelled("N-central preview was cancelled")
+        bounded_enrichment = max(0, min(int(enrich_limit), 250))
         enrichment_targets = [
             (index, str(row.get("deviceId") or ""))
             for index, row in enumerate(rows[:bounded_enrichment])
@@ -476,19 +505,66 @@ class NcentralClient:
         asset_payloads: dict[int, dict[str, Any]] = {}
         if enrichment_targets:
             worker_count = min(MAX_ASSET_ENRICHMENT_WORKERS, len(enrichment_targets))
+            completed = 0
+            target_iterator = iter(enrichment_targets)
             with ThreadPoolExecutor(
                 max_workers=worker_count,
                 thread_name_prefix="ncentral-asset-read",
             ) as executor:
-                pending = {
-                    executor.submit(self._get, f"/api/devices/{int(device_id)}/assets"): index
-                    for index, device_id in enrichment_targets
-                }
-                for future in as_completed(pending):
-                    index = pending[future]
-                    payload = future.result()
-                    if isinstance(payload, dict):
-                        asset_payloads[index] = payload
+                pending: dict[Future[Any], int] = {}
+
+                def submit_next() -> bool:
+                    try:
+                        index, device_id = next(target_iterator)
+                    except StopIteration:
+                        return False
+                    pending[executor.submit(self._get, f"/api/devices/{int(device_id)}/assets")] = (
+                        index
+                    )
+                    return True
+
+                for _index in range(worker_count):
+                    submit_next()
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "enriching",
+                            "current": 0,
+                            "total": len(enrichment_targets),
+                            "discovered": len(rows),
+                            "enriched": 0,
+                        }
+                    )
+                while pending:
+                    if cancel_requested and cancel_requested():
+                        for future in pending:
+                            future.cancel()
+                        raise NcentralOperationCancelled("N-central preview was cancelled")
+                    completed_futures, _pending_futures = wait(
+                        pending,
+                        timeout=0.5,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not completed_futures:
+                        continue
+                    for future in completed_futures:
+                        index = pending.pop(future)
+                        payload = future.result()
+                        if isinstance(payload, dict):
+                            asset_payloads[index] = payload
+                        completed += 1
+                        if progress_callback:
+                            progress_callback(
+                                {
+                                    "phase": "enriching",
+                                    "current": completed,
+                                    "total": len(enrichment_targets),
+                                    "discovered": len(rows),
+                                    "enriched": completed,
+                                }
+                            )
+                        if not (cancel_requested and cancel_requested()):
+                            submit_next()
 
         records: list[dict[str, Any]] = []
         for index, row in enumerate(rows):

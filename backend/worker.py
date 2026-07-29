@@ -19,8 +19,10 @@ def _enabled_workers() -> list:
     workers = []
     if backend_main._worker_flag("NOTIFICATION_WORKER_ENABLED"):
         workers.append(backend_main._notification_worker_definition())
-    if backend_main._worker_flag("INTEGRATION_WORKER_ENABLED"):
-        workers.append(backend_main._integration_worker_definition())
+    # The integration consumer also drains operator-triggered preview jobs.
+    # INTEGRATION_WORKER_ENABLED controls scheduled policies, not this durable
+    # queue, so a dedicated worker must always include it.
+    workers.append(backend_main._integration_worker_definition())
     return workers
 
 

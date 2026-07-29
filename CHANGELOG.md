@@ -19,6 +19,11 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Native N-central device-filter, class and status policies with immutable provider IDs,
   reviewed dry-run reconciliation, manual identity linking and lease-safe continuous
   previews.
+- Restart-safe asynchronous N-central previews backed by durable `sync_runs`, with
+  progress polling, lease heartbeats, stale-run recovery, cooperative cancellation and
+  attributable retry lineage.
+- Selectable fast, balanced and full N-central enrichment profiles, using bounded
+  read-only detail requests without retaining complete provider payloads in run history.
 - Provider-neutral reviewed import and linking controls so ConnectWise and N-central
   observations can converge on one canonical CI without provider-side writes.
 

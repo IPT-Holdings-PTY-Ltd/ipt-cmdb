@@ -19,6 +19,7 @@ DEFAULT_CI_POLICY: dict[str, Any] = {
     "includedStatusIds": [],
     "excludedExternalIds": [],
     "providerFilterId": "",
+    "enrichmentMode": "balanced",
     "syncMode": "manual",
     "intervalMinutes": 360,
     "enabled": False,
@@ -64,6 +65,7 @@ def normalize_ci_policy(policy: Mapping[str, Any] | None) -> dict[str, Any]:
     type_mode = str(source.get("typeMode") or "all")
     status_mode = str(source.get("statusMode") or "all")
     sync_mode = str(source.get("syncMode") or "manual")
+    enrichment_mode = str(source.get("enrichmentMode") or "balanced")
     interval = int(source.get("intervalMinutes") or 360)
     return {
         "typeMode": type_mode if type_mode in {"all", "selected"} else "all",
@@ -74,6 +76,9 @@ def normalize_ci_policy(policy: Mapping[str, Any] | None) -> dict[str, Any]:
         "includedStatusIds": identifiers("includedStatusIds"),
         "excludedExternalIds": identifiers("excludedExternalIds"),
         "providerFilterId": str(source.get("providerFilterId") or "").strip()[:160],
+        "enrichmentMode": (
+            enrichment_mode if enrichment_mode in {"fast", "balanced", "full"} else "balanced"
+        ),
         "syncMode": sync_mode if sync_mode in {"manual", "continuous_preview"} else "manual",
         "intervalMinutes": max(15, min(interval, 10080)),
         "enabled": bool(source.get("enabled", False)),

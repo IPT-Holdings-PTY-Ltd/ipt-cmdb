@@ -5,20 +5,20 @@ import LinkOutlined from '@mui/icons-material/LinkOutlined';
 import {
   Alert, Autocomplete, Box, Button, Card, CardContent, Checkbox, Chip, CircularProgress,
   Dialog, DialogActions, DialogContent, DialogTitle, FormControl, FormControlLabel,
-  Grid, InputLabel, List, ListItem, ListItemIcon, ListItemText, MenuItem, Paper, Select,
-  Stack, Step, StepLabel, Stepper, Table, TableBody, TableCell, TableContainer, TableHead,
-  TableRow, TextField, Typography,
+  FormHelperText, Grid, InputLabel, LinearProgress, List, ListItem, ListItemIcon,
+  ListItemText, MenuItem, Paper, Select, Stack, Step, StepLabel, Stepper, Table, TableBody, TableCell,
+  TableContainer, TableHead, TableRow, TextField, Typography,
 } from '@mui/material';
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router';
 import { canonicalAssetTypes } from './assetCatalog';
 import { PageHeading, RootGuard } from './RootAdmin';
-import { apiFetch, getSession } from './session';
+import { ApiError, apiFetch, getSession } from './session';
 import { Title } from './ui';
 import type {
   Asset, Company, ConfigurationReconciliationItem, ConfigurationReconciliationPreview,
   ConnectWiseCiPolicy, IntegrationProviderManifest, IntegrationTestResult, NcentralConnection,
-  NcentralDeviceOptions, NcentralDiscoveryPreview, ProviderCompany,
+  NcentralDeviceOptions, NcentralDiscoveryPreview, NcentralPreviewRun, ProviderCompany,
 } from './types';
 import { useWorkspace } from './workspace';
 
@@ -28,6 +28,7 @@ function emptyPolicy(companyId = '', providerParentId = ''): ConnectWiseCiPolicy
   return {
     id: '', provider: 'ncentral', companyId, providerParentId, providerFilterId: '',
     typeMode: 'all', includedTypeIds: [], typeMappings: {}, blockUnmappedTypes: false,
+    enrichmentMode: 'balanced',
     statusMode: 'all', includedStatusIds: [], excludedExternalIds: [],
     syncMode: 'manual', intervalMinutes: 360, enabled: false, revision: 0,
   };
@@ -35,6 +36,77 @@ function emptyPolicy(companyId = '', providerParentId = ''): ConnectWiseCiPolicy
 
 function errorMessage(value: unknown): string {
   return value instanceof Error ? value.message : 'The N-central operation could not be completed.';
+}
+
+function previewRunIsActive(run: NcentralPreviewRun | null): boolean {
+  return Boolean(run && (run.status === 'queued' || run.status === 'running'));
+}
+
+export function NcentralPreviewProgressPanel({
+  run,
+  busy,
+  onCancel,
+  onRetry,
+}: {
+  run: NcentralPreviewRun;
+  busy: boolean;
+  onCancel: () => void;
+  onRetry: () => void;
+}) {
+  const active = previewRunIsActive(run);
+  const percent = Math.max(0, Math.min(100, Number(run.progress.percent) || 0));
+  const determinate = run.progress.total > 0 || run.status === 'success';
+  const statusColor = run.status === 'success'
+    ? 'success'
+    : run.status === 'failed'
+      ? 'error'
+      : run.status === 'cancelled'
+        ? 'default'
+        : 'info';
+  const phase = (run.phase || run.status).replaceAll('_', ' ');
+
+  return <Paper variant="outlined" sx={{ p: 2 }}>
+    <Stack spacing={1.5}>
+      <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}
+        sx={{ justifyContent: 'space-between', alignItems: { sm: 'center' } }}>
+        <Box aria-live="polite">
+          <Stack direction="row" spacing={1} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
+            <Typography variant="h6">N-central preview run</Typography>
+            <Chip size="small" color={statusColor}
+              label={run.cancelRequested && active ? 'cancelling' : run.status} />
+          </Stack>
+          <Typography variant="body2" color="text.secondary">
+            {phase.charAt(0).toUpperCase() + phase.slice(1)} · {run.message}
+          </Typography>
+        </Box>
+        <Stack direction="row" spacing={1}>
+          {active && run.canCancel && <Button size="small" color="inherit" variant="outlined"
+            disabled={busy || run.cancelRequested} onClick={onCancel}>
+            {run.cancelRequested ? 'Cancelling…' : 'Cancel run'}
+          </Button>}
+          {!active && run.canRetry && <Button size="small" variant="outlined"
+            disabled={busy} onClick={onRetry}>Retry run</Button>}
+        </Stack>
+      </Stack>
+      <LinearProgress
+        aria-label="N-central preview progress"
+        variant={determinate ? 'determinate' : 'indeterminate'}
+        value={determinate ? (run.status === 'success' ? 100 : percent) : undefined}
+      />
+      <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
+        {determinate && <Chip size="small" variant="outlined" label={`${Math.round(percent)}% complete`} />}
+        <Chip size="small" variant="outlined" label={`${run.progress.discovered} discovered`} />
+        <Chip size="small" variant="outlined" label={`${run.progress.enriched} enriched`} />
+        <Chip size="small" variant="outlined" label={`${run.progress.reviewed} reviewed`} />
+      </Stack>
+      {run.status === 'failed' && <Alert severity="error">
+        {run.error || run.message || 'The N-central preview failed.'}
+      </Alert>}
+      {run.status === 'cancelled' && <Alert severity="info">
+        This preview was cancelled. Its partial observations were not published to the review queue.
+      </Alert>}
+    </Stack>
+  </Paper>;
 }
 
 export function NcentralIntegrationPage() {
@@ -54,6 +126,7 @@ export function NcentralIntegrationPage() {
   const [options, setOptions] = useState<NcentralDeviceOptions | null>(null);
   const [policy, setPolicy] = useState<ConnectWiseCiPolicy>(emptyPolicy());
   const [preview, setPreview] = useState<ConfigurationReconciliationPreview | null>(null);
+  const [previewRun, setPreviewRun] = useState<NcentralPreviewRun | null>(null);
   const [selectedDeviceIds, setSelectedDeviceIds] = useState<string[]>([]);
   const [notice, setNotice] = useState<Notice>(null);
   const [error, setError] = useState('');
@@ -64,6 +137,10 @@ export function NcentralIntegrationPage() {
   const [linkItem, setLinkItem] = useState<ConfigurationReconciliationItem | null>(null);
   const [linkAssets, setLinkAssets] = useState<Asset[]>([]);
   const [linkAssetId, setLinkAssetId] = useState('');
+  const optionsCache = useRef(new Map<string, NcentralDeviceOptions>());
+  const optionsRequest = useRef(0);
+  const latestRunRequest = useRef(0);
+  const previewScope = useRef('');
 
   const load = useCallback(async () => {
     try {
@@ -96,6 +173,11 @@ export function NcentralIntegrationPage() {
   const selectedMapping = mappedOrganizations.find(
     item => item.externalId === selectedOrganizationId,
   );
+  const selectedCompanyId = selectedMapping?.mappedCompanyId || '';
+  const previewScopeKey = selectedCompanyId && selectedOrganizationId
+    ? `${selectedCompanyId}:${selectedOrganizationId}`
+    : '';
+  previewScope.current = previewScopeKey;
   const reviewableItems = (preview?.items || []).filter(
     item => ['create', 'update', 'link'].includes(item.action),
   );
@@ -107,6 +189,94 @@ export function NcentralIntegrationPage() {
     && connection.enabled
     && connection.lifecycleStatus === 'active',
   );
+  const scopedPreviewRun = previewRun
+    && previewRun.companyId === selectedCompanyId
+    && previewRun.providerCompanyId === selectedOrganizationId
+    ? previewRun
+    : null;
+  const previewRunActive = previewRunIsActive(scopedPreviewRun);
+  const previewRunId = scopedPreviewRun?.id || '';
+
+  const acceptPreviewRun = useCallback((run: NcentralPreviewRun, expectedScope: string) => {
+    if (!expectedScope || previewScope.current !== expectedScope) return false;
+    setPreviewRun(run);
+    if (run.status === 'success') {
+      if (run.result) setPreview(run.result);
+      setSelectedDeviceIds([]);
+      setNotice({
+        severity: run.result?.counts.conflict ? 'warning' : 'success',
+        message: run.message,
+      });
+    } else if (run.status === 'failed') {
+      setNotice({ severity: 'error', message: run.error || run.message });
+    } else if (run.status === 'cancelled') {
+      setNotice({ severity: 'info', message: run.message });
+    }
+    return true;
+  }, []);
+
+  useEffect(() => {
+    if (!previewScopeKey) {
+      setPreviewRun(null);
+      return undefined;
+    }
+    const requestNumber = ++latestRunRequest.current;
+    const controller = new AbortController();
+    const query = new URLSearchParams({
+      companyId: selectedCompanyId,
+      providerCompanyId: selectedOrganizationId,
+    });
+    void apiFetch<NcentralPreviewRun | null>(
+      `/api/integrations/ncentral/devices/preview-runs/latest?${query.toString()}`,
+      { signal: controller.signal },
+    ).then(run => {
+      if (requestNumber !== latestRunRequest.current || !run) return;
+      acceptPreviewRun(run, previewScopeKey);
+    }).catch(value => {
+      if (controller.signal.aborted || requestNumber !== latestRunRequest.current) return;
+      if (value instanceof ApiError && value.status === 404) return;
+      setError(errorMessage(value));
+    });
+    return () => controller.abort();
+  }, [acceptPreviewRun, previewScopeKey, selectedCompanyId, selectedOrganizationId]);
+
+  useEffect(() => {
+    if (!previewRunId || !previewRunActive) return undefined;
+    const runId = previewRunId;
+    const expectedScope = previewScopeKey;
+    let stopped = false;
+    let timer: number | undefined;
+    let controller: AbortController | null = null;
+
+    const poll = async () => {
+      controller = new AbortController();
+      let pollAgain = true;
+      try {
+        const run = await apiFetch<NcentralPreviewRun>(
+          `/api/integrations/ncentral/devices/preview-runs/${encodeURIComponent(runId)}`,
+          { signal: controller.signal },
+        );
+        if (stopped || !acceptPreviewRun(run, expectedScope)) return;
+        pollAgain = previewRunIsActive(run);
+      } catch (value) {
+        if (stopped || controller.signal.aborted) return;
+        setNotice({
+          severity: 'warning',
+          message: `Progress could not be refreshed (${errorMessage(value)}). Retrying automatically…`,
+        });
+      } finally {
+        controller = null;
+      }
+      if (!stopped && pollAgain) timer = window.setTimeout(() => void poll(), 1500);
+    };
+
+    timer = window.setTimeout(() => void poll(), 250);
+    return () => {
+      stopped = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      controller?.abort();
+    };
+  }, [acceptPreviewRun, previewRunActive, previewRunId, previewScopeKey]);
 
   async function saveConnection(event: FormEvent) {
     event.preventDefault();
@@ -229,8 +399,15 @@ export function NcentralIntegrationPage() {
     } catch (value) { setError(errorMessage(value)); } finally { setBusy(''); }
   }
 
-  const loadDeviceOptions = useCallback(async () => {
-    if (!selectedMapping?.mappedCompanyId) return;
+  const loadDeviceOptions = useCallback(async (force = false) => {
+    if (!selectedCompanyId || !selectedOrganizationId) return;
+    const scope = `${selectedCompanyId}:${selectedOrganizationId}`;
+    const cached = optionsCache.current.get(scope);
+    if (cached && !force) {
+      setOptions(cached); setPolicy(cached.policy);
+      return;
+    }
+    const requestNumber = ++optionsRequest.current;
     setBusy('options'); setError(''); setPreview(null);
     try {
       const result = await apiFetch<NcentralDeviceOptions>(
@@ -238,14 +415,21 @@ export function NcentralIntegrationPage() {
         {
           method: 'POST',
           body: JSON.stringify({
-            companyId: selectedMapping.mappedCompanyId,
-            providerCompanyId: selectedMapping.externalId,
+            companyId: selectedCompanyId,
+            providerCompanyId: selectedOrganizationId,
           }),
         },
       );
-      setOptions(result); setPolicy(result.policy);
-    } catch (value) { setError(errorMessage(value)); } finally { setBusy(''); }
-  }, [selectedMapping]);
+      optionsCache.current.set(scope, result);
+      if (requestNumber === optionsRequest.current && previewScope.current === scope) {
+        setOptions(result); setPolicy(result.policy);
+      }
+    } catch (value) {
+      if (requestNumber === optionsRequest.current) setError(errorMessage(value));
+    } finally {
+      if (requestNumber === optionsRequest.current) setBusy('');
+    }
+  }, [selectedCompanyId, selectedOrganizationId]);
 
   useEffect(() => {
     if (activeStep === 3 && selectedOrganizationId) void loadDeviceOptions();
@@ -253,7 +437,8 @@ export function NcentralIntegrationPage() {
 
   function updatePolicy(changes: Partial<ConnectWiseCiPolicy>) {
     setPolicy(current => ({ ...current, ...changes }));
-    setPreview(null); setSelectedDeviceIds([]);
+    latestRunRequest.current += 1;
+    setPreview(null); setPreviewRun(null); setSelectedDeviceIds([]);
   }
 
   function updateTypeMapping(providerTypeId: string, canonicalType: string) {
@@ -279,6 +464,7 @@ export function NcentralIntegrationPage() {
             includedTypeIds: policy.includedTypeIds,
             typeMappings: policy.typeMappings,
             blockUnmappedTypes: policy.blockUnmappedTypes,
+            enrichmentMode: policy.enrichmentMode || 'balanced',
             statusMode: policy.statusMode,
             includedStatusIds: policy.includedStatusIds,
             excludedExternalIds: policy.excludedExternalIds,
@@ -290,6 +476,10 @@ export function NcentralIntegrationPage() {
         },
       );
       setPolicy(stored);
+      if (previewScopeKey) {
+        const cached = optionsCache.current.get(previewScopeKey);
+        if (cached) optionsCache.current.set(previewScopeKey, { ...cached, policy: stored });
+      }
       if (showNotice) setNotice({
         severity: 'success',
         message: 'Device filter, type mappings and preview schedule saved with an audit revision.',
@@ -299,45 +489,85 @@ export function NcentralIntegrationPage() {
   }
 
   async function previewDevices() {
-    if (!selectedMapping?.mappedCompanyId) return;
-    setBusy('preview-devices'); setError('');
+    if (!selectedCompanyId || !selectedOrganizationId || !previewScopeKey) return;
+    const expectedScope = previewScopeKey;
+    setError('');
     const stored = isAdmin ? await savePolicy(false) : policy;
-    if (!stored) { setBusy(''); return; }
-    setBusy('preview-devices');
+    if (!stored || previewScope.current !== expectedScope) return;
+    latestRunRequest.current += 1;
+    setBusy('enqueue-preview'); setPreview(null); setPreviewRun(null); setSelectedDeviceIds([]);
     try {
-      const result = await apiFetch<ConfigurationReconciliationPreview>(
-        '/api/integrations/ncentral/devices/preview',
+      const run = await apiFetch<NcentralPreviewRun>(
+        '/api/integrations/ncentral/devices/preview-runs',
         {
           method: 'POST',
           body: JSON.stringify({
-            companyId: selectedMapping.mappedCompanyId,
-            providerCompanyId: selectedMapping.externalId,
+            companyId: selectedCompanyId,
+            providerCompanyId: selectedOrganizationId,
           }),
         },
       );
-      setPreview(result); setSelectedDeviceIds([]);
-      setNotice({
-        severity: result.counts.conflict ? 'warning' : 'success',
-        message: result.message,
-      });
+      if (acceptPreviewRun(run, expectedScope) && previewRunIsActive(run)) {
+        setNotice({
+          severity: 'info',
+          message: 'The read-only preview is running in the background. You may leave this page and return later.',
+        });
+      }
     } catch (value) { setError(errorMessage(value)); } finally { setBusy(''); }
   }
 
   async function syncNow() {
-    if (!policy.id) return;
-    setBusy('sync-now'); setError('');
+    if (!policy.id || !previewScopeKey) return;
+    const expectedScope = previewScopeKey;
+    latestRunRequest.current += 1;
+    setBusy('enqueue-sync'); setError(''); setPreview(null); setPreviewRun(null);
+    setSelectedDeviceIds([]);
     try {
-      const result = await apiFetch<ConfigurationReconciliationPreview>(
-        `/api/integrations/ncentral/devices/policies/${encodeURIComponent(policy.id)}/sync-now`,
+      const run = await apiFetch<NcentralPreviewRun>(
+        `/api/integrations/ncentral/devices/policies/${encodeURIComponent(policy.id)}/preview-runs`,
         { method: 'POST' },
       );
-      setPreview(result); setSelectedDeviceIds([]);
-      setNotice({ severity: result.counts.conflict ? 'warning' : 'success', message: result.message });
+      if (acceptPreviewRun(run, expectedScope) && previewRunIsActive(run)) {
+        setNotice({
+          severity: 'info',
+          message: 'The saved policy is running in the background. Progress will update here.',
+        });
+      }
+    } catch (value) { setError(errorMessage(value)); } finally { setBusy(''); }
+  }
+
+  async function cancelPreviewRun() {
+    if (!scopedPreviewRun || !previewScopeKey) return;
+    const expectedScope = previewScopeKey;
+    setBusy('cancel-preview'); setError('');
+    try {
+      const run = await apiFetch<NcentralPreviewRun>(
+        `/api/integrations/ncentral/devices/preview-runs/${encodeURIComponent(scopedPreviewRun.id)}/cancel`,
+        { method: 'POST' },
+      );
+      acceptPreviewRun(run, expectedScope);
+    } catch (value) { setError(errorMessage(value)); } finally { setBusy(''); }
+  }
+
+  async function retryPreviewRun() {
+    if (!scopedPreviewRun || !previewScopeKey) return;
+    const expectedScope = previewScopeKey;
+    latestRunRequest.current += 1;
+    setBusy('retry-preview'); setError(''); setPreview(null); setSelectedDeviceIds([]);
+    try {
+      const run = await apiFetch<NcentralPreviewRun>(
+        `/api/integrations/ncentral/devices/preview-runs/${encodeURIComponent(scopedPreviewRun.id)}/retry`,
+        { method: 'POST' },
+      );
+      if (acceptPreviewRun(run, expectedScope) && previewRunIsActive(run)) {
+        setNotice({ severity: 'info', message: 'The preview retry has been queued.' });
+      }
     } catch (value) { setError(errorMessage(value)); } finally { setBusy(''); }
   }
 
   async function importDevices() {
     if (!selectedMapping?.mappedCompanyId || !selectedDeviceIds.length) return;
+    const resolvedIds = [...selectedDeviceIds];
     setBusy('import'); setError('');
     try {
       const result = await apiFetch<{ message: string }>(
@@ -353,7 +583,31 @@ export function NcentralIntegrationPage() {
         },
       );
       setNotice({ severity: 'success', message: result.message });
-      await previewDevices();
+      const removeResolvedItems = (current: ConfigurationReconciliationPreview | null) => {
+        if (!current) return current;
+        const resolved = current.items.filter(item => resolvedIds.includes(item.externalId));
+        if (!resolved.length) return current;
+        const counts = { ...current.counts };
+        for (const item of resolved) counts[item.action] = Math.max(0, counts[item.action] - 1);
+        const queueSummary = current.queueSummary
+          ? {
+            ...current.queueSummary,
+            pending: Math.max(0, current.queueSummary.pending - resolved.length),
+            resolved: current.queueSummary.resolved + resolved.length,
+          }
+          : undefined;
+        return {
+          ...current,
+          counts,
+          queueSummary,
+          items: current.items.filter(item => !resolvedIds.includes(item.externalId)),
+        };
+      };
+      setPreview(removeResolvedItems);
+      setPreviewRun(current => current?.result
+        ? { ...current, result: removeResolvedItems(current.result) }
+        : current);
+      setSelectedDeviceIds([]);
     } catch (value) { setError(errorMessage(value)); } finally { setBusy(''); }
   }
 
@@ -586,10 +840,13 @@ export function NcentralIntegrationPage() {
               : <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
                 <FormControl fullWidth sx={{ maxWidth: 620 }}><InputLabel>Mapped N-central customer</InputLabel>
                   <Select label="Mapped N-central customer" value={selectedOrganizationId}
+                    disabled={previewRunActive}
                     onChange={event => {
                       const externalId = event.target.value;
                       const mapped = mappedOrganizations.find(item => item.externalId === externalId);
+                      optionsRequest.current += 1; latestRunRequest.current += 1;
                       setSelectedOrganizationId(externalId); setOptions(null); setPreview(null);
+                      setPreviewRun(null); setSelectedDeviceIds([]);
                       setPolicy(emptyPolicy(mapped?.mappedCompanyId || '', externalId));
                     }}>
                     {mappedOrganizations.map(item => <MenuItem key={item.externalId} value={item.externalId}>
@@ -597,8 +854,9 @@ export function NcentralIntegrationPage() {
                     </MenuItem>)}
                   </Select>
                 </FormControl>
-                <Button variant="outlined" disabled={!selectedOrganizationId || busy === 'options'}
-                  onClick={() => void loadDeviceOptions()}>
+                <Button variant="outlined"
+                  disabled={!selectedOrganizationId || busy === 'options' || previewRunActive}
+                  onClick={() => void loadDeviceOptions(true)}>
                   {busy === 'options' ? 'Loading…' : 'Refresh choices'}
                 </Button>
               </Stack>}
@@ -607,6 +865,7 @@ export function NcentralIntegrationPage() {
               <Grid container spacing={2}>
                 <Grid size={{ xs: 12 }}><FormControl fullWidth><InputLabel>N-central device filter</InputLabel>
                   <Select label="N-central device filter" value={policy.providerFilterId || ''}
+                    disabled={previewRunActive}
                     onChange={event => updatePolicy({ providerFilterId: event.target.value })}>
                     <MenuItem value=""><em>All devices visible to this customer</em></MenuItem>
                     {options.deviceFilters.map(item => <MenuItem key={item.id} value={item.id}>
@@ -616,6 +875,7 @@ export function NcentralIntegrationPage() {
                 </FormControl></Grid>
                 <Grid size={{ xs: 12, md: 6 }}><FormControl fullWidth><InputLabel>Device class scope</InputLabel>
                   <Select multiple label="Device class scope" value={policy.includedTypeIds}
+                    disabled={previewRunActive}
                     onChange={event => updatePolicy({
                       typeMode: (event.target.value as string[]).length ? 'selected' : 'all',
                       includedTypeIds: event.target.value as string[],
@@ -628,6 +888,7 @@ export function NcentralIntegrationPage() {
                 </FormControl></Grid>
                 <Grid size={{ xs: 12, md: 6 }}><FormControl fullWidth><InputLabel>License/status scope</InputLabel>
                   <Select multiple label="License/status scope" value={policy.includedStatusIds}
+                    disabled={previewRunActive}
                     onChange={event => updatePolicy({
                       statusMode: (event.target.value as string[]).length ? 'selected' : 'all',
                       includedStatusIds: event.target.value as string[],
@@ -640,11 +901,28 @@ export function NcentralIntegrationPage() {
                 </FormControl></Grid>
                 <Grid size={{ xs: 12, md: 6 }}><TextField fullWidth label="Excluded N-central device IDs"
                   value={policy.excludedExternalIds.join(', ')}
+                  disabled={previewRunActive}
                   onChange={event => updatePolicy({ excludedExternalIds: event.target.value.split(',').map(value => value.trim()).filter(Boolean) })}
                   helperText="Optional immutable device IDs, separated by commas."
                 /></Grid>
+                <Grid size={{ xs: 12, md: 6 }}><FormControl fullWidth>
+                  <InputLabel>Enrichment depth</InputLabel>
+                  <Select label="Enrichment depth" value={policy.enrichmentMode || 'balanced'}
+                    disabled={previewRunActive}
+                    onChange={event => updatePolicy({
+                      enrichmentMode: event.target.value as NonNullable<ConnectWiseCiPolicy['enrichmentMode']>,
+                    })}>
+                    <MenuItem value="fast">Fast · no device detail calls</MenuItem>
+                    <MenuItem value="balanced">Balanced · enrich up to 25 devices</MenuItem>
+                    <MenuItem value="full">Full · enrich up to 250 devices</MenuItem>
+                  </Select>
+                  <FormHelperText>
+                    Read-only. Greater enrichment adds identity evidence but takes longer.
+                  </FormHelperText>
+                </FormControl></Grid>
                 <Grid size={{ xs: 12, md: 3 }}><FormControl fullWidth><InputLabel>Sync mode</InputLabel>
                   <Select label="Sync mode" value={policy.syncMode}
+                    disabled={previewRunActive}
                     onChange={event => updatePolicy({
                       syncMode: event.target.value as ConnectWiseCiPolicy['syncMode'],
                       enabled: event.target.value === 'continuous_preview' ? policy.enabled : false,
@@ -654,13 +932,15 @@ export function NcentralIntegrationPage() {
                   </Select>
                 </FormControl></Grid>
                 <Grid size={{ xs: 12, md: 3 }}><TextField fullWidth type="number" label="Interval minutes"
-                  value={policy.intervalMinutes} disabled={policy.syncMode === 'manual'}
+                  value={policy.intervalMinutes}
+                  disabled={policy.syncMode === 'manual' || previewRunActive}
                   onChange={event => updatePolicy({ intervalMinutes: Number(event.target.value) })}
                   slotProps={{ htmlInput: { min: 15, max: 10080 } }}
                 /></Grid>
               </Grid>
               {policy.syncMode === 'continuous_preview' && <FormControlLabel
                 control={<Checkbox checked={policy.enabled}
+                  disabled={previewRunActive}
                   onChange={(_, checked) => updatePolicy({ enabled: checked })} />}
                 label="Enable this saved policy for the integration worker"
               />}
@@ -668,6 +948,7 @@ export function NcentralIntegrationPage() {
                 <Typography variant="body2" color="text.secondary">Map N-central device classes to canonical CMDB types. Unmapped classes can be blocked from import.</Typography>
               </Box>
               <FormControlLabel control={<Checkbox checked={policy.blockUnmappedTypes}
+                disabled={previewRunActive}
                 onChange={(_, checked) => updatePolicy({ blockUnmappedTypes: checked })} />}
                 label="Block devices whose class has no canonical mapping"
               />
@@ -680,6 +961,7 @@ export function NcentralIntegrationPage() {
                 </TableCell><TableCell align="right">{item.count}</TableCell>
                 <TableCell><FormControl fullWidth size="small"><InputLabel>CMDB type</InputLabel>
                   <Select label="CMDB type" value={policy.typeMappings[item.id] || ''}
+                    disabled={previewRunActive}
                     onChange={event => updateTypeMapping(item.id, event.target.value)}>
                     <MenuItem value=""><em>Use N-central class name</em></MenuItem>
                     {canonicalAssetTypes.map(type => <MenuItem key={type} value={type}>{type}</MenuItem>)}
@@ -687,14 +969,25 @@ export function NcentralIntegrationPage() {
                 </FormControl></TableCell>
               </TableRow>)}</TableBody></Table></TableContainer>
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
-                <Button variant="outlined" disabled={!isAdmin || Boolean(busy)}
+                <Button variant="outlined" disabled={!isAdmin || Boolean(busy) || previewRunActive}
                   onClick={() => void savePolicy()}>{busy === 'save-policy' ? 'Saving…' : 'Save policy'}</Button>
-                <Button variant="contained" startIcon={<CloudSyncOutlined />} disabled={Boolean(busy)}
-                  onClick={() => void previewDevices()}>{busy === 'preview-devices' ? 'Reconciling…' : 'Preview device changes'}</Button>
-                <Button variant="outlined" disabled={!policy.id || Boolean(busy)}
-                  onClick={() => void syncNow()}>{busy === 'sync-now' ? 'Syncing…' : 'Sync saved policy now'}</Button>
+                <Button variant="contained" startIcon={<CloudSyncOutlined />}
+                  disabled={Boolean(busy) || previewRunActive}
+                  onClick={() => void previewDevices()}>
+                  {busy === 'enqueue-preview' ? 'Starting…' : 'Preview device changes'}
+                </Button>
+                <Button variant="outlined" disabled={!policy.id || Boolean(busy) || previewRunActive}
+                  onClick={() => void syncNow()}>
+                  {busy === 'enqueue-sync' ? 'Starting…' : 'Sync saved policy now'}
+                </Button>
               </Stack>
             </Stack></Paper>}
+            {scopedPreviewRun && <NcentralPreviewProgressPanel
+              run={scopedPreviewRun}
+              busy={busy === 'cancel-preview' || busy === 'retry-preview'}
+              onCancel={() => void cancelPreviewRun()}
+              onRetry={() => void retryPreviewRun()}
+            />}
             {preview && <Stack spacing={2}>
               <Alert severity={preview.counts.conflict ? 'warning' : 'success'}>{preview.message}</Alert>
               <Grid container spacing={1.5}>{([

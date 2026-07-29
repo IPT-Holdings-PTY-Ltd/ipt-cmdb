@@ -93,4 +93,22 @@ Assignment is changed only through the dedicated reassignment action. Eligible t
 
 ## Integration and audit records
 
-`integration_connections` stores provider type, scope, public configuration and installation-bound encrypted credential material. API responses, audit values and portable exports remove that material. `provider_company_observations` retains the least-data ConnectWise discovery snapshot, while `external_object_mappings` holds the durable provider-company-to-canonical-customer decision. `sync_runs` records execution outcomes and `audit_events` captures security- and data-relevant mutations. Passportal credential content does not belong in any of these records.
+`integration_connections` stores provider type, scope, public configuration and
+installation-bound encrypted credential material. API responses, audit values and
+portable exports remove that material. `provider_company_observations` retains the
+least-data ConnectWise discovery snapshot, while `external_object_mappings` holds the
+durable provider-company-to-canonical-customer decision.
+
+`sync_runs` is both execution evidence and the durable job envelope for asynchronous
+integration previews. A run records its tenant and saved-policy scope, request/available
+times, trigger and requester, bounded progress, attempt count, lease owner/expiry and
+heartbeat, cancellation state, retry lineage, terminal status and a sanitized result or
+error summary. A unique active-run key prevents duplicate queued/running work for the
+same policy. Expired running leases can be reclaimed after a worker restart.
+
+Provider response bodies and complete device payloads do not belong in `sync_runs`.
+Sanitized, reviewable observations are retained separately in
+`integration_ci_review_items`, where their immutable provider identities, hashes and
+proposed canonical decisions support later linking or import. `audit_events` captures
+security- and data-relevant mutations. Passportal credential content does not belong in
+any of these records.

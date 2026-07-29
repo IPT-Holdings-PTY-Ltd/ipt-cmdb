@@ -428,6 +428,33 @@ export type ConfigurationReconciliationPreview = {
   queueSummary?: { pending: number; created: number; updated: number; resolved: number };
 };
 
+export type NcentralPreviewRun = {
+  id: string;
+  companyId: string;
+  providerCompanyId: string;
+  policyId?: string | null;
+  policyRevision?: number;
+  status: 'queued' | 'running' | 'success' | 'failed' | 'cancelled';
+  phase: string;
+  progress: {
+    current: number;
+    total: number;
+    percent: number;
+    discovered: number;
+    enriched: number;
+    reviewed: number;
+  };
+  message: string;
+  error?: string;
+  startedAt?: string | null;
+  updatedAt?: string | null;
+  finishedAt?: string | null;
+  canCancel: boolean;
+  canRetry: boolean;
+  cancelRequested: boolean;
+  result?: ConfigurationReconciliationPreview | null;
+};
+
 export type ProviderFilterOption = { id: string; name: string; count: number };
 
 export type ConnectWiseCiPolicy = {
@@ -439,6 +466,7 @@ export type ConnectWiseCiPolicy = {
   includedTypeIds: string[];
   typeMappings: Record<string, string>;
   blockUnmappedTypes: boolean;
+  enrichmentMode?: 'fast' | 'balanced' | 'full';
   statusMode: 'all' | 'selected';
   includedStatusIds: string[];
   excludedExternalIds: string[];
@@ -465,6 +493,7 @@ export type IntegrationPreviewStatus = {
   workerEnabled: boolean;
   workerHealthy: boolean;
   workerIntervalSeconds: number;
+  scheduledPoliciesEnabled: boolean;
   executionMode: 'embedded' | 'dedicated' | 'one_shot';
   heartbeatAgeSeconds?: number | null;
   runtime?: WorkerRuntimeStatus | null;
