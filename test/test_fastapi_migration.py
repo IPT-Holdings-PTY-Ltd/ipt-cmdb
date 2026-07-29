@@ -4,7 +4,7 @@ import json
 import os
 import unittest
 from datetime import date, timedelta
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pyotp
 from fastapi.testclient import TestClient
@@ -797,21 +797,25 @@ class FastApiMigrationTests(unittest.TestCase):
             ),
             patch.object(
                 backend_main.REPOSITORY,
-                "record_sync_run",
+                "renew_ci_sync_policy_run",
+                return_value={"id": "policy-1"},
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "publish_and_complete_ci_policy_preview",
                 return_value={
-                    "id": "run-recovered",
-                    "finishedAt": "2026-07-27T10:05:00Z",
+                    "run": {
+                        "id": "run-recovered",
+                        "finishedAt": "2026-07-27T10:05:00Z",
+                    },
+                    "queueSummary": {
+                        "pending": 0,
+                        "created": 0,
+                        "updated": 0,
+                        "resolved": 0,
+                    },
+                    "policy": {"id": "policy-1", "consecutiveFailures": 0},
                 },
-            ),
-            patch.object(
-                backend_main.REPOSITORY,
-                "replace_ci_review_items",
-                return_value={"pending": 0, "created": 0, "updated": 0, "resolved": 0},
-            ),
-            patch.object(
-                backend_main.REPOSITORY,
-                "complete_ci_sync_policy_run",
-                return_value={"id": "policy-1", "consecutiveFailures": 0},
             ),
             patch.object(backend_main, "_queue_integration_alert") as queue_alert,
         ):
@@ -820,6 +824,8 @@ class FastApiMigrationTests(unittest.TestCase):
                 "42",
                 actor_id=None,
                 trigger="continuous_preview",
+                policy_id="policy-1",
+                lease_owner="scheduled-worker",
             )
 
         queue_alert.assert_called_once()
@@ -840,34 +846,32 @@ class FastApiMigrationTests(unittest.TestCase):
         recorded_runs = []
         recorded_actors = []
 
-        def record_run(_kind, run, _update_connection, actor_id):
+        def record_failure(_kind, _policy_id, _lease_owner, run, _error, actor_id):
             stored = {**run}
             recorded_runs.append(stored)
             recorded_actors.append(actor_id)
-            return stored
+            return {
+                "run": stored,
+                "policy": {"id": "policy-1", "consecutiveFailures": 0},
+            }
 
-        with (
-            patch.object(
-                backend_main.REPOSITORY,
-                "record_sync_run",
-                side_effect=record_run,
-            ),
-            patch.object(
-                backend_main.REPOSITORY,
-                "complete_ci_sync_policy_run",
-                return_value={"id": "policy-1", "consecutiveFailures": 0},
-            ),
+        with patch.object(
+            backend_main.REPOSITORY,
+            "fail_and_complete_ci_policy_preview",
+            side_effect=record_failure,
         ):
             backend_main._record_connectwise_ci_preview_failure(
                 policy,
                 backend_main.ConnectWiseRequestError("provider-secret-marker"),
                 trigger="continuous_preview",
+                lease_owner="scheduled-worker",
             )
             backend_main._record_connectwise_ci_preview_failure(
                 policy,
                 backend_main.ConnectWiseRequestError("provider-secret-marker"),
                 trigger="manual_sync",
                 actor_id="operator",
+                lease_owner="manual-worker",
             )
 
         self.assertTrue(recorded_runs[0]["message"].startswith("Continuous preview failed"))
@@ -876,6 +880,108 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(recorded_runs[1]["attributes"]["trigger"], "manual_sync")
         self.assertEqual(recorded_actors, [None, "operator"])
         self.assertNotIn("provider-secret-marker", json.dumps(recorded_runs))
+
+    def test_direct_preview_discards_results_when_atomic_publication_loses_lease(self):
+        """A stale direct worker must not fall back to the legacy multi-commit writes."""
+
+        preview = {
+            "companyId": "acme",
+            "companyName": "Acme Manufacturing",
+            "providerCompanyId": "42",
+            "providerCompanyName": "Acme Manufacturing",
+            "credentialSource": "stored",
+            "readOnly": True,
+            "writesAttempted": False,
+            "discovered": 1,
+            "included": 1,
+            "excluded": 0,
+            "exclusionReasons": {},
+            "availableTypes": [],
+            "availableStatuses": [],
+            "typeMappingSummary": {},
+            "appliedPolicy": {
+                "id": "policy-1",
+                "revision": 1,
+                "consecutiveFailures": 0,
+            },
+            "counts": {
+                "create": 1,
+                "update": 0,
+                "link": 0,
+                "unchanged": 0,
+                "conflict": 0,
+            },
+            "items": [{"externalId": "100", "action": "create"}],
+        }
+        with (
+            patch.object(
+                backend_main,
+                "_connectwise_configuration_preview",
+                return_value=preview,
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "renew_ci_sync_policy_run",
+                return_value={"id": "policy-1"},
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "publish_and_complete_ci_policy_preview",
+                return_value=None,
+            ) as publish,
+            patch.object(backend_main.REPOSITORY, "record_sync_run") as legacy_record,
+            patch.object(backend_main.REPOSITORY, "replace_ci_review_items") as legacy_queue,
+            self.assertRaises(backend_main._IntegrationPreviewLeaseLost),
+        ):
+            backend_main._execute_connectwise_ci_preview(
+                "acme",
+                "42",
+                actor_id=None,
+                trigger="continuous_preview",
+                policy_id="policy-1",
+                lease_owner="stale-worker",
+            )
+
+        publish.assert_called_once()
+        legacy_record.assert_not_called()
+        legacy_queue.assert_not_called()
+
+    def test_scheduled_worker_treats_reclaimed_lease_as_neutral(self):
+        """Lease takeover must not create a false failure or success result."""
+
+        policy = {
+            "id": "policy-1",
+            "provider": "connectwise",
+            "companyId": "acme",
+            "providerParentId": "42",
+        }
+        with (
+            patch.object(
+                backend_main,
+                "_process_queued_integration_previews",
+                return_value={"processed": 0, "succeeded": 0, "failed": 0},
+            ),
+            patch.object(backend_main, "_worker_flag", return_value=True),
+            patch.object(
+                backend_main.REPOSITORY,
+                "claim_due_ci_sync_policy",
+                return_value=policy,
+            ),
+            patch.object(
+                backend_main,
+                "_execute_connectwise_ci_preview",
+                side_effect=backend_main.ConnectWiseRequestError("provider failed"),
+            ),
+            patch.object(
+                backend_main,
+                "_record_connectwise_ci_preview_failure",
+                side_effect=backend_main._IntegrationPreviewLeaseLost("reclaimed"),
+            ) as record_failure,
+        ):
+            result = backend_main._run_due_integration_previews(limit=1)
+
+        self.assertEqual(result, {"processed": 1, "succeeded": 0, "failed": 0})
+        record_failure.assert_called_once()
 
     def test_sync_now_failure_is_attributed_to_the_authenticated_operator(self):
         """Operator-triggered failure evidence should retain its human actor."""
@@ -925,6 +1031,7 @@ class FastApiMigrationTests(unittest.TestCase):
             failure,
             trigger="manual_sync",
             actor_id="operator",
+            lease_owner=ANY,
         )
 
     def test_local_password_recovery_is_generic_single_use_and_revokes_credentials(self):
@@ -2513,7 +2620,15 @@ class FastApiMigrationTests(unittest.TestCase):
                     }
                 ]
 
-            def discover_devices(self, org_unit_id, *, filter_id="", enrich_limit=0):
+            def discover_devices(
+                self,
+                org_unit_id,
+                *,
+                filter_id="",
+                enrich_limit=0,
+                progress_callback=None,
+                cancel_requested=None,
+            ):
                 device_discovery_calls.append(
                     {
                         "orgUnitId": org_unit_id,
@@ -2525,6 +2640,16 @@ class FastApiMigrationTests(unittest.TestCase):
                     raise AssertionError("unexpected organization")
                 if filter_id and filter_id != "managed-servers":
                     raise AssertionError("unexpected device filter")
+                if cancel_requested and cancel_requested():
+                    raise AssertionError("preview unexpectedly cancelled")
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "discovering",
+                            "current": 2,
+                            "total": 2,
+                        }
+                    )
                 return [
                     {
                         "externalId": "7001",
@@ -3008,7 +3133,11 @@ class FastApiMigrationTests(unittest.TestCase):
                 headers=headers,
             )
             self.assertEqual(already_running.status_code, 409, already_running.text)
-            backend_main.REPOSITORY.complete_ci_sync_policy_run(policy_id, success=True)
+            backend_main.REPOSITORY.complete_ci_sync_policy_run(
+                policy_id,
+                lease_owner="test-worker",
+                success=True,
+            )
             manual_sync = self.client.post(
                 (f"/api/integrations/connectwise/configurations/policies/{policy_id}/sync-now"),
                 headers=headers,
