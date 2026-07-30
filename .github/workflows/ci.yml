@@ -120,6 +120,20 @@ jobs:
           docker compose \
             --env-file "$environment" \
             -f compose.appliance.yml \
+            run --rm --no-deps --entrypoint /bin/sh cmdb -ec '
+              test "$(id -u)" -ne 0
+              for secret in \
+                /run/secrets/database_url \
+                /run/secrets/bootstrap_admin_password \
+                /run/secrets/mfa_encryption_key
+              do
+                test -r "$secret"
+                test ! -w "$secret"
+              done
+            '
+          docker compose \
+            --env-file "$environment" \
+            -f compose.appliance.yml \
             up -d
           container_id="$(
             docker compose \
@@ -144,6 +158,9 @@ jobs:
           expected_version = os.environ["EXPECTED_VERSION"]
           deadline = time.monotonic() + 180
           last_error = "the service did not respond"
+
+          class FatalContainerError(RuntimeError):
+              pass
 
           def read_container_state() -> tuple[dict, int]:
               result = subprocess.run(
@@ -187,12 +204,21 @@ jobs:
               try:
                   state, restart_count = read_container_state()
                   health = state.get("Health")
+                  if restart_count != 0:
+                      raise FatalContainerError("the fresh CMDB container restarted")
+                  if state.get("OOMKilled") is True:
+                      raise FatalContainerError("the CMDB container was killed for memory")
+                  if state.get("Dead") is True:
+                      raise FatalContainerError("the CMDB container entered a dead state")
                   if state.get("Running") is not True:
-                      raise RuntimeError("the CMDB container is not running")
+                      status = str(state.get("Status", "unknown"))
+                      if status in {"dead", "exited"}:
+                          raise FatalContainerError(
+                              f"the CMDB container entered the {status} state"
+                          )
+                      raise RuntimeError("the CMDB container is not running yet")
                   if not isinstance(health, dict) or health.get("Status") != "healthy":
                       raise RuntimeError("the CMDB container is not healthy yet")
-                  if restart_count != 0:
-                      raise RuntimeError("the fresh CMDB container restarted")
                   live = read_json("/api/live")
                   ready = read_json("/api/ready")
                   if live.get("status") != "alive":
@@ -213,6 +239,10 @@ jobs:
                       raise RuntimeError("/api/ready did not report the current schema")
                   if ready.get("schemaVersion") != ready.get("expectedSchemaVersion"):
                       raise RuntimeError("/api/ready reported a schema version mismatch")
+              except FatalContainerError as error:
+                  raise SystemExit(
+                      f"Compact appliance startup failed: {error}"
+                  ) from None
               except (
                   json.JSONDecodeError,
                   OSError,

@@ -35,8 +35,14 @@ test('compact-appliance CI waits for exact readiness and preserves failure diagn
   assert.ok(diagnosticsStart > smokeStart);
   assert.ok(cleanupStart > diagnosticsStart);
   assert.doesNotMatch(smoke, /up -d --wait/);
+  assert.match(smoke, /run --rm --no-deps --entrypoint \/bin\/sh cmdb/);
+  assert.match(smoke, /test "\$\(id -u\)" -ne 0/);
+  assert.match(smoke, /test -r "\$secret"/);
+  assert.match(smoke, /test ! -w "\$secret"/);
   assert.match(smoke, /up -d\r?\n/);
   assert.match(smoke, /deadline = time\.monotonic\(\) \+ 180/);
+  assert.match(smoke, /class FatalContainerError\(RuntimeError\)/);
+  assert.match(smoke, /except FatalContainerError as error/);
   assert.match(smoke, /health\.get\("Status"\) != "healthy"/);
   assert.match(smoke, /restart_count != 0/);
   assert.match(smoke, /read_json\("\/api\/live"\)/);

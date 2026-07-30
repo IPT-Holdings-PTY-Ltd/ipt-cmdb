@@ -48,8 +48,20 @@ email that should receive the first platform-administrator mapping on a blank da
 ## 3. Configure the deployment
 
 Copy `.env.production.example` to `.env.production`, select an immutable image, and
-set absolute paths for both secret files. Apply host ACLs so only the deployment
-account can read them.
+set absolute paths for all secret files. On Linux, keep them in a deployment-owned
+directory that is `0700`, then make only the individual files read-only after writing
+them. Other host users cannot traverse the parent directory, while native Docker
+Engine can bind-mount the files for the non-root CMDB process:
+
+```sh
+secret_directory=/srv/ipt-cmdb/secrets
+chmod 0700 "$secret_directory"
+chmod 0444 "$secret_directory"/*.txt
+```
+
+Rotate a value by writing a protected temporary file and atomically replacing the old
+file, then restore mode `0444`. Docker Desktop users should retain protected Windows
+parent ACLs instead of applying POSIX modes.
 
 The default bind address is `127.0.0.1`, intentionally preventing direct remote
 access. If the reverse proxy runs on another host or container network, bind only to

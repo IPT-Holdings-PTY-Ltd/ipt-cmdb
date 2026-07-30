@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import unittest
 import uuid
@@ -127,6 +128,28 @@ class ApplianceScriptContractTests(unittest.TestCase):
             secret_paths = sorted((instance / "secrets").glob("*.txt"))
             self.assertEqual(len(secret_paths), 4)
             self.assertTrue(all(path.stat().st_size >= 32 for path in secret_paths))
+            process_output = first.stdout + first.stderr
+            self.assertTrue(
+                all(path.read_text(encoding="utf-8") not in process_output for path in secret_paths)
+            )
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(instance.stat().st_mode), 0o700)
+                self.assertEqual(
+                    stat.S_IMODE((instance / ".env.appliance").stat().st_mode),
+                    0o600,
+                )
+                self.assertEqual(
+                    stat.S_IMODE((instance / "secrets").stat().st_mode),
+                    0o700,
+                )
+                self.assertEqual(
+                    stat.S_IMODE((instance / "backups").stat().st_mode),
+                    0o700,
+                )
+                self.assertTrue(
+                    all(stat.S_IMODE(path.stat().st_mode) == 0o444 for path in secret_paths)
+                )
+                self.assertTrue(all(path.stat().st_uid == os.getuid() for path in secret_paths))
             before = {path.name: file_digest(path) for path in secret_paths}
 
             second = subprocess.run(
@@ -344,6 +367,28 @@ class ApplianceScriptContractTests(unittest.TestCase):
             self.assertEqual(environment["CMDB_MIGRATION_LOCK_TIMEOUT_MS"], "60000")
             self.assertEqual(environment["CMDB_MIGRATION_STATEMENT_TIMEOUT_MS"], "900000")
             secret_paths = sorted((instance / "secrets").glob("*.txt"))
+            process_output = first.stdout + first.stderr
+            self.assertTrue(
+                all(path.read_text(encoding="utf-8") not in process_output for path in secret_paths)
+            )
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(instance.stat().st_mode), 0o700)
+                self.assertEqual(
+                    stat.S_IMODE((instance / ".env.appliance").stat().st_mode),
+                    0o600,
+                )
+                self.assertEqual(
+                    stat.S_IMODE((instance / "secrets").stat().st_mode),
+                    0o700,
+                )
+                self.assertEqual(
+                    stat.S_IMODE((instance / "backups").stat().st_mode),
+                    0o700,
+                )
+                self.assertTrue(
+                    all(stat.S_IMODE(path.stat().st_mode) == 0o444 for path in secret_paths)
+                )
+                self.assertTrue(all(path.stat().st_uid == os.getuid() for path in secret_paths))
             before = {path.name: file_digest(path) for path in secret_paths}
 
             second = subprocess.run(

@@ -89,6 +89,12 @@ The initializer creates `.appliance/customer-acme/` containing:
 - the internal PostgreSQL connection URL;
 - an initially empty backup directory.
 
+On Linux, the initializer keeps the instance and secret directories `0700`, keeps the
+environment file `0600`, and makes the individual container-mounted secret files
+read-only (`0444`). Other host users cannot traverse the protected parent directory,
+while native Docker Engine can bind-mount those files for the non-root CMDB process.
+Docker Desktop retains the protected Windows ACL model instead.
+
 It also records `CMDB_IMAGE_DIGEST`, allowing health and incident evidence to identify
 the exact release. A non-loopback installation must use a digest. A SemVer image tag is
 accepted only with an explicit loopback public origin for local evaluation.

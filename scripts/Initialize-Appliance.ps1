@@ -179,12 +179,16 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw 'Unable to restrict the appliance instance directories.'
         }
-        $protectedFiles = @($environmentPath) + @(
+        $secretFiles = @(
             Get-ChildItem -LiteralPath $secretPath -File | Select-Object -ExpandProperty FullName
         )
-        & $chmod.Source 600 @protectedFiles
+        & $chmod.Source 600 $environmentPath
         if ($LASTEXITCODE -ne 0) {
-            throw 'Unable to restrict the appliance environment and secret files.'
+            throw 'Unable to restrict the appliance environment file.'
+        }
+        & $chmod.Source 444 @secretFiles
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Unable to restrict the appliance secret files.'
         }
     }
 

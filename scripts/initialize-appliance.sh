@@ -92,7 +92,7 @@ printf '%s' "$postgres_password" > "${secret_path}/postgres-password.txt"
 printf 'postgresql://cmdb:%s@postgres:5432/cmdb?sslmode=disable' "$postgres_password" > "${secret_path}/database-url.txt"
 printf '%s' "$bootstrap_password" > "${secret_path}/bootstrap-admin-password.txt"
 printf '%s' "$mfa_key" > "${secret_path}/mfa-encryption-key.txt"
-chmod 600 "$secret_path"/*
+chmod 444 "$secret_path"/*
 
 cat > "$environment_path" <<EOF
 COMPOSE_PROJECT_NAME=cmdb-${instance_name}

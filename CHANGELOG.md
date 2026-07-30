@@ -55,6 +55,9 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ### Fixed
 
+- Made Linux file-backed Compose secrets readable by the non-root CMDB and worker
+  processes while retaining private `0700` directories, `0600` environment files and
+  read-only `0444` secret files.
 - Made the first N-central discovery-policy save install its root connection record
   atomically, preventing a first-use `Integration connection not found` response.
 - Forwarded the documented N-central environment contract and compatibility token alias
