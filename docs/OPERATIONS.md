@@ -7,7 +7,34 @@
 Use liveness probes against `/api/live` and traffic readiness probes against `/api/ready`.
 Treat database/schema failures as unavailable; do not route production traffic to a
 local fallback. `/api/health` and `/api/v2/health` remain informational compatibility
-surfaces rather than traffic gates.
+surfaces rather than traffic gates. Readiness opens a bounded live PostgreSQL
+connection, runs a bounded statement, and compares the complete version/checksum
+migration history with the image. A reachable database with a missing, changed, or
+unexpected migration therefore still returns `503`.
+
+## Logs and alerts
+
+Container profiles emit one-line JSON application logs by default. Request records use
+stable `event`, `request_id`, `correlation_id`, `method`, route-template, status and
+duration fields; they do not include query strings, request bodies, authorization
+headers, client addresses or arbitrary application dictionaries. Common credential
+forms are redacted as a second line of defence. Set `LOG_FORMAT=text` only for an
+interactive local troubleshooting session.
+
+The Azure baseline provisions an independent Azure Monitor action group and alerts for:
+
+- readiness `503` responses;
+- non-readiness application `5xx` responses;
+- a missing web/worker runtime heartbeat;
+- PostgreSQL unavailability; and
+- PostgreSQL storage utilization at or above 80 percent by default.
+
+Azure Monitor sends these notifications directly to the configured operations email;
+the application's Microsoft Graph email integration is not a dependency. Repeated
+readiness alerts require a database-connectivity and migration-history check. A worker
+alert requires checking the Container App replica and the durable worker status before
+restarting it. Raise the storage limit only after capacity planning, not to silence an
+active capacity incident.
 
 ## Routine checks
 
@@ -26,15 +53,92 @@ The MSP dashboard exposes the last five categories as operational work queues.
 
 ## Upgrade procedure
 
-1. Review `CHANGELOG.md` and new files under `db/migrations`.
-2. Run the full automated test suite.
-3. Run blank-bootstrap and forward-upgrade verification against PostgreSQL.
-4. Take or verify a recoverable production backup/PITR point.
-5. Deploy the image to a staging revision.
-6. Confirm health, authentication and tenant isolation.
-7. Promote the revision and monitor logs and database state.
+Every release has an authoritative `release-manifest.json` and `SHA256SUMS`. The
+manifest pins the exact container digest and records the application version, expected
+schema/history, supported PostgreSQL major, database change classification, backup
+requirement, and rollback boundary. Never infer those values from `latest`.
 
-Never change the contents of an applied migration. Add a new migration with a later ordered version.
+For either Compose appliance or external-PostgreSQL deployments, use the host-side
+`scripts/Update-Cmdb.ps1` or `scripts/update-cmdb.sh` supplied in the verified release
+bundle:
+
+1. run its check action, which is the default and makes no deployment change;
+2. review the verified target digest, manifest SHA-256, changelog, database
+   classification, rollback boundary, maintenance window, and smoke-test plan;
+3. confirm off-host appliance-backup retention or a tested external PostgreSQL
+   PITR/backup point;
+4. apply only with both the exact target version and exact manifest SHA-256 printed by
+   that check;
+5. require the updater's version, digest, schema, schema-history, and readiness
+   validation to pass;
+6. verify authentication, tenant isolation, one asset, one relationship, one report,
+   integration/notification queues, and the worker heartbeat; and
+7. retain the recovery point and monitor application/database state through the
+   acceptance period.
+
+External PostgreSQL apply also requires a structured, non-secret recovery reference,
+for example `change:CHG-12345`. Update history stores only its SHA-256 and limited
+metadata, never the raw reference. The POSIX form uses
+`--recovery-evidence-ref`; PowerShell uses `-RecoveryPointEvidence`.
+
+Both updaters inspect the existing Compose project and require `-WorkerSplit` or
+`--worker-split` to match the presence of a worker container exactly. A topology
+mismatch fails before any mutation. They preserve the worker's initial state: a running
+worker is stopped before web and restarted after readiness, while an intentionally
+stopped worker stays stopped.
+
+If the target digest is already configured, check/apply succeeds only when the
+container is healthy and readiness matches the target version, digest, schema, and
+schema-history checksum. A mismatch is a repair incident: inspect `/api/ready` and
+recreate or repair the exact approved image rather than claiming the update succeeded.
+For a different digest, apply refuses unavailable or invalid current schema metadata
+and rejects schema downgrade before pulling or stopping services.
+
+The application container does not receive the Docker socket and cannot update itself.
+Scheduled jobs may run check-only mode and send the result to operations monitoring;
+they must never contain an apply approval. Do not use Watchtower or another unattended
+container updater, and do not deploy mutable `latest`.
+
+The updater stops every selected application writer before the final appliance backup,
+then executes `python scripts/migrate_postgres.py` in one ephemeral target-image
+container. Migrations serialize on a PostgreSQL advisory lock and are bounded by these
+defaults:
+
+```dotenv
+CMDB_MIGRATION_LOCK_TIMEOUT_MS=60000
+CMDB_MIGRATION_STATEMENT_TIMEOUT_MS=900000
+```
+
+The lock timeout may be configured from 1 second to 15 minutes and the statement timeout
+from 1 second to 60 minutes. A timeout stops the update for investigation; it is not a
+reason to change or skip an applied migration. Never change the contents of an applied
+migration. Add a new migration with a later ordered version.
+
+The web container's `/api/ready` gate compares the live database's complete
+version/checksum history with the target image and exposes its deterministic
+`schemaHistorySha256`. A dedicated worker exposes no HTTP port, so its image-level HTTP
+health check is disabled. Treat a running worker process plus a fresh durable heartbeat
+and recent success as its health signal. The updater restarts a previously running
+worker only after exact web readiness succeeds.
+
+### Failure and rollback
+
+Before migration begins, the Compose updater can restore the previous environment and
+restart the previous application image. Once the migration command starts, automatic
+image rollback is disabled because a failed command may already have committed schema
+work.
+
+The current repository enforces exact migration history. Therefore any schema-version
+change requires restoring the pre-update database backup/PITR point before starting an
+older image, even when the SQL change was operationally classified as expand-only. An
+image-only rollback may be reviewed only when the manifest says `database.changeClassification`
+is `none` and the schema version/history are confirmed unchanged. Keep workers stopped
+during database recovery.
+
+PostgreSQL major-version upgrades are separate rehearsed database operations; the
+application updater never pulls, recreates, or upgrades PostgreSQL. Azure deployments
+use a staged Container Apps revision rather than the Compose scripts, but must enforce
+the same manifest, recovery-point, migration, readiness, and rollback boundaries.
 
 ## Portable export/import
 
@@ -75,6 +179,9 @@ docker compose logs --tail 200 cmdb
 docker compose logs --tail 200 postgres
 docker compose restart cmdb
 ```
+
+`restart` restarts the currently configured container; it does not adopt a newly pulled
+image. Use it only for same-image incident recovery, not as an upgrade mechanism.
 
 `docker compose down` preserves the named database volume. Removing the volume destroys the local PostgreSQL data and should only be done for an intentional demo reset.
 

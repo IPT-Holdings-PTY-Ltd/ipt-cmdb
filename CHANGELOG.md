@@ -6,6 +6,12 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ### Added
 
+- Live readiness checks for PostgreSQL connectivity and the complete checksum-protected
+  migration history, with bounded connection/statement timeouts and sanitized failures.
+- Structured, redacted JSON diagnostics for API requests and worker heartbeats, using
+  stable route templates, correlation IDs, status and duration without request secrets.
+- Azure Monitor action-group notifications for readiness failures, application 5xx
+  responses, stale worker telemetry, PostgreSQL availability and storage pressure.
 - Backward-compatible `combined`, `web`, and `worker` process roles, with a reusable
   dedicated worker entry point and `--once` mode for scheduled container jobs.
 - Optional Docker Compose worker overlay and zero-idle-cost Azure Container Apps worker
@@ -29,6 +35,23 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Cross-replica local-password reservations with identifier/source cooldowns,
   `Retry-After` guidance and bounded authentication audit evidence.
 - Trusted-proxy deployment contracts for Docker and Azure Container Apps.
+- Guided Windows and Linux appliance installers with atomic secret generation,
+  immutable digest enforcement, Compose preflight, bounded startup waits and live
+  plus schema-readiness verification.
+- Authoritative runtime release metadata for the application version, source commit
+  and deployed image digest in OCI labels and operator-safe health responses.
+- Guarded release publishing with explicit database/rollback classification,
+  multi-architecture attested images, machine-readable compatibility manifests,
+  deterministic self-hosted bundles and stable-channel promotion only after the
+  GitHub release succeeds.
+- CI coverage that boots a fresh compact appliance from the built image and verifies
+  its liveness, canonical PostgreSQL readiness and reported application version.
+- Guarded Windows and POSIX update commands for compact appliances and external
+  PostgreSQL deployments, with read-only release checks, exact version plus manifest
+  checksum approval, verified recovery evidence, one-shot migrations, preserved worker
+  state and manifest/schema-history-matched readiness verification.
+- Bounded PostgreSQL migration lock and statement timeouts so blocked upgrades fail
+  visibly instead of hanging indefinitely.
 
 ### Fixed
 
@@ -45,6 +68,10 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 - Replaced brittle test-file cleanup with isolated temporary directories.
 - Standardized PostgreSQL row-lock clause ordering and retained the persisted MFA
   attempt count when concurrent requests reach or consume a challenge limit.
+- Replaced the legacy one-file PostgreSQL migration helper with the same advisory-locked,
+  checksum-protected forward-only migration plan used by the running application.
+- Disabled the inherited HTTP health check on dedicated worker containers, which do not
+  expose the web service port during Compose update waits.
 
 ### Security
 

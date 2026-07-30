@@ -98,7 +98,60 @@ jobs:
         run: npm run build
 
       - name: Build container
-        run: docker build --tag ipt-cmdb:ci .
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          docker build \
+            --build-arg "CMDB_VERSION=$version" \
+            --build-arg "CMDB_SOURCE_COMMIT=$(git rev-parse HEAD)" \
+            --tag "ipt-cmdb:$version-ci" \
+            .
+
+      - name: Smoke-test a fresh compact-appliance install
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          sh scripts/initialize-appliance.sh \
+            admin@example.test \
+            ci-smoke \
+            http://127.0.0.1:3011 \
+            "ipt-cmdb:$version-ci" \
+            3011
+          environment=".appliance/ci-smoke/.env.appliance"
+          docker compose \
+            --env-file "$environment" \
+            -f compose.appliance.yml \
+            up -d --wait --wait-timeout 180
+          python - <<'PY'
+          import json
+          import urllib.request
+          from pathlib import Path
+
+          expected_version = Path("VERSION").read_text(encoding="utf-8").strip()
+          for path in ("/api/live", "/api/ready"):
+              with urllib.request.urlopen(
+                  f"http://127.0.0.1:3011{path}",
+                  timeout=10,
+              ) as response:
+                  payload = json.load(response)
+              if response.status != 200:
+                  raise SystemExit(f"{path} returned HTTP {response.status}")
+              if payload["applicationVersion"] != expected_version:
+                  raise SystemExit(
+                      f"{path} reported {payload['applicationVersion']}, "
+                      f"expected {expected_version}"
+                  )
+          PY
+
+      - name: Clean up compact-appliance smoke test
+        if: always()
+        run: |
+          environment=".appliance/ci-smoke/.env.appliance"
+          if [[ -f "$environment" ]]; then
+            docker compose \
+              --env-file "$environment" \
+              -f compose.appliance.yml \
+              down --volumes --remove-orphans
+          fi
 
   security:
     name: Security checks

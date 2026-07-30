@@ -7,13 +7,21 @@ The `infra/` Bicep baseline provisions a complete Azure runtime:
 - VNet integration and private PostgreSQL Flexible Server networking
 - PostgreSQL 16 database with 14-day PITR retention
 - Key Vault references through a user-assigned managed identity
-- Log Analytics
+- Log Analytics with structured application logs
+- Azure Monitor action group and readiness, 5xx, worker, PostgreSQL availability, and
+  PostgreSQL storage alerts
 - startup, liveness, and readiness probes
 - a non-ingress worker Container App that scales to zero until dedicated mode is selected
 - optional Microsoft Entra authentication at the Container Apps boundary
 
 The default PostgreSQL SKU and single app replica are economical starting values, not
 a universal production sizing recommendation.
+
+Operational alerts are enabled by default and use `bootstrapAdminEmail` as their
+receiver. Set the optional `operationalAlertEmail` Bicep parameter to a monitored
+operations mailbox. Use `enableOperationalAlerts=false` only for a deliberate
+non-production deployment. `postgresStorageAlertPercent` defaults to 80 and accepts
+values from 50 through 95.
 
 ## Prerequisites
 
@@ -141,9 +149,28 @@ Then verify:
 3. an unmapped Entra user receives no CMDB access;
 4. tenant switching respects customer/group assignments;
 5. an asset read and branded PDF report succeed;
-6. Container Apps logs contain request IDs but no secrets.
+6. Container Apps logs contain JSON request IDs and route templates but no secrets;
 7. a forged left-most `X-Forwarded-For` value does not change the resolved client
-   shown in audit evidence.
+   shown in audit evidence;
+8. the Azure Monitor action group has a confirmed email receiver and each alert rule
+   is enabled.
+
+The direct Log Analytics connection used by this template writes console output to
+`ContainerAppConsoleLogs_CL`. A quick structured-log check is:
+
+```powershell
+$workspace = az monitor log-analytics workspace show `
+  --resource-group <resource-group> `
+  --workspace-name <workspace-name> `
+  --query customerId -o tsv
+az monitor log-analytics query `
+  --workspace $workspace `
+  --analytics-query "ContainerAppConsoleLogs_CL | where ContainerAppName_s startswith 'cmdb-' | extend payload=parse_json(Log_s) | where isnotempty(payload.event) | project TimeGenerated, ContainerAppName_s, payload | take 20"
+```
+
+Azure Monitor delivery is independent of the CMDB Microsoft Graph email setup. Test the
+action group from Azure Monitor after deployment and route it to an address monitored
+outside the CMDB application.
 
 ## Security and operations notes
 
@@ -163,6 +190,9 @@ Then verify:
   governed local break-glass accounts only.
 - PostgreSQL coordinates local-password identifier and source limits across replicas;
   an external WAF/ingress rate limit remains recommended for volumetric attacks.
+- `LOG_FORMAT=json` and `LOG_LEVEL=INFO` are set on web and worker containers. Uvicorn's
+  duplicate access log is disabled in the image; request middleware is the canonical
+  request diagnostic stream.
 
 ## IaC validation without deployment
 

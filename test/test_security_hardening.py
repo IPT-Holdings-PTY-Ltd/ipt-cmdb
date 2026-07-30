@@ -17,6 +17,7 @@ from src.cmdb.database_config import (
     encryption_key,
     write_encrypted_database_url,
 )
+from src.cmdb.version import APPLICATION_VERSION
 
 
 class DatabaseConfigurationSecurityTests(unittest.TestCase):
@@ -98,26 +99,87 @@ class ApiExposureSecurityTests(unittest.TestCase):
         with patch.object(core, "DATABASE_MODE", "PostgreSQL unavailable"):
             response = backend_main.liveness()
 
-        self.assertEqual(response, {"status": "alive", "api": "FastAPI"})
+        self.assertEqual(response["status"], "alive")
+        self.assertEqual(response["api"], "FastAPI")
+        self.assertEqual(response["applicationVersion"], APPLICATION_VERSION)
 
     def test_readiness_requires_canonical_postgres_repository(self):
         with (
             patch.object(core, "DATABASE_MODE", "PostgreSQL unavailable"),
             patch.object(backend_main.REPOSITORY, "mode", "local"),
+            patch.object(core, "database_readiness") as probe,
         ):
             response = backend_main.readiness()
 
         self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            json.loads(response.body)["applicationVersion"],
+            APPLICATION_VERSION,
+        )
         self.assertNotIn("PostgreSQL unavailable", response.body.decode())
+        probe.assert_not_called()
 
     def test_readiness_accepts_canonical_postgres_repository(self):
         with (
             patch.object(core, "DATABASE_MODE", "PostgreSQL"),
             patch.object(backend_main.REPOSITORY, "mode", "canonical_postgresql"),
+            patch.object(
+                core,
+                "database_readiness",
+                return_value={
+                    "databaseAvailable": True,
+                    "schemaCurrent": True,
+                    "schemaVersion": core.SCHEMA_VERSION,
+                    "expectedSchemaVersion": core.SCHEMA_VERSION,
+                },
+            ),
         ):
             response = backend_main.readiness()
 
         self.assertEqual(response.status_code, 200)
+        readiness_body = json.loads(response.body)
+        self.assertTrue(readiness_body["schemaCurrent"])
+        self.assertEqual(readiness_body["applicationVersion"], APPLICATION_VERSION)
+        self.assertEqual(
+            readiness_body["schemaHistorySha256"],
+            core.SCHEMA_HISTORY_SHA256,
+        )
+
+    def test_readiness_fails_closed_on_live_database_error_without_leaking_details(self):
+        secret = "postgresql://cmdb:password-value@db.internal/cmdb"
+        with (
+            patch.object(core, "DATABASE_MODE", "PostgreSQL"),
+            patch.object(backend_main.REPOSITORY, "mode", "canonical_postgresql"),
+            patch.object(core, "database_readiness", side_effect=RuntimeError(secret)),
+        ):
+            response = backend_main.readiness()
+
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(json.loads(response.body)["databaseAvailable"])
+        self.assertNotIn(secret, response.body.decode())
+        self.assertNotIn("db.internal", response.body.decode())
+
+    def test_readiness_rejects_schema_drift_while_database_is_reachable(self):
+        with (
+            patch.object(core, "DATABASE_MODE", "PostgreSQL"),
+            patch.object(backend_main.REPOSITORY, "mode", "canonical_postgresql"),
+            patch.object(
+                core,
+                "database_readiness",
+                return_value={
+                    "databaseAvailable": True,
+                    "schemaCurrent": False,
+                    "schemaVersion": "older",
+                    "expectedSchemaVersion": core.SCHEMA_VERSION,
+                },
+            ),
+        ):
+            response = backend_main.readiness()
+
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 503)
+        self.assertTrue(body["databaseAvailable"])
+        self.assertFalse(body["schemaCurrent"])
 
     def test_health_does_not_expose_repository_exception_text(self):
         with (
@@ -128,6 +190,10 @@ class ApiExposureSecurityTests(unittest.TestCase):
 
         self.assertEqual(response["status"], "degraded")
         self.assertFalse(response["databaseAvailable"])
+        self.assertEqual(response["applicationVersion"], APPLICATION_VERSION)
+        self.assertIn("sourceCommit", response)
+        self.assertIn("imageDigest", response)
+        self.assertEqual(response["schemaHistorySha256"], core.SCHEMA_HISTORY_SHA256)
         self.assertNotIn("repositoryError", response)
         self.assertNotIn("db.internal", json.dumps(response))
 

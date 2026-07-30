@@ -6,12 +6,15 @@ import asyncio
 import logging
 import os
 import socket
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 LOGGER = logging.getLogger("cmdb.worker")
+_RUNTIME_LOG_INTERVAL_SECONDS = 60
+_LAST_RUNTIME_LOG: dict[str, float] = {}
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,26 @@ def _processed_count(result: dict[str, Any]) -> int:
     return 0
 
 
+def _should_log_runtime_event(worker: PeriodicWorker, worker_id: str, event: str) -> bool:
+    """Bound routine heartbeat logs while always retaining lifecycle failures."""
+
+    key = f"{worker.name}:{worker_id}"
+    now = time.monotonic()
+    if event == "stopped":
+        _LAST_RUNTIME_LOG.pop(key, None)
+        return True
+    if event in {"starting", "cycle_failed"}:
+        _LAST_RUNTIME_LOG[key] = now
+        return True
+    if event not in {"heartbeat", "cycle_succeeded"}:
+        return False
+    last_logged = _LAST_RUNTIME_LOG.get(key, 0)
+    if now - last_logged < _RUNTIME_LOG_INTERVAL_SECONDS:
+        return False
+    _LAST_RUNTIME_LOG[key] = now
+    return True
+
+
 def _observe(
     observer: Callable[..., Any],
     worker: PeriodicWorker,
@@ -71,6 +94,17 @@ def _observe(
 ) -> None:
     """Persist runtime evidence without making telemetry a worker dependency."""
 
+    if _should_log_runtime_event(worker, worker_id, event):
+        LOGGER.info(
+            "Worker runtime event",
+            extra={
+                "event": "worker_runtime",
+                "worker_name": worker.name,
+                "worker_id": worker_id,
+                "operation": event,
+                "processed": processed,
+            },
+        )
     try:
         observer(
             worker.name,

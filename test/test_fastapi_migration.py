@@ -13,6 +13,7 @@ import app as core
 import backend.main as backend_main
 from src.cmdb.email_delivery import DeliveryResult, EmailDeliveryError
 from src.cmdb.repository import StateRepository
+from src.cmdb.version import APPLICATION_VERSION
 
 api = backend_main.api
 
@@ -115,6 +116,24 @@ class FastApiMigrationTests(unittest.TestCase):
 
     def _headers(self, email: str, password: str = "ChangeMe!") -> dict[str, str]:
         return {"Authorization": f"Bearer {self._login(email, password)}"}
+
+    def test_request_log_uses_route_template_without_query_or_authorization_values(self):
+        sentinel = "must-not-appear-in-logs"
+        with self.assertLogs("cmdb.api", level="WARNING") as captured:
+            response = self.client.get(
+                f"/api/assets/asset-1?token={sentinel}",
+                headers={"Authorization": f"Bearer {sentinel}"},
+            )
+
+        self.assertEqual(response.status_code, 401)
+        request_record = next(
+            record
+            for record in captured.records
+            if getattr(record, "event", "") == "http_request_completed"
+        )
+        self.assertEqual(request_record.route, "/api/assets/{asset_id}")
+        self.assertEqual(request_record.status_code, 401)
+        self.assertNotIn(sentinel, " ".join(captured.output))
 
     def test_notification_worker_finishes_cleanup_during_shutdown(self):
         events: list[str] = []
@@ -1543,7 +1562,7 @@ class FastApiMigrationTests(unittest.TestCase):
     def test_openapi_identifies_the_direct_fastapi_surface(self):
         schema = api.openapi()
         self.assertEqual(schema["info"]["title"], "CMDB Hub API")
-        self.assertEqual(schema["info"]["version"], "0.4.0")
+        self.assertEqual(schema["info"]["version"], APPLICATION_VERSION)
         self.assertIn("/api/assets", schema["paths"])
         self.assertNotIn("/api/v2/assets/{asset_id}", schema["paths"])
         self.assertIn("/api/contacts", schema["paths"])
