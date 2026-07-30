@@ -107,6 +107,22 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIn("Worker ready", rendered)
         self.assertIn("worker_name=integrations", rendered)
 
+    def test_migration_metadata_is_preserved_in_json_and_text_logs(self):
+        record = self.record(
+            "PostgreSQL migrations applied",
+            event="postgres_migrations_applied",
+            migration_count=2,
+            schema_version="2026.07.29.2",
+        )
+
+        payload = json.loads(JsonLogFormatter().format(record))
+        rendered = TextLogFormatter().format(record)
+
+        self.assertEqual(payload["migration_count"], 2)
+        self.assertEqual(payload["schema_version"], "2026.07.29.2")
+        self.assertIn("migration_count=2", rendered)
+        self.assertIn("schema_version=2026.07.29.2", rendered)
+
     def test_configure_logging_is_idempotent(self):
         with patch.dict(os.environ, {"LOG_FORMAT": "json", "LOG_LEVEL": "INFO"}):
             configure_logging()

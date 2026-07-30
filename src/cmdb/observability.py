@@ -25,6 +25,8 @@ _ALLOWED_EXTRA_FIELDS = (
     "message_id",
     "provider",
     "operation",
+    "migration_count",
+    "schema_version",
     "policy_id",
     "run_id",
     "worker_name",

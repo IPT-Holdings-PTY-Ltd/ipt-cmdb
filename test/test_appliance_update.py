@@ -203,11 +203,16 @@ def fake_docker_environment(
     else:
         executable = binary_directory / "docker"
         configured_images = "postgres:16-alpine\\n" if include_postgres else ""
+        migration_failure = '  *"migrate_postgres.py"*) exit 1 ;;\n' if fail_migration else ""
         executable.write_text(
             "#!/bin/sh\n"
             'printf "%s\\n" "$*" >> "$FAKE_DOCKER_LOG"\n'
             'case "$*" in\n'
             '  "compose version --short") printf "v2.30.0\\n" ;;\n'
+            + migration_failure
+            + '  *"com.docker.compose.service=worker"*) : ;;\n'
+            '  *"com.docker.compose.service=cmdb"*) printf "aaaaaaaaaaaa\\n" ;;\n'
+            '  inspect*) printf "true|healthy\\n" ;;\n'
             f'  *"config --images"*) printf "{configured_images}" ;;\n'
             '  *"/api/health"*) printf '
             "'\"%s\\\\n\"' "
