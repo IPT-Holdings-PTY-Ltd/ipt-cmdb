@@ -87,9 +87,10 @@ chmod 700 "$staging_path" "$secret_path" "$backup_path"
 postgres_password="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
 bootstrap_password="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
 mfa_key="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n')"
+database_url="postgresql://cmdb:${postgres_password}@postgres:5432/cmdb?sslmode=disable"
 
 printf '%s' "$postgres_password" > "${secret_path}/postgres-password.txt"
-printf 'postgresql://cmdb:%s@postgres:5432/cmdb?sslmode=disable' "$postgres_password" > "${secret_path}/database-url.txt"
+printf '%s' "$database_url" > "${secret_path}/database-url.txt"
 printf '%s' "$bootstrap_password" > "${secret_path}/bootstrap-admin-password.txt"
 printf '%s' "$mfa_key" > "${secret_path}/mfa-encryption-key.txt"
 chmod 444 "$secret_path"/*

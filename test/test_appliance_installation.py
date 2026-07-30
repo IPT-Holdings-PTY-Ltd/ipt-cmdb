@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import shutil
 import stat
@@ -44,6 +45,22 @@ def file_digest(path: Path) -> str:
     """Return a stable digest without exposing generated secret values."""
 
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def assert_database_secret_consistency(
+    test_case: unittest.TestCase,
+    instance: Path,
+) -> None:
+    """Verify the database URL embeds the generated password without logging it."""
+
+    secret_path = instance / "secrets"
+    password = (secret_path / "postgres-password.txt").read_text(encoding="utf-8")
+    database_url = (secret_path / "database-url.txt").read_text(encoding="utf-8")
+    expected = f"postgresql://cmdb:{password}@postgres:5432/cmdb?sslmode=disable"
+    test_case.assertTrue(
+        hmac.compare_digest(database_url, expected),
+        "database-url.txt must embed the generated PostgreSQL password",
+    )
 
 
 class ApplianceScriptContractTests(unittest.TestCase):
@@ -128,6 +145,7 @@ class ApplianceScriptContractTests(unittest.TestCase):
             secret_paths = sorted((instance / "secrets").glob("*.txt"))
             self.assertEqual(len(secret_paths), 4)
             self.assertTrue(all(path.stat().st_size >= 32 for path in secret_paths))
+            assert_database_secret_consistency(self, instance)
             process_output = first.stdout + first.stderr
             self.assertTrue(
                 all(path.read_text(encoding="utf-8") not in process_output for path in secret_paths)
@@ -367,6 +385,8 @@ class ApplianceScriptContractTests(unittest.TestCase):
             self.assertEqual(environment["CMDB_MIGRATION_LOCK_TIMEOUT_MS"], "60000")
             self.assertEqual(environment["CMDB_MIGRATION_STATEMENT_TIMEOUT_MS"], "900000")
             secret_paths = sorted((instance / "secrets").glob("*.txt"))
+            self.assertEqual(len(secret_paths), 4)
+            assert_database_secret_consistency(self, instance)
             process_output = first.stdout + first.stderr
             self.assertTrue(
                 all(path.read_text(encoding="utf-8") not in process_output for path in secret_paths)
