@@ -124,6 +124,7 @@ from src.cmdb.repository import (
     hash_password,
     integration_connection_audit_value,
 )
+from src.cmdb.version import release_metadata
 from src.cmdb.worker_runtime import PeriodicWorker, process_role, run_periodic_worker
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -472,15 +473,44 @@ async def application_lifespan(_application: FastAPI):
 
 api = FastAPI(
     title="CMDB Hub API",
-    version="0.4.0",
+    version=release_metadata().application_version,
     description="Tenant-aware CMDB API served directly by FastAPI.",
     lifespan=application_lifespan,
 )
 
 
 @api.middleware("http")
+async def require_operational_database(request: Request, call_next):
+    """Expose only setup/auth endpoints until canonical PostgreSQL is active."""
+    if core.DATABASE_MODE != "database setup" or not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    allowed = {
+        "/api/live",
+        "/api/ready",
+        "/api/health",
+        "/api/v2/health",
+        "/api/auth/config",
+        "/api/login",
+        "/api/logout",
+        "/api/me",
+        "/api/branding/public",
+        "/api/database/status",
+        "/api/database/test",
+        "/api/database/config",
+        "/api/companies",
+    }
+    if request.url.path in allowed:
+        return await call_next(request)
+    return JSONResponse(
+        {"detail": "Configure PostgreSQL before using operational CMDB features"},
+        status_code=503,
+    )
+
+
+@api.middleware("http")
 async def audit_and_correlation_context(request: Request, call_next):
     """Correlate diagnostics and audit evidence without logging credentials."""
+
     requested_id = request.headers.get("x-request-id", "").strip()
     request_id = (
         requested_id[:100] if _SAFE_CONTEXT_ID.fullmatch(requested_id) else str(uuid.uuid4())
@@ -531,48 +561,42 @@ async def audit_and_correlation_context(request: Request, call_next):
                 )
             except Exception:
                 LOGGER.exception("audit_denial_record_failed")
-        LOGGER.info(
-            "request_complete",
+        route = getattr(request.scope.get("route"), "path", "<unmatched>")
+        level = (
+            logging.ERROR
+            if response.status_code >= 500
+            else logging.WARNING
+            if response.status_code >= 400
+            else logging.INFO
+        )
+        LOGGER.log(
+            level,
+            "HTTP request completed",
             extra={
-                "request_id": request_id,
-                "correlation_id": correlation,
+                "event": "http_request_completed",
                 "method": request.method,
-                "path": request.url.path,
+                "route": route,
                 "status_code": response.status_code,
                 "duration_ms": round((time.perf_counter() - started) * 1000, 2),
             },
         )
         return response
+    except Exception as error:
+        route = getattr(request.scope.get("route"), "path", "<unmatched>")
+        LOGGER.error(
+            "HTTP request failed",
+            extra={
+                "event": "http_request_failed",
+                "method": request.method,
+                "route": route,
+                "status_code": 500,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                "error_type": type(error).__name__,
+            },
+        )
+        raise
     finally:
         reset_audit_context(token)
-
-
-@api.middleware("http")
-async def require_operational_database(request: Request, call_next):
-    """Expose only setup/auth endpoints until canonical PostgreSQL is active."""
-    if core.DATABASE_MODE != "database setup" or not request.url.path.startswith("/api/"):
-        return await call_next(request)
-    allowed = {
-        "/api/live",
-        "/api/ready",
-        "/api/health",
-        "/api/v2/health",
-        "/api/auth/config",
-        "/api/login",
-        "/api/logout",
-        "/api/me",
-        "/api/branding/public",
-        "/api/database/status",
-        "/api/database/test",
-        "/api/database/config",
-        "/api/companies",
-    }
-    if request.url.path in allowed:
-        return await call_next(request)
-    return JSONResponse(
-        {"detail": "Configure PostgreSQL before using operational CMDB features"},
-        status_code=503,
-    )
 
 
 def _build_repository() -> StateRepository:
@@ -1428,6 +1452,7 @@ class ChangeApprovalValidateRequest(BaseModel):
 @api.get("/api/v2/health", tags=["platform"])
 @api.get("/api/health", tags=["platform"])
 def health() -> dict:
+    artifact = release_metadata().public()
     database_unavailable = core.DATABASE_MODE == "PostgreSQL unavailable"
     database_available = core.DATABASE_MODE == "PostgreSQL"
     return {
@@ -1441,8 +1466,10 @@ def health() -> dict:
         "repositoryMode": REPOSITORY.mode,
         "databaseAvailable": database_available,
         "expectedSchemaVersion": core.SCHEMA_VERSION,
+        "schemaHistorySha256": core.SCHEMA_HISTORY_SHA256,
         "authentication": os.getenv("AUTH_MODE", "local"),
         "processRole": process_role(),
+        **artifact,
     }
 
 
@@ -1450,19 +1477,47 @@ def health() -> dict:
 def liveness() -> dict[str, str]:
     """Confirm that the API process can accept HTTP requests."""
 
-    return {"status": "alive", "api": "FastAPI"}
+    return {
+        "status": "alive",
+        "api": "FastAPI",
+        "applicationVersion": release_metadata().application_version,
+    }
 
 
 @api.get("/api/ready", tags=["platform"])
 def readiness() -> JSONResponse:
-    """Report whether the canonical PostgreSQL repository is ready for traffic."""
+    """Report live PostgreSQL connectivity and exact migration readiness."""
 
-    ready = core.DATABASE_MODE == "PostgreSQL" and REPOSITORY.mode == "canonical_postgresql"
+    artifact = release_metadata().public()
+    canonical = core.DATABASE_MODE == "PostgreSQL" and REPOSITORY.mode == "canonical_postgresql"
+    probe: dict[str, Any] = {
+        "databaseAvailable": False,
+        "schemaCurrent": False,
+        "schemaVersion": None,
+        "expectedSchemaVersion": core.SCHEMA_VERSION,
+        "schemaHistorySha256": core.SCHEMA_HISTORY_SHA256,
+    }
+    if canonical:
+        try:
+            probe = core.database_readiness()
+        except Exception as error:
+            LOGGER.warning(
+                "PostgreSQL readiness probe failed",
+                extra={
+                    "event": "readiness_probe_failed",
+                    "error_type": type(error).__name__,
+                },
+            )
+    ready = canonical and probe["databaseAvailable"] and probe["schemaCurrent"]
     return JSONResponse(
         {
             "status": "ready" if ready else "not_ready",
-            "databaseAvailable": ready,
+            "databaseAvailable": bool(probe["databaseAvailable"]),
+            "schemaCurrent": bool(probe["schemaCurrent"]),
+            "schemaVersion": probe.get("schemaVersion"),
             "expectedSchemaVersion": core.SCHEMA_VERSION,
+            "schemaHistorySha256": core.SCHEMA_HISTORY_SHA256,
+            **artifact,
         },
         status_code=200 if ready else 503,
     )

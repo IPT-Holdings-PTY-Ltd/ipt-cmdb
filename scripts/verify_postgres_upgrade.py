@@ -35,14 +35,21 @@ def main() -> None:
     """Create a baseline database and verify its forward-only upgrade path."""
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--admin-url", default="postgresql://cmdb:cmdb@localhost:5432/postgres")
+    parser.add_argument(
+        "--admin-url",
+        default="postgresql://cmdb:cmdb@127.0.0.1:5432/postgres",
+    )
     parser.add_argument("--database", default="cmdb_upgrade_verify")
     args = parser.parse_args()
     if not args.database.startswith("cmdb_upgrade_verify"):
         raise SystemExit("Verification database must start with cmdb_upgrade_verify")
 
     with (
-        psycopg.connect(args.admin_url, autocommit=True) as connection,
+        psycopg.connect(
+            args.admin_url,
+            autocommit=True,
+            connect_timeout=10,
+        ) as connection,
         connection.cursor() as cursor,
     ):
         cursor.execute(
@@ -268,7 +275,11 @@ def main() -> None:
         )
     finally:
         with (
-            psycopg.connect(args.admin_url, autocommit=True) as connection,
+            psycopg.connect(
+                args.admin_url,
+                autocommit=True,
+                connect_timeout=10,
+            ) as connection,
             connection.cursor() as cursor,
         ):
             cursor.execute(

@@ -7,6 +7,25 @@ on:
         description: Semantic version, for example 0.3.0 or 0.3.0-rc.1
         required: true
         type: string
+      database_change:
+        description: Database compatibility classification for this release
+        required: true
+        type: choice
+        default: review-required
+        options:
+          - review-required
+          - none
+          - expand-only-compatible
+          - restore-required
+      rollback_policy:
+        description: Old-image compatibility after the release migration runs
+        required: true
+        type: choice
+        default: review-required
+        options:
+          - review-required
+          - previous-image-compatible
+          - database-restore-required
 
 permissions:
   contents: write
@@ -15,7 +34,7 @@ permissions:
   attestations: write
 
 concurrency:
-  group: release-${{ inputs.version }}
+  group: release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -25,26 +44,61 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.release.outputs.version }}
+      minor_version: ${{ steps.release.outputs.minor_version }}
       tag: ${{ steps.release.outputs.tag }}
       target_sha: ${{ steps.release.outputs.target_sha }}
       prerelease: ${{ steps.release.outputs.prerelease }}
-      publish_latest: ${{ steps.release.outputs.publish_latest }}
+      database_change: ${{ steps.release.outputs.database_change }}
+      rollback_policy: ${{ steps.release.outputs.rollback_policy }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
-      - name: Validate version and repository state
+      - name: Validate version, release policy and repository state
         id: release
         shell: bash
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
+          DATABASE_CHANGE: ${{ inputs.database_change }}
+          ROLLBACK_POLICY: ${{ inputs.rollback_policy }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          EXPECTED_WORKFLOW_REF: >-
+            ${{ format(
+              '{0}/.github/workflows/release.yml@refs/heads/{1}',
+              github.repository,
+              github.event.repository.default_branch
+            ) }}
         run: |
           set -euo pipefail
+          if [[ "$WORKFLOW_REF" != "$EXPECTED_WORKFLOW_REF" ]]; then
+            echo "Releases must run from release.yml on the default branch ($DEFAULT_BRANCH)." >&2
+            exit 1
+          fi
+
           version="${REQUESTED_VERSION#v}"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
             echo "Version must use semantic versioning, such as 0.3.0 or 0.3.0-rc.1." >&2
+            exit 1
+          fi
+
+          if [[ "$DATABASE_CHANGE" == "review-required" ]]; then
+            echo "Classify the release's database change before publishing." >&2
+            exit 1
+          fi
+          if [[ "$ROLLBACK_POLICY" == "review-required" ]]; then
+            echo "Select the reviewed rollback policy before publishing." >&2
+            exit 1
+          fi
+          if [[ "$DATABASE_CHANGE" == "restore-required" && "$ROLLBACK_POLICY" != "database-restore-required" ]]; then
+            echo "A restore-required database change cannot claim previous-image compatibility." >&2
+            exit 1
+          fi
+          if [[ "$DATABASE_CHANGE" == "expand-only-compatible" && "$ROLLBACK_POLICY" == "previous-image-compatible" ]]; then
+            echo "Previous-image compatibility is not yet supported after any schema-version change." >&2
+            echo "Select database-restore-required until N-1 compatibility is exercised in CI." >&2
             exit 1
           fi
 
@@ -55,8 +109,23 @@ jobs:
           fi
 
           package_version="$(node -p "require('./package.json').version")"
-          if [[ "$package_version" != "$version" ]]; then
-            echo "package.json is $package_version; update it to $version before releasing." >&2
+          package_lock_version="$(node -p "require('./package-lock.json').version")"
+          package_lock_root_version="$(
+            node -p "require('./package-lock.json').packages[''].version"
+          )"
+          root_version="$(tr -d '[:space:]' < VERSION)"
+          if [[ \
+            "$package_version" != "$version" ||
+            "$package_lock_version" != "$version" ||
+            "$package_lock_root_version" != "$version" ||
+            "$root_version" != "$version"
+          ]]; then
+            echo "Release versions are inconsistent." >&2
+            echo "Requested: $version" >&2
+            echo "VERSION: $root_version" >&2
+            echo "package.json: $package_version" >&2
+            echo "package-lock.json: $package_lock_version" >&2
+            echo "package-lock root package: $package_lock_root_version" >&2
             exit 1
           fi
           if ! grep -Fq "## [$version]" CHANGELOG.md; then
@@ -65,18 +134,18 @@ jobs:
           fi
 
           prerelease=false
-          publish_latest=true
           if [[ "$version" == *-* ]]; then
             prerelease=true
-            publish_latest=false
           fi
 
           {
             echo "version=$version"
+            echo "minor_version=$(cut -d. -f1,2 <<< "$version")"
             echo "tag=$tag"
             echo "target_sha=$(git rev-parse HEAD)"
             echo "prerelease=$prerelease"
-            echo "publish_latest=$publish_latest"
+            echo "database_change=$DATABASE_CHANGE"
+            echo "rollback_policy=$ROLLBACK_POLICY"
           } >> "$GITHUB_OUTPUT"
 
   quality:
@@ -86,69 +155,268 @@ jobs:
     with:
       test_ref: ${{ needs.prepare.outputs.target_sha }}
 
-  release-approval:
-    name: Release approval
-    needs: [prepare, quality]
-    runs-on: ubuntu-latest
-    environment: release
-    steps:
-      - name: Confirm release candidate
-        run: |
-          echo "Releasing ${{ needs.prepare.outputs.tag }}"
-          echo "Commit ${{ needs.prepare.outputs.target_sha }}"
-
   publish-image:
-    name: Publish release image
-    needs: [prepare, release-approval]
+    name: Publish immutable release image
+    needs: [prepare, quality]
     uses: ./.github/workflows/container-image.yml
     with:
+      version: ${{ needs.prepare.outputs.version }}
       release_tag: ${{ needs.prepare.outputs.tag }}
-      source_ref: ${{ needs.prepare.outputs.target_sha }}
-      publish_latest: ${{ fromJSON(needs.prepare.outputs.publish_latest) }}
+      source_sha: ${{ needs.prepare.outputs.target_sha }}
 
   publish-release:
     name: Publish GitHub release
     needs: [prepare, publish-image]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment: release
+    timeout-minutes: 15
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.prepare.outputs.tag }}
       VERSION: ${{ needs.prepare.outputs.version }}
       TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
       PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+      DATABASE_CHANGE: ${{ needs.prepare.outputs.database_change }}
+      ROLLBACK_POLICY: ${{ needs.prepare.outputs.rollback_policy }}
       IMAGE_NAME: ${{ needs.publish-image.outputs.image_name }}
       IMAGE_DIGEST: ${{ needs.publish-image.outputs.image_digest }}
+      ARTIFACT_DIRECTORY: release-artifacts
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.target_sha }}
+          fetch-depth: 0
 
-      - name: Create release manifest
+      - name: Create machine-readable release manifest
         shell: bash
         run: |
           set -euo pipefail
-          cat > release-manifest.txt <<EOF
-          IPT CMDB release: $TAG
-          Commit: $TARGET_SHA
-          Container: $IMAGE_NAME:$VERSION
-          Digest: $IMAGE_DIGEST
+          mkdir -p "$ARTIFACT_DIRECTORY"
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          from src.cmdb.migrations import migration_plan, schema_history_sha256
+
+          root = Path.cwd()
+          plan = migration_plan(root)
+          history_lines = [
+              f"{item.version} {item.path.relative_to(root).as_posix()} {item.checksum}"
+              for item in plan
+          ]
+          history_text = "\n".join(history_lines) + "\n"
+          history_hash = schema_history_sha256(root)
+
+          compose = (root / "compose.appliance.yml").read_text(encoding="utf-8")
+          postgres_majors = set(
+              re.findall(r"POSTGRES_IMAGE:-postgres:(\d+)-alpine", compose)
+          )
+          if len(postgres_majors) != 1:
+              raise SystemExit(
+                  "compose.appliance.yml must declare one consistent PostgreSQL major"
+              )
+
+          digest = os.environ["IMAGE_DIGEST"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("The image workflow did not return a valid sha256 digest")
+          image_name = os.environ["IMAGE_NAME"]
+          target_sha = os.environ["TARGET_SHA"]
+          source_timestamp = subprocess.check_output(
+              ["git", "show", "-s", "--format=%cI", target_sha],
+              text=True,
+          ).strip()
+          manifest = {
+              "manifestVersion": 1,
+              "version": os.environ["VERSION"],
+              "tag": os.environ["TAG"],
+              "commit": target_sha,
+              "prerelease": os.environ["PRERELEASE"] == "true",
+              "sourceTimestamp": source_timestamp,
+              "image": {
+                  "name": image_name,
+                  "digest": digest,
+                  "reference": f"{image_name}@{digest}",
+                  "versionTag": f"{image_name}:{os.environ['VERSION']}",
+                  "commitTag": f"{image_name}:sha-{target_sha}",
+                  "architectures": ["linux/amd64", "linux/arm64"],
+              },
+              "database": {
+                  "schemaVersion": plan[-1].version,
+                  "schemaHistorySha256": history_hash,
+                  "schemaHistoryAlgorithm": (
+                      "sha256 of newline-delimited "
+                      "'version path file-sha256' records in migration order"
+                  ),
+                  "postgresqlMajor": int(next(iter(postgres_majors))),
+                  "changeClassification": os.environ["DATABASE_CHANGE"],
+                  "backupRequired": os.environ["DATABASE_CHANGE"] != "none",
+                  "rollbackPolicy": os.environ["ROLLBACK_POLICY"],
+                  "rollbackBoundary": "schema-version-change-requires-database-restore",
+                  "migrationPolicy": "forward-only",
+              },
+          }
+          artifact_directory = root / os.environ["ARTIFACT_DIRECTORY"]
+          (artifact_directory / "schema-history.txt").write_text(
+              history_text,
+              encoding="utf-8",
+              newline="\n",
+          )
+          (artifact_directory / "release-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+              newline="\n",
+          )
+          (artifact_directory / "release-manifest.txt").write_text(
+              "\n".join(
+                  [
+                      f"IPT CMDB release: {os.environ['TAG']}",
+                      f"Commit: {target_sha}",
+                      f"Container: {image_name}:{os.environ['VERSION']}",
+                      f"Digest: {digest}",
+                      f"Exact image: {image_name}@{digest}",
+                      "Authoritative manifest: release-manifest.json",
+                      "",
+                  ]
+              ),
+              encoding="utf-8",
+              newline="\n",
+          )
+          PY
+
+      - name: Package deterministic deployment bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_name="ipt-cmdb-$VERSION"
+          bundle_parent="$RUNNER_TEMP/ipt-cmdb-release"
+          bundle_root="$bundle_parent/$bundle_name"
+          archive_base="$ARTIFACT_DIRECTORY/$bundle_name-self-hosted"
+          mkdir -p "$bundle_root"
+
+          bundle_files=(
+            ".env.production.example"
+            "LICENSE"
+            "SECURITY.md"
+            "SUPPORT.md"
+            "VERSION"
+            "compose.appliance.yml"
+            "compose.production.yml"
+            "compose.worker.yml"
+            "docs/DEPLOYMENT.md"
+            "docs/OPERATIONS.md"
+            "docs/RELEASING.md"
+            "docs/deployment/APPLIANCE.md"
+            "docs/deployment/SELF_HOSTED.md"
+            "docs/deployment/WORKERS.md"
+            "scripts/Initialize-Appliance.ps1"
+            "scripts/Install-Cmdb.ps1"
+            "scripts/Update-Cmdb.ps1"
+            "scripts/appliance-backup.sh"
+            "scripts/appliance-restore.sh"
+            "scripts/initialize-appliance.sh"
+            "scripts/install-cmdb.sh"
+            "scripts/update-cmdb.sh"
+          )
+          for file in "${bundle_files[@]}"; do
+            test -f "$file"
+            install -D -m 0644 "$file" "$bundle_root/$file"
+          done
+          chmod 0755 \
+            "$bundle_root/scripts/appliance-backup.sh" \
+            "$bundle_root/scripts/appliance-restore.sh" \
+            "$bundle_root/scripts/initialize-appliance.sh" \
+            "$bundle_root/scripts/install-cmdb.sh" \
+            "$bundle_root/scripts/update-cmdb.sh"
+
+          install -m 0644 \
+            "$ARTIFACT_DIRECTORY/release-manifest.json" \
+            "$bundle_root/release-manifest.json"
+          install -m 0644 \
+            "$ARTIFACT_DIRECTORY/release-manifest.txt" \
+            "$bundle_root/release-manifest.txt"
+          install -m 0644 \
+            "$ARTIFACT_DIRECTORY/schema-history.txt" \
+            "$bundle_root/schema-history.txt"
+
+          exact_image="$IMAGE_NAME@$IMAGE_DIGEST"
+          sed -i "s|^CMDB_IMAGE=.*$|CMDB_IMAGE=$exact_image|" \
+            "$bundle_root/.env.production.example"
+          cat > "$bundle_root/RELEASE.md" <<EOF
+          # IPT CMDB $VERSION self-hosted deployment bundle
+
+          Exact container image:
+
+          \`$exact_image\`
+
+          Verify this bundle with its internal \`SHA256SUMS\` before installation.
+          The machine-readable \`release-manifest.json\` is the source of truth for
+          image, schema, PostgreSQL and rollback compatibility. This bundle is for
+          the Compose appliance and external-PostgreSQL self-hosted profiles; it is
+          not an Azure source deployment.
           EOF
 
-      - name: Create GitHub release and tag
+          (
+            cd "$bundle_root"
+            checksum_file="$RUNNER_TEMP/$bundle_name-SHA256SUMS"
+            find . -type f ! -name SHA256SUMS -print0 |
+              LC_ALL=C sort -z |
+              xargs -0 sha256sum > "$checksum_file"
+            install -m 0644 "$checksum_file" SHA256SUMS
+          )
+
+          source_date_epoch="$(git show -s --format=%ct "$TARGET_SHA")"
+          find "$bundle_root" -exec touch -d "@$source_date_epoch" {} +
+          tar \
+            --sort=name \
+            --mtime="@$source_date_epoch" \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -czf "$archive_base.tar.gz" \
+            -C "$bundle_parent" \
+            "$bundle_name"
+          (
+            cd "$bundle_parent"
+            find "$bundle_name" -type f -print |
+              LC_ALL=C sort |
+              zip -X -q "$GITHUB_WORKSPACE/$archive_base.zip" -@
+          )
+
+          (
+            cd "$ARTIFACT_DIRECTORY"
+            sha256sum \
+              release-manifest.json \
+              release-manifest.txt \
+              "$bundle_name-self-hosted.tar.gz" \
+              "$bundle_name-self-hosted.zip" > SHA256SUMS
+          )
+
+      - name: Create GitHub release and attach deployment artifacts
         shell: bash
         run: |
           set -euo pipefail
+          bundle_name="ipt-cmdb-$VERSION-self-hosted"
           options=(
             "$TAG"
-            "release-manifest.txt#Release manifest"
+            "$ARTIFACT_DIRECTORY/release-manifest.json#Machine-readable release manifest"
+            "$ARTIFACT_DIRECTORY/release-manifest.txt#Compatibility release manifest"
+            "$ARTIFACT_DIRECTORY/$bundle_name.tar.gz#Self-hosted deployment bundle (tar.gz)"
+            "$ARTIFACT_DIRECTORY/$bundle_name.zip#Self-hosted deployment bundle (zip)"
+            "$ARTIFACT_DIRECTORY/SHA256SUMS#Release artifact checksums"
             --target "$TARGET_SHA"
             --title "IPT CMDB $TAG"
             --generate-notes
             --fail-on-no-commits
-            --notes "Container: \`$IMAGE_NAME:$VERSION\`  
-          Digest: \`$IMAGE_DIGEST\`"
+            --notes "Exact container: \`$IMAGE_NAME@$IMAGE_DIGEST\`
+
+          Database change: \`$DATABASE_CHANGE\`
+          Rollback policy: \`$ROLLBACK_POLICY\`
+
+          Verify downloaded deployment artifacts against \`SHA256SUMS\`."
           )
           if [[ "$PRERELEASE" == "true" ]]; then
             options+=(--prerelease --latest=false)
@@ -162,7 +430,56 @@ jobs:
           {
             echo "### Published $TAG"
             echo "- Commit: \`$TARGET_SHA\`"
-            echo "- Container: \`$IMAGE_NAME:$VERSION\`"
-            echo "- Digest: \`$IMAGE_DIGEST\`"
+            echo "- Exact container: \`$IMAGE_NAME@$IMAGE_DIGEST\`"
+            echo "- Database change: \`$DATABASE_CHANGE\`"
+            echo "- Rollback policy: \`$ROLLBACK_POLICY\`"
+            echo "- Self-hosted deployment bundles: ZIP and tar.gz"
             echo "- Release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote-stable:
+    name: Promote stable image channels
+    needs: [prepare, publish-image, publish-release]
+    if: needs.prepare.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      IMAGE_NAME: ${{ needs.publish-image.outputs.image_name }}
+      IMAGE_DIGEST: ${{ needs.publish-image.outputs.image_digest }}
+      MINOR_VERSION: ${{ needs.prepare.outputs.minor_version }}
+    steps:
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote minor and latest tags from the released digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          exact_image="$IMAGE_NAME@$IMAGE_DIGEST"
+          for tag in "$MINOR_VERSION" latest; do
+            docker buildx imagetools create --tag "$IMAGE_NAME:$tag" "$exact_image"
+            promoted_digest="$(
+              docker buildx imagetools inspect "$IMAGE_NAME:$tag" |
+                sed -n 's/^Digest:[[:space:]]*//p' |
+                head -n 1
+            )"
+            if [[ "$promoted_digest" != "$IMAGE_DIGEST" ]]; then
+              echo "Tag $tag resolved to $promoted_digest, expected $IMAGE_DIGEST." >&2
+              exit 1
+            fi
+          done
+
+      - name: Summarize stable promotion
+        run: |
+          {
+            echo "### Promoted stable channels"
+            echo "- \`$IMAGE_NAME:$MINOR_VERSION\`"
+            echo "- \`$IMAGE_NAME:latest\`"
+            echo "- Both resolve to \`$IMAGE_DIGEST\`"
           } >> "$GITHUB_STEP_SUMMARY"

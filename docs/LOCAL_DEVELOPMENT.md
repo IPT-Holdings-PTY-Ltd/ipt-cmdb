@@ -82,10 +82,10 @@ docker build --tag ipt-cmdb:local .
 Database bootstrap and upgrade checks need a reachable PostgreSQL administrator connection:
 
 ```powershell
-$env:TEST_POSTGRES_ADMIN_URL='postgresql://cmdb:cmdb@localhost:5432/postgres'
+$env:TEST_POSTGRES_ADMIN_URL='postgresql://cmdb:cmdb@127.0.0.1:5432/postgres'
 python -m unittest discover -s test -p "test_postgres_repository.py" -v
-python scripts/verify_blank_postgres.py --admin-url postgresql://postgres:postgres@localhost:5432/postgres
-python scripts/verify_postgres_upgrade.py --admin-url postgresql://postgres:postgres@localhost:5432/postgres
+python scripts/verify_blank_postgres.py --admin-url postgresql://cmdb:cmdb@127.0.0.1:5432/postgres
+python scripts/verify_postgres_upgrade.py --admin-url postgresql://cmdb:cmdb@127.0.0.1:5432/postgres
 ```
 
 The repository contract test and both verifiers create isolated temporary databases and remove

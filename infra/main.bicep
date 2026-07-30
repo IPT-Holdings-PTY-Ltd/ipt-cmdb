@@ -37,6 +37,9 @@ param entraClientSecret string = ''
 @description('Initial image used during provisioning. azd deploy replaces this with the built image.')
 param bootstrapImage string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
 
+@description('Immutable sha256 digest associated with the deployed application image.')
+param imageDigest string = 'unknown'
+
 @description('Optional external HTTPS origin. Set this when using a custom domain.')
 param publicBaseUrl string = ''
 
@@ -84,6 +87,17 @@ param postgresSkuName string = 'Standard_B1ms'
 ])
 param postgresSkuTier string = 'Burstable'
 
+@description('Provision Azure Monitor email notifications and reliability alert rules.')
+param enableOperationalAlerts bool = true
+
+@description('Email recipient for Azure Monitor operational alerts.')
+param operationalAlertEmail string = bootstrapAdminEmail
+
+@minValue(50)
+@maxValue(95)
+@description('PostgreSQL storage utilization percentage that raises an operational alert.')
+param postgresStorageAlertPercent int = 80
+
 var suffix = uniqueString(subscription().id, resourceGroup().id, environmentName)
 var compactEnvironmentName = replace(replace(toLower(environmentName), '-', ''), '_', '')
 var commonTags = {
@@ -96,6 +110,7 @@ var workerAppName = 'cmdb-worker-${environmentName}-${suffix}'
 var notificationWorkerEnabled = enableNotificationWorker || notificationWorkerSetting == 'true'
 var integrationWorkerEnabled = enableIntegrationWorker || integrationWorkerSetting == 'true'
 var postgresName = 'cmdb-pg-${environmentName}-${suffix}'
+var workerLogAppName = workerDeploymentMode == 'dedicated' ? workerAppName : appName
 var databaseUrl = 'postgresql://${postgresAdministratorLogin}:${postgresAdministratorPassword}@${postgresName}.postgres.database.azure.com:5432/cmdb?sslmode=require'
 var keyVaultSecrets = concat([
   {
@@ -422,6 +437,26 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
               value: workerDeploymentMode == 'dedicated' ? 'web' : 'combined'
             }
             {
+              name: 'CMDB_IMAGE_DIGEST'
+              value: imageDigest
+            }
+            {
+              name: 'LOG_FORMAT'
+              value: 'json'
+            }
+            {
+              name: 'LOG_LEVEL'
+              value: 'INFO'
+            }
+            {
+              name: 'READINESS_CONNECT_TIMEOUT_SECONDS'
+              value: '3'
+            }
+            {
+              name: 'READINESS_STATEMENT_TIMEOUT_MS'
+              value: '2000'
+            }
+            {
               name: 'BOOTSTRAP_ADMIN_EMAIL'
               value: bootstrapAdminEmail
             }
@@ -540,6 +575,7 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
                 scheme: 'HTTP'
               }
               periodSeconds: 10
+              timeoutSeconds: 5
               failureThreshold: 6
             }
           ]
@@ -613,6 +649,18 @@ resource workerApp 'Microsoft.App/containerApps@2025-01-01' = {
             {
               name: 'CMDB_PROCESS_ROLE'
               value: 'worker'
+            }
+            {
+              name: 'CMDB_IMAGE_DIGEST'
+              value: imageDigest
+            }
+            {
+              name: 'LOG_FORMAT'
+              value: 'json'
+            }
+            {
+              name: 'LOG_LEVEL'
+              value: 'INFO'
             }
             {
               name: 'BOOTSTRAP_ADMIN_EMAIL'
@@ -717,6 +765,260 @@ resource authConfig 'Microsoft.App/containerApps/authConfigs@2025-01-01' = if (e
   dependsOn: [
     entraSecret
   ]
+}
+
+resource operationalActionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = if (enableOperationalAlerts) {
+  name: 'cmdb-operations-${environmentName}-${suffix}'
+  location: 'global'
+  tags: commonTags
+  properties: {
+    enabled: true
+    groupShortName: take('cmdb${compactEnvironmentName}', 12)
+    emailReceivers: [
+      {
+        name: 'platform-operations'
+        emailAddress: operationalAlertEmail
+        useCommonAlertSchema: true
+      }
+    ]
+  }
+}
+
+resource readinessUnavailableAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if (enableOperationalAlerts) {
+  name: 'cmdb-readiness-${environmentName}-${suffix}'
+  location: location
+  tags: commonTags
+  kind: 'LogAlert'
+  properties: {
+    displayName: 'IPT CMDB readiness unavailable'
+    description: 'The CMDB API reported that PostgreSQL or its migration history was not ready.'
+    enabled: true
+    severity: 1
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT5M'
+    autoMitigate: true
+    checkWorkspaceAlertsStorageConfigured: false
+    skipQueryValidation: true
+    scopes: [
+      logAnalytics.id
+    ]
+    criteria: {
+      allOf: [
+        {
+          query: format(
+            '''
+              ContainerAppConsoleLogs_CL
+              | where ContainerAppName_s == '{0}'
+              | extend payload = parse_json(Log_s)
+              | where tostring(payload.event) == 'http_request_completed'
+              | where tostring(payload.route) == '/api/ready'
+              | where toint(payload.status_code) == 503
+              | summarize Failures = count()
+            ''',
+            appName
+          )
+          metricMeasureColumn: 'Failures'
+          operator: 'GreaterThan'
+          threshold: 0
+          timeAggregation: 'Maximum'
+          failingPeriods: {
+            minFailingPeriodsToAlert: 1
+            numberOfEvaluationPeriods: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: [
+        operationalActionGroup.id
+      ]
+    }
+  }
+}
+
+resource applicationServerErrorAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if (enableOperationalAlerts) {
+  name: 'cmdb-http-5xx-${environmentName}-${suffix}'
+  location: location
+  tags: commonTags
+  kind: 'LogAlert'
+  properties: {
+    displayName: 'IPT CMDB application server errors'
+    description: 'The CMDB API returned one or more non-readiness HTTP 5xx responses.'
+    enabled: true
+    severity: 2
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT5M'
+    autoMitigate: true
+    checkWorkspaceAlertsStorageConfigured: false
+    skipQueryValidation: true
+    scopes: [
+      logAnalytics.id
+    ]
+    criteria: {
+      allOf: [
+        {
+          query: format(
+            '''
+              ContainerAppConsoleLogs_CL
+              | where ContainerAppName_s == '{0}'
+              | extend payload = parse_json(Log_s)
+              | where tostring(payload.event) in ('http_request_completed', 'http_request_failed')
+              | where tostring(payload.route) != '/api/ready'
+              | where toint(payload.status_code) >= 500
+              | summarize Failures = count()
+            ''',
+            appName
+          )
+          metricMeasureColumn: 'Failures'
+          operator: 'GreaterThan'
+          threshold: 0
+          timeAggregation: 'Maximum'
+          failingPeriods: {
+            minFailingPeriodsToAlert: 1
+            numberOfEvaluationPeriods: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: [
+        operationalActionGroup.id
+      ]
+    }
+  }
+}
+
+resource staleWorkerAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if (enableOperationalAlerts) {
+  name: 'cmdb-worker-stale-${environmentName}-${suffix}'
+  location: location
+  tags: commonTags
+  kind: 'LogAlert'
+  properties: {
+    displayName: 'IPT CMDB worker heartbeat missing'
+    description: 'No CMDB worker runtime event was observed during the last 15 minutes.'
+    enabled: true
+    severity: 2
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT15M'
+    autoMitigate: true
+    checkWorkspaceAlertsStorageConfigured: false
+    skipQueryValidation: true
+    scopes: [
+      logAnalytics.id
+    ]
+    criteria: {
+      allOf: [
+        {
+          query: format(
+            '''
+              let Heartbeats = toscalar(
+                ContainerAppConsoleLogs_CL
+                | where ContainerAppName_s == '{0}'
+                | extend payload = parse_json(Log_s)
+                | where tostring(payload.event) == 'worker_runtime'
+                | count
+              );
+              print Heartbeats = Heartbeats
+            ''',
+            workerLogAppName
+          )
+          metricMeasureColumn: 'Heartbeats'
+          operator: 'LessThan'
+          threshold: 1
+          timeAggregation: 'Maximum'
+          failingPeriods: {
+            minFailingPeriodsToAlert: 1
+            numberOfEvaluationPeriods: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: [
+        operationalActionGroup.id
+      ]
+    }
+  }
+}
+
+resource postgresUnavailableAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = if (enableOperationalAlerts) {
+  name: 'cmdb-postgres-unavailable-${environmentName}-${suffix}'
+  location: 'global'
+  tags: commonTags
+  properties: {
+    description: 'Azure Database for PostgreSQL reported an unavailable database.'
+    severity: 1
+    enabled: true
+    scopes: [
+      postgres.id
+    ]
+    evaluationFrequency: 'PT1M'
+    windowSize: 'PT5M'
+    autoMitigate: true
+    targetResourceType: 'Microsoft.DBforPostgreSQL/flexibleServers'
+    targetResourceRegion: location
+    criteria: {
+      'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
+      allOf: [
+        {
+          name: 'PostgreSQLAvailability'
+          criterionType: 'StaticThresholdCriterion'
+          metricNamespace: 'Microsoft.DBforPostgreSQL/flexibleServers'
+          metricName: 'is_db_alive'
+          operator: 'LessThan'
+          threshold: 1
+          timeAggregation: 'Minimum'
+          skipMetricValidation: false
+          dimensions: []
+        }
+      ]
+    }
+    actions: [
+      {
+        actionGroupId: operationalActionGroup.id
+      }
+    ]
+  }
+}
+
+resource postgresStorageAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = if (enableOperationalAlerts) {
+  name: 'cmdb-postgres-storage-${environmentName}-${suffix}'
+  location: 'global'
+  tags: commonTags
+  properties: {
+    description: 'Azure Database for PostgreSQL storage utilization is above the configured limit.'
+    severity: 2
+    enabled: true
+    scopes: [
+      postgres.id
+    ]
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT15M'
+    autoMitigate: true
+    targetResourceType: 'Microsoft.DBforPostgreSQL/flexibleServers'
+    targetResourceRegion: location
+    criteria: {
+      'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
+      allOf: [
+        {
+          name: 'PostgreSQLStoragePressure'
+          criterionType: 'StaticThresholdCriterion'
+          metricNamespace: 'Microsoft.DBforPostgreSQL/flexibleServers'
+          metricName: 'storage_percent'
+          operator: 'GreaterThanOrEqual'
+          threshold: postgresStorageAlertPercent
+          timeAggregation: 'Maximum'
+          skipMetricValidation: false
+          dimensions: []
+        }
+      ]
+    }
+    actions: [
+      {
+        actionGroupId: operationalActionGroup.id
+      }
+    ]
+  }
 }
 
 output AZURE_CONTAINER_REGISTRY_ENDPOINT string = registry.properties.loginServer

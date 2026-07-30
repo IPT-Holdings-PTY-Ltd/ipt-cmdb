@@ -22,6 +22,14 @@ LOCAL_LOGIN_ENVIRONMENT = {
     "LOCAL_LOGIN_PENDING_TTL_SECONDS": "${LOCAL_LOGIN_PENDING_TTL_SECONDS:-120}",
     "LOCAL_LOGIN_THROTTLE_AUDIT_SECONDS": ("${LOCAL_LOGIN_THROTTLE_AUDIT_SECONDS:-300}"),
 }
+OBSERVABILITY_ENVIRONMENT = {
+    "LOG_FORMAT": "${LOG_FORMAT:-json}",
+    "LOG_LEVEL": "${LOG_LEVEL:-INFO}",
+}
+MIGRATION_ENVIRONMENT = {
+    "CMDB_MIGRATION_LOCK_TIMEOUT_MS": "${CMDB_MIGRATION_LOCK_TIMEOUT_MS:-60000}",
+    "CMDB_MIGRATION_STATEMENT_TIMEOUT_MS": ("${CMDB_MIGRATION_STATEMENT_TIMEOUT_MS:-900000}"),
+}
 
 
 def service_environment(path: Path, service: str) -> dict[str, str]:
@@ -131,7 +139,59 @@ class AuthenticationDeploymentContractTests(unittest.TestCase):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
         self.assertIn('"--proxy-headers"', dockerfile)
+        self.assertIn('"--no-access-log"', dockerfile)
         self.assertNotIn("FORWARDED_ALLOW_IPS=*", dockerfile)
+
+
+class ObservabilityDeploymentContractTests(unittest.TestCase):
+    """Keep structured application logs consistent across container roles."""
+
+    def test_observability_environment_is_forwarded_to_every_runtime_service(self) -> None:
+        deployments = (
+            ("docker-compose.yml", "cmdb"),
+            ("compose.production.yml", "cmdb"),
+            ("compose.appliance.yml", "cmdb"),
+            ("compose.worker.yml", "worker"),
+        )
+
+        for filename, service in deployments:
+            with self.subTest(filename=filename, service=service):
+                environment = service_environment(ROOT / filename, service)
+                for key, expected in OBSERVABILITY_ENVIRONMENT.items():
+                    self.assertEqual(environment.get(key), expected)
+
+    def test_environment_examples_document_logging_controls(self) -> None:
+        for filename in (".env.example", ".env.production.example"):
+            with self.subTest(filename=filename):
+                values = dotenv_values(ROOT / filename)
+                self.assertEqual(values["LOG_FORMAT"], "json")
+                self.assertEqual(values["LOG_LEVEL"], "INFO")
+
+
+class WorkerDeploymentContractTests(unittest.TestCase):
+    """Keep the non-HTTP worker compatible with Compose update waits."""
+
+    def test_worker_disables_the_web_image_healthcheck(self) -> None:
+        worker_compose = (ROOT / "compose.worker.yml").read_text(encoding="utf-8")
+
+        self.assertRegex(
+            worker_compose,
+            r"(?ms)^  worker:\n.*?^    healthcheck:\n      disable: true$",
+        )
+
+    def test_migration_timeouts_are_forwarded_to_every_runtime_service(self) -> None:
+        deployments = (
+            ("docker-compose.yml", "cmdb"),
+            ("compose.production.yml", "cmdb"),
+            ("compose.appliance.yml", "cmdb"),
+            ("compose.worker.yml", "worker"),
+        )
+
+        for filename, service in deployments:
+            with self.subTest(filename=filename, service=service):
+                environment = service_environment(ROOT / filename, service)
+                for key, expected in MIGRATION_ENVIRONMENT.items():
+                    self.assertEqual(environment.get(key), expected)
 
 
 if __name__ == "__main__":

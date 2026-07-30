@@ -30,8 +30,8 @@ the `*.test.ts` or `*.test.tsx` suffix.
 Schema changes must also pass:
 
 ```powershell
-python scripts/verify_blank_postgres.py --admin-url postgresql://postgres:postgres@localhost:5432/postgres
-python scripts/verify_postgres_upgrade.py --admin-url postgresql://postgres:postgres@localhost:5432/postgres
+python scripts/verify_blank_postgres.py --admin-url postgresql://cmdb:cmdb@127.0.0.1:5432/postgres
+python scripts/verify_postgres_upgrade.py --admin-url postgresql://cmdb:cmdb@127.0.0.1:5432/postgres
 ```
 
 ## Design requirements

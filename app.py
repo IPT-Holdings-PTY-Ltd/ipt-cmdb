@@ -25,7 +25,12 @@ from src.cmdb.database_config import (
 from src.cmdb.database_config import (
     encryption_key as database_config_encryption_key,
 )
-from src.cmdb.migrations import apply_migrations, latest_schema_version
+from src.cmdb.migrations import (
+    apply_migrations,
+    latest_schema_version,
+    migration_plan,
+    schema_history_sha256,
+)
 from src.cmdb.repository import hash_password
 
 ROOT = Path(__file__).parent
@@ -41,6 +46,7 @@ CANONICAL_DATABASE_INITIALIZED = False
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "28800"))
 LOCK = threading.Lock()
 SCHEMA_VERSION = latest_schema_version(ROOT)
+SCHEMA_HISTORY_SHA256 = schema_history_sha256(ROOT)
 PORTABLE_BACKUP_VERSION = 2
 
 SEED: dict[str, Any] = {
@@ -193,7 +199,11 @@ def saved_database_url() -> tuple[str | None, str, str | None]:
 DATABASE_URL, DATABASE_SOURCE, DATABASE_ERROR = saved_database_url()
 
 
-def postgres_connection(database_url: str | None = None):
+def postgres_connection(
+    database_url: str | None = None,
+    *,
+    connect_timeout: int = 8,
+):
     """Open a short-lived API-owned PostgreSQL connection when DATABASE_URL is set."""
     try:
         import psycopg
@@ -204,7 +214,7 @@ def postgres_connection(database_url: str | None = None):
     target_url = database_url or DATABASE_URL
     if not target_url:
         raise RuntimeError("PostgreSQL is not configured")
-    return psycopg.connect(target_url, connect_timeout=8)
+    return psycopg.connect(target_url, connect_timeout=max(1, min(connect_timeout, 30)))
 
 
 def load_local_db() -> dict:
@@ -231,8 +241,20 @@ def load_local_db() -> dict:
     return json.loads(json.dumps(SEED))
 
 
-def apply_postgres_schema(database_url: str) -> None:
-    apply_migrations(lambda: postgres_connection(database_url), ROOT)
+def apply_postgres_schema(database_url: str) -> list[str]:
+    """Apply pending canonical migrations and record a sanitized success event."""
+
+    applied = apply_migrations(lambda: postgres_connection(database_url), ROOT)
+    if applied:
+        LOGGER.info(
+            "postgres_migrations_applied",
+            extra={
+                "event": "postgres_migrations_applied",
+                "migration_count": len(applied),
+                "schema_version": applied[-1],
+            },
+        )
+    return applied
 
 
 def build_seed_state(mode: str, source: dict | None = None) -> dict:
@@ -365,6 +387,7 @@ def database_diagnostics(database_url: str | None = None) -> dict:
             "server": version.split(",")[0],
             "schemaVersion": schema_version,
             "expectedSchemaVersion": SCHEMA_VERSION,
+            "schemaHistorySha256": SCHEMA_HISTORY_SHA256,
             "migrationsPending": schema_version != SCHEMA_VERSION,
             "initialized": initialized,
             "schemaState": "blank"
@@ -376,6 +399,50 @@ def database_diagnostics(database_url: str | None = None) -> dict:
             "canCreateSchemaObjects": bool(can_create_schema),
             "legacyStatePending": bool(legacy_state_table and not initialized),
         }
+
+
+def database_readiness(database_url: str | None = None) -> dict[str, Any]:
+    """Probe live PostgreSQL connectivity and the complete expected migration history."""
+
+    try:
+        connect_timeout = int(os.getenv("READINESS_CONNECT_TIMEOUT_SECONDS", "3"))
+    except ValueError:
+        connect_timeout = 3
+    try:
+        statement_timeout_ms = int(os.getenv("READINESS_STATEMENT_TIMEOUT_MS", "2000"))
+    except ValueError:
+        statement_timeout_ms = 2000
+    connect_timeout = max(1, min(connect_timeout, 10))
+    statement_timeout_ms = max(250, min(statement_timeout_ms, 10_000))
+    expected_history = [(item.version, item.checksum) for item in migration_plan(ROOT)]
+
+    with (
+        postgres_connection(
+            database_url,
+            connect_timeout=connect_timeout,
+        ) as connection,
+        connection.cursor() as cursor,
+    ):
+        cursor.execute(
+            "SELECT set_config('statement_timeout', %s, true)",
+            (f"{statement_timeout_ms}ms",),
+        )
+        cursor.execute("SELECT 1")
+        cursor.execute("SELECT to_regclass('public.schema_migrations')")
+        migration_table = cursor.fetchone()[0]
+        applied_history: list[tuple[str, str | None]] = []
+        if migration_table:
+            cursor.execute("SELECT version, checksum FROM schema_migrations ORDER BY version")
+            applied_history = [(str(row[0]), row[1]) for row in cursor.fetchall()]
+
+    schema_version = applied_history[-1][0] if applied_history else None
+    return {
+        "databaseAvailable": True,
+        "schemaCurrent": applied_history == expected_history,
+        "schemaVersion": schema_version,
+        "expectedSchemaVersion": SCHEMA_VERSION,
+        "schemaHistorySha256": SCHEMA_HISTORY_SHA256,
+    }
 
 
 def database_url_from_settings(data: dict) -> str:

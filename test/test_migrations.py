@@ -1,7 +1,14 @@
 import unittest
+from os import environ
 from pathlib import Path
+from unittest.mock import patch
 
-from src.cmdb.migrations import apply_migrations, latest_schema_version, migration_plan
+from src.cmdb.migrations import (
+    apply_migrations,
+    latest_schema_version,
+    migration_plan,
+    schema_history_sha256,
+)
 
 ROOT = Path(__file__).parents[1]
 
@@ -11,6 +18,7 @@ class FakeCursor:
         self.history = history
         self.rows = []
         self.statements = []
+        self.parameters = []
 
     def __enter__(self):
         return self
@@ -21,6 +29,7 @@ class FakeCursor:
     def execute(self, sql, params=None):
         normalized = " ".join(sql.split()).lower()
         self.statements.append(normalized)
+        self.parameters.append(params)
         if normalized.startswith("select version, checksum from schema_migrations"):
             self.rows = sorted(self.history.items())
         elif normalized.startswith("update schema_migrations set checksum"):
@@ -56,9 +65,26 @@ class MigrationTests(unittest.TestCase):
 
         apply_migrations(lambda: connection, ROOT)
 
-        self.assertTrue(
-            connection.last_cursor.statements[0].startswith("select pg_advisory_xact_lock")
-        )
+        statements = connection.last_cursor.statements
+        self.assertTrue(statements[0].startswith("select set_config('lock_timeout'"))
+        self.assertTrue(statements[1].startswith("select set_config('statement_timeout'"))
+        self.assertTrue(statements[2].startswith("select pg_advisory_xact_lock"))
+        self.assertTrue(statements[3].startswith("select set_config('statement_timeout'"))
+        self.assertEqual(connection.last_cursor.parameters[1], ("60000ms",))
+        self.assertEqual(connection.last_cursor.parameters[3], ("900000ms",))
+
+    def test_migration_timeouts_are_bounded_and_fail_closed(self):
+        for name, value in (
+            ("CMDB_MIGRATION_LOCK_TIMEOUT_MS", "not-a-number"),
+            ("CMDB_MIGRATION_LOCK_TIMEOUT_MS", "999"),
+            ("CMDB_MIGRATION_STATEMENT_TIMEOUT_MS", "3600001"),
+        ):
+            with (
+                self.subTest(name=name, value=value),
+                patch.dict(environ, {name: value}, clear=False),
+                self.assertRaisesRegex(RuntimeError, name),
+            ):
+                apply_migrations(lambda: FakeConnection({}), ROOT)
 
     def test_plan_is_ordered_and_latest_version_is_incremental_migration(self):
         plan = migration_plan(ROOT)
@@ -98,6 +124,7 @@ class MigrationTests(unittest.TestCase):
         )
         self.assertEqual(latest_schema_version(ROOT), "2026.07.29.2")
         self.assertTrue(all(len(item.checksum) == 64 for item in plan))
+        self.assertRegex(schema_history_sha256(ROOT), r"^[0-9a-f]{64}$")
 
     def test_migrations_apply_once_and_reject_checksum_drift(self):
         history = {}

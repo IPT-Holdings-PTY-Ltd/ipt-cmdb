@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import time
 from collections.abc import Callable
@@ -14,6 +15,19 @@ BASELINE_VERSION = "2026.07.13.1"
 MIGRATION_NAME = re.compile(
     r"^(?P<version>\d{4}\.\d{2}\.\d{2}\.\d+)__(?P<description>[a-z0-9_]+)\.sql$"
 )
+
+
+def _timeout_ms(name: str, default: int, maximum: int) -> int:
+    """Return a fail-closed migration timeout supplied in milliseconds."""
+
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise RuntimeError(f"{name} must be an integer number of milliseconds") from error
+    if value < 1_000 or value > maximum:
+        raise RuntimeError(f"{name} must be between 1000 and {maximum} milliseconds")
+    return value
 
 
 @dataclass(frozen=True)
@@ -58,8 +72,26 @@ def apply_migrations(connection_factory: Callable[[], Any], root: Path) -> list[
     plan = migration_plan(root)
     planned = {item.version: item for item in plan}
     applied_now: list[str] = []
+    lock_timeout_ms = _timeout_ms("CMDB_MIGRATION_LOCK_TIMEOUT_MS", 60_000, 900_000)
+    statement_timeout_ms = _timeout_ms(
+        "CMDB_MIGRATION_STATEMENT_TIMEOUT_MS",
+        900_000,
+        3_600_000,
+    )
     with connection_factory() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT set_config('lock_timeout', %s, true)",
+            (f"{lock_timeout_ms}ms",),
+        )
+        cursor.execute(
+            "SELECT set_config('statement_timeout', %s, true)",
+            (f"{lock_timeout_ms}ms",),
+        )
         cursor.execute("SELECT pg_advisory_xact_lock(hashtext('cmdb_hub_schema'))")
+        cursor.execute(
+            "SELECT set_config('statement_timeout', %s, true)",
+            (f"{statement_timeout_ms}ms",),
+        )
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -121,3 +153,13 @@ def latest_schema_version(root: Path) -> str:
     """Return the newest schema version available in the migration plan."""
 
     return migration_plan(root)[-1].version
+
+
+def schema_history_sha256(root: Path) -> str:
+    """Hash the complete ordered migration history used by release manifests."""
+
+    history = "\n".join(
+        f"{item.version} {item.path.relative_to(root).as_posix()} {item.checksum}"
+        for item in migration_plan(root)
+    )
+    return hashlib.sha256(f"{history}\n".encode()).hexdigest()

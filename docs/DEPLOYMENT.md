@@ -23,7 +23,8 @@ Every deployment uses the same application image:
 
 - port `3000` serves the SPA and `/api` from one origin;
 - `/api/live` proves that the process is accepting HTTP requests;
-- `/api/ready` returns `200` only when the canonical PostgreSQL repository is ready;
+- `/api/ready` returns `200` only when a bounded live PostgreSQL probe succeeds and the
+  complete version/checksum migration history matches the running image;
 - `/api/health` is an operator-safe informational status and is not a readiness probe;
 - production operational state lives in PostgreSQL;
 - compatible, checksum-protected forward-only migrations run during startup;
@@ -41,7 +42,10 @@ and mounts only a small runtime volume and temporary filesystem.
 |---|---|
 | `DATABASE_URL` or `DATABASE_URL_FILE` | PostgreSQL URL with TLS, normally `sslmode=require` |
 | `DATABASE_SEED_MODE` | `empty` |
+| `CMDB_MIGRATION_LOCK_TIMEOUT_MS` | `60000`; fail rather than wait indefinitely for another migration |
+| `CMDB_MIGRATION_STATEMENT_TIMEOUT_MS` | `900000`; increase only for a reviewed migration |
 | `AUTH_MODE` | `easy_auth` behind a trusted identity boundary |
+| `LOG_FORMAT` / `LOG_LEVEL` | `json` / `INFO` for container deployments |
 | `FORWARDED_ALLOW_IPS` | Exact immediate reverse-proxy IPs/CIDRs; blank for direct access; never `*` |
 | `LOCAL_LOGIN_*` | Reviewed identifier/source limits shared by every web replica |
 | `PUBLIC_BASE_URL` | Exact external HTTPS origin used in local-account recovery links |

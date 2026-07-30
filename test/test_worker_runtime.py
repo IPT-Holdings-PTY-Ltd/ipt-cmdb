@@ -6,7 +6,9 @@ from unittest.mock import patch
 
 from src.cmdb.repository import StateRepository
 from src.cmdb.worker_runtime import (
+    _LAST_RUNTIME_LOG,
     PeriodicWorker,
+    _should_log_runtime_event,
     process_role,
     run_periodic_worker,
     run_worker_cycle,
@@ -17,6 +19,7 @@ class WorkerRuntimeTests(unittest.TestCase):
     """Verify worker topology labels, counters, and failure evidence."""
 
     def setUp(self):
+        _LAST_RUNTIME_LOG.clear()
         self.state = {
             "companies": [],
             "users": [],
@@ -24,6 +27,20 @@ class WorkerRuntimeTests(unittest.TestCase):
             "relationships": [],
         }
         self.repository = StateRepository(self.state, lambda _state: None)
+
+    def test_routine_runtime_logs_are_bounded_to_one_per_minute(self):
+        worker = PeriodicWorker("integrations", 2, lambda: {"processed": 0})
+
+        with patch(
+            "src.cmdb.worker_runtime.time.monotonic",
+            side_effect=[100.0, 110.0, 161.0, 162.0],
+        ):
+            self.assertTrue(_should_log_runtime_event(worker, "worker-test", "starting"))
+            self.assertFalse(_should_log_runtime_event(worker, "worker-test", "cycle_succeeded"))
+            self.assertTrue(_should_log_runtime_event(worker, "worker-test", "heartbeat"))
+            self.assertTrue(_should_log_runtime_event(worker, "worker-test", "stopped"))
+
+        self.assertNotIn("integrations:worker-test", _LAST_RUNTIME_LOG)
 
     def test_one_shot_worker_records_success_and_stopped_heartbeat(self):
         worker = PeriodicWorker("integrations", 60, lambda: {"processed": 3})

@@ -73,13 +73,27 @@ profile. It starts one CMDB container and one PostgreSQL container with generate
 mandatory first-login MFA, persistent volumes, and verified backup/restore tooling:
 
 ```powershell
-.\scripts\Initialize-Appliance.ps1 -AdminEmail owner@example.com -InstanceName customer-acme
-$environment = '.appliance\customer-acme\.env.appliance'
-docker compose --env-file $environment -f compose.appliance.yml up -d
+.\scripts\Install-Cmdb.ps1 `
+  -AdminEmail owner@example.com `
+  -PublicBaseUrl https://cmdb.customer.example `
+  -InstanceName customer-acme `
+  -Image 'ghcr.io/ipt-holdings-pty-ltd/ipt-cmdb@sha256:<release-digest>'
 ```
 
+The downloadable self-hosted release bundle includes `release-manifest.json`, so its
+installer selects the exact image digest without `-Image`. Verify the bundle against the
+release `SHA256SUMS`, then use `Unblock-File` on Windows; never set the execution policy
+to `Unrestricted`.
+
+The same bundle includes host-side Windows and Linux updaters. They default to a
+checksum-verified, check-only action; applying a release requires an operator to approve
+the exact reported version and manifest SHA-256. Both appliance and external-PostgreSQL
+profiles preserve the detected worker state, stop active writers before the final
+recovery point, and validate the target version, digest, schema, and complete
+schema-history checksum. Do not use Watchtower or `latest`.
+
 See the [compact Docker appliance runbook](docs/deployment/APPLIANCE.md) before exposing
-the instance or scheduling backups.
+the instance, scheduling backups, or enabling update checks.
 
 ## Developer workflow
 

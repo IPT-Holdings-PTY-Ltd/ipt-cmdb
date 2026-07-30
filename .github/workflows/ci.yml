@@ -98,7 +98,211 @@ jobs:
         run: npm run build
 
       - name: Build container
-        run: docker build --tag ipt-cmdb:ci .
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          docker build \
+            --build-arg "CMDB_VERSION=$version" \
+            --build-arg "CMDB_SOURCE_COMMIT=$(git rev-parse HEAD)" \
+            --tag "ipt-cmdb:$version-ci" \
+            .
+
+      - name: Smoke-test a fresh compact-appliance install
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          sh scripts/initialize-appliance.sh \
+            admin@example.test \
+            ci-smoke \
+            http://127.0.0.1:3011 \
+            "ipt-cmdb:$version-ci" \
+            3011
+          environment=".appliance/ci-smoke/.env.appliance"
+          docker compose \
+            --env-file "$environment" \
+            -f compose.appliance.yml \
+            run --rm --no-deps --entrypoint /bin/sh cmdb -ec '
+              test "$(id -u)" -ne 0
+              for secret in \
+                /run/secrets/database_url \
+                /run/secrets/bootstrap_admin_password \
+                /run/secrets/mfa_encryption_key
+              do
+                test -r "$secret"
+                test ! -w "$secret"
+              done
+            '
+          docker compose \
+            --env-file "$environment" \
+            -f compose.appliance.yml \
+            up -d
+          container_id="$(
+            docker compose \
+              --env-file "$environment" \
+              -f compose.appliance.yml \
+              ps -q cmdb
+          )"
+          if [[ -z "$container_id" ]]; then
+            echo "The compact-appliance CMDB container was not created." >&2
+            exit 1
+          fi
+          CMDB_CONTAINER_ID="$container_id" EXPECTED_VERSION="$version" python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import time
+          import urllib.error
+          import urllib.request
+
+          base_url = "http://127.0.0.1:3011"
+          container_id = os.environ["CMDB_CONTAINER_ID"]
+          expected_version = os.environ["EXPECTED_VERSION"]
+          deadline = time.monotonic() + 180
+          last_error = "the service did not respond"
+
+          class FatalContainerError(RuntimeError):
+              pass
+
+          def read_container_state() -> tuple[dict, int]:
+              result = subprocess.run(
+                  [
+                      "docker",
+                      "inspect",
+                      "--format",
+                      '{"state":{{json .State}},"restartCount":{{.RestartCount}}}',
+                      container_id,
+                  ],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+                  timeout=5,
+              )
+              if result.returncode != 0:
+                  raise RuntimeError("Docker could not inspect the CMDB container")
+              payload = json.loads(result.stdout)
+              state = payload.get("state")
+              restart_count = payload.get("restartCount")
+              if not isinstance(state, dict) or not isinstance(restart_count, int):
+                  raise RuntimeError("Docker returned invalid CMDB container state")
+              return state, restart_count
+
+          def read_json(path: str) -> dict:
+              try:
+                  with urllib.request.urlopen(
+                      f"{base_url}{path}",
+                      timeout=5,
+                  ) as response:
+                      if response.status != 200:
+                          raise RuntimeError(f"{path} returned HTTP {response.status}")
+                      payload = json.load(response)
+                      if not isinstance(payload, dict):
+                          raise RuntimeError(f"{path} returned an invalid JSON document")
+                      return payload
+              except urllib.error.HTTPError as error:
+                  raise RuntimeError(f"{path} returned HTTP {error.code}") from None
+
+          while time.monotonic() < deadline:
+              try:
+                  state, restart_count = read_container_state()
+                  health = state.get("Health")
+                  if restart_count != 0:
+                      raise FatalContainerError("the fresh CMDB container restarted")
+                  if state.get("OOMKilled") is True:
+                      raise FatalContainerError("the CMDB container was killed for memory")
+                  if state.get("Dead") is True:
+                      raise FatalContainerError("the CMDB container entered a dead state")
+                  if state.get("Running") is not True:
+                      status = str(state.get("Status", "unknown"))
+                      if status in {"dead", "exited"}:
+                          raise FatalContainerError(
+                              f"the CMDB container entered the {status} state"
+                          )
+                      raise RuntimeError("the CMDB container is not running yet")
+                  if not isinstance(health, dict) or health.get("Status") != "healthy":
+                      raise RuntimeError("the CMDB container is not healthy yet")
+                  live = read_json("/api/live")
+                  ready = read_json("/api/ready")
+                  if live.get("status") != "alive":
+                      raise RuntimeError("/api/live did not report alive")
+                  if live.get("applicationVersion") != expected_version:
+                      raise RuntimeError(
+                          "/api/live reported an unexpected application version"
+                      )
+                  if ready.get("applicationVersion") != expected_version:
+                      raise RuntimeError(
+                          "/api/ready reported an unexpected application version"
+                      )
+                  if ready.get("status") != "ready":
+                      raise RuntimeError("/api/ready did not report ready")
+                  if ready.get("databaseAvailable") is not True:
+                      raise RuntimeError("/api/ready did not report database availability")
+                  if ready.get("schemaCurrent") is not True:
+                      raise RuntimeError("/api/ready did not report the current schema")
+                  if ready.get("schemaVersion") != ready.get("expectedSchemaVersion"):
+                      raise RuntimeError("/api/ready reported a schema version mismatch")
+              except FatalContainerError as error:
+                  raise SystemExit(
+                      f"Compact appliance startup failed: {error}"
+                  ) from None
+              except (
+                  json.JSONDecodeError,
+                  OSError,
+                  RuntimeError,
+                  TypeError,
+                  ValueError,
+              ) as error:
+                  last_error = str(error) or type(error).__name__
+                  time.sleep(2)
+                  continue
+
+              print(
+                  "Compact appliance is ready: "
+                  f"version={ready['applicationVersion']} "
+                  f"schema={ready['schemaVersion']}"
+              )
+              break
+          else:
+              raise SystemExit(
+                  "Compact appliance did not become ready within 180 seconds: "
+                  f"{last_error}"
+              )
+          PY
+
+      - name: Diagnose failed compact-appliance smoke test
+        if: failure()
+        run: |
+          environment=".appliance/ci-smoke/.env.appliance"
+          if [[ -f "$environment" ]]; then
+            docker compose \
+              --env-file "$environment" \
+              -f compose.appliance.yml \
+              ps --all || true
+            container_id="$(
+              docker compose \
+                --env-file "$environment" \
+                -f compose.appliance.yml \
+                ps -q cmdb 2>/dev/null || true
+            )"
+            if [[ -n "$container_id" ]]; then
+              docker inspect \
+                --format '{"state":{{json .State}},"restartCount":{{.RestartCount}}}' \
+                "$container_id" || true
+            fi
+            docker compose \
+              --env-file "$environment" \
+              -f compose.appliance.yml \
+              logs --no-color --timestamps --tail 300 || true
+          fi
+
+      - name: Clean up compact-appliance smoke test
+        if: always()
+        run: |
+          environment=".appliance/ci-smoke/.env.appliance"
+          if [[ -f "$environment" ]]; then
+            docker compose \
+              --env-file "$environment" \
+              -f compose.appliance.yml \
+              down --volumes --remove-orphans
+          fi
 
   security:
     name: Security checks

@@ -4,15 +4,26 @@ services:
   cmdb:
     environment:
       CMDB_PROCESS_ROLE: web
+      CMDB_IMAGE_DIGEST: ${CMDB_IMAGE_DIGEST:-unknown}
 
   worker:
     image: ${CMDB_IMAGE:?Set CMDB_IMAGE to the same immutable image as the web service}
     command: ["python", "-m", "backend.worker"]
+    # The worker does not expose HTTP. Disable the image-level web health check
+    # so Compose can wait for the process to remain running without probing port
+    # 3000 inside this container.
+    healthcheck:
+      disable: true
     environment:
       DATA_DIR: /app/data
       DATABASE_URL_FILE: /run/secrets/database_url
       DATABASE_SEED_MODE: empty
+      CMDB_MIGRATION_LOCK_TIMEOUT_MS: ${CMDB_MIGRATION_LOCK_TIMEOUT_MS:-60000}
+      CMDB_MIGRATION_STATEMENT_TIMEOUT_MS: ${CMDB_MIGRATION_STATEMENT_TIMEOUT_MS:-900000}
       CMDB_PROCESS_ROLE: worker
+      CMDB_IMAGE_DIGEST: ${CMDB_IMAGE_DIGEST:-unknown}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?Set BOOTSTRAP_ADMIN_EMAIL}
       BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/bootstrap_admin_password
       MFA_ENCRYPTION_KEY_FILE: /run/secrets/mfa_encryption_key
