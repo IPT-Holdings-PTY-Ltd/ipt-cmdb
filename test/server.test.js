@@ -21,6 +21,35 @@ test('Node runtime floor stays aligned across package, lockfile, CI and Docker',
   assert.match(dockerfile, new RegExp(`^FROM node:${minimumNode.replaceAll('.', '\\.')}-alpine AS frontend-build$`, 'm'));
 });
 
+test('compact-appliance CI waits for exact readiness and preserves failure diagnostics', () => {
+  const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const smokeStart = ci.indexOf('      - name: Smoke-test a fresh compact-appliance install');
+  const diagnosticsStart = ci.indexOf(
+    '      - name: Diagnose failed compact-appliance smoke test',
+  );
+  const cleanupStart = ci.indexOf('      - name: Clean up compact-appliance smoke test');
+  const smoke = ci.slice(smokeStart, diagnosticsStart);
+  const diagnostics = ci.slice(diagnosticsStart, cleanupStart);
+
+  assert.ok(smokeStart >= 0);
+  assert.ok(diagnosticsStart > smokeStart);
+  assert.ok(cleanupStart > diagnosticsStart);
+  assert.doesNotMatch(smoke, /up -d --wait/);
+  assert.match(smoke, /up -d\r?\n/);
+  assert.match(smoke, /deadline = time\.monotonic\(\) \+ 180/);
+  assert.match(smoke, /health\.get\("Status"\) != "healthy"/);
+  assert.match(smoke, /restart_count != 0/);
+  assert.match(smoke, /read_json\("\/api\/live"\)/);
+  assert.match(smoke, /read_json\("\/api\/ready"\)/);
+  assert.match(smoke, /live\.get\("status"\) != "alive"/);
+  assert.match(smoke, /ready\.get\("databaseAvailable"\) is not True/);
+  assert.match(smoke, /ready\.get\("schemaCurrent"\) is not True/);
+  assert.match(smoke, /ready\.get\("schemaVersion"\) != ready\.get\("expectedSchemaVersion"\)/);
+  assert.match(diagnostics, /if: failure\(\)/);
+  assert.match(diagnostics, /docker inspect/);
+  assert.match(diagnostics, /logs --no-color --timestamps --tail 300/);
+});
+
 test('container publishing is reusable only through the guarded release workflow', () => {
   const workflow = readFileSync(
     new URL('../.github/workflows/container-image.yml', import.meta.url),
