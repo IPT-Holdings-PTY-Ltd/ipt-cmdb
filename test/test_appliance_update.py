@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 POWERSHELL = shutil.which("pwsh")
 POSIX_SHELL = shutil.which("sh")
+NATIVE_POSIX_TESTS = os.name == "posix" and POSIX_SHELL is not None
 OLD_DIGEST = "sha256:" + ("1" * 64)
 TARGET_DIGEST = "sha256:" + ("2" * 64)
 IMAGE_NAME = "ghcr.io/ipt-holdings-pty-ltd/ipt-cmdb"
@@ -378,7 +379,10 @@ class ApplianceUpdaterContractTests(unittest.TestCase):
             if directory.exists():
                 shutil.rmtree(directory)
 
-    @unittest.skipUnless(POSIX_SHELL, "A POSIX shell is not available")
+    @unittest.skipUnless(
+        NATIVE_POSIX_TESTS,
+        "POSIX updater tests require a native POSIX host",
+    )
     def test_posix_check_is_read_only(self) -> None:
         temporary_base = ROOT / "tmp"
         temporary_base.mkdir(exist_ok=True)
@@ -424,7 +428,10 @@ class ApplianceUpdaterContractTests(unittest.TestCase):
             if directory.exists():
                 shutil.rmtree(directory)
 
-    @unittest.skipUnless(POSIX_SHELL, "A POSIX shell is not available")
+    @unittest.skipUnless(
+        NATIVE_POSIX_TESTS,
+        "POSIX updater tests require a native POSIX host",
+    )
     def test_posix_external_database_check_is_read_only(self) -> None:
         """External PostgreSQL checks must not mutate state or manage a database."""
 
