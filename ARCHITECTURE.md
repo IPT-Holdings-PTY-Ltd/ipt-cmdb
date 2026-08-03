@@ -128,6 +128,36 @@ The visual perspectives use one canonical graph. Full-stack lanes group foundati
 
 Virtualization impact uses recorded HA, cluster membership, host health, minimum-host capacity, mobility and protection evidence. It is an operational planning aid, not a replacement for live hypervisor admission-control data.
 
+### Relationship discovery and materialization
+
+Provider topology evidence enters `ci_relationship_candidates`, not the canonical graph.
+Candidates are tenant-scoped, versioned and fingerprinted so an unchanged observation can
+increase confidence without allowing materially changed evidence to inherit an earlier
+decision. The relationship screen exposes a provider-neutral review queue and an optional
+proposed-edge overlay. Proposed edges are presentation-only: impact traversal, change
+scope and reports continue to use canonical relationships until a candidate is approved.
+
+N-central's highest-confidence detector uses immutable provider device IDs for both ends
+of an explicit virtualization relation. Exact, uniquely owned configured DNS or DHCP IPs
+may produce lower-confidence `provided_by` hints, but those hints always require review.
+Names, sites, subnets, default gateways and address proximity are never topology inputs.
+Physical switch connectivity also remains unknown unless LLDP/CDP or another provider
+supplies endpoint-specific neighbour evidence.
+
+Canonical materialization has two guarded paths:
+
+1. an authorized administrator approves a pending candidate with review notes; or
+2. a platform administrator has explicitly enabled `auto_explicit`, selected the
+   relationship type, and the immutable-identity candidate passes confidence, repeated
+   observation and freshness thresholds.
+
+Automatic evaluation currently accepts only the versioned explicit-virtualization
+detector and the saved type allow-list. A failed gate keeps the suggestion pending. The
+approval repository operation revalidates tenant, endpoints, evidence revision,
+duplicates and dependency cycles in the same transaction that creates the canonical
+edge and records the candidate decision. Existing manual relationships take precedence;
+provider refresh, retirement and automation cannot overwrite or delete them.
+
 ## Change-control snapshots
 
 Change packages reference live scope CIs during preparation. When saved, the package freezes impacted CI names, paths, ownership, business systems, risk factors and technical plans. Later CI edits therefore do not rewrite historical evidence.
@@ -145,7 +175,10 @@ tests, saved discovery policy, explicit customer mapping, configuration-item inp
 durable continuous-preview policies, a persistent provider-neutral review queue and
 administrator-selected canonical imports. N-central exchanges its permanent User-API
 token for a short-lived bearer token in memory and applies its native device-filter ID
-before CMDB class/status policy. The ConnectWise change-ticket action is declared but
+before CMDB class/status policy. An optional N-able platform GraphQL adapter adds
+allow-listed inventory evidence through a separately stored API token. GraphQL assets
+crosswalk to REST through N-central server ID plus device ID; Partner, Service
+Organization and Site objects cannot establish a CMDB tenant boundary. The ConnectWise change-ticket action is declared but
 disabled. No provider-write executor exists in this release.
 
 Provider observations enter a common reconciliation boundary. Adapters never write directly to canonical customers, CIs, contacts or relationships. A future workflow action follows a separate route:

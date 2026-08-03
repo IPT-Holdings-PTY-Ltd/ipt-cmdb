@@ -41,6 +41,49 @@ class IntegrationReconciliationTests(unittest.TestCase):
                     normalize_ci_policy({"enrichmentMode": mode})["enrichmentMode"],
                     mode,
                 )
+
+    def test_relationship_automation_is_review_only_and_bounded_by_default(self):
+        """A saved CI policy must never silently enable topology changes."""
+
+        default = normalize_ci_policy(None)
+        self.assertEqual(default["relationshipAutomationMode"], "review")
+        self.assertEqual(default["relationshipAutoApproveTypes"], [])
+        self.assertEqual(default["relationshipMinConfidence"], 0.98)
+        self.assertEqual(default["relationshipMinObservations"], 2)
+        self.assertEqual(default["relationshipMaxEvidenceAgeHours"], 72)
+        self.assertEqual(default["missingDeviceRequiredSnapshots"], 3)
+        self.assertEqual(default["missingDeviceMinimumHours"], 24)
+
+        enabled = normalize_ci_policy(
+            {
+                "relationshipAutomationMode": "auto_explicit",
+                "relationshipAutoApproveTypes": ["hosts", "hosts", "stored_on"],
+                "relationshipMinConfidence": 0.25,
+                "relationshipMinObservations": 99,
+                "relationshipMaxEvidenceAgeHours": 9999,
+            }
+        )
+        self.assertEqual(enabled["relationshipAutomationMode"], "auto_explicit")
+        self.assertEqual(enabled["relationshipAutoApproveTypes"], ["hosts", "stored_on"])
+        self.assertEqual(enabled["relationshipMinConfidence"], 0.5)
+        self.assertEqual(enabled["relationshipMinObservations"], 10)
+        self.assertEqual(enabled["relationshipMaxEvidenceAgeHours"], 720)
+        bounded_presence = normalize_ci_policy(
+            {
+                "missingDeviceRequiredSnapshots": 999,
+                "missingDeviceMinimumHours": 9999,
+            }
+        )
+        self.assertEqual(bounded_presence["missingDeviceRequiredSnapshots"], 10)
+        self.assertEqual(bounded_presence["missingDeviceMinimumHours"], 720)
+        minimum_presence = normalize_ci_policy(
+            {
+                "missingDeviceRequiredSnapshots": 0,
+                "missingDeviceMinimumHours": 0,
+            }
+        )
+        self.assertEqual(minimum_presence["missingDeviceRequiredSnapshots"], 2)
+        self.assertEqual(minimum_presence["missingDeviceMinimumHours"], 1)
         for invalid in ("", "everything", "FULL", 42):
             with self.subTest(invalid=invalid):
                 self.assertEqual(

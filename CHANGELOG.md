@@ -55,6 +55,15 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ### Fixed
 
+- Made balanced N-central detail enrichment retain its bounded rotation cursor, so
+  larger estates advance beyond the first 25 devices on successive successful previews.
+- Prevented partial N-central and GraphQL reads from replacing previously collected
+  inventory with authoritative empty snapshots when a source section was not read.
+- Separated N-central OS capability properties from genuine Windows Server roles and
+  features, and added explainable Hyper-V host classification from host-side virtual
+  switch adapter evidence without inventing guest relationships.
+- Corrected selected-device N-central capability checks for the documented nested
+  `data` response envelope and aligned GraphQL-derived counts with stored collections.
 - Made Linux file-backed Compose secrets readable by the non-root CMDB and worker
   processes while retaining private `0700` directories, `0600` environment files and
   read-only `0444` secret files.

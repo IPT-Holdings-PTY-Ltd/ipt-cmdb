@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import unittest
+from copy import deepcopy
 from datetime import date, timedelta
 from unittest.mock import ANY, patch
 
@@ -116,6 +117,112 @@ class FastApiMigrationTests(unittest.TestCase):
 
     def _headers(self, email: str, password: str = "ChangeMe!") -> dict[str, str]:
         return {"Authorization": f"Bearer {self._login(email, password)}"}
+
+    def _seed_provider_link_review(
+        self,
+        provider: str,
+        external_id: str,
+        *,
+        connection_revision: int = 7,
+    ) -> tuple[dict, dict, dict]:
+        """Seed one exact manual-preview generation for explicit-link tests."""
+
+        connection = next(
+            (
+                item
+                for item in core.DB["integrations"]
+                if item.get("type") == provider and item.get("companyId") is None
+            ),
+            None,
+        )
+        if connection is None:
+            backend_main.REPOSITORY.ensure_integration_connection(
+                provider,
+                "N-central" if provider == "ncentral" else "ConnectWise Manage",
+                "admin",
+            )
+            connection = next(
+                item
+                for item in core.DB["integrations"]
+                if item.get("type") == provider and item.get("companyId") is None
+            )
+        connection.update(
+            enabled=True,
+            lifecycleStatus="active",
+            revision=connection_revision,
+        )
+        provider_parent_id = "101" if provider == "ncentral" else "42"
+        core.DB.setdefault("providerCompanyObservations", []).append(
+            {
+                "id": f"{provider}-company-observation",
+                "provider": provider,
+                "externalId": provider_parent_id,
+                "name": "Acme Manufacturing",
+                "active": True,
+                "deleted": False,
+            }
+        )
+        core.DB.setdefault("providerCompanyMappings", []).append(
+            {
+                "id": f"{provider}-company-mapping",
+                "provider": provider,
+                "externalId": provider_parent_id,
+                "companyId": "acme",
+                "active": True,
+            }
+        )
+        policy = backend_main.REPOSITORY.update_ci_sync_policy(
+            provider,
+            "acme",
+            provider_parent_id,
+            backend_main.normalize_ci_policy({"syncMode": "manual", "enabled": False}),
+            actor_id="admin",
+        )
+        run_id = f"{provider}-review-run-{external_id}"
+        core.DB["syncRuns"].insert(
+            0,
+            {
+                "id": run_id,
+                "type": provider,
+                "status": "success",
+                "companyId": "acme",
+                "providerCompanyId": provider_parent_id,
+                "policyId": policy["id"],
+                "attributes": {
+                    "operation": (
+                        "device_preview" if provider == "ncentral" else "configuration_preview"
+                    ),
+                    "companyId": "acme",
+                    "providerCompanyId": provider_parent_id,
+                    "policyId": policy["id"],
+                    "policyRevision": policy["revision"],
+                    "connectionRevision": connection_revision,
+                    "readOnly": True,
+                },
+            },
+        )
+        record = {
+            "externalId": external_id,
+            "providerParentId": provider_parent_id,
+            "name": f"{provider.upper()}-{external_id}",
+            "type": "Server",
+            "status": "Active",
+            "fields": {},
+            "metadata": {},
+        }
+        review = {
+            "id": f"{provider}-review-{external_id}",
+            "policyId": policy["id"],
+            "companyId": "acme",
+            "externalId": external_id,
+            "externalName": record["name"],
+            "providerRecord": record,
+            "state": "pending",
+            "contentHash": f"hash-{provider}-{external_id}",
+            "lastRunId": run_id,
+        }
+        core.DB.setdefault("integrationCiReviewItems", []).append(review)
+        return connection, policy, review
 
     def test_request_log_uses_route_template_without_query_or_authorization_values(self):
         sentinel = "must-not-appear-in-logs"
@@ -453,6 +560,756 @@ class FastApiMigrationTests(unittest.TestCase):
             backend_main.REPOSITORY.get_ci_review_item(queued_ids["northwind"])["state"],
             "pending",
         )
+
+    def test_presence_lifecycle_queue_is_validated_paginated_and_tenant_scoped(self):
+        """Only root readers may list evidence and operators stay within assigned customers."""
+
+        candidates = [
+            {
+                "id": "presence-acme",
+                "companyId": "acme",
+                "companyName": "Acme Manufacturing",
+                "provider": "ncentral",
+                "externalId": "device-1",
+                "externalName": "ACME-HV01",
+                "state": "eligible",
+                "revision": 2,
+            },
+            {
+                "id": "presence-northwind",
+                "companyId": "northwind",
+                "companyName": "Northwind Traders",
+                "provider": "ncentral",
+                "externalId": "device-2",
+                "externalName": "NW-HV01",
+                "state": "monitoring",
+                "revision": 1,
+            },
+        ]
+
+        def scoped_candidates(**filters):
+            rows = deepcopy(candidates)
+            company_id = filters.get("company_id")
+            company_ids = filters.get("company_ids")
+            if company_id:
+                rows = [item for item in rows if item["companyId"] == company_id]
+            if company_ids is not None:
+                rows = [item for item in rows if item["companyId"] in company_ids]
+            state = filters.get("state")
+            if state:
+                rows = [item for item in rows if item["state"] == state]
+            return {
+                "items": rows,
+                "total": len(rows),
+                "summary": {
+                    "observed": 0,
+                    "monitoring": sum(item["state"] == "monitoring" for item in rows),
+                    "eligible": sum(item["state"] == "eligible" for item in rows),
+                    "notEvaluated": 0,
+                    "retired": 0,
+                    "restoreReady": 0,
+                    "total": len(rows),
+                },
+            }
+
+        with patch.object(
+            backend_main.REPOSITORY,
+            "list_ci_presence_lifecycle",
+            side_effect=scoped_candidates,
+            create=True,
+        ) as listing:
+            admin = self.client.get(
+                "/api/integration-reconciliation/lifecycle-candidates"
+                "?provider=ncentral&limit=100&offset=0",
+                headers=self._headers("admin@example.com"),
+            )
+            operator = self.client.get(
+                "/api/integration-reconciliation/lifecycle-candidates?provider=ncentral",
+                headers=self._headers("operator@example.com"),
+            )
+            client = self.client.get(
+                "/api/integration-reconciliation/lifecycle-candidates?provider=ncentral",
+                headers=self._headers("client@acme.example"),
+            )
+            forbidden_tenant = self.client.get(
+                "/api/integration-reconciliation/lifecycle-candidates"
+                "?provider=ncentral&companyId=northwind",
+                headers=self._headers("operator@example.com"),
+            )
+            invalid_provider = self.client.get(
+                "/api/integration-reconciliation/lifecycle-candidates?provider=unknown",
+                headers=self._headers("admin@example.com"),
+            )
+            invalid_state = self.client.get(
+                "/api/integration-reconciliation/lifecycle-candidates?state=deleted",
+                headers=self._headers("admin@example.com"),
+            )
+            invalid_limit = self.client.get(
+                "/api/integration-reconciliation/lifecycle-candidates?limit=501",
+                headers=self._headers("admin@example.com"),
+            )
+            invalid_offset = self.client.get(
+                "/api/integration-reconciliation/lifecycle-candidates?offset=25001",
+                headers=self._headers("admin@example.com"),
+            )
+
+        self.assertEqual(admin.status_code, 200, admin.text)
+        self.assertEqual(admin.json()["total"], 2)
+        self.assertEqual(operator.status_code, 200, operator.text)
+        self.assertEqual(operator.json()["total"], 1)
+        self.assertEqual(operator.json()["items"][0]["companyId"], "acme")
+        self.assertEqual(client.status_code, 403)
+        self.assertEqual(forbidden_tenant.status_code, 403)
+        self.assertEqual(invalid_provider.status_code, 422)
+        self.assertEqual(invalid_state.status_code, 422)
+        self.assertEqual(invalid_limit.status_code, 422)
+        self.assertEqual(invalid_offset.status_code, 422)
+        operator_call = listing.call_args_list[1]
+        self.assertEqual(operator_call.kwargs["company_ids"], ["acme"])
+        self.assertEqual(operator_call.kwargs["limit"], 50)
+        self.assertEqual(operator_call.kwargs["offset"], 0)
+
+    def test_presence_lifecycle_actions_are_admin_only_and_revision_safe(self):
+        """Source retirement and restore require explicit admin notes and revisions."""
+
+        admin_headers = self._headers("admin@example.com")
+        operator_headers = self._headers("operator@example.com")
+        retired = {"id": "presence-1", "state": "retired", "revision": 3}
+        restored = {"id": "presence-1", "state": "observed", "revision": 4}
+        with (
+            patch.object(
+                backend_main.REPOSITORY,
+                "retire_ci_presence_mapping",
+                return_value=retired,
+                create=True,
+            ) as retire,
+            patch.object(
+                backend_main.REPOSITORY,
+                "restore_ci_presence_mapping",
+                return_value=restored,
+                create=True,
+            ) as restore,
+        ):
+            retired_response = self.client.post(
+                "/api/integration-reconciliation/lifecycle-candidates/presence-1/retire",
+                headers=admin_headers,
+                json={"expectedRevision": 2, "notes": "Provider source was decommissioned"},
+            )
+            denied = self.client.post(
+                "/api/integration-reconciliation/lifecycle-candidates/presence-1/retire",
+                headers=operator_headers,
+                json={"expectedRevision": 2, "notes": "Operator cannot approve this"},
+            )
+            restored_response = self.client.post(
+                "/api/integration-reconciliation/lifecycle-candidates/presence-1/restore",
+                headers=admin_headers,
+                json={"expectedRevision": 3, "notes": "Device identity was observed again"},
+            )
+
+        self.assertEqual(retired_response.status_code, 200, retired_response.text)
+        self.assertEqual(retired_response.json()["state"], "retired")
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(restored_response.status_code, 200, restored_response.text)
+        retire.assert_called_once_with(
+            "presence-1",
+            2,
+            "Provider source was decommissioned",
+            "admin",
+        )
+        restore.assert_called_once_with(
+            "presence-1",
+            3,
+            "Device identity was observed again",
+            "admin",
+        )
+
+        with patch.object(
+            backend_main.REPOSITORY,
+            "retire_ci_presence_mapping",
+            side_effect=ValueError("Presence evidence changed; refresh before deciding"),
+            create=True,
+        ):
+            conflict = self.client.post(
+                "/api/integration-reconciliation/lifecycle-candidates/presence-1/retire",
+                headers=admin_headers,
+                json={"expectedRevision": 2, "notes": "Provider source was decommissioned"},
+            )
+        with patch.object(
+            backend_main.REPOSITORY,
+            "restore_ci_presence_mapping",
+            return_value=None,
+            create=True,
+        ):
+            missing = self.client.post(
+                "/api/integration-reconciliation/lifecycle-candidates/missing/restore",
+                headers=admin_headers,
+                json={"expectedRevision": 1, "notes": "Device identity was observed again"},
+            )
+
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(missing.status_code, 404)
+
+    def test_ncentral_bulk_import_skips_restore_required_before_asset_update(self):
+        """A retired N-central source must not partially update its canonical asset."""
+
+        core.DB["providerCiMappings"] = [
+            {
+                "id": "retired-ncentral-mapping",
+                "provider": "ncentral",
+                "companyId": "acme",
+                "providerParentId": "101",
+                "externalId": "7001",
+                "assetId": "asset-1",
+                "active": False,
+            }
+        ]
+        core.DB["integrationCiPresence"] = [
+            {
+                "id": "retired-ncentral-presence",
+                "mappingId": "retired-ncentral-mapping",
+                "state": "restore_ready",
+            }
+        ]
+        preview = {
+            "companyName": "Acme Manufacturing",
+            "discovered": 1,
+            "appliedPolicy": {"id": "policy-ncentral"},
+            "items": [
+                {
+                    "externalId": "7001",
+                    "name": "ACME-NC01",
+                    "action": "update",
+                    "assetId": "asset-1",
+                    "changes": {"name": "MUST-NOT-BE-WRITTEN"},
+                    "changedFields": ["name"],
+                    "record": {
+                        "externalId": "7001",
+                        "providerParentId": "101",
+                        "name": "ACME-NC01",
+                        "type": "Server",
+                        "status": "Active",
+                        "fields": {},
+                        "metadata": {},
+                    },
+                }
+            ],
+        }
+
+        with patch.object(
+            backend_main,
+            "_ncentral_device_preview",
+            return_value=deepcopy(preview),
+        ):
+            response = self.client.post(
+                "/api/integrations/ncentral/devices/import",
+                headers=self._headers("admin@example.com"),
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "101",
+                    "externalIds": ["7001"],
+                    "decisionNotes": "Regression test for governed restoration",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["updated"], 0)
+        self.assertEqual(response.json()["skipped"], 1)
+        self.assertEqual(response.json()["skippedItems"][0]["action"], "restore_required")
+        self.assertEqual(core.DB["assets"][0]["name"], "ACME-DC01")
+        self.assertFalse(core.DB["providerCiMappings"][0]["active"])
+
+    def test_connectwise_bulk_import_skips_restore_required_before_asset_create(self):
+        """A retired ConnectWise source must not leave an orphan canonical asset."""
+
+        core.DB["providerCiMappings"] = [
+            {
+                "id": "retired-connectwise-mapping",
+                "provider": "connectwise",
+                "companyId": "acme",
+                "providerParentId": "42",
+                "externalId": "9001",
+                "assetId": "asset-1",
+                "active": False,
+            }
+        ]
+        core.DB["integrationCiPresence"] = [
+            {
+                "id": "retired-connectwise-presence",
+                "mappingId": "retired-connectwise-mapping",
+                "state": "retired",
+            }
+        ]
+        preview = {
+            "companyName": "Acme Manufacturing",
+            "discovered": 1,
+            "appliedPolicy": {"id": "policy-connectwise"},
+            "items": [
+                {
+                    "externalId": "9001",
+                    "name": "CW-DEVICE-9001",
+                    "action": "create",
+                    "assetId": None,
+                    "changes": {},
+                    "changedFields": [],
+                    "record": {
+                        "externalId": "9001",
+                        "providerParentId": "42",
+                        "name": "CW-DEVICE-9001",
+                        "type": "Server",
+                        "status": "Active",
+                        "fields": {},
+                        "metadata": {},
+                    },
+                }
+            ],
+        }
+        asset_count = len(core.DB["assets"])
+
+        with patch.object(
+            backend_main,
+            "_connectwise_configuration_preview",
+            return_value=deepcopy(preview),
+        ):
+            response = self.client.post(
+                "/api/integrations/connectwise/configurations/import",
+                headers=self._headers("admin@example.com"),
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "42",
+                    "externalIds": ["9001"],
+                    "decisionNotes": "Regression test for governed restoration",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["created"], 0)
+        self.assertEqual(response.json()["skipped"], 1)
+        self.assertEqual(response.json()["skippedItems"][0]["action"], "restore_required")
+        self.assertEqual(len(core.DB["assets"]), asset_count)
+        self.assertFalse(core.DB["providerCiMappings"][0]["active"])
+
+    def test_provider_bulk_imports_roll_back_canonical_writes_on_atomic_failpoint(self):
+        """Neither provider may retain an asset when its atomic mapping commit fails."""
+
+        headers = self._headers("admin@example.com")
+        cases = (
+            (
+                "ncentral",
+                "/api/integrations/ncentral/devices/import",
+                "_ncentral_device_preview",
+                "101",
+                "7001",
+            ),
+            (
+                "connectwise",
+                "/api/integrations/connectwise/configurations/import",
+                "_connectwise_configuration_preview",
+                "42",
+                "9001",
+            ),
+        )
+        for provider, route, preview_name, provider_parent_id, external_id in cases:
+            with self.subTest(provider=provider):
+                preview = {
+                    "companyName": "Acme Manufacturing",
+                    "discovered": 1,
+                    "appliedPolicy": {"id": f"policy-{provider}"},
+                    "items": [
+                        {
+                            "externalId": external_id,
+                            "name": f"DEVICE-{external_id}",
+                            "action": "create",
+                            "assetId": None,
+                            "changes": {},
+                            "changedFields": [],
+                            "record": {
+                                "externalId": external_id,
+                                "providerParentId": provider_parent_id,
+                                "name": f"DEVICE-{external_id}",
+                                "type": "Server",
+                                "status": "Active",
+                                "fields": {},
+                                "metadata": {},
+                            },
+                        }
+                    ],
+                }
+                asset_count = len(core.DB["assets"])
+                with (
+                    patch.object(backend_main, preview_name, return_value=deepcopy(preview)),
+                    patch.object(
+                        backend_main.REPOSITORY,
+                        "_provider_import_failpoint",
+                        side_effect=ValueError("simulated mapping failure"),
+                    ),
+                ):
+                    response = self.client.post(
+                        route,
+                        headers=headers,
+                        json={
+                            "companyId": "acme",
+                            "providerCompanyId": provider_parent_id,
+                            "externalIds": [external_id],
+                            "decisionNotes": "Atomic rollback regression test",
+                        },
+                    )
+
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertEqual(len(core.DB["assets"]), asset_count)
+                self.assertFalse(
+                    any(
+                        item.get("provider") == provider and item.get("externalId") == external_id
+                        for item in core.DB.get("providerCiMappings", [])
+                    )
+                )
+
+    def test_provider_import_preflight_fails_closed_on_scope_mismatch(self):
+        """Immutable identities cannot move across customer or provider-parent scope."""
+
+        item = {
+            "externalId": "7001",
+            "name": "ACME-NC01",
+            "record": {"externalId": "7001", "name": "ACME-NC01"},
+        }
+        with patch.object(
+            backend_main.REPOSITORY,
+            "classify_provider_ci_mapping_import",
+            return_value={
+                "decision": "allow",
+                "mappingId": "mapping-1",
+                "companyMatches": False,
+                "providerParentMatches": True,
+                "reason": "No governed retirement blocks this provider identity.",
+            },
+        ):
+            allowed, skipped = backend_main._provider_import_preflight(
+                "ncentral",
+                "acme",
+                "101",
+                {"7001": item},
+                {"7001"},
+            )
+
+        self.assertEqual(allowed, [])
+        self.assertEqual(skipped[0]["action"], "scope_conflict")
+        self.assertIn("another customer", skipped[0]["reason"])
+
+    def test_single_item_link_routes_reject_cross_scope_provider_identities(self):
+        """Explicit links cannot reassign an immutable ID across tenant boundaries."""
+
+        core.DB["providerCiMappings"] = [
+            {
+                "id": "cross-scope-ncentral",
+                "provider": "ncentral",
+                "companyId": "northwind",
+                "providerParentId": "202",
+                "externalId": "7001",
+                "assetId": "asset-2",
+                "active": True,
+            },
+            {
+                "id": "cross-scope-connectwise",
+                "provider": "connectwise",
+                "companyId": "northwind",
+                "providerParentId": "84",
+                "externalId": "9001",
+                "assetId": "asset-2",
+                "active": True,
+            },
+        ]
+        ncentral_item = {
+            "id": "review-ncentral-7001",
+            "externalId": "7001",
+            "externalName": "ACME-NC01",
+            "policyId": "policy-ncentral",
+            "providerRecord": {
+                "externalId": "7001",
+                "providerParentId": "101",
+                "name": "ACME-NC01",
+                "type": "Server",
+                "status": "Active",
+                "fields": {},
+                "metadata": {},
+            },
+        }
+        connectwise_preview = {
+            "appliedPolicy": {"id": "policy-connectwise"},
+            "items": [
+                {
+                    "externalId": "9001",
+                    "name": "CW-DEVICE-9001",
+                    "record": {
+                        "externalId": "9001",
+                        "providerParentId": "42",
+                        "name": "CW-DEVICE-9001",
+                    },
+                }
+            ],
+        }
+
+        with (
+            patch.object(backend_main, "_ncentral_mapped_company", return_value={}),
+            patch.object(
+                backend_main.REPOSITORY,
+                "get_ci_review_item_by_identity",
+                return_value=ncentral_item,
+            ),
+            patch.object(
+                backend_main,
+                "_connectwise_configuration_preview",
+                return_value=connectwise_preview,
+            ),
+            patch.object(
+                backend_main.REPOSITORY,
+                "record_provider_ci_mapping",
+                wraps=backend_main.REPOSITORY.record_provider_ci_mapping,
+            ) as record_mapping,
+        ):
+            ncentral = self.client.post(
+                "/api/integrations/ncentral/devices/link",
+                headers=self._headers("admin@example.com"),
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "101",
+                    "externalId": "7001",
+                    "assetId": "asset-1",
+                },
+            )
+            connectwise = self.client.post(
+                "/api/integrations/connectwise/configurations/link",
+                headers=self._headers("admin@example.com"),
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "42",
+                    "externalId": "9001",
+                    "assetId": "asset-1",
+                },
+            )
+
+        self.assertEqual(ncentral.status_code, 409, ncentral.text)
+        self.assertEqual(connectwise.status_code, 409, connectwise.text)
+        self.assertIn("scoped elsewhere", ncentral.json()["detail"])
+        self.assertIn("scoped elsewhere", connectwise.json()["detail"])
+        record_mapping.assert_not_called()
+
+    def test_single_item_link_directs_retired_mapping_to_missing_devices(self):
+        """Lifecycle retirement cannot be bypassed by an explicit link action."""
+
+        core.DB["providerCiMappings"] = [
+            {
+                "id": "retired-connectwise-link",
+                "provider": "connectwise",
+                "companyId": "acme",
+                "providerParentId": "42",
+                "externalId": "9001",
+                "assetId": "asset-1",
+                "active": False,
+            }
+        ]
+        core.DB["integrationCiPresence"] = [
+            {
+                "id": "retired-connectwise-link-presence",
+                "mappingId": "retired-connectwise-link",
+                "state": "retired",
+            }
+        ]
+        preview = {
+            "appliedPolicy": {"id": "policy-connectwise"},
+            "items": [
+                {
+                    "externalId": "9001",
+                    "name": "CW-DEVICE-9001",
+                    "record": {"externalId": "9001", "name": "CW-DEVICE-9001"},
+                }
+            ],
+        }
+
+        with patch.object(
+            backend_main,
+            "_connectwise_configuration_preview",
+            return_value=preview,
+        ):
+            response = self.client.post(
+                "/api/integrations/connectwise/configurations/link",
+                headers=self._headers("admin@example.com"),
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "42",
+                    "externalId": "9001",
+                    "assetId": "asset-1",
+                },
+            )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("Missing devices", response.json()["detail"])
+
+    def test_single_item_link_rejects_inactive_mapping_without_lifecycle_row(self):
+        """An ungoverned inactive identity is a clean conflict, never a server error."""
+
+        core.DB["providerCiMappings"] = [
+            {
+                "id": "inactive-connectwise-link",
+                "provider": "connectwise",
+                "companyId": "acme",
+                "providerParentId": "42",
+                "externalId": "9001",
+                "assetId": "asset-1",
+                "active": False,
+            }
+        ]
+        preview = {
+            "appliedPolicy": {"id": "policy-connectwise"},
+            "items": [
+                {
+                    "externalId": "9001",
+                    "name": "CW-DEVICE-9001",
+                    "record": {"externalId": "9001", "name": "CW-DEVICE-9001"},
+                }
+            ],
+        }
+
+        with patch.object(
+            backend_main,
+            "_connectwise_configuration_preview",
+            return_value=preview,
+        ):
+            response = self.client.post(
+                "/api/integrations/connectwise/configurations/link",
+                headers=self._headers("admin@example.com"),
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "42",
+                    "externalId": "9001",
+                    "assetId": "asset-1",
+                },
+            )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("inactive without a governed restore action", response.json()["detail"])
+
+    def test_manual_policy_review_generation_allows_explicit_links_for_both_providers(self):
+        """Scheduler-disabled manual policies remain valid when every generation matches."""
+
+        headers = self._headers("admin@example.com")
+        routes = {
+            "ncentral": "/api/integrations/ncentral/devices/link",
+            "connectwise": "/api/integrations/connectwise/configurations/link",
+        }
+        parents = {"ncentral": "101", "connectwise": "42"}
+        for index, provider in enumerate(("ncentral", "connectwise"), start=1):
+            external_id = f"manual-{index}"
+            _connection, policy, _review = self._seed_provider_link_review(
+                provider,
+                external_id,
+            )
+            self.assertFalse(policy["enabled"])
+            response = self.client.post(
+                routes[provider],
+                headers=headers,
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": parents[provider],
+                    "externalId": external_id,
+                    "assetId": "asset-1",
+                },
+            )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["assetId"], "asset-1")
+
+    def test_explicit_links_reject_stale_review_generations_for_both_providers(self):
+        """A connection change after preview requires another reviewed provider read."""
+
+        headers = self._headers("admin@example.com")
+        routes = {
+            "ncentral": "/api/integrations/ncentral/devices/link",
+            "connectwise": "/api/integrations/connectwise/configurations/link",
+        }
+        parents = {"ncentral": "101", "connectwise": "42"}
+        for index, provider in enumerate(("ncentral", "connectwise"), start=1):
+            external_id = f"stale-{index}"
+            connection, _policy, review = self._seed_provider_link_review(
+                provider,
+                external_id,
+            )
+            connection["revision"] += 1
+            response = self.client.post(
+                routes[provider],
+                headers=headers,
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": parents[provider],
+                    "externalId": external_id,
+                    "assetId": "asset-1",
+                },
+            )
+
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertIn("Run preview again", response.json()["detail"])
+            self.assertEqual(review["state"], "pending")
+            self.assertFalse(
+                any(
+                    item.get("provider") == provider and item.get("externalId") == external_id
+                    for item in core.DB.get("providerCiMappings", [])
+                )
+            )
+
+    def test_explicit_link_rejects_legacy_review_without_source_generation(self):
+        """Review observations from older releases cannot authorize a canonical write."""
+
+        _connection, _policy, review = self._seed_provider_link_review(
+            "ncentral",
+            "legacy-generation",
+        )
+        review.pop("lastRunId")
+        response = self.client.post(
+            "/api/integrations/ncentral/devices/link",
+            headers=self._headers("admin@example.com"),
+            json={
+                "companyId": "acme",
+                "providerCompanyId": "101",
+                "externalId": "legacy-generation",
+                "assetId": "asset-1",
+            },
+        )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("older release", response.json()["detail"])
+        self.assertEqual(review["state"], "pending")
+
+    def test_explicit_links_reject_policy_changes_after_review_for_both_providers(self):
+        """A saved-policy edit invalidates earlier link evidence for either provider."""
+
+        headers = self._headers("admin@example.com")
+        routes = {
+            "ncentral": "/api/integrations/ncentral/devices/link",
+            "connectwise": "/api/integrations/connectwise/configurations/link",
+        }
+        parents = {"ncentral": "101", "connectwise": "42"}
+        for index, provider in enumerate(("ncentral", "connectwise"), start=1):
+            external_id = f"policy-stale-{index}"
+            _connection, policy, review = self._seed_provider_link_review(
+                provider,
+                external_id,
+            )
+            stored_policy = next(
+                item for item in core.DB["integrationCiPolicies"] if item.get("id") == policy["id"]
+            )
+            stored_policy["revision"] += 1
+            response = self.client.post(
+                routes[provider],
+                headers=headers,
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": parents[provider],
+                    "externalId": external_id,
+                    "assetId": "asset-1",
+                },
+            )
+
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertIn("Run preview again", response.json()["detail"])
+            self.assertEqual(review["state"], "pending")
 
     def test_connectwise_company_observations_and_preview_samples_respect_scope(self):
         """Scoped operators must not see other or unmapped provider-company names."""
@@ -2216,6 +3073,159 @@ class FastApiMigrationTests(unittest.TestCase):
         self.assertEqual(deleted.status_code, 200)
         self.assertEqual(deleted.json()["deletedId"], created.json()["id"])
 
+    def test_provider_relationship_candidates_require_review_and_preserve_provenance(self):
+        connection, policy, _review = self._seed_provider_link_review(
+            "ncentral", "relationship-context"
+        )
+        relationship_context = {
+            "policy_id": policy["id"],
+            "expected_policy_revision": policy["revision"],
+            "expected_connection_revision": connection["revision"],
+            "provider_parent_id": "101",
+        }
+        core.DB["assets"].append(
+            {
+                "id": "asset-3",
+                "companyId": "acme",
+                "name": "ACME-VM01",
+                "type": "Virtual machine",
+                "status": "Active",
+                "source": "ncentral",
+                "fields": {},
+            }
+        )
+        host_mapping = backend_main.REPOSITORY.record_provider_ci_mapping(
+            "ncentral",
+            "acme",
+            {
+                "externalId": "7001",
+                "name": "ACME-HV01",
+                "providerVersion": "host-v1",
+                "providerParentId": "101",
+                "identifiers": {},
+            },
+            "asset-1",
+            "admin",
+        )
+        backend_main.REPOSITORY.record_provider_ci_mapping(
+            "ncentral",
+            "acme",
+            {
+                "externalId": "7002",
+                "name": "ACME-VM01",
+                "providerVersion": "guest-v1",
+                "providerParentId": "101",
+                "identifiers": {},
+            },
+            "asset-3",
+            "admin",
+        )
+        candidate_values = [
+            {
+                "fromCiId": "asset-1",
+                "toCiId": "asset-3",
+                "fromExternalIdentity": {
+                    "provider": "ncentral",
+                    "externalId": "7001",
+                },
+                "toExternalIdentity": {
+                    "provider": "ncentral",
+                    "externalId": "7002",
+                },
+                "relationshipType": "hosts",
+                "confidence": 1,
+                "evidence": {
+                    "messages": ["Explicit N-central guest device ID"],
+                    "impactPolicy": "required",
+                },
+            }
+        ]
+        candidates = backend_main.REPOSITORY.upsert_relationship_candidates(
+            "ncentral",
+            "acme",
+            host_mapping["id"],
+            candidate_values,
+        )
+        candidate_id = candidates[0]["id"]
+
+        legacy = self.client.post(
+            f"/api/relationship-candidates/{candidate_id}/decision",
+            headers=self._headers("admin@example.com"),
+            json={
+                "decision": "approve",
+                "notes": "Legacy evidence must be refreshed",
+                "expectedRevision": candidates[0]["revision"],
+            },
+        )
+        self.assertEqual(legacy.status_code, 409, legacy.text)
+        self.assertIn("generation evidence is missing", legacy.text)
+        candidates = backend_main.REPOSITORY.upsert_relationship_candidates(
+            "ncentral",
+            "acme",
+            host_mapping["id"],
+            candidate_values,
+            **relationship_context,
+        )
+        candidate_id = candidates[0]["id"]
+
+        client_headers = self._headers("client@acme.example")
+        visible = self.client.get(
+            "/api/relationship-candidates?companyId=acme&state=pending",
+            headers=client_headers,
+        )
+        self.assertEqual(visible.status_code, 200, visible.text)
+        self.assertEqual(visible.json()[0]["fromName"], "ACME-DC01")
+        blocked = self.client.post(
+            f"/api/relationship-candidates/{candidate_id}/decision",
+            headers=client_headers,
+            json={"decision": "approve", "notes": "Reviewed evidence"},
+        )
+        self.assertEqual(blocked.status_code, 403)
+
+        stale = self.client.post(
+            f"/api/relationship-candidates/{candidate_id}/decision",
+            headers=self._headers("admin@example.com"),
+            json={
+                "decision": "approve",
+                "notes": "Reviewed stale provider evidence",
+                "expectedRevision": candidates[0]["revision"] + 1,
+            },
+        )
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertIn("changed; refresh", stale.text)
+        self.assertFalse(
+            any(
+                item.get("fromId") == "asset-1"
+                and item.get("toId") == "asset-3"
+                and item.get("type") == "hosts"
+                for item in backend_main.REPOSITORY.list_relationships()
+            )
+        )
+
+        approved = self.client.post(
+            f"/api/relationship-candidates/{candidate_id}/decision",
+            headers=self._headers("admin@example.com"),
+            json={
+                "decision": "approve",
+                "notes": "Reviewed provider evidence",
+                "expectedRevision": candidates[0]["revision"],
+            },
+        )
+        self.assertEqual(approved.status_code, 200, approved.text)
+        relationship = approved.json()["approvedRelationship"]
+        self.assertEqual(relationship["type"], "hosts")
+        self.assertEqual(relationship["provenance"], "provider")
+        self.assertEqual(relationship["sourceMappingId"], host_mapping["id"])
+        self.assertEqual(relationship["confidence"], 1)
+        self.assertEqual(approved.json()["revision"], candidates[0]["revision"] + 1)
+        # The legacy proposal was observed once and then refreshed with a
+        # governed provider generation before approval.
+        self.assertEqual(approved.json()["observationCount"], 2)
+        self.assertEqual(
+            approved.json()["approvedRelationshipId"],
+            relationship["id"],
+        )
+
     def test_change_package_uses_repository_and_respects_customer_scope(self):
         client_token = self._login("client@acme.example")
         payload = {
@@ -2720,12 +3730,43 @@ class FastApiMigrationTests(unittest.TestCase):
                     }
                 ]
 
+            def probe_device_capabilities(
+                self,
+                org_unit_id,
+                *,
+                device_id="",
+                sample_size=3,
+            ):
+                self.assert_scope = (org_unit_id, device_id, sample_size)
+                return {
+                    "provider": "ncentral",
+                    "readOnly": True,
+                    "sampleCount": 1,
+                    "samples": [
+                        {
+                            "sample": 1,
+                            "endpoints": {
+                                "assets": {
+                                    "accessStatus": "available",
+                                    "shape": {
+                                        "type": "object",
+                                        "fields": [{"name": "computerSystem", "type": "object"}],
+                                    },
+                                }
+                            },
+                        }
+                    ],
+                    "organizationEndpoints": {"active_issues": {"accessStatus": "available"}},
+                }
+
             def discover_devices(
                 self,
                 org_unit_id,
                 *,
                 filter_id="",
                 enrich_limit=0,
+                enrichment_offset=0,
+                priority_external_ids=None,
                 progress_callback=None,
                 cancel_requested=None,
             ):
@@ -2734,6 +3775,8 @@ class FastApiMigrationTests(unittest.TestCase):
                         "orgUnitId": org_unit_id,
                         "filterId": filter_id,
                         "enrichLimit": enrich_limit,
+                        "enrichmentOffset": enrichment_offset,
+                        "priorityExternalIds": sorted(priority_external_ids or []),
                     }
                 )
                 if org_unit_id != "101":
@@ -2763,12 +3806,32 @@ class FastApiMigrationTests(unittest.TestCase):
                         "fields": {
                             "serialNumber": "NC-SERIAL-7001",
                             "ipAddress": "10.0.0.71",
+                            "lastAgentCheckIn": "2026-07-28T09:45:00Z",
                         },
                         "metadata": {
                             "lifecycle": "in_service",
                             "serialNumber": "NC-SERIAL-7001",
                         },
                         "identifiers": {"serial_number": "NC-SERIAL-7001"},
+                        "inventoryCollections": {
+                            "hardware": {
+                                "manufacturer": "Dell",
+                                "model": "PowerEdge R650",
+                            },
+                            "network_interfaces": [
+                                {
+                                    "key": "nic-1",
+                                    "name": "Ethernet",
+                                    "macAddress": "00:11:22:33:44:55",
+                                    "ipAddresses": ["10.0.0.71"],
+                                }
+                            ],
+                            "virtualization": {
+                                "kind": "hypervisor_host",
+                                "platform": "Hyper-V",
+                                "evidence": ["installed_server_feature"],
+                            },
+                        },
                         "providerVersion": "2026-07-28T10:00:00Z",
                     },
                     {
@@ -2830,6 +3893,23 @@ class FastApiMigrationTests(unittest.TestCase):
                 json={"companyId": "acme"},
             )
             self.assertEqual(mapped.status_code, 200, mapped.text)
+            capability = self.client.post(
+                "/api/integrations/ncentral/capabilities",
+                headers=headers,
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "101",
+                    "externalId": "7001",
+                    "sampleLimit": 1,
+                },
+            )
+            self.assertEqual(capability.status_code, 200, capability.text)
+            self.assertTrue(capability.json()["readOnly"])
+            self.assertEqual(
+                capability.json()["samples"][0]["endpoints"]["assets"]["accessStatus"],
+                "available",
+            )
+            self.assertNotIn("permanent-user-api-token", capability.text)
 
             options = self.client.post(
                 "/api/integrations/ncentral/devices/options",
@@ -2854,6 +3934,11 @@ class FastApiMigrationTests(unittest.TestCase):
                     "typeMappings": {"server": "Server"},
                     "statusMode": "selected",
                     "includedStatusIds": ["normal"],
+                    "relationshipAutomationMode": "auto_explicit",
+                    "relationshipAutoApproveTypes": ["hosts"],
+                    "relationshipMinConfidence": 0.99,
+                    "relationshipMinObservations": 3,
+                    "relationshipMaxEvidenceAgeHours": 24,
                     "syncMode": "manual",
                     "enabled": False,
                     "expectedRevision": policy.json()["revision"],
@@ -2861,6 +3946,21 @@ class FastApiMigrationTests(unittest.TestCase):
             )
             self.assertEqual(saved_policy.status_code, 200, saved_policy.text)
             self.assertEqual(saved_policy.json()["providerFilterId"], "managed-servers")
+            self.assertEqual(saved_policy.json()["relationshipAutomationMode"], "auto_explicit")
+            self.assertEqual(saved_policy.json()["relationshipAutoApproveTypes"], ["hosts"])
+
+            invalid_automation = self.client.put(
+                "/api/integrations/ncentral/devices/policy",
+                headers=headers,
+                json={
+                    "companyId": "acme",
+                    "providerCompanyId": "101",
+                    "relationshipAutomationMode": "auto_explicit",
+                    "relationshipAutoApproveTypes": ["connected_to"],
+                    "expectedRevision": saved_policy.json()["revision"],
+                },
+            )
+            self.assertEqual(invalid_automation.status_code, 400, invalid_automation.text)
 
             preview = self.client.post(
                 "/api/integrations/ncentral/devices/preview",
@@ -2882,6 +3982,10 @@ class FastApiMigrationTests(unittest.TestCase):
             )
             self.assertEqual(imported.status_code, 200, imported.text)
             self.assertEqual(imported.json()["created"], 1)
+            self.assertEqual(
+                device_discovery_calls[-1]["priorityExternalIds"],
+                ["7001"],
+            )
             imported_asset = next(
                 item
                 for item in backend_main.REPOSITORY.list_assets()
@@ -2889,6 +3993,17 @@ class FastApiMigrationTests(unittest.TestCase):
             )
             self.assertEqual(imported_asset["source"], "ncentral")
             self.assertEqual(imported_asset["externalId"], "7001")
+            self.assertEqual(imported_asset["lastSeen"], "2026-07-28T09:45:00Z")
+            inventory = self.client.get(
+                f"/api/assets/{imported_asset['id']}/inventory",
+                headers=headers,
+            )
+            self.assertEqual(inventory.status_code, 200, inventory.text)
+            self.assertEqual(
+                inventory.json()["collections"]["hardware"][0]["payload"]["model"],
+                "PowerEdge R650",
+            )
+            self.assertEqual(len(inventory.json()["networkInterfaces"]), 1)
             calls_before_link = len(device_discovery_calls)
             linked = self.client.post(
                 "/api/integrations/ncentral/devices/link",
@@ -2970,6 +4085,693 @@ class FastApiMigrationTests(unittest.TestCase):
             "Generate or verify the token, save the connection, and retry.",
         )
         self.assertNotIn(marker, detail)
+
+    def test_ncentral_graphql_environment_defaults_do_not_lock_the_wizard(self):
+        """Treat Compose defaults as defaults, not as environment-owned credentials."""
+
+        environment = {
+            "NCENTRAL_GRAPHQL_ENABLED": "false",
+            "NCENTRAL_GRAPHQL_ENDPOINT": "https://api.n-able.com/graphql",
+            "NCENTRAL_GRAPHQL_API_TOKEN": "",
+            "NCENTRAL_GRAPHQL_API_TOKEN_FILE": "",
+            "NCENTRAL_GRAPHQL_PAGE_SIZE": "100",
+            "NCENTRAL_GRAPHQL_SERVER_ID": "",
+        }
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(backend_main._ncentral_graphql_environment_configuration())
+        with (
+            patch.dict(os.environ, {**environment, "NCENTRAL_GRAPHQL_ENABLED": "true"}),
+            self.assertRaises(backend_main.NableGraphqlConfigurationError),
+        ):
+            backend_main._ncentral_graphql_environment_configuration()
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    **environment,
+                    "NCENTRAL_GRAPHQL_ENABLED": "true",
+                    "NCENTRAL_GRAPHQL_API_TOKEN": "valid-token",
+                    "NCENTRAL_GRAPHQL_SERVER_ID": "x" * 161,
+                },
+            ),
+            self.assertRaises(backend_main.NableGraphqlConfigurationError),
+        ):
+            backend_main._ncentral_graphql_environment_configuration()
+
+    def test_ncentral_graphql_capability_cache_is_flattened_and_token_free(self):
+        """Expose persisted capability metadata in the UI contract without raw envelopes."""
+
+        backend_main.REPOSITORY.ensure_integration_connection("ncentral", "N-central", "admin")
+        backend_main._record_ncentral_graphql_capability(
+            status="supported",
+            summary={"readOnly": True, "reachable": True, "candidateCount": 2},
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "NCENTRAL_GRAPHQL_ENABLED": "false",
+                "NCENTRAL_GRAPHQL_ENDPOINT": "https://api.n-able.com/graphql",
+                "NCENTRAL_GRAPHQL_API_TOKEN": "",
+                "NCENTRAL_GRAPHQL_API_TOKEN_FILE": "",
+            },
+        ):
+            public = backend_main._ncentral_graphql_connection_public()
+        self.assertTrue(public["capability"]["reachable"])
+        self.assertTrue(public["capability"]["readOnly"])
+        self.assertEqual(public["capability"]["candidateCount"], 2)
+        self.assertNotIn("summary", public["capability"])
+        self.assertNotIn("graphqlApiToken", json.dumps(public))
+
+    def test_ncentral_rest_and_graphql_saves_preserve_each_other(self):
+        """Keep shared encrypted credentials and configuration transport-specific."""
+
+        headers = self._headers("admin@example.com")
+        encryption_key = base64.urlsafe_b64encode(b"g" * 32).decode("ascii")
+        environment = {
+            "MFA_ENCRYPTION_KEY": encryption_key,
+            "NCENTRAL_BASE_URL": "",
+            "NCENTRAL_USER_API_TOKEN": "",
+            "NCENTRAL_USER_API_TOKEN_FILE": "",
+            "NCENTRAL_API_TOKEN": "",
+            "NCENTRAL_GRAPHQL_ENABLED": "false",
+            "NCENTRAL_GRAPHQL_ENDPOINT": "https://api.n-able.com/graphql",
+            "NCENTRAL_GRAPHQL_API_TOKEN": "",
+            "NCENTRAL_GRAPHQL_API_TOKEN_FILE": "",
+        }
+        with patch.dict(os.environ, environment):
+            invalid_graphql_token = self.client.put(
+                "/api/integrations/ncentral/graphql/config",
+                headers=headers,
+                json={
+                    "graphqlEnabled": True,
+                    "graphqlEndpoint": "https://api.n-able.com/graphql",
+                    "graphqlApiToken": "invalid token",
+                    "graphqlPageSize": 73,
+                    "graphqlServerId": "server-a",
+                    "expectedRevision": 1,
+                },
+            )
+            self.assertEqual(invalid_graphql_token.status_code, 400)
+            self.assertIsNone(backend_main.REPOSITORY.get_integration_connection("ncentral"))
+            graphql_saved = self.client.put(
+                "/api/integrations/ncentral/graphql/config",
+                headers=headers,
+                json={
+                    "graphqlEnabled": False,
+                    "graphqlEndpoint": "https://api.n-able.com/graphql",
+                    "graphqlApiToken": "graphql-token",
+                    "graphqlPageSize": 73,
+                    "graphqlServerId": "server-a",
+                    "expectedRevision": 1,
+                },
+            )
+            self.assertEqual(graphql_saved.status_code, 200, graphql_saved.text)
+            rest_public = self.client.get(
+                "/api/integrations/ncentral/config", headers=headers
+            ).json()
+            self.assertFalse(rest_public["configured"])
+            self.assertTrue(rest_public["graphql"]["configured"])
+            self.assertTrue(rest_public["graphql"]["hasCredentials"])
+            self.assertFalse(rest_public["graphql"]["graphqlEnabled"])
+            self.assertEqual(rest_public["graphql"]["connectionStatus"], "configured")
+
+            missing_rest_token = self.client.put(
+                "/api/integrations/ncentral/config",
+                headers=headers,
+                json={
+                    "enabled": True,
+                    "baseUrl": "https://ncentral.example.com",
+                    "userApiToken": "",
+                    "pageSize": 250,
+                    "expectedRevision": graphql_saved.json()["revision"],
+                },
+            )
+            self.assertEqual(missing_rest_token.status_code, 400, missing_rest_token.text)
+
+            rest_saved = self.client.put(
+                "/api/integrations/ncentral/config",
+                headers=headers,
+                json={
+                    "enabled": True,
+                    "baseUrl": "https://ncentral.example.com",
+                    "userApiToken": "rest-token",
+                    "pageSize": 250,
+                    "expectedRevision": graphql_saved.json()["revision"],
+                },
+            )
+            self.assertEqual(rest_saved.status_code, 200, rest_saved.text)
+            self.assertEqual(rest_saved.json()["graphql"]["graphqlServerId"], "server-a")
+            self.assertEqual(rest_saved.json()["graphql"]["graphqlPageSize"], 73)
+
+            with patch.object(
+                backend_main.NableGraphqlClient,
+                "test_connection",
+                return_value={
+                    "reachable": True,
+                    "customerCandidates": [],
+                    "candidateCount": 0,
+                    "truncated": False,
+                },
+            ):
+                disabled_graphql_test = self.client.post(
+                    "/api/integrations/ncentral/graphql/test",
+                    headers=headers,
+                )
+            self.assertEqual(
+                disabled_graphql_test.status_code,
+                200,
+                disabled_graphql_test.text,
+            )
+            self.assertTrue(disabled_graphql_test.json()["reachable"])
+            self.assertFalse(rest_saved.json()["graphql"]["graphqlEnabled"])
+
+            graphql_rotated = self.client.put(
+                "/api/integrations/ncentral/graphql/config",
+                headers=headers,
+                json={
+                    "graphqlEnabled": True,
+                    "graphqlEndpoint": "https://api.n-able.com/graphql",
+                    "graphqlApiToken": "",
+                    "graphqlPageSize": 50,
+                    "graphqlServerId": "server-b",
+                    "expectedRevision": rest_saved.json()["revision"],
+                },
+            )
+            self.assertEqual(graphql_rotated.status_code, 200, graphql_rotated.text)
+            rest_rotated = self.client.put(
+                "/api/integrations/ncentral/config",
+                headers=headers,
+                json={
+                    "enabled": True,
+                    "baseUrl": "https://ncentral.example.com/v2",
+                    "userApiToken": "",
+                    "pageSize": 300,
+                    "expectedRevision": graphql_rotated.json()["revision"],
+                },
+            )
+            self.assertEqual(rest_rotated.status_code, 200, rest_rotated.text)
+            self.assertTrue(rest_rotated.json()["graphql"]["graphqlEnabled"])
+            self.assertEqual(rest_rotated.json()["graphql"]["graphqlServerId"], "server-b")
+
+        backend_main.REPOSITORY.update_integration_connection(
+            "connectwise",
+            {
+                "configuration": {"baseUrl": "https://cw.example.com"},
+                "credentialsEncrypted": "opaque-connectwise-ciphertext",
+                "credentialsNonce": "opaque-nonce",
+            },
+            "admin",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "CW_BASE_URL": "",
+                "CW_COMPANY_ID": "",
+                "CW_PUBLIC_KEY": "",
+                "CW_PRIVATE_KEY": "",
+                "CW_CLIENT_ID": "",
+            },
+        ):
+            self.assertTrue(backend_main._connectwise_connection_public()["configured"])
+
+    def test_ncentral_policy_omission_preserves_graphql_scope_and_empty_clears(self):
+        """Keep old clients from clearing scope while allowing an explicit reset."""
+
+        headers = self._headers("admin@example.com")
+        backend_main.REPOSITORY.ensure_integration_connection("ncentral", "N-central", "admin")
+        core.DB.setdefault("providerCompanyObservations", []).append(
+            {
+                "id": "observation-101",
+                "provider": "ncentral",
+                "externalId": "101",
+                "name": "Acme N-central",
+                "active": True,
+            }
+        )
+        backend_main.REPOSITORY.map_provider_company("ncentral", "101", "acme", "admin")
+        initial = backend_main.REPOSITORY.update_ci_sync_policy(
+            "ncentral",
+            "acme",
+            "101",
+            {"graphqlOrganizationIds": ["graphql-acme"]},
+            0,
+            "admin",
+        )
+        omitted = self.client.put(
+            "/api/integrations/ncentral/devices/policy",
+            headers=headers,
+            json={
+                "companyId": "acme",
+                "providerCompanyId": "101",
+                "expectedRevision": initial["revision"],
+            },
+        )
+        self.assertEqual(omitted.status_code, 200, omitted.text)
+        self.assertEqual(omitted.json()["graphqlOrganizationIds"], ["graphql-acme"])
+        cleared = self.client.put(
+            "/api/integrations/ncentral/devices/policy",
+            headers=headers,
+            json={
+                "companyId": "acme",
+                "providerCompanyId": "101",
+                "graphqlOrganizationIds": [],
+                "expectedRevision": omitted.json()["revision"],
+            },
+        )
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        self.assertEqual(cleared.json()["graphqlOrganizationIds"], [])
+
+    def test_graphql_preview_enforces_customer_scope_before_cache_read(self):
+        """Reject a restricted operator before any cache or provider lookup."""
+
+        headers = self._headers("operator@example.com")
+        with patch.object(
+            backend_main,
+            "_ncentral_graphql_cached_read",
+            side_effect=AssertionError("cache must not be read"),
+        ):
+            for path in ("preview", "refresh"):
+                with self.subTest(path=path):
+                    response = self.client.post(
+                        f"/api/integrations/ncentral/graphql/{path}",
+                        headers=headers,
+                        json={
+                            "companyId": "northwind",
+                            "providerCompanyId": "202",
+                            "queryKey": "asset_inventory",
+                        },
+                    )
+                    self.assertEqual(response.status_code, 403, response.text)
+
+    def test_graphql_customer_catalogue_is_platform_admin_only(self):
+        """Prevent an MSP operator from enumerating token-wide Customer identities."""
+
+        headers = self._headers("operator@example.com")
+        with patch.object(
+            backend_main,
+            "_ncentral_graphql_effective_configuration",
+            side_effect=AssertionError("provider configuration must not be read"),
+        ):
+            response = self.client.post(
+                "/api/integrations/ncentral/graphql/test",
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 403, response.text)
+
+    def test_graphql_server_detection_is_platform_admin_only(self):
+        """Reject source-server detection before any scoped provider read."""
+
+        headers = self._headers("operator@example.com")
+        with patch.object(
+            backend_main,
+            "_ncentral_graphql_server_candidate_read",
+            side_effect=AssertionError("provider identity must not be read"),
+        ):
+            response = self.client.post(
+                "/api/integrations/ncentral/graphql/server-candidates",
+                headers=headers,
+                json={"companyId": "acme", "providerCompanyId": "101", "limit": 25},
+            )
+
+        self.assertEqual(response.status_code, 403, response.text)
+
+    def test_graphql_server_detection_correlates_rest_ids_without_persisting(self):
+        """Recommend only one complete, REST-corroborated source-server observation."""
+
+        headers = self._headers("admin@example.com")
+        backend_main.REPOSITORY.ensure_integration_connection("ncentral", "N-central", "admin")
+        core.DB.setdefault("providerCompanyObservations", []).append(
+            {
+                "id": "observation-101",
+                "provider": "ncentral",
+                "externalId": "101",
+                "name": "Acme N-central",
+                "active": True,
+            }
+        )
+        backend_main.REPOSITORY.map_provider_company("ncentral", "101", "acme", "admin")
+        backend_main.REPOSITORY.update_ci_sync_policy(
+            "ncentral",
+            "acme",
+            "101",
+            {"graphqlOrganizationIds": ["graphql-acme"]},
+            0,
+            "admin",
+        )
+        revision_before = backend_main.REPOSITORY.get_integration_connection("ncentral")["revision"]
+
+        class FakeGraphqlClient:
+            truncated = False
+            candidates = (
+                {
+                    "serverId": "server-a",
+                    "deviceIds": ["7001", "7002"],
+                    "graphqlDeviceCount": 2,
+                },
+            )
+
+            def __init__(self, configuration):
+                self.configuration = configuration
+
+            def source_server_candidates(self, *, organization_ids, limit):
+                if organization_ids != ["graphql-acme"] or limit != 25:
+                    raise AssertionError("unexpected GraphQL detection scope")
+                return {
+                    "organizationIds": organization_ids,
+                    "candidates": list(self.__class__.candidates),
+                    "truncated": self.__class__.truncated,
+                }
+
+        class FakeRestClient:
+            def __init__(self, configuration):
+                self.configuration = configuration
+
+            def discover_devices(self, org_unit_id, *, enrich_limit):
+                if org_unit_id != "101" or enrich_limit != 0:
+                    raise AssertionError("unexpected REST detection scope")
+                return [
+                    {"externalId": "7002"},
+                    {"externalId": "9001"},
+                ]
+
+        with (
+            patch.object(
+                backend_main,
+                "_ncentral_graphql_effective_configuration",
+                return_value=({"graphqlApiToken": "secret"}, "encrypted_database"),
+            ),
+            patch.object(
+                backend_main,
+                "_ncentral_effective_configuration",
+                return_value=({"userApiToken": "secret"}, "encrypted_database"),
+            ),
+            patch.object(backend_main, "NableGraphqlClient", FakeGraphqlClient),
+            patch.object(backend_main, "NcentralClient", FakeRestClient),
+        ):
+            response = self.client.post(
+                "/api/integrations/ncentral/graphql/server-candidates",
+                headers=headers,
+                json={"companyId": "acme", "providerCompanyId": "101", "limit": 25},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(
+                response.json(),
+                {
+                    "companyId": "acme",
+                    "providerCompanyId": "101",
+                    "candidates": [
+                        {
+                            "serverId": "server-a",
+                            "graphqlDeviceCount": 2,
+                            "restDeviceMatchCount": 1,
+                        }
+                    ],
+                    "recommendedServerId": "server-a",
+                    "confidence": "exact",
+                    "truncated": False,
+                    "readOnly": True,
+                    "writesAttempted": False,
+                },
+            )
+
+            FakeGraphqlClient.truncated = True
+            truncated = self.client.post(
+                "/api/integrations/ncentral/graphql/server-candidates",
+                headers=headers,
+                json={"companyId": "acme", "providerCompanyId": "101", "limit": 25},
+            )
+        self.assertEqual(truncated.status_code, 200, truncated.text)
+        self.assertIsNone(truncated.json()["recommendedServerId"])
+        self.assertEqual(truncated.json()["confidence"], "ambiguous")
+        self.assertTrue(truncated.json()["truncated"])
+
+        FakeGraphqlClient.truncated = False
+        FakeGraphqlClient.candidates = (
+            {
+                "serverId": "server-a",
+                "deviceIds": ["7002"],
+                "graphqlDeviceCount": 1,
+            },
+            {
+                "serverId": "server-b",
+                "deviceIds": ["8001"],
+                "graphqlDeviceCount": 1,
+            },
+        )
+        with (
+            patch.object(
+                backend_main,
+                "_ncentral_graphql_effective_configuration",
+                return_value=({"graphqlApiToken": "secret"}, "encrypted_database"),
+            ),
+            patch.object(
+                backend_main,
+                "_ncentral_effective_configuration",
+                return_value=({"userApiToken": "secret"}, "encrypted_database"),
+            ),
+            patch.object(backend_main, "NableGraphqlClient", FakeGraphqlClient),
+            patch.object(backend_main, "NcentralClient", FakeRestClient),
+        ):
+            ambiguous = self.client.post(
+                "/api/integrations/ncentral/graphql/server-candidates",
+                headers=headers,
+                json={"companyId": "acme", "providerCompanyId": "101", "limit": 25},
+            )
+        self.assertEqual(ambiguous.status_code, 200, ambiguous.text)
+        self.assertIsNone(ambiguous.json()["recommendedServerId"])
+        self.assertEqual(ambiguous.json()["confidence"], "ambiguous")
+        self.assertEqual(
+            [item["serverId"] for item in ambiguous.json()["candidates"]],
+            ["server-a", "server-b"],
+        )
+
+        FakeGraphqlClient.candidates = (
+            {
+                "serverId": "server-c",
+                "deviceIds": ["8001"],
+                "graphqlDeviceCount": 1,
+            },
+        )
+        with (
+            patch.object(
+                backend_main,
+                "_ncentral_graphql_effective_configuration",
+                return_value=({"graphqlApiToken": "secret"}, "encrypted_database"),
+            ),
+            patch.object(
+                backend_main,
+                "_ncentral_effective_configuration",
+                return_value=({"userApiToken": "secret"}, "encrypted_database"),
+            ),
+            patch.object(backend_main, "NableGraphqlClient", FakeGraphqlClient),
+            patch.object(backend_main, "NcentralClient", FakeRestClient),
+        ):
+            no_overlap = self.client.post(
+                "/api/integrations/ncentral/graphql/server-candidates",
+                headers=headers,
+                json={"companyId": "acme", "providerCompanyId": "101", "limit": 25},
+            )
+        self.assertEqual(no_overlap.status_code, 200, no_overlap.text)
+        self.assertIsNone(no_overlap.json()["recommendedServerId"])
+        self.assertEqual(no_overlap.json()["confidence"], "none")
+        self.assertEqual(
+            no_overlap.json()["candidates"],
+            [
+                {
+                    "serverId": "server-c",
+                    "graphqlDeviceCount": 1,
+                    "restDeviceMatchCount": 0,
+                }
+            ],
+        )
+        revision_after = backend_main.REPOSITORY.get_integration_connection("ncentral")["revision"]
+        self.assertEqual(revision_after, revision_before)
+        self.assertNotIn("secret", response.text)
+
+    def test_graphql_refresh_populates_cache_and_rest_consumes_cache_only(self):
+        """Make explicit refresh the only GraphQL asset-provider read path."""
+
+        headers = self._headers("admin@example.com")
+        encryption_key = base64.urlsafe_b64encode(b"q" * 32).decode("ascii")
+        environment = {
+            "MFA_ENCRYPTION_KEY": encryption_key,
+            "NCENTRAL_BASE_URL": "",
+            "NCENTRAL_USER_API_TOKEN": "",
+            "NCENTRAL_USER_API_TOKEN_FILE": "",
+            "NCENTRAL_API_TOKEN": "",
+            "NCENTRAL_GRAPHQL_ENABLED": "false",
+            "NCENTRAL_GRAPHQL_ENDPOINT": "https://api.n-able.com/graphql",
+            "NCENTRAL_GRAPHQL_API_TOKEN": "",
+            "NCENTRAL_GRAPHQL_API_TOKEN_FILE": "",
+        }
+        backend_main.REPOSITORY.ensure_integration_connection("ncentral", "N-central", "admin")
+        core.DB.setdefault("providerCompanyObservations", []).append(
+            {
+                "id": "observation-101",
+                "provider": "ncentral",
+                "externalId": "101",
+                "name": "Acme N-central",
+                "active": True,
+            }
+        )
+        backend_main.REPOSITORY.map_provider_company("ncentral", "101", "acme", "admin")
+        policy = backend_main.REPOSITORY.update_ci_sync_policy(
+            "ncentral",
+            "acme",
+            "101",
+            {"graphqlOrganizationIds": ["graphql-acme"]},
+            0,
+            "admin",
+        )
+
+        class FakeGraphqlClient:
+            calls = 0
+
+            def __init__(self, configuration):
+                self.configuration = configuration
+
+            def full_asset_inventory(self, *, organization_ids, maximum):
+                self.__class__.calls += 1
+                if organization_ids != ["graphql-acme"] or maximum != 10_000:
+                    raise AssertionError("unexpected GraphQL scope")
+                return {
+                    "queryKey": "asset_inventory",
+                    "organizationIds": organization_ids,
+                    "totalCount": 1,
+                    "truncated": False,
+                    "pagesRead": 1,
+                    "items": [
+                        {
+                            "graphqlAssetId": "graph-7001",
+                            "name": "ACME-NC01",
+                            "customer": {"id": "graphql-acme", "name": "Acme"},
+                            "site": None,
+                            "serviceOrganization": None,
+                            "sourceIdentity": {
+                                "provider": "ncentral",
+                                "namespace": "nable_graphql_asset",
+                                "externalId": "graph-7001",
+                            },
+                            "restIdentity": {
+                                "provider": "ncentral",
+                                "namespace": "ncentral_rest_device",
+                                "serverId": "server-a",
+                                "deviceId": "7001",
+                                "crosswalkKey": "server-a:7001",
+                            },
+                            "summary": {
+                                "system": {"manufacturer": "Dell", "model": "R650"},
+                                "networkInterfaces": [
+                                    {
+                                        "name": "Ethernet",
+                                        "macAddress": "00:11:22:33:44:55",
+                                        "addresses": [{"address": "10.0.0.71"}],
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                }
+
+        class FakeRestClient:
+            def __init__(self, configuration):
+                self.configuration = configuration
+
+            def discover_devices(self, org_unit_id, **_options):
+                if org_unit_id != "101":
+                    raise AssertionError("unexpected REST customer")
+                return [
+                    {
+                        "externalId": "7001",
+                        "name": "ACME-NC01",
+                        "fields": {},
+                        "metadata": {},
+                        "inventoryCollections": {"software": {"count": 2}},
+                    }
+                ]
+
+            def list_device_filters(self):
+                return []
+
+        with patch.dict(os.environ, environment):
+            encrypted, nonce = backend_main.encrypt_secret(
+                json.dumps(
+                    {
+                        "userApiToken": "rest-token",
+                        "graphqlApiToken": "graphql-token",
+                    }
+                ),
+                "integration:ncentral",
+            )
+            backend_main.REPOSITORY.update_integration_connection(
+                "ncentral",
+                {
+                    "enabled": True,
+                    "configuration": {
+                        "baseUrl": "https://ncentral.example.com",
+                        "pageSize": 250,
+                        "graphqlEnabled": True,
+                        "graphqlEndpoint": "https://api.n-able.com/graphql",
+                        "graphqlPageSize": 100,
+                        "graphqlServerId": "server-a",
+                    },
+                    "credentialsEncrypted": encrypted,
+                    "credentialsNonce": nonce,
+                },
+                "admin",
+            )
+            with patch.object(backend_main, "NableGraphqlClient", FakeGraphqlClient):
+                refreshed = self.client.post(
+                    "/api/integrations/ncentral/graphql/refresh",
+                    headers=headers,
+                    json={
+                        "companyId": "acme",
+                        "providerCompanyId": "101",
+                        "queryKey": "asset_inventory",
+                    },
+                )
+            self.assertEqual(refreshed.status_code, 200, refreshed.text)
+            self.assertEqual(refreshed.json()["cache"]["status"], "fresh")
+            self.assertEqual(refreshed.json()["cache"]["deviceCount"], 1)
+            self.assertEqual(FakeGraphqlClient.calls, 1)
+
+            with patch.object(
+                backend_main,
+                "NableGraphqlClient",
+                side_effect=AssertionError("preview must not call GraphQL"),
+            ):
+                preview = self.client.post(
+                    "/api/integrations/ncentral/graphql/preview",
+                    headers=headers,
+                    json={
+                        "companyId": "acme",
+                        "providerCompanyId": "101",
+                        "queryKey": "asset_inventory",
+                    },
+                )
+            self.assertEqual(preview.status_code, 200, preview.text)
+            self.assertEqual(preview.json()["cache"]["status"], "fresh")
+            self.assertEqual(preview.json()["items"][0]["graphqlAssetId"], "graph-7001")
+
+            with (
+                patch.object(backend_main, "NcentralClient", FakeRestClient),
+                patch.object(
+                    backend_main,
+                    "NableGraphqlClient",
+                    side_effect=AssertionError("REST discovery must consume cache only"),
+                ),
+            ):
+                _mapped, records, _source, saved_policy, _filters = (
+                    backend_main._ncentral_device_context("acme", "101")
+                )
+            self.assertEqual(saved_policy["id"], policy["id"])
+            self.assertEqual(records[0]["fields"]["nableGraphqlAssetId"], "graph-7001")
+            self.assertEqual(records[0]["inventoryCollections"]["software"]["count"], 2)
+            self.assertEqual(
+                records[0]["inventoryCollections"]["network_interfaces"][0]["ipAddresses"],
+                ["10.0.0.71"],
+            )
 
     def test_connectwise_company_discovery_is_root_scoped_review_gated_and_secret_safe(self):
         client_token = self._login("client@acme.example")

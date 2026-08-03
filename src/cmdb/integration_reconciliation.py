@@ -18,8 +18,16 @@ DEFAULT_CI_POLICY: dict[str, Any] = {
     "statusMode": "all",
     "includedStatusIds": [],
     "excludedExternalIds": [],
+    "graphqlOrganizationIds": [],
     "providerFilterId": "",
     "enrichmentMode": "balanced",
+    "relationshipAutomationMode": "review",
+    "relationshipAutoApproveTypes": [],
+    "relationshipMinConfidence": 0.98,
+    "relationshipMinObservations": 2,
+    "relationshipMaxEvidenceAgeHours": 72,
+    "missingDeviceRequiredSnapshots": 3,
+    "missingDeviceMinimumHours": 24,
     "syncMode": "manual",
     "intervalMinutes": 360,
     "enabled": False,
@@ -66,7 +74,28 @@ def normalize_ci_policy(policy: Mapping[str, Any] | None) -> dict[str, Any]:
     status_mode = str(source.get("statusMode") or "all")
     sync_mode = str(source.get("syncMode") or "manual")
     enrichment_mode = str(source.get("enrichmentMode") or "balanced")
+    relationship_automation_mode = str(source.get("relationshipAutomationMode") or "review")
     interval = int(source.get("intervalMinutes") or 360)
+    try:
+        relationship_min_confidence = float(source.get("relationshipMinConfidence", 0.98))
+    except (TypeError, ValueError):
+        relationship_min_confidence = 0.98
+    try:
+        relationship_min_observations = int(source.get("relationshipMinObservations", 2))
+    except (TypeError, ValueError):
+        relationship_min_observations = 2
+    try:
+        relationship_max_evidence_age_hours = int(source.get("relationshipMaxEvidenceAgeHours", 72))
+    except (TypeError, ValueError):
+        relationship_max_evidence_age_hours = 72
+    try:
+        missing_device_required_snapshots = int(source.get("missingDeviceRequiredSnapshots", 3))
+    except (TypeError, ValueError):
+        missing_device_required_snapshots = 3
+    try:
+        missing_device_minimum_hours = int(source.get("missingDeviceMinimumHours", 24))
+    except (TypeError, ValueError):
+        missing_device_minimum_hours = 24
     return {
         "typeMode": type_mode if type_mode in {"all", "selected"} else "all",
         "includedTypeIds": identifiers("includedTypeIds"),
@@ -75,9 +104,37 @@ def normalize_ci_policy(policy: Mapping[str, Any] | None) -> dict[str, Any]:
         "statusMode": status_mode if status_mode in {"all", "selected"} else "all",
         "includedStatusIds": identifiers("includedStatusIds"),
         "excludedExternalIds": identifiers("excludedExternalIds"),
+        # GraphQL Customer IDs are saved with the customer-specific policy. They
+        # are never inferred from the REST organization ID or mutable name.
+        "graphqlOrganizationIds": identifiers("graphqlOrganizationIds"),
         "providerFilterId": str(source.get("providerFilterId") or "").strip()[:160],
         "enrichmentMode": (
             enrichment_mode if enrichment_mode in {"fast", "balanced", "full"} else "balanced"
+        ),
+        # Relationship automation remains review-only unless a platform
+        # administrator explicitly enables immutable provider evidence. The
+        # relationship type allow-list is intentionally empty by default.
+        "relationshipAutomationMode": (
+            relationship_automation_mode
+            if relationship_automation_mode in {"review", "auto_explicit"}
+            else "review"
+        ),
+        "relationshipAutoApproveTypes": identifiers("relationshipAutoApproveTypes"),
+        "relationshipMinConfidence": max(0.5, min(relationship_min_confidence, 1.0)),
+        "relationshipMinObservations": max(2, min(relationship_min_observations, 10)),
+        "relationshipMaxEvidenceAgeHours": max(
+            1,
+            min(relationship_max_evidence_age_hours, 720),
+        ),
+        # Missing-provider evidence never changes a canonical CI automatically.
+        # These thresholds only make a mapping eligible for explicit review.
+        "missingDeviceRequiredSnapshots": max(
+            2,
+            min(missing_device_required_snapshots, 10),
+        ),
+        "missingDeviceMinimumHours": max(
+            1,
+            min(missing_device_minimum_hours, 720),
         ),
         "syncMode": sync_mode if sync_mode in {"manual", "continuous_preview"} else "manual",
         "intervalMinutes": max(15, min(interval, 10080)),

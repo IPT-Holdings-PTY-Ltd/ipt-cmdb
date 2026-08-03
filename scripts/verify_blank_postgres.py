@@ -66,15 +66,31 @@ def main() -> None:
         diagnostics = core.database_diagnostics()
         companies = backend.REPOSITORY.list_companies()
         users = backend.REPOSITORY.list_users()
+        with (
+            psycopg.connect(target_url, connect_timeout=10) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT to_regclass('integration_capability_snapshots')::text,
+                       to_regclass('integration_enrichment_previews')::text
+                """
+            )
+            cache_tables = cursor.fetchone()
         assert core.DATABASE_MODE == "PostgreSQL"
         assert backend.REPOSITORY.mode == "canonical_postgresql"
         assert diagnostics["schemaVersion"] == core.SCHEMA_VERSION
         assert diagnostics["initialized"] is True
         assert companies == []
         assert any(user["role"] == "platform_admin" for user in users)
+        assert cache_tables == (
+            "integration_capability_snapshots",
+            "integration_enrichment_previews",
+        )
         print(
             f"Blank bootstrap verified: schema={diagnostics['schemaVersion']} "
-            f"repository={backend.REPOSITORY.mode} companies={len(companies)} users={len(users)}"
+            f"repository={backend.REPOSITORY.mode} companies={len(companies)} "
+            f"users={len(users)} provider_cache=ready"
         )
     finally:
         with (

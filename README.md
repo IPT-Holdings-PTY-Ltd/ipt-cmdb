@@ -31,7 +31,7 @@ IPT CMDB combines a tenant-aware asset inventory, business-system modelling, int
 | Governance | Append-only attributable audit ledger, request correlation, tenant-aware Audit Center and CI activity timelines |
 | Data quality | MSP/customer quality scores, prioritized findings, audited exceptions, provider-neutral reconciliation workbench and enforced per-customer field authority |
 | Reports | Controlled MSP/customer report catalogue with branded PDF, filterable XLSX and UTF-8 CSV exports |
-| Integrations | Capability-driven provider registry; guided ConnectWise and N-central setup, encrypted/environment credentials, immutable-ID filters and customer mapping, restart-safe queued previews, provider-neutral review queues and authority-governed imports |
+| Integrations | Capability-driven provider registry; guided ConnectWise and hybrid N-central REST/N-able GraphQL setup, encrypted/environment credentials, immutable-ID filters and customer mapping, restart-safe queued previews, provider-neutral review queues and authority-governed imports |
 | Email | Root-managed Microsoft Graph sender, Azure managed identity or app credentials, Exchange mailbox scoping, audited outbox and test delivery |
 
 Passportal passwords, secure notes and credential values are explicitly out of scope. Only approved metadata associations should enter the CMDB.
@@ -159,7 +159,8 @@ Canonical CI UUIDs remain stable when provider names change. Provider IDs are st
 Manual N-central previews are durable jobs rather than long-running browser requests.
 The combined process consumes them automatically; a split web deployment must keep a
 dedicated worker running. Scheduled continuous-preview policies remain separately
-opt-in.
+opt-in. Optional N-able GraphQL enrichment is Customer-scoped, query-only and cached;
+slow patch/vulnerability reads do not block normal REST discovery or identity linking.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime, tenancy, identity and reconciliation design.
 
@@ -195,10 +196,11 @@ Interactive API documentation is available at `/docs` while the API is running.
 ## Near-term roadmap
 
 1. Add the Passportal metadata adapter through the provider registry and canonical identity layer.
-2. Expand N-central operational-state evidence beyond the current selectable fast, balanced and full inventory profiles.
-3. Bulk ownership, relationship-layer and lifecycle correction actions from data-quality findings.
-4. Expand change approval with reusable policies, escalation reminders and ConnectWise ticket publishing.
-5. Add governed workflow triggers and outputs through the provider-neutral worker boundary.
+2. Add governed bulk ownership and lifecycle correction actions from data-quality findings.
+3. Expand change approval with reusable policies, escalation reminders and ConnectWise ticket publishing.
+4. Add governed workflow triggers and outputs through the provider-neutral worker boundary.
+5. Extend provider relationship evidence beyond explicit N-central virtualization IDs
+   as supported APIs expose trustworthy immutable topology references.
 
 External provider writes remain disabled until a reviewable, auditable workflow is implemented.
 

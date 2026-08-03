@@ -5,7 +5,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlparse, urlunparse
@@ -120,6 +120,42 @@ def _direct_run(policy_id: str, run_id: str, status: str = "success") -> dict:
     }
 
 
+def _presence_snapshot(
+    completed_at: str,
+    *,
+    policy_revision: int,
+    connection_revision: int,
+    observed: bool = False,
+    complete: bool = True,
+) -> dict:
+    """Return one bounded immutable-scope presence envelope."""
+
+    return {
+        "observedRecords": (
+            [
+                {
+                    "externalId": "presence-device-1",
+                    "externalName": "PRESENCE-01",
+                    "providerParentId": "101",
+                }
+            ]
+            if observed
+            else []
+        ),
+        "providerReadComplete": complete,
+        "providerFilterId": "",
+        "scopeMode": "unfiltered",
+        "discoveryScopeFingerprint": "a" * 64,
+        "policyDecisionFingerprint": "b" * 64,
+        "connectionRevision": connection_revision,
+        "policyRevision": policy_revision,
+        "snapshotStartedAt": completed_at,
+        "providerReadCompletedAt": completed_at,
+        "requiredAbsences": 3,
+        "minimumMissingHours": 24,
+    }
+
+
 @unittest.skipUnless(ADMIN_URL, "TEST_POSTGRES_ADMIN_URL is not configured")
 class PostgresPreviewConcurrencyTests(unittest.TestCase):
     """Prove cross-connection preview and policy lease invariants."""
@@ -195,6 +231,27 @@ class PostgresPreviewConcurrencyTests(unittest.TestCase):
         }
         self.repository = PostgresCmdbRepository(state, lambda _state: None, self.connection)
         self.repository.bootstrap()
+        discovery_time = "2026-07-01T00:00:00Z"
+        self.repository.record_company_discovery(
+            "ncentral",
+            {
+                "id": "00000000-0000-0000-0000-000000000101",
+                "status": "success",
+                "startedAt": discovery_time,
+                "finishedAt": discovery_time,
+                "message": "Test organization discovery",
+                "attributes": {"operation": "company_discovery"},
+            },
+            [
+                {
+                    "externalId": "101",
+                    "identifier": "acme",
+                    "name": "Acme Manufacturing",
+                    "deleted": False,
+                }
+            ],
+        )
+        self.repository.map_provider_company("ncentral", "101", "acme")
         self.policy = self.repository.update_ci_sync_policy(
             "ncentral",
             "acme",
@@ -349,6 +406,66 @@ class PostgresPreviewConcurrencyTests(unittest.TestCase):
         self.assertEqual(self._policy_lease()[:2], (None, None))
         self.assertEqual(self._audit_count(self.policy["id"], "review_queue_refreshed"), 1)
         self.assertEqual(self._audit_count(queued["id"], "completed"), 1)
+
+    def test_terminal_and_generic_runs_never_reenable_integration(self) -> None:
+        """Only explicit administrator configuration may change the kill switch."""
+
+        owner = "disabled-terminal-owner"
+        self.assertIsNotNone(
+            self.repository.claim_ci_sync_policy_now(self.policy["id"], owner, lease_seconds=120)
+        )
+        with self.connection() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_connections SET enabled = false
+                WHERE provider = 'ncentral' AND company_id IS NULL
+                """
+            )
+        run = _direct_run(
+            self.policy["id"],
+            "00000000-0000-0000-0000-000000000812",
+        )
+        run["attributes"]["policyRevision"] = self.policy["revision"]
+        self.assertIsNotNone(
+            self.repository.publish_and_complete_ci_policy_preview(
+                "ncentral", self.policy["id"], owner, run, []
+            )
+        )
+        self.repository.record_sync_run(
+            "ncentral",
+            {
+                "id": "disabled-generic-run",
+                "status": "success",
+                "finishedAt": "2026-07-10T01:00:00Z",
+                "message": "Completed while disabled",
+            },
+            configured=True,
+        )
+        connection = self.repository.get_integration_connection("ncentral")
+        assert connection is not None
+        self.assertFalse(connection["enabled"])
+        self.repository.record_company_discovery(
+            "ncentral",
+            {
+                "id": "00000000-0000-0000-0000-000000000813",
+                "status": "success",
+                "startedAt": "2026-07-10T02:00:00Z",
+                "finishedAt": "2026-07-10T02:00:00Z",
+                "message": "Discovery completed while disabled",
+                "attributes": {"operation": "company_discovery"},
+            },
+            [
+                {
+                    "externalId": "101",
+                    "identifier": "acme",
+                    "name": "Acme Manufacturing",
+                    "deleted": False,
+                }
+            ],
+        )
+        connection = self.repository.get_integration_connection("ncentral")
+        assert connection is not None
+        self.assertFalse(connection["enabled"])
 
     def test_publish_rolls_back_when_terminal_update_fails(self) -> None:
         """A terminal write failure must roll back review rows and audits."""
@@ -800,6 +917,609 @@ class PostgresPreviewConcurrencyTests(unittest.TestCase):
         self.assertEqual(self._run_row(current_failure_id)[0], "failed")
         self.assertEqual(self._policy_lease()[:2], (None, None))
         self.assertEqual(self._policy_schedule()[3], 1)
+
+    def test_postgres_presence_lifecycle_is_review_gated_and_non_destructive(self) -> None:
+        """Complete absence can retire only a mapping and fresh evidence can restore it."""
+
+        lifecycle_policy = _policy_input()
+        lifecycle_policy["providerFilterId"] = ""
+        self.policy = self.repository.update_ci_sync_policy(
+            "ncentral",
+            "acme",
+            "101",
+            lifecycle_policy,
+            expected_revision=self.policy["revision"],
+            actor_id=None,
+        )
+
+        asset = self.repository.create_asset(
+            {
+                "id": "presence-asset-1",
+                "companyId": "acme",
+                "name": "PRESENCE-01",
+                "type": "Server",
+                "status": "Active",
+                "source": "manual",
+                "fields": {},
+                "metadata": {"lifecycle": "in_service", "operationalStatus": "healthy"},
+            }
+        )
+        mapping = self.repository.record_provider_ci_mapping(
+            "ncentral",
+            "acme",
+            {
+                "externalId": "presence-device-1",
+                "name": "PRESENCE-01",
+                "providerParentId": "101",
+            },
+            asset["id"],
+        )
+        dependency = self.repository.create_asset(
+            {
+                "id": "presence-asset-2",
+                "companyId": "acme",
+                "name": "PRESENCE-SQL-01",
+                "type": "Database",
+                "status": "Active",
+                "source": "manual",
+                "fields": {},
+                "metadata": {"lifecycle": "in_service", "operationalStatus": "healthy"},
+            }
+        )
+        provider_relationship = self.repository.create_relationship(
+            {
+                "id": "presence-provider-edge",
+                "fromId": asset["id"],
+                "toId": dependency["id"],
+                "type": "depends_on",
+                "sourceMappingId": mapping["id"],
+                "provenance": "provider",
+            },
+            "acme",
+        )
+        manual_relationship = self.repository.create_relationship(
+            {
+                "id": "presence-manual-edge",
+                "fromId": dependency["id"],
+                "toId": asset["id"],
+                "type": "managed_by",
+            },
+            "acme",
+        )
+        connection = self.repository.get_integration_connection("ncentral")
+        assert connection is not None
+        relationship_context = {
+            "policy_id": self.policy["id"],
+            "expected_policy_revision": self.policy["revision"],
+            "expected_connection_revision": connection["revision"],
+            "provider_parent_id": "101",
+        }
+        for unsafe_parent in ("202", None):
+            with self.connection() as database, database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE external_object_mappings
+                    SET external_parent_id = %s
+                    WHERE id = %s::uuid
+                    """,
+                    (unsafe_parent, mapping["id"]),
+                )
+            with self.assertRaisesRegex(ValueError, "Provider mapping is unavailable"):
+                self.repository.upsert_relationship_candidates(
+                    "ncentral", "acme", mapping["id"], [], **relationship_context
+                )
+        with self.connection() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE external_object_mappings
+                SET external_parent_id = '101'
+                WHERE id = %s::uuid
+                """,
+                (mapping["id"],),
+            )
+        candidate = self.repository.upsert_relationship_candidates(
+            "ncentral",
+            "acme",
+            mapping["id"],
+            [
+                {
+                    "fromCiId": asset["id"],
+                    "toCiId": dependency["id"],
+                    "relationshipType": "connected_to",
+                    "confidence": 0.9,
+                    "evidence": {"rule": "presence_lifecycle_contract"},
+                }
+            ],
+            observed_at="2029-12-31T00:00:00Z",
+            **relationship_context,
+        )[0]
+        with self.assertRaisesRegex(ValueError, "CI policy changed"):
+            self.repository.upsert_relationship_candidates(
+                "ncentral",
+                "acme",
+                mapping["id"],
+                [],
+                expected_policy_revision=self.policy["revision"] - 1,
+                expected_connection_revision=connection["revision"],
+                policy_id=self.policy["id"],
+                provider_parent_id="101",
+            )
+        with self.connection() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_connections
+                SET revision = revision + 1
+                WHERE provider = 'ncentral' AND company_id IS NULL
+                """
+            )
+        with self.assertRaisesRegex(ValueError, "integration settings changed"):
+            self.repository.approve_relationship_candidate(
+                "acme",
+                candidate["id"],
+                expected_revision=candidate["revision"],
+            )
+        with self.connection() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_connections
+                SET revision = %s
+                WHERE provider = 'ncentral' AND company_id IS NULL
+                """,
+                (connection["revision"],),
+            )
+        self.assertTrue(self.repository.unmap_provider_company("ncentral", "101"))
+        with self.assertRaisesRegex(ValueError, "provider customer mapping"):
+            self.repository.approve_relationship_candidate(
+                "acme",
+                candidate["id"],
+                expected_revision=candidate["revision"],
+            )
+        self.repository.map_provider_company("ncentral", "101", "acme")
+        scope_conflict = self.repository.classify_provider_ci_mapping_import(
+            "ncentral", "acme", "presence-device-1", "different-parent"
+        )
+        self.assertEqual(scope_conflict["decision"], "scope_conflict")
+        self.assertFalse(scope_conflict["providerParentMatches"])
+        with self.assertRaisesRegex(ValueError, "different customer or provider parent"):
+            self.repository.record_provider_ci_mapping(
+                "ncentral",
+                "acme",
+                {
+                    "externalId": "presence-device-1",
+                    "name": "PRESENCE-01",
+                    "providerParentId": "different-parent",
+                },
+                asset["id"],
+            )
+
+        def publish(run_id: str, completed_at: str, *, observed: bool = False) -> None:
+            claimed = self.repository.claim_ci_sync_policy_now(
+                self.policy["id"], run_id, lease_seconds=120
+            )
+            self.assertIsNotNone(claimed)
+            run = _direct_run(self.policy["id"], run_id)
+            run["attributes"]["policyRevision"] = self.policy["revision"]
+            published = self.repository.publish_and_complete_ci_policy_preview(
+                "ncentral",
+                self.policy["id"],
+                run_id,
+                run,
+                [],
+                presence_snapshot=_presence_snapshot(
+                    completed_at,
+                    policy_revision=self.policy["revision"],
+                    connection_revision=connection["revision"],
+                    observed=observed,
+                ),
+            )
+            self.assertIsNotNone(published)
+
+        publish("00000000-0000-0000-0000-000000000961", "2030-01-01T00:00:00Z")
+        publish("00000000-0000-0000-0000-000000000962", "2030-01-02T01:00:00Z")
+        publish("00000000-0000-0000-0000-000000000963", "2030-01-03T02:00:00Z")
+        lifecycle = self.repository.list_ci_presence_lifecycle(
+            provider="ncentral", company_ids=["acme"]
+        )
+        self.assertEqual(lifecycle["summary"]["eligible"], 1)
+        eligible = lifecycle["items"][0]
+        completed_at = datetime(2030, 1, 3, 2, tzinfo=UTC)
+        with patch(
+            "src.cmdb.repository._ci_presence_reference_time",
+            return_value=completed_at + timedelta(hours=24),
+        ):
+            self.assertTrue(
+                self.repository.list_ci_presence_lifecycle(
+                    provider="ncentral", company_ids=["acme"]
+                )["items"][0]["actionAllowed"]
+            )
+        with patch(
+            "src.cmdb.repository._ci_presence_reference_time",
+            return_value=completed_at + timedelta(hours=24, seconds=1),
+        ):
+            expired = self.repository.list_ci_presence_lifecycle(
+                provider="ncentral", company_ids=["acme"]
+            )["items"][0]
+            self.assertFalse(expired["actionAllowed"])
+            with self.assertRaisesRegex(ValueError, "Presence evidence is stale"):
+                self.repository.retire_ci_presence_mapping(
+                    eligible["id"], eligible["revision"], "Expired provider evidence", None
+                )
+        with self.connection() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_ci_policies
+                SET filter_policy = filter_policy || '{"providerFilterId":"managed"}'::jsonb
+                WHERE id = %s::uuid
+                """,
+                (self.policy["id"],),
+            )
+        filtered = self.repository.list_ci_presence_lifecycle(
+            provider="ncentral", company_ids=["acme"]
+        )["items"][0]
+        self.assertFalse(filtered["actionAllowed"])
+        with self.assertRaisesRegex(ValueError, "Presence evidence is stale"):
+            self.repository.retire_ci_presence_mapping(
+                eligible["id"], eligible["revision"], "Stale filtered evidence", None
+            )
+        with self.connection() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_ci_policies
+                SET filter_policy = filter_policy || '{"providerFilterId":""}'::jsonb
+                WHERE id = %s::uuid
+                """,
+                (self.policy["id"],),
+            )
+            cursor.execute(
+                """
+                UPDATE provider_company_observations observation
+                SET active = false
+                FROM integration_connections integration
+                WHERE observation.integration_connection_id = integration.id
+                  AND integration.provider = 'ncentral'
+                  AND observation.external_id = '101'
+                """
+            )
+        inactive_scope = self.repository.list_ci_presence_lifecycle(
+            provider="ncentral", company_ids=["acme"]
+        )["items"][0]
+        self.assertFalse(inactive_scope["actionAllowed"])
+        with self.assertRaisesRegex(ValueError, "Presence evidence is stale"):
+            self.repository.retire_ci_presence_mapping(
+                eligible["id"], eligible["revision"], "Inactive customer evidence", None
+            )
+        with self.connection() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE provider_company_observations observation
+                SET active = true
+                FROM integration_connections integration
+                WHERE observation.integration_connection_id = integration.id
+                  AND integration.provider = 'ncentral'
+                  AND observation.external_id = '101'
+                """
+            )
+        retired = self.repository.retire_ci_presence_mapping(
+            eligible["id"], eligible["revision"], "Verified provider retirement", None
+        )
+        assert retired is not None
+        self.assertEqual(retired["state"], "retired")
+        self.assertEqual(
+            self.repository.classify_provider_ci_mapping_import(
+                "ncentral", "acme", "presence-device-1", "101"
+            )["decision"],
+            "restore_required",
+        )
+        self.assertIsNotNone(self.repository.get_asset(asset["id"]))
+        self.assertTrue(
+            {provider_relationship["id"], manual_relationship["id"]}.issubset(
+                {item["id"] for item in self.repository.list_relationships()}
+            )
+        )
+        self.assertEqual(
+            self.repository.list_relationship_candidates("acme", include_retired=True), []
+        )
+        with self.assertRaisesRegex(ValueError, "Restore the provider mapping"):
+            self.repository.approve_relationship_candidate(
+                "acme",
+                candidate["id"],
+                expected_revision=candidate["revision"],
+            )
+        with self.assertRaisesRegex(ValueError, "restore it from Missing devices"):
+            self.repository.record_provider_ci_mapping(
+                "ncentral",
+                "acme",
+                {
+                    "externalId": "presence-device-1",
+                    "name": "PRESENCE-01",
+                    "providerParentId": "101",
+                },
+                asset["id"],
+            )
+
+        publish(
+            "00000000-0000-0000-0000-000000000964",
+            "2030-01-04T03:00:00Z",
+            observed=True,
+        )
+        restore_ready = self.repository.list_ci_presence_lifecycle(
+            provider="ncentral", company_ids=["acme"]
+        )["items"][0]
+        self.assertEqual(restore_ready["state"], "restore_ready")
+        reappeared_at = datetime(2030, 1, 4, 3, tzinfo=UTC)
+        with patch(
+            "src.cmdb.repository._ci_presence_reference_time",
+            return_value=reappeared_at + timedelta(hours=24, seconds=1),
+        ):
+            self.assertFalse(
+                self.repository.list_ci_presence_lifecycle(
+                    provider="ncentral", company_ids=["acme"]
+                )["items"][0]["actionAllowed"]
+            )
+            with self.assertRaisesRegex(ValueError, "Presence evidence is stale"):
+                self.repository.restore_ci_presence_mapping(
+                    restore_ready["id"],
+                    restore_ready["revision"],
+                    "Expired positive evidence",
+                    None,
+                )
+        restored = self.repository.restore_ci_presence_mapping(
+            restore_ready["id"],
+            restore_ready["revision"],
+            "Fresh provider evidence verified",
+            None,
+        )
+        assert restored is not None
+        self.assertEqual(restored["state"], "observed")
+        active = self.repository.list_provider_ci_mappings("ncentral", "acme")
+        self.assertEqual(active[0]["id"], mapping["id"])
+        self.assertEqual(
+            self.repository.classify_provider_ci_mapping_import(
+                "ncentral", "acme", "presence-device-1", "101"
+            )["decision"],
+            "allow",
+        )
+        self.assertEqual(self.repository.list_relationship_candidates("acme"), [])
+        self.assertTrue(
+            {provider_relationship["id"], manual_relationship["id"]}.issubset(
+                {item["id"] for item in self.repository.list_relationships()}
+            )
+        )
+
+    def test_atomic_provider_create_rolls_back_every_write_at_failpoint(self) -> None:
+        """A mapping failure cannot commit an orphan canonical CI or audit trail."""
+
+        external_id = "atomic-fail-device"
+        with (
+            patch.object(
+                self.repository,
+                "_provider_import_failpoint",
+                side_effect=RuntimeError("synthetic atomic import failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "synthetic atomic import failure"),
+        ):
+            self.repository.apply_reviewed_provider_ci_import(
+                "ncentral",
+                "acme",
+                {
+                    "externalId": external_id,
+                    "name": "ATOMIC-FAIL-01",
+                    "providerParentId": "101",
+                },
+                "create",
+                asset={
+                    "id": "atomic-fail-asset",
+                    "companyId": "acme",
+                    "name": "ATOMIC-FAIL-01",
+                    "type": "Server",
+                    "status": "Active",
+                    "source": "ncentral",
+                    "externalId": external_id,
+                    "fields": {},
+                    "metadata": {},
+                },
+                provider_parent_id="101",
+            )
+        with self.connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT count(*) FROM configuration_items WHERE attributes->>'externalId' = %s",
+                (external_id,),
+            )
+            self.assertEqual(int(cursor.fetchone()[0]), 0)
+            cursor.execute(
+                "SELECT count(*) FROM external_object_mappings WHERE external_id = %s",
+                (external_id,),
+            )
+            self.assertEqual(int(cursor.fetchone()[0]), 0)
+
+    def test_atomic_provider_import_locks_review_generation_and_customer_scope(self) -> None:
+        """Reviewed writes reject queue, generation, remap and stale-update races."""
+
+        external_id = "atomic-reviewed-device"
+        review_id = "00000000-0000-0000-0000-000000000811"
+        content_hash = "a" * 64
+        connection = self.repository.get_integration_connection("ncentral")
+        assert connection is not None
+        with self.connection() as database, database.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO integration_ci_review_items (
+                    id, policy_id, company_id, external_id, external_name,
+                    decision, provider_record, evidence, content_hash, state
+                )
+                SELECT %s::uuid, %s::uuid, company.id, %s, %s,
+                       'create', '{}'::jsonb, '{}'::jsonb, %s, 'pending'
+                FROM companies company WHERE company.slug = 'acme'
+                """,
+                (review_id, self.policy["id"], external_id, "ATOMIC-REVIEWED-01", content_hash),
+            )
+
+        payload = {
+            "id": "atomic-reviewed-asset",
+            "companyId": "acme",
+            "name": "ATOMIC-REVIEWED-01",
+            "type": "Server",
+            "status": "Active",
+            "source": "ncentral",
+            "externalId": external_id,
+            "fields": {},
+            "metadata": {},
+        }
+        record = {
+            "externalId": external_id,
+            "name": "ATOMIC-REVIEWED-01",
+            "providerParentId": "101",
+        }
+        with self.assertRaisesRegex(ValueError, "generation is stale"):
+            self.repository.apply_reviewed_provider_ci_import(
+                "ncentral",
+                "acme",
+                record,
+                "create",
+                asset=payload,
+                provider_parent_id="101",
+                policy_id=self.policy["id"],
+                review_item_id=review_id,
+                review_content_hash=content_hash,
+                expected_policy_revision=self.policy["revision"] - 1,
+                expected_connection_revision=connection["revision"],
+            )
+        with self.assertRaisesRegex(ValueError, "queue item changed"):
+            self.repository.apply_reviewed_provider_ci_import(
+                "ncentral",
+                "acme",
+                record,
+                "create",
+                asset=payload,
+                provider_parent_id="101",
+                policy_id=self.policy["id"],
+                review_item_id=review_id,
+                review_content_hash="b" * 64,
+                expected_policy_revision=self.policy["revision"],
+                expected_connection_revision=connection["revision"],
+            )
+        applied = self.repository.apply_reviewed_provider_ci_import(
+            "ncentral",
+            "acme",
+            record,
+            "create",
+            asset=payload,
+            provider_parent_id="101",
+            policy_id=self.policy["id"],
+            review_item_id=review_id,
+            review_content_hash=content_hash,
+            expected_policy_revision=self.policy["revision"],
+            expected_connection_revision=connection["revision"],
+        )
+        self.assertEqual(applied["reviewItemsResolved"], 1)
+        target = self.repository.create_asset(
+            {
+                "id": "atomic-other-asset",
+                "companyId": "acme",
+                "name": "ATOMIC-OTHER-01",
+                "type": "Server",
+                "status": "Active",
+                "fields": {},
+                "metadata": {},
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "update target no longer matches"):
+            self.repository.apply_reviewed_provider_ci_import(
+                "ncentral",
+                "acme",
+                record,
+                "update",
+                asset_id=target["id"],
+                changes={"name": "SHOULD-NOT-CHANGE"},
+                provider_parent_id="101",
+            )
+        self.assertEqual(self.repository.get_asset(target["id"])["name"], "ATOMIC-OTHER-01")
+
+        self.assertTrue(self.repository.unmap_provider_company("ncentral", "101"))
+        with self.assertRaisesRegex(ValueError, "active provider customer mapping changed"):
+            self.repository.apply_reviewed_provider_ci_import(
+                "ncentral",
+                "acme",
+                {"externalId": "scope-race-create", "providerParentId": "101"},
+                "create",
+                asset={**payload, "id": "scope-race-asset", "externalId": "scope-race-create"},
+                provider_parent_id="101",
+            )
+        with self.assertRaisesRegex(ValueError, "active provider customer mapping changed"):
+            self.repository.apply_reviewed_provider_ci_import(
+                "ncentral",
+                "acme",
+                record,
+                "link",
+                asset_id=target["id"],
+                provider_parent_id="101",
+            )
+        self.assertEqual(applied["mapping"]["assetId"], applied["asset"]["id"])
+
+    def test_concurrent_atomic_provider_create_has_one_ci_and_one_mapping(self) -> None:
+        """Identity advisory locking prevents a duplicate-CI orphan race."""
+
+        external_id = "atomic-race-device"
+        second_repository = PostgresCmdbRepository(
+            deepcopy(self.repository.state),
+            lambda _state: None,
+            self.connection,
+        )
+        barrier = threading.Barrier(2)
+
+        def create(repository: PostgresCmdbRepository, suffix: str) -> dict:
+            barrier.wait(timeout=10)
+            try:
+                return repository.apply_reviewed_provider_ci_import(
+                    "ncentral",
+                    "acme",
+                    {
+                        "externalId": external_id,
+                        "name": "ATOMIC-RACE-01",
+                        "providerParentId": "101",
+                    },
+                    "create",
+                    asset={
+                        "id": f"atomic-race-asset-{suffix}",
+                        "companyId": "acme",
+                        "name": "ATOMIC-RACE-01",
+                        "type": "Server",
+                        "status": "Active",
+                        "source": "ncentral",
+                        "externalId": external_id,
+                        "fields": {},
+                        "metadata": {},
+                    },
+                    provider_parent_id="101",
+                )
+            except ValueError as error:
+                return {"error": str(error)}
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(
+                executor.map(
+                    lambda pair: create(*pair),
+                    [(self.repository, "a"), (second_repository, "b")],
+                )
+            )
+        self.assertEqual(sum("mapping" in item for item in results), 1)
+        self.assertEqual(sum("already mapped" in item.get("error", "") for item in results), 1)
+        with self.connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT count(*) FROM configuration_items WHERE attributes->>'externalId' = %s",
+                (external_id,),
+            )
+            self.assertEqual(int(cursor.fetchone()[0]), 1)
+            cursor.execute(
+                """
+                SELECT count(*), count(DISTINCT canonical_entity_id)
+                FROM external_object_mappings
+                WHERE external_object_type = 'configuration' AND external_id = %s
+                """,
+                (external_id,),
+            )
+            mapping_count, canonical_count = cursor.fetchone()
+            self.assertEqual((int(mapping_count), int(canonical_count)), (1, 1))
 
     def test_direct_preview_queue_failure_rolls_back_every_side_effect(self) -> None:
         """A queue write error cannot leave terminal history or release the lease."""

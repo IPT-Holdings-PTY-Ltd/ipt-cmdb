@@ -13,18 +13,24 @@ NCENTRAL_MANIFEST = ProviderManifest(
     key="ncentral",
     name="N-central",
     vendor="N-able",
-    version="1.0",
+    version="1.2",
     description=(
         "Read customer organization and device inventory into provider-ID-first, "
-        "review-gated CMDB reconciliation."
+        "review-gated CMDB reconciliation, with optional N-able GraphQL enrichment."
     ),
     scopes=("msp",),
-    authentication_modes=("user_api_token", "environment_managed", "docker_secret_file"),
+    authentication_modes=(
+        "user_api_token",
+        "nable_graphql_api_token",
+        "environment_managed",
+        "docker_secret_file",
+    ),
     prerequisites=(
         "Dedicated N-central API user with required access groups",
         "MFA disabled for the API user as required by N-central",
         "Generated N-central User-API token",
         "HTTPS N-central server URL",
+        "Optional N-able Platform API token for read-only GraphQL enrichment",
     ),
     operations=(
         ProviderOperation(
@@ -42,6 +48,27 @@ NCENTRAL_MANIFEST = ProviderManifest(
             entity_type="configuration_item",
             status="available",
             description="Read mapped-customer devices through saved filters and reviewed imports.",
+        ),
+        ProviderOperation(
+            key="asset.enrich",
+            label="Enrich device inventory",
+            direction="input",
+            entity_type="configuration_item",
+            status="available",
+            description=(
+                "Read explicitly mapped Customer assets through static N-able GraphQL queries."
+            ),
+        ),
+        ProviderOperation(
+            key="patch.observe",
+            label="Read patch evidence",
+            direction="input",
+            entity_type="patch_installation",
+            status="available",
+            description=(
+                "Read Customer-scoped patch installation evidence through a separate "
+                "static query; patch data is never merged into base asset inventory."
+            ),
         ),
         ProviderOperation(
             key="device.manage",

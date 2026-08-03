@@ -14,5 +14,6 @@ outputs
 work
 .appliance
 backups
+appliance-secrets
 tmp*
 *.pyc

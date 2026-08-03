@@ -11,10 +11,12 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import threading
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -47,7 +49,8 @@ CREDENTIAL_REFERENCES = {
     "connectwise": "env://CW_BASE_URL,CW_COMPANY_ID,CW_PUBLIC_KEY,CW_PRIVATE_KEY,CW_CLIENT_ID",
     "ncentral": (
         "env://NCENTRAL_BASE_URL,"
-        "NCENTRAL_USER_API_TOKEN|NCENTRAL_USER_API_TOKEN_FILE|NCENTRAL_API_TOKEN"
+        "NCENTRAL_USER_API_TOKEN|NCENTRAL_USER_API_TOKEN_FILE|NCENTRAL_API_TOKEN,"
+        "NCENTRAL_GRAPHQL_API_TOKEN|NCENTRAL_GRAPHQL_API_TOKEN_FILE"
     ),
     "passportal": "env://PASSPORTAL_BASE_URL,PASSPORTAL_API_TOKEN",
 }
@@ -157,6 +160,480 @@ def parse_timestamp(value: Any) -> datetime | None:
 
 ACTIVE_CI_PREVIEW_RUN_STATUSES = {"queued", "running"}
 RETRYABLE_CI_PREVIEW_RUN_STATUSES = {"failed", "cancelled"}
+INVENTORY_COLLECTION_TYPE = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
+INVENTORY_MAX_COLLECTION_BYTES = 2 * 1024 * 1024
+INVENTORY_MAX_COLLECTION_ITEMS = 5_000
+CI_PRESENCE_MAX_OBSERVED_IDENTITIES = 25_000
+INVENTORY_MAX_NETWORK_INTERFACES = 512
+RELATIONSHIP_CANDIDATE_STATES = {"pending", "approved", "rejected", "ignored"}
+CI_PRESENCE_STATES = {
+    "observed",
+    "monitoring",
+    "eligible",
+    "not_evaluated",
+    "retired",
+    "restore_ready",
+}
+CI_PRESENCE_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _provider_ci_import_decision(
+    *,
+    mapping_exists: bool,
+    mapping_active: bool,
+    lifecycle_state: str | None,
+    company_matches: bool,
+    provider_parent_matches: bool,
+) -> tuple[str, str]:
+    """Return the fail-closed disposition for one immutable provider identity."""
+
+    if mapping_exists and (not company_matches or not provider_parent_matches):
+        return (
+            "scope_conflict",
+            "This immutable provider identity is scoped to a different customer or provider "
+            "parent; review its existing mapping before importing.",
+        )
+    if mapping_exists and not mapping_active:
+        if lifecycle_state in {"retired", "restore_ready"}:
+            return (
+                "restore_required",
+                "This immutable provider mapping is retired; restore it from Missing devices "
+                "before importing.",
+            )
+        return (
+            "inactive_mapping",
+            "This immutable provider mapping is inactive without a governed restore action; "
+            "an administrator must review it before importing.",
+        )
+    return "allow", "No immutable mapping conflict blocks this provider identity."
+
+
+CANONICAL_RELATIONSHIP_TYPES = {
+    "connected_to",
+    "depends_on",
+    "installed_on",
+    "licensed_to",
+    "used_by",
+    "related_to",
+    "hosts",
+    "backs_up",
+    "managed_by",
+    "member_of",
+    "stored_on",
+    "provided_by",
+    "protected_by",
+}
+RELATIONSHIP_IMPACT_POLICIES = {"required", "degraded", "redundant", "informational"}
+SYMMETRIC_RELATIONSHIP_TYPES = {"connected_to", "related_to"}
+INTEGRATION_CAPABILITY_CACHE_MAX_BYTES = 64 * 1024
+INTEGRATION_ENRICHMENT_CACHE_MAX_BYTES = 256 * 1024
+INTEGRATION_CACHE_MIN_TTL_SECONDS = 30
+INTEGRATION_CACHE_MAX_TTL_SECONDS = 7 * 24 * 60 * 60
+INTEGRATION_CAPABILITY_STATUSES = {"supported", "unsupported", "unavailable", "error"}
+INTEGRATION_ENRICHMENT_STATUSES = {"ready", "partial", "unavailable", "error"}
+INTEGRATION_CACHE_KEY = re.compile(r"^[a-z][a-z0-9_.:-]{0,119}$")
+INTEGRATION_SOURCE_NAMESPACE = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
+INTEGRATION_CACHE_SENSITIVE_KEYS = {
+    "accesstoken",
+    "apikey",
+    "apitoken",
+    "authorization",
+    "clientsecret",
+    "cookie",
+    "credential",
+    "credentials",
+    "graphqlapitoken",
+    "header",
+    "headers",
+    "password",
+    "privatekey",
+    "refreshtoken",
+    "secret",
+    "setcookie",
+    "token",
+    "userapitoken",
+    "xapikey",
+}
+
+
+def _json_fingerprint(value: Any) -> str:
+    """Return a stable SHA-256 fingerprint for one JSON-safe value."""
+
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _bounded_integration_cache_summary(value: Any, *, maximum_bytes: int) -> tuple[dict, str]:
+    """Validate one bounded normalized cache summary and return its fingerprint.
+
+    Provider response envelopes and credential-shaped fields are rejected rather
+    than scrubbed.  This keeps accidental raw GraphQL responses and tokens out of
+    PostgreSQL while still allowing tenant-scoped normalized inventory fields.
+    """
+
+    if not isinstance(value, dict):
+        raise ValueError("Integration cache summary must be an object")
+    entry_count = 0
+
+    def inspect(item: Any, depth: int = 0) -> None:
+        nonlocal entry_count
+        if depth > 12:
+            raise ValueError("Integration cache summary is too deeply nested")
+        if isinstance(item, dict):
+            entry_count += len(item)
+            if entry_count > 10_000:
+                raise ValueError("Integration cache summary contains too many fields")
+            for raw_key, child in item.items():
+                key = re.sub(r"[^a-z0-9]", "", str(raw_key).casefold())
+                if key in {"data", "errors"}:
+                    raise ValueError("Raw GraphQL response envelopes cannot be cached")
+                if key in INTEGRATION_CACHE_SENSITIVE_KEYS or key.endswith(
+                    (
+                        "apikey",
+                        "authorization",
+                        "cookie",
+                        "credential",
+                        "password",
+                        "privatekey",
+                        "secret",
+                        "token",
+                    )
+                ):
+                    raise ValueError("Integration cache summary contains a sensitive field")
+                inspect(child, depth + 1)
+        elif isinstance(item, list):
+            entry_count += len(item)
+            if entry_count > 10_000:
+                raise ValueError("Integration cache summary contains too many entries")
+            for child in item:
+                inspect(child, depth + 1)
+
+    inspect(value)
+    summary = deepcopy(value)
+    try:
+        encoded = json.dumps(
+            summary,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError) as error:
+        raise ValueError("Integration cache summary must be JSON serializable") from error
+    if len(encoded) > maximum_bytes:
+        raise ValueError("Integration cache summary is too large")
+    return summary, hashlib.sha256(encoded).hexdigest()
+
+
+def _bounded_integration_cache_ttl(value: Any, *, default: int = 900) -> int:
+    """Return a finite cache lifetime within the operational safety bounds."""
+
+    try:
+        ttl_seconds = int(default if value is None else value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Integration cache TTL must be an integer") from error
+    if not INTEGRATION_CACHE_MIN_TTL_SECONDS <= ttl_seconds <= INTEGRATION_CACHE_MAX_TTL_SECONDS:
+        raise ValueError(
+            "Integration cache TTL must be between "
+            f"{INTEGRATION_CACHE_MIN_TTL_SECONDS} and "
+            f"{INTEGRATION_CACHE_MAX_TTL_SECONDS} seconds"
+        )
+    return ttl_seconds
+
+
+def _integration_cache_identifier(value: Any, label: str, maximum: int = 255) -> str:
+    """Return a required bounded source identity without changing its value."""
+
+    identifier = str(value or "").strip()
+    if not identifier or len(identifier) > maximum:
+        raise ValueError(f"{label} must contain between 1 and {maximum} characters")
+    return identifier
+
+
+def _integration_cache_optional_uuid(value: Any, label: str) -> str | None:
+    """Return a canonical optional UUID used by a tenant-scoped cache link."""
+
+    if not value:
+        return None
+    try:
+        return str(uuid.UUID(str(value)))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} is invalid") from error
+
+
+def _inventory_collection_type(value: Any) -> str:
+    """Normalize a provider collection label to a bounded provider-neutral key."""
+
+    text = re.sub(r"(?<!^)(?=[A-Z])", "_", str(value or "").strip())
+    normalized = re.sub(r"[^a-z0-9]+", "_", text.casefold()).strip("_")
+    if not INVENTORY_COLLECTION_TYPE.fullmatch(normalized):
+        raise ValueError("Inventory collection type is invalid")
+    return normalized
+
+
+def _bounded_inventory_payload(value: Any) -> tuple[Any, int, str]:
+    """Validate and fingerprint one bounded inventory collection payload."""
+
+    if not isinstance(value, (dict, list)):
+        raise ValueError("Inventory collection payload must be an object or array")
+    item_count = len(value) if isinstance(value, list) else 1
+    if item_count > INVENTORY_MAX_COLLECTION_ITEMS:
+        raise ValueError("Inventory collection contains too many items")
+    payload = deepcopy(value)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > INVENTORY_MAX_COLLECTION_BYTES:
+        raise ValueError("Inventory collection payload is too large")
+    return payload, item_count, hashlib.sha256(encoded).hexdigest()
+
+
+def _normalized_interface(value: Any, ordinal: int) -> dict[str, Any]:
+    """Return one bounded, provider-neutral network interface observation."""
+
+    if not isinstance(value, dict):
+        raise ValueError("Network interface observations must be objects")
+    item = deepcopy(value)
+    explicit_key = str(
+        item.get("interfaceKey")
+        or item.get("key")
+        or item.get("externalId")
+        or item.get("id")
+        or ""
+    ).strip()
+    mac_address = str(item.get("macAddress") or item.get("mac") or "").strip()
+    name = str(item.get("name") or item.get("interfaceName") or "").strip()
+    key_material = explicit_key or mac_address.casefold() or f"{name.casefold()}:{ordinal}"
+    interface_key = (
+        key_material[:255]
+        if explicit_key
+        else hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+    )
+
+    def string_list(*names: str) -> list[str]:
+        raw: Any = []
+        for candidate in names:
+            if candidate in item:
+                raw = item.get(candidate)
+                break
+        if raw is None:
+            return []
+        values = raw if isinstance(raw, list) else [raw]
+        return list(
+            dict.fromkeys(str(entry).strip()[:255] for entry in values if str(entry).strip())
+        )
+
+    speed = item.get("speedMbps", item.get("speed"))
+    try:
+        speed_mbps = max(0, int(speed)) if speed is not None and str(speed).strip() else None
+    except (TypeError, ValueError):
+        speed_mbps = None
+    known = {
+        "interfaceKey",
+        "key",
+        "externalId",
+        "id",
+        "name",
+        "interfaceName",
+        "description",
+        "macAddress",
+        "mac",
+        "ipAddresses",
+        "addresses",
+        "ipAddress",
+        "gateways",
+        "gateway",
+        "dnsServers",
+        "dns",
+        "dhcpEnabled",
+        "vlanId",
+        "operationalState",
+        "state",
+        "speedMbps",
+        "speed",
+        "attributes",
+    }
+    raw_attributes = item.get("attributes")
+    attributes: dict[str, Any] = (
+        deepcopy(raw_attributes) if isinstance(raw_attributes, dict) else {}
+    )
+    attributes.update({key: deepcopy(entry) for key, entry in item.items() if key not in known})
+    normalized = {
+        "interfaceKey": interface_key,
+        "name": name[:500],
+        "description": str(item.get("description") or "")[:1000],
+        "macAddress": mac_address[:64],
+        "ipAddresses": string_list("ipAddresses", "addresses", "ipAddress"),
+        "gateways": string_list("gateways", "gateway"),
+        "dnsServers": string_list("dnsServers", "dns"),
+        "dhcpEnabled": (
+            bool(item.get("dhcpEnabled")) if item.get("dhcpEnabled") is not None else None
+        ),
+        "vlanId": str(item.get("vlanId") or "")[:128],
+        "operationalState": str(item.get("operationalState") or item.get("state") or "")[:80],
+        "speedMbps": speed_mbps,
+        "attributes": attributes,
+    }
+    normalized["fingerprint"] = _json_fingerprint(normalized)
+    return normalized
+
+
+def _relationship_candidate_key(value: dict[str, Any]) -> str:
+    """Return the caller-supplied SHA-256 key or derive one from stable identity."""
+
+    supplied = str(value.get("candidateKey") or "").strip().casefold()
+    if re.fullmatch(r"[0-9a-f]{64}", supplied):
+        return supplied
+    identity = {
+        "fromCiId": str(value.get("fromCiId") or ""),
+        "toCiId": str(value.get("toCiId") or ""),
+        "fromExternalIdentity": value.get("fromExternalIdentity") or {},
+        "toExternalIdentity": value.get("toExternalIdentity") or {},
+        "relationshipType": str(value.get("relationshipType") or value.get("type") or ""),
+    }
+    return _json_fingerprint(identity)
+
+
+def _relationship_evidence_fingerprint(value: object) -> str:
+    """Return a validated provider evidence fingerprint or an empty value."""
+
+    if not isinstance(value, dict):
+        return ""
+    fingerprint = str(value.get("evidenceFingerprint") or "").strip().casefold()
+    return fingerprint if re.fullmatch(r"[0-9a-f]{64}", fingerprint) else ""
+
+
+def _relationship_candidate_evidence_changed(
+    stored: dict[str, Any], incoming_evidence: dict[str, Any]
+) -> bool:
+    """Return whether fresh versioned evidence should reopen a closed proposal."""
+
+    if stored.get("state") not in {"ignored", "rejected"}:
+        return False
+    stored_fingerprint = _relationship_evidence_fingerprint(stored.get("evidence"))
+    incoming_fingerprint = _relationship_evidence_fingerprint(incoming_evidence)
+    return bool(
+        stored_fingerprint and incoming_fingerprint and stored_fingerprint != incoming_fingerprint
+    )
+
+
+def _required_relationship_provider_context(evidence: Any) -> dict[str, Any]:
+    """Return one complete stored provider generation or require a fresh preview."""
+
+    raw_evidence = evidence if isinstance(evidence, dict) else {}
+    raw_context = raw_evidence.get("providerContext")
+    if not isinstance(raw_context, dict):
+        raise ValueError(
+            "Provider relationship context is stale: provider generation evidence is "
+            "missing. Run a new preview."
+        )
+    try:
+        context: dict[str, Any] = {
+            "policyId": str(raw_context.get("policyId") or "").strip(),
+            "policyRevision": int(str(raw_context.get("policyRevision"))),
+            "connectionRevision": int(str(raw_context.get("connectionRevision"))),
+            "providerParentId": str(raw_context.get("providerParentId") or "").strip(),
+        }
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "Provider relationship context is stale: provider generation evidence is "
+            "invalid. Run a new preview."
+        ) from error
+    if (
+        not context["policyId"]
+        or int(context["policyRevision"]) < 1
+        or int(context["connectionRevision"]) < 1
+        or not context["providerParentId"]
+    ):
+        raise ValueError(
+            "Provider relationship context is stale: provider generation evidence is "
+            "invalid. Run a new preview."
+        )
+    return context
+
+
+def _supplied_relationship_provider_context(
+    *,
+    policy_id: str | None,
+    expected_policy_revision: int | None,
+    expected_connection_revision: int | None,
+    provider_parent_id: str | None,
+) -> dict[str, Any] | None:
+    """Normalize an optional caller generation for equality with stored evidence."""
+
+    values = (
+        policy_id,
+        expected_policy_revision,
+        expected_connection_revision,
+        provider_parent_id,
+    )
+    if not any(value is not None for value in values):
+        return None
+    if any(value is None for value in values) or not policy_id or not provider_parent_id:
+        raise ValueError(
+            "Provider relationship context is stale: the expected provider generation "
+            "is incomplete. Run a new preview."
+        )
+    assert expected_policy_revision is not None
+    assert expected_connection_revision is not None
+    try:
+        return {
+            "policyId": str(policy_id).strip(),
+            "policyRevision": int(expected_policy_revision),
+            "connectionRevision": int(expected_connection_revision),
+            "providerParentId": str(provider_parent_id).strip(),
+        }
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "Provider relationship context is stale: the expected provider generation "
+            "is invalid. Run a new preview."
+        ) from error
+
+
+def _matching_relationship(
+    relationships: Iterable[dict[str, Any]],
+    from_ci_id: str,
+    to_ci_id: str,
+    relationship_type: str,
+) -> dict[str, Any] | None:
+    """Return an exact edge or the reverse edge for a symmetric type."""
+
+    for item in relationships:
+        if item.get("type") != relationship_type:
+            continue
+        if item.get("fromId") == from_ci_id and item.get("toId") == to_ci_id:
+            return item
+        if (
+            relationship_type in SYMMETRIC_RELATIONSHIP_TYPES
+            and item.get("fromId") == to_ci_id
+            and item.get("toId") == from_ci_id
+        ):
+            return item
+    return None
+
+
+def _dependency_cycle(
+    relationships: Iterable[dict[str, Any]],
+    from_ci_id: str,
+    to_ci_id: str,
+) -> bool:
+    """Return true when adding ``from depends_on to`` would close a cycle."""
+
+    adjacency: dict[str, list[str]] = {}
+    for item in relationships:
+        if item.get("type") == "depends_on":
+            adjacency.setdefault(str(item.get("fromId") or ""), []).append(
+                str(item.get("toId") or "")
+            )
+    pending = [to_ci_id]
+    visited: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current == from_ci_id:
+            return True
+        if current in visited:
+            continue
+        visited.add(current)
+        pending.extend(adjacency.get(current, []))
+    return False
 
 
 def _ci_preview_dedupe_key(
@@ -255,6 +732,10 @@ def _sanitized_preview_summary(value: Any) -> dict[str, Any]:
     unmapped = raw_unmapped if isinstance(raw_unmapped, list) else []
     raw_enrichment = source.get("enrichment")
     enrichment: dict[str, Any] = raw_enrichment if isinstance(raw_enrichment, dict) else {}
+    raw_presence = source.get("presenceSummary")
+    presence: dict[str, Any] = raw_presence if isinstance(raw_presence, dict) else {}
+    raw_relationships = source.get("relationshipSummary")
+    relationships: dict[str, Any] = raw_relationships if isinstance(raw_relationships, dict) else {}
     applied_policy: dict[str, Any] = {}
     if policy:
         for key in (
@@ -308,9 +789,337 @@ def _sanitized_preview_summary(value: Any) -> dict[str, Any]:
                 0,
                 min(int(enrichment.get("assetDetailsRequested") or 0), 250),
             ),
+            # Retaining these bounded cursors lets balanced previews advance
+            # through the fleet without storing any provider record values.
+            "offset": max(0, min(int(enrichment.get("offset") or 0), 1_000_000)),
+            "nextOffset": max(
+                0,
+                min(int(enrichment.get("nextOffset") or 0), 1_000_000),
+            ),
             "bounded": bool(enrichment.get("bounded", True)),
             "reason": str(enrichment.get("reason") or "")[:240],
         },
+        "presenceSummary": {
+            "providerReadComplete": bool(presence.get("providerReadComplete")),
+            "observedCount": max(0, int(presence.get("observedCount") or 0)),
+            "providerFilterApplied": bool(presence.get("providerFilterApplied")),
+            "scopeMode": (
+                "provider_filtered"
+                if str(presence.get("scopeMode") or "").replace("-", "_")
+                in {"provider_filtered", "native_filtered", "filtered"}
+                else "unfiltered"
+            ),
+            "discoveryScopeFingerprint": str(presence.get("discoveryScopeFingerprint") or "")[:64],
+            "policyDecisionFingerprint": str(presence.get("policyDecisionFingerprint") or "")[:64],
+            "connectionRevision": max(0, int(presence.get("connectionRevision") or 0)),
+            "policyRevision": max(0, int(presence.get("policyRevision") or 0)),
+            "requiredAbsences": max(
+                2,
+                min(int(presence.get("requiredAbsences") or 3), 10),
+            ),
+            "minimumMissingHours": max(
+                1,
+                min(int(presence.get("minimumMissingHours") or 24), 720),
+            ),
+            "snapshotStartedAt": str(presence.get("snapshotStartedAt") or "")[:160] or None,
+            "providerReadCompletedAt": str(presence.get("providerReadCompletedAt") or "")[:160]
+            or None,
+        },
+        "relationshipSummary": {
+            key: max(0, int(relationships.get(key) or 0))
+            for key in ("observed", "evaluated", "autoApproved", "reviewRequired", "errors")
+        }
+        | {
+            "skippedStalePolicy": bool(relationships.get("skippedStalePolicy")),
+            "message": str(relationships.get("message") or "")[:500],
+        },
+    }
+
+
+def _normalized_ci_presence_snapshot(value: Any) -> dict[str, Any]:
+    """Validate one bounded provider-presence observation envelope."""
+
+    if not isinstance(value, dict):
+        raise ValueError("Presence snapshot must be an object")
+    raw_records = value.get("observedRecords")
+    if not isinstance(raw_records, list):
+        raise ValueError("Presence snapshot observedRecords must be an array")
+    if len(raw_records) > CI_PRESENCE_MAX_OBSERVED_IDENTITIES:
+        raise ValueError("Presence snapshot contains too many observed records")
+
+    provider_filter_id = str(value.get("providerFilterId") or "").strip()[:500]
+    raw_scope_mode = str(value.get("scopeMode") or "unfiltered").strip().casefold()
+    raw_scope_mode = raw_scope_mode.replace("-", "_")
+    if provider_filter_id or raw_scope_mode in {"provider_filtered", "native_filtered", "filtered"}:
+        scope_mode = "provider_filtered"
+    elif raw_scope_mode == "unfiltered":
+        scope_mode = "unfiltered"
+    else:
+        raise ValueError("Presence snapshot scopeMode is invalid")
+
+    fingerprints: dict[str, str] = {}
+    for key, label in (
+        ("discoveryScopeFingerprint", "discovery scope fingerprint"),
+        ("policyDecisionFingerprint", "policy decision fingerprint"),
+    ):
+        fingerprint = str(value.get(key) or "").strip().casefold()
+        if not CI_PRESENCE_FINGERPRINT.fullmatch(fingerprint):
+            raise ValueError(f"Presence snapshot {label} is invalid")
+        fingerprints[key] = fingerprint
+
+    started_at = str(value.get("snapshotStartedAt") or "").strip()
+    completed_at = str(value.get("providerReadCompletedAt") or "").strip()
+    started = parse_timestamp(started_at)
+    completed = parse_timestamp(completed_at) if completed_at else None
+    if started is None:
+        raise ValueError("Presence snapshot start time is invalid")
+    if completed_at and completed is None:
+        raise ValueError("Presence snapshot completion time is invalid")
+    if completed is not None and completed < started:
+        raise ValueError("Presence snapshot completion precedes its start")
+
+    observed_records: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_record in raw_records:
+        if not isinstance(raw_record, dict):
+            raise ValueError("Presence snapshot records must be objects")
+        external_id = str(raw_record.get("externalId") or "").strip()
+        provider_parent_id = str(raw_record.get("providerParentId") or "").strip()
+        if not external_id or len(external_id) > 500:
+            raise ValueError("Presence snapshot externalId is invalid")
+        if not provider_parent_id or len(provider_parent_id) > 500:
+            raise ValueError("Presence snapshot providerParentId is invalid")
+        if external_id in seen:
+            continue
+        seen.add(external_id)
+        observed_records.append(
+            {
+                "externalId": external_id,
+                "externalName": str(raw_record.get("externalName") or "")[:1000],
+                "providerParentId": provider_parent_id,
+            }
+        )
+
+    def bounded_integer(key: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            result = int(value.get(key, default))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Presence snapshot {key} must be an integer") from error
+        return max(minimum, min(result, maximum))
+
+    return {
+        "observedRecords": observed_records,
+        "providerReadComplete": bool(value.get("providerReadComplete")),
+        "providerFilterId": provider_filter_id,
+        "scopeMode": scope_mode,
+        **fingerprints,
+        "connectionRevision": bounded_integer("connectionRevision", 0, 0, 2_147_483_647),
+        "policyRevision": bounded_integer("policyRevision", 0, 0, 2_147_483_647),
+        "requiredAbsences": bounded_integer("requiredAbsences", 3, 2, 10),
+        "minimumMissingHours": bounded_integer("minimumMissingHours", 24, 1, 720),
+        "snapshotStartedAt": started.isoformat().replace("+00:00", "Z"),
+        "providerReadCompletedAt": (
+            completed.isoformat().replace("+00:00", "Z") if completed is not None else None
+        ),
+    }
+
+
+def _ci_presence_action(value: dict[str, Any]) -> tuple[str | None, str]:
+    """Return the only safe operator action for a lifecycle row."""
+
+    state = str(value.get("state") or "")
+    active = bool(value.get("mappingActive", value.get("active", True)))
+    if state == "eligible" and active:
+        return "retire", "Required complete snapshots and minimum missing time were reached."
+    if state == "restore_ready" and not active:
+        return "restore", "The provider observed this previously retired mapping again."
+    reasons = {
+        "observed": "The provider currently reports this configuration item.",
+        "monitoring": "More complete missing snapshots or elapsed time are required.",
+        "not_evaluated": "A filtered or incomplete provider read cannot prove absence.",
+        "retired": "The immutable provider mapping is retired until it is observed again.",
+        "restore_ready": "The mapping must remain retired before it can be restored.",
+        "eligible": "The mapping must remain active before it can be retired.",
+    }
+    return None, reasons.get(state, "No lifecycle action is currently available.")
+
+
+def _ci_presence_reference_time() -> datetime:
+    """Return the trusted clock used to expire provider action evidence."""
+
+    return datetime.now(UTC)
+
+
+def _ci_presence_evidence_max_age_hours(policy: Any) -> int:
+    """Derive a bounded action window from three policy cadences."""
+
+    normalized = normalize_ci_policy(policy if isinstance(policy, dict) else {})
+    cadence_minutes = max(15, int(normalized.get("intervalMinutes") or 360))
+    three_cadences_hours = (cadence_minutes * 3 + 59) // 60
+    return min(168, max(24, three_cadences_hours))
+
+
+def _ci_presence_stale_evidence_reason(value: dict[str, Any]) -> str:
+    """Explain why stored provider evidence no longer authorizes an action."""
+
+    restore_evidence = str(value.get("state") or "") == "restore_ready"
+    if not value.get("providerReadComplete"):
+        return "The provider read was incomplete. Run a new complete preview."
+    try:
+        max_age_hours = min(
+            168,
+            max(24, int(value.get("presenceEvidenceMaxAgeHours") or 24)),
+        )
+    except (TypeError, ValueError):
+        max_age_hours = 24
+    completed_at = parse_timestamp(value.get("providerReadCompletedAt"))
+    if completed_at is None:
+        return "The provider read completion time is unavailable. Run a new complete preview."
+    reference_time = _ci_presence_reference_time()
+    if reference_time > completed_at + timedelta(hours=max_age_hours):
+        return (
+            f"The provider evidence is older than the allowed {max_age_hours}-hour window. "
+            "Run a new complete preview."
+        )
+    if restore_evidence:
+        observed_at = parse_timestamp(value.get("lastObservedAt") or value.get("reappearedAt"))
+        if observed_at is None:
+            return (
+                "A fresh positive provider observation is required before restoring this mapping."
+            )
+        if reference_time > observed_at + timedelta(hours=max_age_hours):
+            return (
+                "The positive provider observation has expired. Run a new complete preview "
+                "before restoring this mapping."
+            )
+    if not restore_evidence and value.get("scopeMode") != "unfiltered":
+        return "The stored provider scope was filtered. Run an unfiltered preview."
+    if not value.get("policyExists", True):
+        return "The CI policy no longer exists. Reconfigure it and run a new preview."
+    if not restore_evidence and value.get("currentPolicyFiltered"):
+        return "The current CI policy uses provider filtering. Run an unfiltered preview."
+    if int(value.get("currentPolicyRevision", value.get("policyRevision") or 0)) != int(
+        value.get("policyRevision") or 0
+    ):
+        return "The CI policy changed after this evidence was captured. Run a new preview."
+    if not value.get("integrationExists", True):
+        return "The integration connection no longer exists."
+    if (
+        not value.get("currentIntegrationEnabled", True)
+        or str(value.get("currentIntegrationLifecycle") or "active") != "active"
+    ):
+        return "The integration is not active. Re-enable it and run a new preview."
+    if int(value.get("currentConnectionRevision", value.get("connectionRevision") or 0)) != int(
+        value.get("connectionRevision") or 0
+    ):
+        return (
+            "The integration settings changed after this evidence was captured. Run a new preview."
+        )
+    if not value.get("providerCompanyMappingValid", True):
+        return (
+            "The provider customer mapping changed or is inactive. Remap it and run a new preview."
+        )
+    mapping_changed = parse_timestamp(value.get("providerCompanyMappingChangedAt"))
+    snapshot_started = parse_timestamp(value.get("snapshotStartedAt"))
+    if mapping_changed and snapshot_started and mapping_changed > snapshot_started:
+        return (
+            "The provider customer mapping changed after this preview started. Run a new preview."
+        )
+    return ""
+
+
+def _public_ci_presence(value: dict[str, Any]) -> dict[str, Any]:
+    """Return one provider-presence row using the stable frontend contract."""
+
+    public = {
+        "id": value.get("id"),
+        "provider": value.get("provider"),
+        "companyId": value.get("companyId"),
+        "companyName": value.get("companyName") or "",
+        "providerParentId": value.get("providerParentId"),
+        "mappingId": value.get("mappingId"),
+        "assetId": value.get("assetId") or value.get("ciId"),
+        "assetName": value.get("assetName") or "",
+        "externalId": value.get("externalId"),
+        "externalName": value.get("externalName") or "",
+        "state": value.get("state"),
+        "mappingActive": bool(value.get("mappingActive", value.get("active", True))),
+        "absenceCount": max(0, int(value.get("absenceCount") or 0)),
+        "requiredAbsences": max(2, min(int(value.get("requiredAbsences") or 3), 10)),
+        "minimumMissingHours": max(1, min(int(value.get("minimumMissingHours") or 24), 720)),
+        "firstMissingAt": value.get("firstMissingAt"),
+        "lastMissingAt": value.get("lastMissingAt"),
+        "candidateSince": value.get("candidateSince"),
+        "lastObservedAt": value.get("lastObservedAt"),
+        "lastEvaluatedAt": value.get("lastEvaluatedAt"),
+        "lastEvaluatedRunId": value.get("lastEvaluatedRunId"),
+        "scopeMode": value.get("scopeMode") or "unfiltered",
+        "providerReadComplete": bool(value.get("providerReadComplete")),
+        "evaluationReason": value.get("evaluationReason") or "",
+        "discoveryScopeFingerprint": value.get("discoveryScopeFingerprint") or "",
+        "policyDecisionFingerprint": value.get("policyDecisionFingerprint") or "",
+        "connectionRevision": max(0, int(value.get("connectionRevision") or 0)),
+        "policyRevision": max(0, int(value.get("policyRevision") or 0)),
+        "snapshotStartedAt": value.get("snapshotStartedAt"),
+        "providerReadCompletedAt": value.get("providerReadCompletedAt"),
+        "presenceEvidenceMaxAgeHours": max(
+            24,
+            min(int(value.get("presenceEvidenceMaxAgeHours") or 24), 168),
+        ),
+        "revision": max(1, int(value.get("revision") or 1)),
+        "reviewedBy": value.get("reviewedBy"),
+        "reviewedAt": value.get("reviewedAt"),
+        "reviewNotes": value.get("reviewNotes") or "",
+        "createdAt": value.get("createdAt"),
+        "updatedAt": value.get("updatedAt"),
+        "staleEvidenceReason": value.get("staleEvidenceReason") or "",
+    }
+    public["consecutiveCompleteAbsences"] = public["absenceCount"]
+    public["firstAbsentAt"] = public["firstMissingAt"]
+    public["retiredAt"] = value.get("retiredAt") or (
+        public["reviewedAt"] if public["state"] in {"retired", "restore_ready"} else None
+    )
+    public["retiredByName"] = value.get("retiredByName") or ""
+    public["retirementNotes"] = value.get("retirementNotes") or (
+        public["reviewNotes"] if public["state"] in {"retired", "restore_ready"} else ""
+    )
+    public["reappearedAt"] = (
+        public["lastObservedAt"] if public["state"] == "restore_ready" else None
+    )
+    action, reason = _ci_presence_action(public)
+    stale_reason = str(public["staleEvidenceReason"] or _ci_presence_stale_evidence_reason(value))
+    if stale_reason:
+        action = None
+        reason = stale_reason
+        public["staleEvidenceReason"] = stale_reason
+    public["actionAllowed"] = action is not None
+    public["availableAction"] = action
+    public["actionReason"] = reason
+    return public
+
+
+def _ci_presence_collection(items: list[dict[str, Any]], total: int | None = None) -> dict:
+    """Return a paged lifecycle collection with complete state counts."""
+
+    summary = {
+        "total": len(items) if total is None else total,
+        "observed": 0,
+        "monitoring": 0,
+        "eligible": 0,
+        "notEvaluated": 0,
+        "retired": 0,
+        "restoreReady": 0,
+    }
+    public_keys = {"not_evaluated": "notEvaluated", "restore_ready": "restoreReady"}
+    for item in items:
+        state = str(item.get("state") or "")
+        key = public_keys.get(state, state)
+        if key in summary:
+            summary[key] += 1
+    return {
+        "items": items,
+        "total": len(items) if total is None else total,
+        "summary": summary,
     }
 
 
@@ -363,6 +1172,7 @@ def _public_sync_run(
                 "providerCompanyId",
                 "policyId",
                 "policyRevision",
+                "connectionRevision",
                 "readOnly",
             )
             if key in attributes
@@ -517,6 +1327,8 @@ class StateRepository:
         self.state = state
         self.save_state = save_state
         self._authentication_lock = threading.RLock()
+        self._integration_enrichment_lock_guard = threading.Lock()
+        self._integration_enrichment_locks: dict[str, threading.RLock] = {}
         self.state.setdefault("auditEvents", [])
         self.state.setdefault("dataQualityExceptions", [])
         self.state.setdefault("reconciliationCandidates", [])
@@ -567,6 +1379,13 @@ class StateRepository:
         self.state.setdefault("changeTemplates", default_change_template_records())
         self.state.setdefault("providerCompanyObservations", [])
         self.state.setdefault("providerCompanyMappings", [])
+        self.state.setdefault("integrationCiPresence", [])
+        self.state.setdefault("ciInventorySnapshots", [])
+        self.state.setdefault("ciNetworkInterfaces", [])
+        self.state.setdefault("ciRelationshipCandidates", [])
+        for candidate in self.state["ciRelationshipCandidates"]:
+            candidate.setdefault("revision", 1)
+            candidate.setdefault("observationCount", 1)
         self.state.setdefault("workerRuntimeStatus", {})
         self.state.setdefault("providerRateLimitStatus", {})
 
@@ -581,7 +1400,7 @@ class StateRepository:
         processed: int = 0,
         error: str = "",
         metadata: dict[str, Any] | None = None,
-    ) -> dict:
+    ) -> dict | None:
         """Persist the latest worker heartbeat for local development and tests."""
 
         current = self.state["workerRuntimeStatus"].get(worker_name)
@@ -1924,18 +2743,60 @@ class StateRepository:
     def create_relationship(
         self, relationship: dict, company_id: str, actor_id: str | None = None
     ) -> dict:
-        self.state["relationships"].append(deepcopy(relationship))
+        evidence = deepcopy(relationship.get("evidence") or {})
+        if not isinstance(evidence, dict):
+            raise ValueError("Relationship evidence must be an object")
+        confidence = float(relationship.get("confidence", 1))
+        if confidence < 0 or confidence > 1:
+            raise ValueError("Relationship confidence must be between 0 and 1")
+        source_mapping_id = relationship.get("sourceMappingId") or None
+        provenance = str(
+            relationship.get("provenance") or ("provider" if source_mapping_id else "manual")
+        )
+        if provenance not in {"manual", "provider"}:
+            raise ValueError("Relationship provenance is invalid")
+        stored = {
+            **deepcopy(relationship),
+            "sourceMappingId": source_mapping_id,
+            "confidence": confidence,
+            "evidence": evidence,
+            "provenance": provenance,
+        }
+        existing = next(
+            (
+                item
+                for item in self.state["relationships"]
+                if item.get("fromId") == stored.get("fromId")
+                and item.get("toId") == stored.get("toId")
+                and item.get("type") == stored.get("type")
+            ),
+            None,
+        )
+        if existing:
+            before = deepcopy(existing)
+            existing.setdefault("sourceMappingId", None)
+            existing.setdefault("confidence", 1.0)
+            existing.setdefault("evidence", {})
+            existing.setdefault("provenance", "manual")
+            if provenance == "manual" or existing.get("provenance", "manual") != "manual":
+                existing.update(stored)
+            stored = existing
+            action = "reactivated"
+        else:
+            self.state["relationships"].append(stored)
+            before = None
+            action = "created"
         self._audit(
             company_id,
             actor_id,
             "relationship",
-            relationship["id"],
-            "created",
-            None,
-            relationship,
+            stored["id"],
+            action,
+            before,
+            stored,
         )
         self.save_state(self.state)
-        return deepcopy(relationship)
+        return deepcopy(stored)
 
     def delete_relationship(
         self, relationship_id: str, company_id: str, actor_id: str | None = None
@@ -3408,6 +4269,344 @@ class StateRepository:
             **deepcopy(record),
         }
 
+    def upsert_integration_capability_snapshot(
+        self,
+        kind: str,
+        capability_key: str,
+        snapshot: dict,
+        *,
+        ttl_seconds: int = 900,
+    ) -> dict:
+        """Cache one bounded provider capability in local development state."""
+
+        if not self.get_integration_connection(kind):
+            raise ValueError("Integration connection not found")
+        key = str(capability_key or "").strip().casefold()
+        if not INTEGRATION_CACHE_KEY.fullmatch(key):
+            raise ValueError("Integration capability key is invalid")
+        status = str(snapshot.get("status") or "").strip().casefold()
+        if status not in INTEGRATION_CAPABILITY_STATUSES:
+            raise ValueError("Integration capability status is invalid")
+        summary, summary_fingerprint = _bounded_integration_cache_summary(
+            snapshot.get("summary") or {},
+            maximum_bytes=INTEGRATION_CAPABILITY_CACHE_MAX_BYTES,
+        )
+        schema_fingerprint = (
+            str(snapshot.get("schemaFingerprint") or summary_fingerprint).strip().casefold()
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", schema_fingerprint):
+            raise ValueError("Integration capability schema fingerprint is invalid")
+        ttl = _bounded_integration_cache_ttl(ttl_seconds)
+        now = datetime.now(UTC)
+        rows = self.state.setdefault("integrationCapabilitySnapshots", [])
+        record = next(
+            (
+                item
+                for item in rows
+                if item.get("provider") == kind and item.get("capabilityKey") == key
+            ),
+            None,
+        )
+        if not record:
+            record = {
+                "id": canonical_uuid("integration_capability", f"{kind}:{key}"),
+                "provider": kind,
+                "capabilityKey": key,
+                "createdAt": utc_now(),
+            }
+            rows.append(record)
+        record.update(
+            status=status,
+            summary=summary,
+            schemaFingerprint=schema_fingerprint,
+            errorCategory=str(snapshot.get("errorCategory") or "").strip()[:80],
+            checkedAt=now.isoformat().replace("+00:00", "Z"),
+            expiresAt=(now + timedelta(seconds=ttl)).isoformat().replace("+00:00", "Z"),
+            updatedAt=utc_now(),
+        )
+        self.save_state(self.state)
+        return {**deepcopy(record), "stale": False}
+
+    def get_integration_capability_snapshot(
+        self,
+        kind: str,
+        capability_key: str,
+        *,
+        include_expired: bool = False,
+    ) -> dict | None:
+        """Return one local capability cache entry."""
+
+        key = str(capability_key or "").strip().casefold()
+        if not INTEGRATION_CACHE_KEY.fullmatch(key):
+            raise ValueError("Integration capability key is invalid")
+        record = next(
+            (
+                item
+                for item in self.state.get("integrationCapabilitySnapshots", [])
+                if item.get("provider") == kind and item.get("capabilityKey") == key
+            ),
+            None,
+        )
+        if not record:
+            return None
+        expires_at = parse_timestamp(record.get("expiresAt"))
+        stale = not expires_at or expires_at <= datetime.now(UTC)
+        return {**deepcopy(record), "stale": stale} if include_expired or not stale else None
+
+    def upsert_integration_enrichment_preview(
+        self,
+        kind: str,
+        company_id: str,
+        preview: dict,
+        *,
+        ttl_seconds: int = 900,
+    ) -> dict:
+        """Cache normalized GraphQL enrichment in local development state."""
+
+        if not self.get_integration_connection(kind):
+            raise ValueError("Integration connection not found")
+        if not any(
+            company.get("id") == company_id and company.get("status") != "inactive"
+            for company in self.state.get("companies", [])
+        ):
+            raise ValueError("Customer not found")
+        namespace = str(preview.get("sourceNamespace") or "").strip().casefold()
+        if not INTEGRATION_SOURCE_NAMESPACE.fullmatch(namespace):
+            raise ValueError("Integration source namespace is invalid")
+        server_id = _integration_cache_identifier(preview.get("sourceServerId"), "Source server ID")
+        device_id = _integration_cache_identifier(preview.get("sourceDeviceId"), "Source device ID")
+        provider_parent_id = _integration_cache_identifier(
+            preview.get("providerParentId"), "Provider parent ID"
+        )
+        status = str(preview.get("status") or "").strip().casefold()
+        if status not in INTEGRATION_ENRICHMENT_STATUSES:
+            raise ValueError("Integration enrichment status is invalid")
+        summary, summary_fingerprint = _bounded_integration_cache_summary(
+            preview.get("summary") or {},
+            maximum_bytes=INTEGRATION_ENRICHMENT_CACHE_MAX_BYTES,
+        )
+        source_fingerprint = (
+            str(preview.get("sourceFingerprint") or summary_fingerprint).strip().casefold()
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", source_fingerprint):
+            raise ValueError("Integration enrichment source fingerprint is invalid")
+        ttl = _bounded_integration_cache_ttl(ttl_seconds)
+        now = datetime.now(UTC)
+        rows = self.state.setdefault("integrationEnrichmentPreviews", [])
+        record = next(
+            (
+                item
+                for item in rows
+                if item.get("provider") == kind
+                and item.get("companyId") == company_id
+                and item.get("sourceNamespace") == namespace
+                and item.get("sourceServerId") == server_id
+                and item.get("sourceDeviceId") == device_id
+            ),
+            None,
+        )
+        if not record:
+            record = {
+                "id": canonical_uuid(
+                    "integration_enrichment",
+                    f"{kind}:{company_id}:{namespace}:{server_id}:{device_id}",
+                ),
+                "provider": kind,
+                "companyId": company_id,
+                "sourceNamespace": namespace,
+                "sourceServerId": server_id,
+                "sourceDeviceId": device_id,
+                "createdAt": utc_now(),
+            }
+            rows.append(record)
+        record.update(
+            providerParentId=provider_parent_id,
+            policyId=preview.get("policyId") or None,
+            syncRunId=preview.get("syncRunId") or None,
+            assetId=preview.get("assetId") or preview.get("canonicalCiId") or None,
+            sourceMappingId=preview.get("sourceMappingId") or None,
+            status=status,
+            summary=summary,
+            sourceFingerprint=source_fingerprint,
+            observedAt=now.isoformat().replace("+00:00", "Z"),
+            expiresAt=(now + timedelta(seconds=ttl)).isoformat().replace("+00:00", "Z"),
+            updatedAt=utc_now(),
+        )
+        self.save_state(self.state)
+        return {**deepcopy(record), "stale": False}
+
+    @contextmanager
+    def integration_enrichment_scope_lock(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        source_server_id: str,
+    ) -> Iterator[None]:
+        """Serialize one local cache publication scope across worker threads."""
+
+        scope_key = ":".join((kind, company_id, str(provider_parent_id), str(source_server_id)))
+        with self._integration_enrichment_lock_guard:
+            scope_lock = self._integration_enrichment_locks.setdefault(
+                scope_key,
+                threading.RLock(),
+            )
+        with scope_lock:
+            yield
+
+    def list_integration_enrichment_previews(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str | None = None,
+        *,
+        source_server_id: str | None = None,
+        include_expired: bool = False,
+        limit: int = 100,
+    ) -> list[dict]:
+        """List a bounded tenant-scoped local enrichment cache."""
+
+        bounded_limit = max(1, min(int(limit), 25_000))
+        rows = []
+        for record in self.state.get("integrationEnrichmentPreviews", []):
+            if record.get("provider") != kind or record.get("companyId") != company_id:
+                continue
+            if provider_parent_id is not None and record.get("providerParentId") != str(
+                provider_parent_id
+            ):
+                continue
+            if source_server_id is not None and record.get("sourceServerId") != str(
+                source_server_id
+            ):
+                continue
+            expires_at = parse_timestamp(record.get("expiresAt"))
+            stale = not expires_at or expires_at <= datetime.now(UTC)
+            if stale and not include_expired:
+                continue
+            rows.append({**deepcopy(record), "stale": stale})
+        return sorted(
+            rows,
+            key=lambda item: (item.get("observedAt") or "", item.get("id") or ""),
+            reverse=True,
+        )[:bounded_limit]
+
+    def replace_integration_enrichment_generation(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        source_server_id: str,
+        generation_id: str | None,
+    ) -> int:
+        """Remove superseded rows after a complete tenant-scoped cache refresh."""
+
+        retained_generation = str(generation_id or "")
+        rows = self.state.get("integrationEnrichmentPreviews", [])
+        retained: list[dict[str, Any]] = []
+        removed = 0
+        for record in rows:
+            summary = record.get("summary")
+            record_generation = (
+                str(summary.get("cacheGenerationId") or "") if isinstance(summary, dict) else ""
+            )
+            in_scope = (
+                record.get("provider") == kind
+                and record.get("companyId") == company_id
+                and record.get("providerParentId") == str(provider_parent_id)
+                and record.get("sourceServerId") == str(source_server_id)
+            )
+            if in_scope and (not retained_generation or record_generation != retained_generation):
+                removed += 1
+                continue
+            retained.append(record)
+        if removed:
+            self.state["integrationEnrichmentPreviews"] = retained
+            self.save_state(self.state)
+        return removed
+
+    def delete_integration_enrichment_generation(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        source_server_id: str,
+        generation_id: str,
+    ) -> int:
+        """Delete one unpublished tenant-scoped cache generation."""
+
+        selected_generation = str(generation_id or "")
+        if not selected_generation:
+            raise ValueError("Cache generation ID is required")
+        rows = self.state.get("integrationEnrichmentPreviews", [])
+        retained: list[dict[str, Any]] = []
+        removed = 0
+        for record in rows:
+            summary = record.get("summary")
+            record_generation = (
+                str(summary.get("cacheGenerationId") or "") if isinstance(summary, dict) else ""
+            )
+            matches = (
+                record.get("provider") == kind
+                and record.get("companyId") == company_id
+                and record.get("providerParentId") == str(provider_parent_id)
+                and record.get("sourceServerId") == str(source_server_id)
+                and record_generation == selected_generation
+            )
+            if matches:
+                removed += 1
+                continue
+            retained.append(record)
+        if removed:
+            self.state["integrationEnrichmentPreviews"] = retained
+            self.save_state(self.state)
+        return removed
+
+    def prune_integration_enrichment_previews(
+        self,
+        kind: str,
+        *,
+        max_entries: int = 5_000,
+    ) -> int:
+        """Remove stale rows without splitting a published cache generation."""
+
+        del max_entries
+        candidates = [
+            item
+            for item in self.state.get("integrationEnrichmentPreviews", [])
+            if item.get("provider") == kind
+        ]
+        now = datetime.now(UTC)
+
+        def expired(item: dict[str, Any]) -> bool:
+            expires_at = parse_timestamp(item.get("expiresAt"))
+            return not expires_at or expires_at <= now
+
+        expired_generations = {
+            str(summary.get("cacheGenerationId"))
+            for item in candidates
+            if expired(item)
+            and isinstance((summary := item.get("summary")), dict)
+            and summary.get("cacheGenerationId")
+        }
+        doomed = set()
+        for item in candidates:
+            summary = item.get("summary")
+            generation_id = (
+                str(summary.get("cacheGenerationId") or "") if isinstance(summary, dict) else ""
+            )
+            if (generation_id and generation_id in expired_generations) or (
+                not generation_id and expired(item)
+            ):
+                doomed.add(item.get("id"))
+        if doomed:
+            self.state["integrationEnrichmentPreviews"] = [
+                item
+                for item in self.state.get("integrationEnrichmentPreviews", [])
+                if item.get("id") not in doomed
+            ]
+            self.save_state(self.state)
+        return len(doomed)
+
     def ensure_integration_connection(
         self, kind: str, name: str, actor_id: str | None = None
     ) -> dict:
@@ -3727,8 +4926,14 @@ class StateRepository:
             None,
         )
         before = deepcopy(mapping) if mapping else None
+        mapped_at = utc_now()
         if mapping:
-            mapping.update(companyId=company_id, externalName=observation["name"], active=True)
+            mapping.update(
+                companyId=company_id,
+                externalName=observation["name"],
+                active=True,
+                lastSyncedAt=mapped_at,
+            )
         else:
             mapping = {
                 "id": str(uuid.uuid4()),
@@ -3737,6 +4942,9 @@ class StateRepository:
                 "externalName": observation["name"],
                 "companyId": company_id,
                 "active": True,
+                "firstSeenAt": mapped_at,
+                "lastSeenAt": mapped_at,
+                "lastSyncedAt": mapped_at,
             }
             self.state["providerCompanyMappings"].append(mapping)
         self._audit(
@@ -3771,7 +4979,7 @@ class StateRepository:
         if not mapping:
             return False
         before = deepcopy(mapping)
-        mapping["active"] = False
+        mapping.update(active=False, lastSyncedAt=utc_now())
         self._audit(
             mapping.get("companyId"),
             actor_id,
@@ -3794,6 +5002,622 @@ class StateRepository:
             and item.get("companyId") == company_id
             and item.get("active", True)
         ]
+
+    def classify_provider_ci_mapping_import(
+        self,
+        kind: str,
+        company_id: str,
+        external_id: str,
+        provider_parent_id: str | None = None,
+    ) -> dict:
+        """Preflight one provider identity before any canonical import mutation."""
+
+        mapping = next(
+            (
+                item
+                for item in self.state.get("providerCiMappings", [])
+                if item.get("provider") == kind and item.get("externalId") == external_id
+            ),
+            None,
+        )
+        presence = next(
+            (
+                item
+                for item in self.state.get("integrationCiPresence", [])
+                if mapping is not None and item.get("mappingId") == mapping.get("id")
+            ),
+            None,
+        )
+        company_matches = not mapping or mapping.get("companyId") == company_id
+        provider_parent_matches = bool(
+            not mapping
+            or not provider_parent_id
+            or not mapping.get("providerParentId")
+            or mapping.get("providerParentId") == provider_parent_id
+        )
+        decision, reason = _provider_ci_import_decision(
+            mapping_exists=mapping is not None,
+            mapping_active=bool(not mapping or mapping.get("active", True)),
+            lifecycle_state=str(presence.get("state") or "") if presence else None,
+            company_matches=company_matches,
+            provider_parent_matches=provider_parent_matches,
+        )
+        return {
+            "decision": decision,
+            "mappingId": mapping.get("id") if mapping else None,
+            "companyMatches": company_matches,
+            "providerParentMatches": provider_parent_matches,
+            "reason": reason,
+        }
+
+    def _apply_state_ci_presence_snapshot(
+        self,
+        kind: str,
+        policy: dict[str, Any],
+        run_id: str,
+        presence_snapshot: dict[str, Any],
+        expected_policy_revision: int,
+    ) -> dict[str, int]:
+        """Evaluate one validated presence snapshot inside a local transaction."""
+
+        snapshot = _normalized_ci_presence_snapshot(presence_snapshot)
+        company_id = str(policy.get("companyId") or "")
+        provider_parent_id = str(policy.get("providerParentId") or "")
+        counts = {state: 0 for state in CI_PRESENCE_STATES}
+        counts["skipped"] = 0
+        current_connection = self.get_integration_connection(kind)
+        current_policy = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("id") == policy.get("id")
+                and item.get("provider") == kind
+                and item.get("companyId") == company_id
+                and item.get("providerParentId") == provider_parent_id
+            ),
+            None,
+        )
+        provider_company_mapping = next(
+            (
+                item
+                for item in self.state.get("providerCompanyMappings", [])
+                if item.get("provider") == kind
+                and item.get("externalId") == provider_parent_id
+                and item.get("companyId") == company_id
+                and item.get("active", True)
+            ),
+            None,
+        )
+        provider_company_observation = next(
+            (
+                item
+                for item in self.state.get("providerCompanyObservations", [])
+                if item.get("provider") == kind
+                and item.get("externalId") == provider_parent_id
+                and item.get("active", True)
+                and not item.get("deleted", False)
+            ),
+            None,
+        )
+        started = parse_timestamp(snapshot["snapshotStartedAt"])
+        company_mapping_changed = parse_timestamp(
+            (provider_company_mapping or {}).get("lastSyncedAt")
+        )
+        if (
+            not snapshot["providerReadComplete"]
+            or snapshot["policyRevision"] != int(expected_policy_revision)
+            or not current_policy
+            or snapshot["policyRevision"] != int(current_policy.get("revision") or 0)
+            or not current_connection
+            or not current_connection.get("enabled", False)
+            or current_connection.get("lifecycleStatus", "active") != "active"
+            or snapshot["connectionRevision"] != int(current_connection.get("revision") or 0)
+            or not provider_company_mapping
+            or not provider_company_observation
+            or bool(company_mapping_changed and started and company_mapping_changed > started)
+        ):
+            return counts
+        if any(
+            item["providerParentId"] != provider_parent_id for item in snapshot["observedRecords"]
+        ):
+            raise ValueError("Presence snapshot includes a record outside the preview scope")
+
+        mappings = [
+            item
+            for item in self.state.get("providerCiMappings", [])
+            if item.get("provider") == kind and item.get("companyId") == company_id
+        ]
+        presence_rows = self.state.setdefault("integrationCiPresence", [])
+        presence_by_mapping = {str(item.get("mappingId") or ""): item for item in presence_rows}
+        observed = {item["externalId"]: item for item in snapshot["observedRecords"]}
+        evaluated_at = snapshot["providerReadCompletedAt"] or utc_now()
+        evaluated = parse_timestamp(evaluated_at) or datetime.now(UTC)
+        for mapping in mappings:
+            external_id = str(mapping.get("externalId") or "")
+            observed_record = observed.get(external_id)
+            current_parent = str(mapping.get("providerParentId") or "")
+            row = presence_by_mapping.get(str(mapping.get("id") or ""))
+
+            if observed_record is not None:
+                if current_parent and current_parent != provider_parent_id:
+                    counts["skipped"] += 1
+                    continue
+                mapping["providerParentId"] = provider_parent_id
+                now = utc_now()
+                if row is None:
+                    row = {
+                        "id": str(uuid.uuid4()),
+                        "mappingId": mapping["id"],
+                        "createdAt": now,
+                        "revision": 0,
+                    }
+                    presence_rows.append(row)
+                    presence_by_mapping[str(mapping["id"])] = row
+                next_state = "restore_ready" if not mapping.get("active", True) else "observed"
+                row.update(
+                    policyId=policy["id"],
+                    provider=kind,
+                    companyId=company_id,
+                    providerParentId=provider_parent_id,
+                    assetId=mapping.get("assetId"),
+                    externalId=external_id,
+                    externalName=(
+                        observed_record.get("externalName")
+                        or mapping.get("externalName")
+                        or external_id
+                    ),
+                    state=next_state,
+                    absenceCount=0,
+                    requiredAbsences=snapshot["requiredAbsences"],
+                    minimumMissingHours=snapshot["minimumMissingHours"],
+                    firstMissingAt=None,
+                    lastMissingAt=None,
+                    candidateSince=None,
+                    lastObservedAt=evaluated_at,
+                    lastEvaluatedAt=evaluated_at,
+                    lastEvaluatedRunId=run_id,
+                    scopeMode=snapshot["scopeMode"],
+                    providerReadComplete=snapshot["providerReadComplete"],
+                    evaluationReason=(
+                        "Provider observation returned for a retired mapping."
+                        if next_state == "restore_ready"
+                        else "Observed in the provider snapshot."
+                    ),
+                    discoveryScopeFingerprint=snapshot["discoveryScopeFingerprint"],
+                    policyDecisionFingerprint=snapshot["policyDecisionFingerprint"],
+                    connectionRevision=snapshot["connectionRevision"],
+                    policyRevision=snapshot["policyRevision"],
+                    snapshotStartedAt=snapshot["snapshotStartedAt"],
+                    providerReadCompletedAt=snapshot["providerReadCompletedAt"],
+                    revision=int(row.get("revision") or 0) + 1,
+                    updatedAt=now,
+                )
+                counts[next_state] += 1
+                continue
+
+            if current_parent != provider_parent_id:
+                # Legacy rows without an immutable parent are backfilled only by
+                # positive evidence; absence must never infer their scope.
+                counts["skipped"] += 1
+                continue
+            if row is not None and row.get("lastEvaluatedRunId") == run_id:
+                counts["skipped"] += 1
+                continue
+            first_seen = parse_timestamp(mapping.get("firstSeenAt"))
+            if started is not None and first_seen is not None and first_seen > started:
+                counts["skipped"] += 1
+                continue
+            if not mapping.get("active", True):
+                if row is not None and row.get("state") == "restore_ready":
+                    row.update(
+                        policyId=policy["id"],
+                        provider=kind,
+                        companyId=company_id,
+                        providerParentId=provider_parent_id,
+                        assetId=mapping.get("assetId"),
+                        externalId=external_id,
+                        externalName=mapping.get("externalName") or external_id,
+                        state="retired",
+                        absenceCount=0,
+                        requiredAbsences=snapshot["requiredAbsences"],
+                        minimumMissingHours=snapshot["minimumMissingHours"],
+                        firstMissingAt=None,
+                        lastMissingAt=None,
+                        candidateSince=None,
+                        evaluationReason="The provider no longer reports the retired mapping.",
+                        lastEvaluatedAt=evaluated_at,
+                        lastEvaluatedRunId=run_id,
+                        scopeMode=snapshot["scopeMode"],
+                        providerReadComplete=snapshot["providerReadComplete"],
+                        discoveryScopeFingerprint=snapshot["discoveryScopeFingerprint"],
+                        policyDecisionFingerprint=snapshot["policyDecisionFingerprint"],
+                        connectionRevision=snapshot["connectionRevision"],
+                        policyRevision=snapshot["policyRevision"],
+                        snapshotStartedAt=snapshot["snapshotStartedAt"],
+                        providerReadCompletedAt=snapshot["providerReadCompletedAt"],
+                        revision=int(row.get("revision") or 0) + 1,
+                        updatedAt=evaluated_at,
+                    )
+                    counts["retired"] += 1
+                else:
+                    counts["skipped"] += 1
+                continue
+
+            if row is None:
+                now = utc_now()
+                row = {
+                    "id": str(uuid.uuid4()),
+                    "mappingId": mapping["id"],
+                    "createdAt": now,
+                    "revision": 0,
+                }
+                presence_rows.append(row)
+                presence_by_mapping[str(mapping["id"])] = row
+
+            scope_changed = (
+                row.get("discoveryScopeFingerprint")
+                and row.get("discoveryScopeFingerprint") != snapshot["discoveryScopeFingerprint"]
+            )
+            absence_count = 0 if scope_changed else int(row.get("absenceCount") or 0)
+            first_missing_at = None if scope_changed else row.get("firstMissingAt")
+            if not snapshot["providerReadComplete"] or snapshot["scopeMode"] != "unfiltered":
+                next_state = "not_evaluated"
+                absence_count = 0
+                first_missing_at = None
+                last_missing_at = None
+                candidate_since = None
+                reason = (
+                    "Provider read was incomplete; absence was not evaluated."
+                    if not snapshot["providerReadComplete"]
+                    else "Provider-side filtering was active; absence was not evaluated."
+                )
+            else:
+                absence_count += 1
+                first_missing_at = first_missing_at or evaluated_at
+                first_missing = parse_timestamp(first_missing_at) or evaluated
+                elapsed_hours = max(0.0, (evaluated - first_missing).total_seconds() / 3600)
+                eligible = (
+                    absence_count >= snapshot["requiredAbsences"]
+                    and elapsed_hours >= snapshot["minimumMissingHours"]
+                )
+                next_state = "eligible" if eligible else "monitoring"
+                last_missing_at = evaluated_at
+                candidate_since = first_missing_at if eligible else None
+                reason = (
+                    "Required complete missing snapshots and minimum elapsed time were reached."
+                    if eligible
+                    else "Waiting for additional complete missing snapshots or elapsed time."
+                )
+            now = utc_now()
+            row.update(
+                policyId=policy["id"],
+                provider=kind,
+                companyId=company_id,
+                providerParentId=provider_parent_id,
+                assetId=mapping.get("assetId"),
+                externalId=external_id,
+                externalName=mapping.get("externalName") or external_id,
+                state=next_state,
+                absenceCount=absence_count,
+                requiredAbsences=snapshot["requiredAbsences"],
+                minimumMissingHours=snapshot["minimumMissingHours"],
+                firstMissingAt=first_missing_at,
+                lastMissingAt=last_missing_at,
+                candidateSince=candidate_since,
+                lastEvaluatedAt=evaluated_at,
+                lastEvaluatedRunId=run_id,
+                scopeMode=snapshot["scopeMode"],
+                providerReadComplete=snapshot["providerReadComplete"],
+                evaluationReason=reason,
+                discoveryScopeFingerprint=snapshot["discoveryScopeFingerprint"],
+                policyDecisionFingerprint=snapshot["policyDecisionFingerprint"],
+                connectionRevision=snapshot["connectionRevision"],
+                policyRevision=snapshot["policyRevision"],
+                snapshotStartedAt=snapshot["snapshotStartedAt"],
+                providerReadCompletedAt=snapshot["providerReadCompletedAt"],
+                revision=int(row.get("revision") or 0) + 1,
+                updatedAt=now,
+            )
+            counts[next_state] += 1
+        return counts
+
+    def _state_ci_presence_stale_reason(self, stored: dict[str, Any]) -> str:
+        """Compare one lifecycle row with current local policy and scope state."""
+
+        policy = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("id") == stored.get("policyId")
+                and item.get("provider") == stored.get("provider")
+                and item.get("companyId") == stored.get("companyId")
+                and item.get("providerParentId") == stored.get("providerParentId")
+            ),
+            None,
+        )
+        integration = next(
+            (
+                item
+                for item in self.state.get("integrations", [])
+                if item.get("type", item.get("id")) == stored.get("provider")
+            ),
+            None,
+        )
+        company_mapping = next(
+            (
+                item
+                for item in self.state.get("providerCompanyMappings", [])
+                if item.get("provider") == stored.get("provider")
+                and item.get("externalId") == stored.get("providerParentId")
+            ),
+            None,
+        )
+        company_observation = next(
+            (
+                item
+                for item in self.state.get("providerCompanyObservations", [])
+                if item.get("provider") == stored.get("provider")
+                and item.get("externalId") == stored.get("providerParentId")
+                and item.get("active", True)
+                and not item.get("deleted", False)
+            ),
+            None,
+        )
+        current_policy = normalize_ci_policy(policy or {})
+        return _ci_presence_stale_evidence_reason(
+            {
+                **stored,
+                "policyExists": policy is not None,
+                "currentPolicyRevision": int((policy or {}).get("revision") or 0),
+                "currentPolicyEnabled": bool((policy or {}).get("enabled", False)),
+                "currentPolicyFiltered": bool(current_policy.get("providerFilterId")),
+                "presenceEvidenceMaxAgeHours": _ci_presence_evidence_max_age_hours(current_policy),
+                "integrationExists": integration is not None,
+                "currentConnectionRevision": int((integration or {}).get("revision") or 0),
+                "currentIntegrationEnabled": bool((integration or {}).get("enabled", False)),
+                "currentIntegrationLifecycle": (integration or {}).get("lifecycleStatus", "active"),
+                "providerCompanyMappingValid": bool(
+                    company_mapping
+                    and company_mapping.get("active", True)
+                    and company_mapping.get("companyId") == stored.get("companyId")
+                    and company_observation
+                ),
+                "providerCompanyMappingChangedAt": (company_mapping or {}).get("lastSyncedAt"),
+            }
+        )
+
+    def list_ci_presence_lifecycle(
+        self,
+        provider: str | None = None,
+        company_id: str | None = None,
+        company_ids: list[str] | None = None,
+        provider_parent_id: str | None = None,
+        state: str | None = None,
+        search: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Return a tenant-filtered, paged provider-presence review queue."""
+
+        if state is not None and state not in CI_PRESENCE_STATES:
+            raise ValueError("Presence lifecycle state is invalid")
+        restrict_companies = company_ids is not None
+        selected_companies = set(company_ids or [])
+        if company_id:
+            selected_companies = (
+                selected_companies.intersection({company_id})
+                if restrict_companies
+                else {company_id}
+            )
+            restrict_companies = True
+        query = str(search or "").strip().casefold()
+        mappings = {
+            str(item.get("id") or ""): item for item in self.state.get("providerCiMappings", [])
+        }
+        companies = {
+            str(item.get("id") or ""): str(item.get("name") or "")
+            for item in self.state.get("companies", [])
+        }
+        assets = {
+            str(item.get("id") or ""): str(item.get("name") or "")
+            for item in self.state.get("assets", [])
+        }
+        reviewers = {
+            str(item.get("id") or ""): str(
+                item.get("name") or item.get("displayName") or item.get("email") or ""
+            )
+            for item in self.state.get("users", [])
+        }
+        rows: list[dict[str, Any]] = []
+        for stored in self.state.get("integrationCiPresence", []):
+            mapping = mappings.get(str(stored.get("mappingId") or ""))
+            if not mapping:
+                continue
+            item = _public_ci_presence(
+                {
+                    **stored,
+                    "mappingActive": mapping.get("active", True),
+                    "companyName": companies.get(str(stored.get("companyId") or ""), ""),
+                    "assetName": assets.get(str(stored.get("assetId") or ""), ""),
+                    "retiredByName": reviewers.get(str(stored.get("reviewedBy") or ""), ""),
+                    "staleEvidenceReason": self._state_ci_presence_stale_reason(stored),
+                }
+            )
+            if provider is not None and item["provider"] != provider:
+                continue
+            if restrict_companies and item["companyId"] not in selected_companies:
+                continue
+            if provider_parent_id is not None and item["providerParentId"] != provider_parent_id:
+                continue
+            if state is not None and item["state"] != state:
+                continue
+            if query and query not in " ".join(
+                str(item.get(key) or "").casefold()
+                for key in ("externalId", "externalName", "assetName", "companyName")
+            ):
+                continue
+            rows.append(item)
+        rows.sort(
+            key=lambda item: (str(item.get("updatedAt") or ""), str(item["id"])), reverse=True
+        )
+        total = len(rows)
+        summary = _ci_presence_collection(rows, total)["summary"]
+        bounded_limit = max(1, min(int(limit or 50), 500))
+        bounded_offset = max(0, int(offset or 0))
+        return {
+            "items": rows[bounded_offset : bounded_offset + bounded_limit],
+            "total": total,
+            "summary": summary,
+        }
+
+    def retire_ci_presence_mapping(
+        self,
+        presence_id: str,
+        expected_revision: int,
+        notes: str,
+        actor_id: str | None,
+    ) -> dict | None:
+        """Deactivate an eligible immutable mapping without retiring its asset."""
+
+        review_notes = str(notes or "").strip()
+        if not review_notes:
+            raise ValueError("Review notes are required")
+        row = next(
+            (
+                item
+                for item in self.state.get("integrationCiPresence", [])
+                if item.get("id") == presence_id
+            ),
+            None,
+        )
+        mapping = next(
+            (
+                item
+                for item in self.state.get("providerCiMappings", [])
+                if row is not None and item.get("id") == row.get("mappingId")
+            ),
+            None,
+        )
+        if row is None or mapping is None:
+            return None
+        if int(row.get("revision") or 0) != int(expected_revision):
+            raise ValueError("Presence lifecycle item changed; reload before saving")
+        if row.get("state") != "eligible" or not mapping.get("active", True):
+            raise ValueError("Only an eligible active mapping can be retired")
+        stale_reason = self._state_ci_presence_stale_reason(row)
+        if stale_reason:
+            raise ValueError(f"Presence evidence is stale: {stale_reason}")
+        before = deepcopy(row)
+        mapping["active"] = False
+        timestamp = utc_now()
+        row.update(
+            state="retired",
+            reviewedBy=actor_id,
+            reviewedAt=timestamp,
+            reviewNotes=review_notes[:2000],
+            evaluationReason="An administrator retired the immutable provider mapping.",
+            revision=int(row.get("revision") or 0) + 1,
+            updatedAt=timestamp,
+        )
+        retired_candidates = 0
+        for candidate in self.state.get("ciRelationshipCandidates", []):
+            if (
+                candidate.get("sourceMappingId") == mapping.get("id")
+                and candidate.get("state") == "pending"
+                and not candidate.get("retiredAt")
+            ):
+                candidate["retiredAt"] = timestamp
+                candidate["revision"] = int(candidate.get("revision") or 1) + 1
+                retired_candidates += 1
+        self._audit(
+            row.get("companyId"),
+            actor_id,
+            "integration_ci_presence",
+            row["id"],
+            "mapping_retired",
+            before,
+            row,
+            metadata={
+                "mappingId": row.get("mappingId"),
+                "assetId": row.get("assetId"),
+                "retiredPendingRelationshipCandidates": retired_candidates,
+            },
+        )
+        self.save_state(self.state)
+        return _public_ci_presence({**row, "mappingActive": False})
+
+    def restore_ci_presence_mapping(
+        self,
+        presence_id: str,
+        expected_revision: int,
+        notes: str,
+        actor_id: str | None,
+    ) -> dict | None:
+        """Reactivate a provider mapping only after fresh provider evidence."""
+
+        review_notes = str(notes or "").strip()
+        if not review_notes:
+            raise ValueError("Review notes are required")
+        row = next(
+            (
+                item
+                for item in self.state.get("integrationCiPresence", [])
+                if item.get("id") == presence_id
+            ),
+            None,
+        )
+        mapping = next(
+            (
+                item
+                for item in self.state.get("providerCiMappings", [])
+                if row is not None and item.get("id") == row.get("mappingId")
+            ),
+            None,
+        )
+        if row is None or mapping is None:
+            return None
+        if int(row.get("revision") or 0) != int(expected_revision):
+            raise ValueError("Presence lifecycle item changed; reload before saving")
+        if row.get("state") != "restore_ready" or mapping.get("active", True):
+            raise ValueError("Only a restore-ready retired mapping can be restored")
+        stale_reason = self._state_ci_presence_stale_reason(row)
+        if stale_reason:
+            raise ValueError(f"Presence evidence is stale: {stale_reason}")
+        before = deepcopy(row)
+        mapping["active"] = True
+        timestamp = utc_now()
+        row.update(
+            state="observed",
+            absenceCount=0,
+            firstMissingAt=None,
+            lastMissingAt=None,
+            candidateSince=None,
+            reviewedBy=actor_id,
+            reviewedAt=timestamp,
+            reviewNotes=review_notes[:2000],
+            evaluationReason="An administrator restored the observed provider mapping.",
+            revision=int(row.get("revision") or 0) + 1,
+            updatedAt=timestamp,
+        )
+        for item in self.state.get("integrationCiReviewItems", []):
+            if (
+                item.get("policyId") == row.get("policyId")
+                and item.get("externalId") == row.get("externalId")
+                and item.get("state") == "pending"
+            ):
+                item.update(state="resolved", reviewedBy=actor_id, reviewedAt=timestamp)
+        self._audit(
+            row.get("companyId"),
+            actor_id,
+            "integration_ci_presence",
+            row["id"],
+            "mapping_restored",
+            before,
+            row,
+            metadata={"mappingId": row.get("mappingId"), "assetId": row.get("assetId")},
+        )
+        self.save_state(self.state)
+        return _public_ci_presence({**row, "mappingActive": True})
 
     def get_ci_sync_policy(self, kind: str, company_id: str, provider_parent_id: str) -> dict:
         """Return one saved provider/customer CI policy or explicit safe defaults."""
@@ -4148,7 +5972,6 @@ class StateRepository:
                     if stored.get("status") == "success"
                     else stored.get("status", "unknown")
                 ),
-                enabled=True,
             )
             self._audit(
                 policy.get("companyId"),
@@ -4169,6 +5992,8 @@ class StateRepository:
         run: dict,
         review_items: list[dict],
         actor_id: str | None = None,
+        *,
+        presence_snapshot: dict[str, Any] | None = None,
     ) -> dict | None:
         """Atomically publish a directly executed preview under its policy lease."""
 
@@ -4193,6 +6018,10 @@ class StateRepository:
         snapshot = deepcopy(self.state)
         try:
             stored = self._record_state_ci_policy_preview(kind, policy, run, actor_id)
+            if presence_snapshot is not None:
+                stored.setdefault("attributes", {})["connectionRevision"] = int(
+                    _normalized_ci_presence_snapshot(presence_snapshot)["connectionRevision"]
+                )
             queue_summary = self._replace_ci_review_items_in_state(
                 policy_id,
                 str(policy.get("companyId") or ""),
@@ -4200,6 +6029,15 @@ class StateRepository:
                 review_items,
                 actor_id,
             )
+            if presence_snapshot is not None:
+                attributes = stored.get("attributes") or {}
+                self._apply_state_ci_presence_snapshot(
+                    kind,
+                    policy,
+                    str(stored["id"]),
+                    presence_snapshot,
+                    int(attributes.get("policyRevision") or 0),
+                )
             trigger = str((stored.get("attributes") or {}).get("trigger") or "")
             finished_policy = self._finish_state_ci_sync_policy(
                 policy_id,
@@ -4907,6 +6745,215 @@ class StateRepository:
             self.save_state(self.state)
         return resolved
 
+    def _provider_import_failpoint(self, stage: str) -> None:
+        """Provide a deterministic no-op seam for atomic-import rollback tests."""
+
+    def apply_reviewed_provider_ci_import(
+        self,
+        kind: str,
+        company_id: str,
+        record: dict,
+        action: str,
+        *,
+        asset_id: str | None = None,
+        asset: dict | None = None,
+        changes: dict | None = None,
+        actor_id: str | None = None,
+        provider_parent_id: str | None = None,
+        policy_id: str | None = None,
+        review_item_id: str | None = None,
+        review_content_hash: str | None = None,
+        expected_policy_revision: int | None = None,
+        expected_connection_revision: int | None = None,
+    ) -> dict:
+        """Apply one reviewed create, update or link as a single local commit."""
+
+        if action not in {"create", "update", "link"}:
+            raise ValueError("Provider import action is invalid")
+        if not isinstance(record, dict) or not str(record.get("externalId") or "").strip():
+            raise ValueError("Provider external identity is required")
+        selected_parent_id = str(provider_parent_id or record.get("providerParentId") or "").strip()
+        working = StateRepository(deepcopy(self.state), lambda _value: None)
+        company_mapping = next(
+            (
+                item
+                for item in working.state.get("providerCompanyMappings", [])
+                if item.get("provider") == kind
+                and item.get("externalId") == selected_parent_id
+                and item.get("companyId") == company_id
+                and item.get("active", True)
+            ),
+            None,
+        )
+        company_observation = next(
+            (
+                item
+                for item in working.state.get("providerCompanyObservations", [])
+                if item.get("provider") == kind
+                and item.get("externalId") == selected_parent_id
+                and item.get("active", True)
+                and not item.get("deleted", False)
+            ),
+            None,
+        )
+        if not selected_parent_id or not company_mapping or not company_observation:
+            raise ValueError(
+                "The active provider customer mapping changed during review. Run a new preview."
+            )
+        generation_supplied = (
+            expected_policy_revision is not None or expected_connection_revision is not None
+        )
+        if generation_supplied:
+            if (
+                not policy_id
+                or expected_policy_revision is None
+                or expected_connection_revision is None
+            ):
+                raise ValueError("Reviewed provider generation is incomplete. Run a new preview.")
+            current_policy = next(
+                (
+                    item
+                    for item in working.state.get("integrationCiPolicies", [])
+                    if item.get("id") == policy_id
+                    and item.get("provider") == kind
+                    and item.get("companyId") == company_id
+                    and item.get("providerParentId") == selected_parent_id
+                ),
+                None,
+            )
+            current_connection = working.get_integration_connection(kind)
+            if (
+                not current_policy
+                or int(current_policy.get("revision") or 0) != int(expected_policy_revision)
+                or not current_connection
+                or not current_connection.get("enabled", False)
+                or current_connection.get("lifecycleStatus", "active") != "active"
+                or int(current_connection.get("revision") or 0) != int(expected_connection_revision)
+            ):
+                raise ValueError("Reviewed provider generation is stale. Run a new preview.")
+        review_guard_supplied = review_item_id is not None or review_content_hash is not None
+        review_item = None
+        if review_guard_supplied:
+            if not review_item_id or not review_content_hash or not policy_id:
+                raise ValueError("Reviewed queue evidence is incomplete. Run a new preview.")
+            review_item = next(
+                (
+                    item
+                    for item in working.state.get("integrationCiReviewItems", [])
+                    if item.get("id") == review_item_id
+                    and item.get("policyId") == policy_id
+                    and item.get("companyId") == company_id
+                    and item.get("externalId") == str(record["externalId"])
+                    and item.get("state") == "pending"
+                    and item.get("contentHash") == review_content_hash
+                ),
+                None,
+            )
+            if review_item is None:
+                raise ValueError("Reviewed queue item changed. Run a new preview.")
+        classification = working.classify_provider_ci_mapping_import(
+            kind,
+            company_id,
+            str(record["externalId"]),
+            selected_parent_id,
+        )
+        if classification["decision"] != "allow":
+            raise ValueError(str(classification["reason"]))
+        existing_mapping = classification.get("mappingId") is not None
+        if action == "create" and existing_mapping:
+            raise ValueError("Provider identity is already mapped; refresh the import preview")
+        existing = next(
+            (
+                item
+                for item in working.state.get("providerCiMappings", [])
+                if item.get("id") == classification.get("mappingId")
+            ),
+            None,
+        )
+        if action == "update" and (
+            not existing or str(existing.get("assetId") or "") != str(asset_id or "")
+        ):
+            raise ValueError(
+                "Provider update target no longer matches its immutable mapping. Run a new preview."
+            )
+
+        stored_asset: dict | None
+        if action == "create":
+            if not isinstance(asset, dict) or asset.get("companyId") != company_id:
+                raise ValueError("A same-customer canonical asset is required for create")
+            stored_asset = working.create_asset(deepcopy(asset), actor_id)
+            self._provider_import_failpoint("after_asset_write")
+            mapping = working.record_provider_ci_mapping(
+                kind,
+                company_id,
+                deepcopy(record),
+                stored_asset["id"],
+                actor_id,
+                provider_parent_id=selected_parent_id,
+            )
+        else:
+            if not asset_id:
+                raise ValueError("A canonical target is required for update or link")
+            # Lock/record immutable identity before changing an existing CI. The
+            # working copy is published only after every operation succeeds.
+            mapping = working.record_provider_ci_mapping(
+                kind,
+                company_id,
+                deepcopy(record),
+                asset_id,
+                actor_id,
+                provider_parent_id=selected_parent_id,
+            )
+            if changes:
+                stored_asset = working.update_asset(asset_id, deepcopy(changes), actor_id)
+            else:
+                stored_asset = next(
+                    (
+                        deepcopy(item)
+                        for item in working.state.get("assets", [])
+                        if item.get("id") == asset_id and item.get("companyId") == company_id
+                    ),
+                    None,
+                )
+            if stored_asset is None:
+                raise ValueError("Configuration item is unavailable in this customer")
+            self._provider_import_failpoint("after_asset_write")
+
+        resolved = 0
+        if review_item is not None:
+            review_item.update(state="resolved", reviewedBy=actor_id, reviewedAt=utc_now())
+            resolved = 1
+        elif policy_id:
+            policy = next(
+                (
+                    item
+                    for item in working.state.get("integrationCiPolicies", [])
+                    if item.get("id") == policy_id
+                    and item.get("provider") == kind
+                    and item.get("companyId") == company_id
+                    and (
+                        not selected_parent_id or item.get("providerParentId") == selected_parent_id
+                    )
+                ),
+                None,
+            )
+            if policy:
+                resolved = working.resolve_ci_review_items(
+                    policy_id,
+                    [str(record["externalId"])],
+                    actor_id,
+                )
+        assert stored_asset is not None
+        self.state.clear()
+        self.state.update(working.state)
+        self.save_state(self.state)
+        return {
+            "action": action,
+            "asset": deepcopy(stored_asset),
+            "mapping": deepcopy(mapping),
+            "reviewItemsResolved": resolved,
+        }
+
     def record_provider_ci_mapping(
         self,
         kind: str,
@@ -4914,6 +6961,8 @@ class StateRepository:
         record: dict,
         asset_id: str,
         actor_id: str | None = None,
+        *,
+        provider_parent_id: str | None = None,
     ) -> dict:
         """Upsert provider identity and retain a deduplicated source observation."""
 
@@ -4927,6 +6976,23 @@ class StateRepository:
             None,
         )
         before = deepcopy(mapping) if mapping else None
+        selected_parent_id = str(provider_parent_id or record.get("providerParentId") or "").strip()
+        presence = next(
+            (
+                item
+                for item in self.state.get("integrationCiPresence", [])
+                if mapping is not None and item.get("mappingId") == mapping.get("id")
+            ),
+            None,
+        )
+        classification = self.classify_provider_ci_mapping_import(
+            kind,
+            company_id,
+            record["externalId"],
+            selected_parent_id,
+        )
+        if classification["decision"] != "allow":
+            raise ValueError(str(classification["reason"]))
         if not mapping:
             mapping = {
                 "id": str(uuid.uuid4()),
@@ -4936,14 +7002,65 @@ class StateRepository:
                 "firstSeenAt": utc_now(),
             }
             mappings.append(mapping)
+        observed_at = utc_now()
         mapping.update(
+            companyId=company_id,
             assetId=asset_id,
             externalName=record.get("name", ""),
             externalVersion=record.get("providerVersion", ""),
+            providerParentId=selected_parent_id or mapping.get("providerParentId"),
             active=True,
-            lastSeenAt=utc_now(),
-            lastSyncedAt=utc_now(),
+            lastSeenAt=observed_at,
+            lastSyncedAt=observed_at,
         )
+        if presence is not None:
+            presence_before = deepcopy(presence)
+            selected_policy = next(
+                (
+                    item
+                    for item in self.state.get("integrationCiPolicies", [])
+                    if item.get("provider") == kind
+                    and item.get("companyId") == company_id
+                    and item.get("providerParentId") == mapping.get("providerParentId")
+                ),
+                None,
+            )
+            if selected_policy is None:
+                self.state["integrationCiPresence"].remove(presence)
+            else:
+                presence.update(
+                    policyId=selected_policy["id"],
+                    provider=kind,
+                    companyId=company_id,
+                    providerParentId=mapping.get("providerParentId"),
+                    assetId=asset_id,
+                    externalId=record["externalId"],
+                    externalName=record.get("name") or record["externalId"],
+                    state="observed",
+                    absenceCount=0,
+                    firstMissingAt=None,
+                    lastMissingAt=None,
+                    candidateSince=None,
+                    lastObservedAt=observed_at,
+                    lastEvaluatedAt=observed_at,
+                    lastEvaluatedRunId=None,
+                    evaluationReason="Reviewed import observed and re-scoped this provider mapping.",
+                    discoveryScopeFingerprint="0" * 64,
+                    policyDecisionFingerprint="0" * 64,
+                    policyRevision=int(selected_policy.get("revision") or 0),
+                    revision=int(presence.get("revision") or 0) + 1,
+                    updatedAt=observed_at,
+                )
+            self._audit(
+                company_id,
+                actor_id,
+                "integration_ci_presence",
+                str(presence.get("id") or mapping["id"]),
+                "mapping_rescoped",
+                presence_before,
+                presence if selected_policy is not None else None,
+                metadata={"mappingId": mapping["id"], "assetId": asset_id},
+            )
         payload_hash = hashlib.sha256(
             json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -4977,6 +7094,875 @@ class StateRepository:
         )
         self.save_state(self.state)
         return deepcopy(mapping)
+
+    def _state_provider_ci_mapping(
+        self,
+        kind: str,
+        company_id: str,
+        asset_id: str,
+        mapping_id: str,
+    ) -> dict:
+        """Return one active provider mapping after enforcing its tenant and CI."""
+
+        mapping = next(
+            (
+                item
+                for item in self.state.get("providerCiMappings", [])
+                if item.get("id") == mapping_id
+                and item.get("provider") == kind
+                and item.get("companyId") == company_id
+                and item.get("assetId") == asset_id
+                and item.get("active", True)
+            ),
+            None,
+        )
+        asset = next(
+            (
+                item
+                for item in self.state.get("assets", [])
+                if item.get("id") == asset_id
+                and item.get("companyId") == company_id
+                and not item.get("retiredAt")
+            ),
+            None,
+        )
+        if not mapping or not asset:
+            raise ValueError("Provider mapping is unavailable for this customer asset")
+        return mapping
+
+    def replace_ci_inventory(
+        self,
+        kind: str,
+        company_id: str,
+        asset_id: str,
+        mapping_id: str,
+        collections: dict[str, Any],
+        *,
+        observed_at: str | None = None,
+        retention: int = 3,
+    ) -> dict:
+        """Replace current provider inventory and retain bounded content history."""
+
+        self._state_provider_ci_mapping(kind, company_id, asset_id, mapping_id)
+        source = (
+            collections.get("inventoryCollections")
+            if isinstance(collections, dict)
+            and isinstance(collections.get("inventoryCollections"), dict)
+            else collections
+        )
+        if not isinstance(source, dict):
+            raise ValueError("Inventory collections must be an object")
+        observed = observed_at or utc_now()
+        if not parse_timestamp(observed):
+            raise ValueError("Inventory observed timestamp is invalid")
+        keep = max(1, min(int(retention), 12))
+        normalized_collections: dict[str, Any] = {}
+        interfaces: list[dict[str, Any]] = []
+        for raw_type, raw_payload in source.items():
+            collection_type = _inventory_collection_type(raw_type)
+            if collection_type == "network_interfaces":
+                if not isinstance(raw_payload, list):
+                    raise ValueError("Network interface inventory must be an array")
+                if len(raw_payload) > INVENTORY_MAX_NETWORK_INTERFACES:
+                    raise ValueError("Network interface inventory contains too many items")
+                interfaces = [
+                    _normalized_interface(item, ordinal) for ordinal, item in enumerate(raw_payload)
+                ]
+                normalized_collections[collection_type] = [
+                    {key: value for key, value in item.items() if key != "fingerprint"}
+                    for item in interfaces
+                ]
+            else:
+                normalized_collections[collection_type] = raw_payload
+
+        stored_snapshots = self.state.setdefault("ciInventorySnapshots", [])
+        current_snapshots: dict[str, dict] = {}
+        stale_types: list[str] = []
+        for collection_type, raw_payload in normalized_collections.items():
+            payload, item_count, fingerprint = _bounded_inventory_payload(raw_payload)
+            current = next(
+                (
+                    item
+                    for item in stored_snapshots
+                    if item.get("mappingId") == mapping_id
+                    and item.get("collectionType") == collection_type
+                    and not item.get("supersededAt")
+                ),
+                None,
+            )
+            current_seen = parse_timestamp(current.get("lastObservedAt")) if current else None
+            incoming_seen = parse_timestamp(observed)
+            is_stale = bool(current_seen and incoming_seen and incoming_seen < current_seen)
+            matching = next(
+                (
+                    item
+                    for item in stored_snapshots
+                    if item.get("mappingId") == mapping_id
+                    and item.get("collectionType") == collection_type
+                    and item.get("fingerprint") == fingerprint
+                ),
+                None,
+            )
+            if is_stale:
+                stale_types.append(collection_type)
+                if not matching:
+                    matching = {
+                        "id": canonical_uuid(
+                            "ci_inventory_snapshot",
+                            f"{mapping_id}:{collection_type}:{fingerprint}",
+                        ),
+                        "companyId": company_id,
+                        "assetId": asset_id,
+                        "mappingId": mapping_id,
+                        "collectionType": collection_type,
+                        "fingerprint": fingerprint,
+                        "payload": payload,
+                        "itemCount": item_count,
+                        "completeness": "unknown",
+                        "firstObservedAt": observed,
+                        "lastObservedAt": observed,
+                        "supersededAt": current.get("firstObservedAt") if current else observed,
+                    }
+                    stored_snapshots.append(matching)
+                current_snapshots[collection_type] = current or matching
+                continue
+            if current and current.get("fingerprint") != fingerprint:
+                current["supersededAt"] = observed
+            if matching:
+                matching.update(
+                    companyId=company_id,
+                    assetId=asset_id,
+                    payload=payload,
+                    itemCount=item_count,
+                    lastObservedAt=observed,
+                    supersededAt=None,
+                )
+            else:
+                matching = {
+                    "id": canonical_uuid(
+                        "ci_inventory_snapshot",
+                        f"{mapping_id}:{collection_type}:{fingerprint}",
+                    ),
+                    "companyId": company_id,
+                    "assetId": asset_id,
+                    "mappingId": mapping_id,
+                    "collectionType": collection_type,
+                    "fingerprint": fingerprint,
+                    "payload": payload,
+                    "itemCount": item_count,
+                    "completeness": "unknown",
+                    "firstObservedAt": observed,
+                    "lastObservedAt": observed,
+                    "supersededAt": None,
+                }
+                stored_snapshots.append(matching)
+            current_snapshots[collection_type] = matching
+
+            history = sorted(
+                (
+                    item
+                    for item in stored_snapshots
+                    if item.get("mappingId") == mapping_id
+                    and item.get("collectionType") == collection_type
+                ),
+                key=lambda item: (
+                    item.get("supersededAt") is None,
+                    item.get("lastObservedAt") or "",
+                    item.get("id") or "",
+                ),
+                reverse=True,
+            )
+            remove_ids = {item["id"] for item in history[keep:]}
+            if remove_ids:
+                stored_snapshots[:] = [
+                    item for item in stored_snapshots if item.get("id") not in remove_ids
+                ]
+
+        if (
+            "network_interfaces" in normalized_collections
+            and "network_interfaces" not in stale_types
+        ):
+            stored_interfaces = self.state.setdefault("ciNetworkInterfaces", [])
+            active_keys = {item["interfaceKey"] for item in interfaces}
+            for stored in stored_interfaces:
+                if (
+                    stored.get("mappingId") == mapping_id
+                    and not stored.get("retiredAt")
+                    and stored.get("interfaceKey") not in active_keys
+                ):
+                    stored["retiredAt"] = observed
+            for interface in interfaces:
+                stored = next(
+                    (
+                        item
+                        for item in stored_interfaces
+                        if item.get("mappingId") == mapping_id
+                        and item.get("interfaceKey") == interface["interfaceKey"]
+                    ),
+                    None,
+                )
+                if stored:
+                    first_observed = stored.get("firstObservedAt") or observed
+                    stored.update(
+                        deepcopy(interface),
+                        companyId=company_id,
+                        assetId=asset_id,
+                        lastObservedAt=observed,
+                        retiredAt=None,
+                    )
+                    stored["firstObservedAt"] = first_observed
+                else:
+                    stored_interfaces.append(
+                        {
+                            "id": canonical_uuid(
+                                "ci_network_interface",
+                                f"{mapping_id}:{interface['interfaceKey']}",
+                            ),
+                            "companyId": company_id,
+                            "assetId": asset_id,
+                            "mappingId": mapping_id,
+                            **deepcopy(interface),
+                            "firstObservedAt": observed,
+                            "lastObservedAt": observed,
+                            "retiredAt": None,
+                        }
+                    )
+        self.save_state(self.state)
+        return {
+            "companyId": company_id,
+            "assetId": asset_id,
+            "mappingId": mapping_id,
+            "observedAt": observed,
+            "collections": {
+                key: {
+                    "fingerprint": value.get("fingerprint", ""),
+                    "itemCount": int(value.get("itemCount") or 0),
+                }
+                for key, value in current_snapshots.items()
+            },
+            "networkInterfaceCount": len(interfaces),
+            "staleCollections": stale_types,
+            "retention": keep,
+        }
+
+    def get_ci_inventory(
+        self,
+        company_id: str,
+        asset_id: str,
+        *,
+        collection_types: Iterable[str] | None = None,
+        include_history: bool = False,
+    ) -> dict:
+        """Return tenant-scoped technical inventory for one active asset."""
+
+        asset = next(
+            (
+                item
+                for item in self.state.get("assets", [])
+                if item.get("id") == asset_id
+                and item.get("companyId") == company_id
+                and not item.get("retiredAt")
+            ),
+            None,
+        )
+        if not asset:
+            raise ValueError("Configuration item is unavailable in this customer")
+        selected = (
+            {_inventory_collection_type(item) for item in collection_types}
+            if collection_types is not None
+            else None
+        )
+        snapshots = [
+            deepcopy(item)
+            for item in self.state.get("ciInventorySnapshots", [])
+            if item.get("companyId") == company_id
+            and item.get("assetId") == asset_id
+            and (include_history or not item.get("supersededAt"))
+            and (selected is None or item.get("collectionType") in selected)
+        ]
+        snapshots.sort(
+            key=lambda item: (
+                item.get("collectionType") or "",
+                item.get("lastObservedAt") or "",
+            ),
+            reverse=True,
+        )
+        grouped: dict[str, list[dict]] = {}
+        for snapshot in snapshots:
+            grouped.setdefault(snapshot["collectionType"], []).append(snapshot)
+        interfaces = [
+            deepcopy(item)
+            for item in self.state.get("ciNetworkInterfaces", [])
+            if item.get("companyId") == company_id
+            and item.get("assetId") == asset_id
+            and (include_history or not item.get("retiredAt"))
+        ]
+        interfaces.sort(key=lambda item: (item.get("name") or "", item.get("interfaceKey") or ""))
+        return {
+            "companyId": company_id,
+            "assetId": asset_id,
+            "collections": grouped,
+            "networkInterfaces": interfaces,
+        }
+
+    def _require_state_provider_relationship_context(
+        self,
+        kind: str,
+        company_id: str,
+        *,
+        policy_id: str | None,
+        expected_policy_revision: int | None,
+        expected_connection_revision: int | None,
+        provider_parent_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Fail closed when a supplied provider topology generation is obsolete."""
+
+        supplied = any(
+            value is not None
+            for value in (
+                policy_id,
+                expected_policy_revision,
+                expected_connection_revision,
+                provider_parent_id,
+            )
+        )
+        if not supplied:
+            return None
+        if (
+            not policy_id
+            or expected_policy_revision is None
+            or expected_connection_revision is None
+            or not provider_parent_id
+        ):
+            raise ValueError(
+                "Provider relationship context is stale: the expected provider generation "
+                "is incomplete. Run a new preview."
+            )
+        policy = next(
+            (
+                item
+                for item in self.state.get("integrationCiPolicies", [])
+                if item.get("id") == policy_id
+                and item.get("provider") == kind
+                and item.get("companyId") == company_id
+                and item.get("providerParentId") == provider_parent_id
+            ),
+            None,
+        )
+        integration = self.get_integration_connection(kind)
+        company_mapping = next(
+            (
+                item
+                for item in self.state.get("providerCompanyMappings", [])
+                if item.get("provider") == kind
+                and item.get("externalId") == provider_parent_id
+                and item.get("companyId") == company_id
+                and item.get("active", True)
+            ),
+            None,
+        )
+        company_observation = next(
+            (
+                item
+                for item in self.state.get("providerCompanyObservations", [])
+                if item.get("provider") == kind
+                and item.get("externalId") == provider_parent_id
+                and item.get("active", True)
+                and not item.get("deleted", False)
+            ),
+            None,
+        )
+        reason = ""
+        if not policy:
+            reason = "the CI policy is missing"
+        elif int(policy.get("revision") or 0) != int(expected_policy_revision):
+            reason = "the CI policy changed after discovery"
+        elif not integration or not integration.get("enabled", False):
+            reason = "the integration is missing or disabled"
+        elif integration.get("lifecycleStatus", "active") != "active":
+            reason = "the integration is not active"
+        elif int(integration.get("revision") or 0) != int(expected_connection_revision):
+            reason = "the integration settings changed after discovery"
+        elif not company_mapping or not company_observation:
+            reason = "the provider customer mapping changed or is inactive"
+        if reason:
+            raise ValueError(
+                f"Provider relationship context is stale: {reason}. Run a new preview."
+            )
+        return {
+            "policyId": policy_id,
+            "policyRevision": int(expected_policy_revision),
+            "connectionRevision": int(expected_connection_revision),
+            "providerParentId": provider_parent_id,
+        }
+
+    def upsert_relationship_candidates(
+        self,
+        kind: str,
+        company_id: str,
+        source_mapping_id: str,
+        candidates: list[dict[str, Any]],
+        *,
+        observed_at: str | None = None,
+        policy_id: str | None = None,
+        expected_policy_revision: int | None = None,
+        expected_connection_revision: int | None = None,
+        provider_parent_id: str | None = None,
+    ) -> list[dict]:
+        """Replace one mapping's relationship proposal set without touching relationships."""
+
+        provider_context = self._require_state_provider_relationship_context(
+            kind,
+            company_id,
+            policy_id=policy_id,
+            expected_policy_revision=expected_policy_revision,
+            expected_connection_revision=expected_connection_revision,
+            provider_parent_id=provider_parent_id,
+        )
+        mapping = next(
+            (
+                item
+                for item in self.state.get("providerCiMappings", [])
+                if item.get("id") == source_mapping_id
+                and item.get("provider") == kind
+                and item.get("companyId") == company_id
+                and item.get("active", True)
+            ),
+            None,
+        )
+        if not mapping:
+            raise ValueError("Provider mapping is unavailable for this customer")
+        if provider_context is not None and mapping.get("providerParentId") != provider_parent_id:
+            raise ValueError(
+                "Provider relationship context is stale: the source CI mapping belongs to "
+                "a different provider customer. Run a new preview."
+            )
+        observed = observed_at or utc_now()
+        if not parse_timestamp(observed):
+            raise ValueError("Relationship candidate timestamp is invalid")
+        company_assets = {
+            str(item.get("id"))
+            for item in self.state.get("assets", [])
+            if item.get("companyId") == company_id and not item.get("retiredAt")
+        }
+        stored_candidates = self.state.setdefault("ciRelationshipCandidates", [])
+        active_keys: set[str] = set()
+        for value in candidates:
+            if not isinstance(value, dict):
+                raise ValueError("Relationship candidates must be objects")
+            from_ci_id = str(value.get("fromCiId") or "") or None
+            to_ci_id = str(value.get("toCiId") or "") or None
+            from_external = deepcopy(value.get("fromExternalIdentity") or {})
+            to_external = deepcopy(value.get("toExternalIdentity") or {})
+            if not isinstance(from_external, dict) or not isinstance(to_external, dict):
+                raise ValueError("Relationship candidate identities must be objects")
+            if (from_ci_id and from_ci_id not in company_assets) or (
+                to_ci_id and to_ci_id not in company_assets
+            ):
+                raise ValueError("Relationship candidate crosses the customer boundary")
+            if not from_ci_id and not from_external:
+                raise ValueError("Relationship candidate source identity is required")
+            if not to_ci_id and not to_external:
+                raise ValueError("Relationship candidate target identity is required")
+            if from_ci_id and from_ci_id == to_ci_id:
+                raise ValueError("Relationship candidate endpoints must be different")
+            relationship_type = str(
+                value.get("relationshipType") or value.get("type") or ""
+            ).strip()
+            if not relationship_type or len(relationship_type) > 80:
+                raise ValueError("Relationship candidate type is invalid")
+            confidence = float(value.get("confidence", 0))
+            if confidence < 0 or confidence > 1:
+                raise ValueError("Relationship candidate confidence must be between 0 and 1")
+            evidence = deepcopy(value.get("evidence") or {})
+            if not isinstance(evidence, dict):
+                raise ValueError("Relationship candidate evidence must be an object")
+            if len(json.dumps(evidence, separators=(",", ":")).encode("utf-8")) > 262_144:
+                raise ValueError("Relationship candidate evidence is too large")
+            if provider_context is not None:
+                evidence["providerContext"] = deepcopy(provider_context)
+            candidate_key = _relationship_candidate_key(value)
+            active_keys.add(candidate_key)
+            stored = next(
+                (
+                    item
+                    for item in stored_candidates
+                    if item.get("sourceMappingId") == source_mapping_id
+                    and item.get("candidateKey") == candidate_key
+                ),
+                None,
+            )
+            incoming_seen = parse_timestamp(observed)
+            stored_seen = parse_timestamp(stored.get("lastSeenAt")) if stored else None
+            if stored and stored_seen and incoming_seen and incoming_seen < stored_seen:
+                continue
+            if stored:
+                evidence_changed = _relationship_candidate_evidence_changed(stored, evidence)
+                stored["revision"] = int(stored.get("revision") or 1) + 1
+                stored["observationCount"] = int(stored.get("observationCount") or 1) + 1
+                stored.update(
+                    fromCiId=from_ci_id,
+                    toCiId=to_ci_id,
+                    fromExternalIdentity=from_external,
+                    toExternalIdentity=to_external,
+                    relationshipType=relationship_type,
+                    confidence=confidence,
+                    evidence=evidence,
+                    lastSeenAt=observed,
+                    retiredAt=None,
+                )
+                if evidence_changed:
+                    stored.update(
+                        state="pending",
+                        decidedBy=None,
+                        decidedAt=None,
+                        decisionNotes="",
+                        approvedRelationshipId=None,
+                    )
+            else:
+                stored_candidates.append(
+                    {
+                        "id": canonical_uuid(
+                            "ci_relationship_candidate",
+                            f"{source_mapping_id}:{candidate_key}",
+                        ),
+                        "companyId": company_id,
+                        "sourceMappingId": source_mapping_id,
+                        "provider": kind,
+                        "candidateKey": candidate_key,
+                        "fromCiId": from_ci_id,
+                        "toCiId": to_ci_id,
+                        "fromExternalIdentity": from_external,
+                        "toExternalIdentity": to_external,
+                        "relationshipType": relationship_type,
+                        "confidence": confidence,
+                        "evidence": evidence,
+                        "state": "pending",
+                        "firstObservedAt": observed,
+                        "lastSeenAt": observed,
+                        "retiredAt": None,
+                        "decidedBy": None,
+                        "decidedAt": None,
+                        "decisionNotes": "",
+                        "approvedRelationshipId": None,
+                        "revision": 1,
+                        "observationCount": 1,
+                    }
+                )
+        incoming_seen = parse_timestamp(observed)
+        for stored in stored_candidates:
+            stored_seen = parse_timestamp(stored.get("lastSeenAt"))
+            if (
+                stored.get("sourceMappingId") == source_mapping_id
+                and not stored.get("retiredAt")
+                and stored.get("candidateKey") not in active_keys
+                and (not stored_seen or not incoming_seen or stored_seen <= incoming_seen)
+            ):
+                stored["retiredAt"] = observed
+                stored["revision"] = int(stored.get("revision") or 1) + 1
+        self.save_state(self.state)
+        return self.list_relationship_candidates(
+            company_id,
+            provider=kind,
+            include_retired=False,
+        )
+
+    def list_relationship_candidates(
+        self,
+        company_id: str,
+        *,
+        state: str | None = None,
+        asset_id: str | None = None,
+        provider: str | None = None,
+        include_retired: bool = False,
+        limit: int = 250,
+    ) -> list[dict]:
+        """Return a bounded tenant-scoped relationship proposal queue."""
+
+        if state is not None and state not in RELATIONSHIP_CANDIDATE_STATES:
+            raise ValueError("Relationship candidate state is invalid")
+        asset_names = {
+            str(item.get("id")): str(item.get("name") or "")
+            for item in self.state.get("assets", [])
+            if item.get("companyId") == company_id
+        }
+        active_mapping_ids = {
+            str(item.get("id") or "")
+            for item in self.state.get("providerCiMappings", [])
+            if item.get("companyId") == company_id and item.get("active", True)
+        }
+        records = [
+            {
+                **deepcopy(item),
+                "fromName": asset_names.get(str(item.get("fromCiId") or ""), ""),
+                "toName": asset_names.get(str(item.get("toCiId") or ""), ""),
+            }
+            for item in self.state.get("ciRelationshipCandidates", [])
+            if item.get("companyId") == company_id
+            and str(item.get("sourceMappingId") or "") in active_mapping_ids
+            and (state is None or item.get("state") == state)
+            and (
+                asset_id is None
+                or item.get("fromCiId") == asset_id
+                or item.get("toCiId") == asset_id
+            )
+            and (provider is None or item.get("provider") == provider)
+            and (include_retired or not item.get("retiredAt"))
+        ]
+        records.sort(
+            key=lambda item: (
+                item.get("lastSeenAt") or "",
+                item.get("id") or "",
+            ),
+            reverse=True,
+        )
+        return records[: max(1, min(int(limit), 1_000))]
+
+    def decide_relationship_candidate(
+        self,
+        company_id: str,
+        candidate_id: str,
+        state: str,
+        actor_id: str | None = None,
+        notes: str = "",
+        approved_relationship_id: str | None = None,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict:
+        """Record a candidate decision without materializing a CI relationship."""
+
+        if state not in RELATIONSHIP_CANDIDATE_STATES:
+            raise ValueError("Relationship candidate state is invalid")
+        candidate = next(
+            (
+                item
+                for item in self.state.get("ciRelationshipCandidates", [])
+                if item.get("id") == candidate_id and item.get("companyId") == company_id
+            ),
+            None,
+        )
+        if not candidate:
+            raise ValueError("Relationship candidate not found")
+        current_revision = int(candidate.get("revision") or 1)
+        if expected_revision is not None and int(expected_revision) != current_revision:
+            raise ValueError("Relationship candidate changed; refresh it before deciding")
+        mapping_active = any(
+            item.get("id") == candidate.get("sourceMappingId")
+            and item.get("companyId") == company_id
+            and item.get("active", True)
+            for item in self.state.get("providerCiMappings", [])
+        )
+        if state == "approved" and not mapping_active:
+            raise ValueError("Restore the provider mapping before approving this suggestion")
+        if state == "approved" and (not candidate.get("fromCiId") or not candidate.get("toCiId")):
+            raise ValueError("Resolve both candidate endpoints before approval")
+        if approved_relationship_id:
+            relationship = next(
+                (
+                    item
+                    for item in self.state.get("relationships", [])
+                    if item.get("id") == approved_relationship_id
+                    and item.get("companyId", company_id) == company_id
+                    and item.get("fromId") == candidate.get("fromCiId")
+                    and item.get("toId") == candidate.get("toCiId")
+                    and item.get("type") == candidate.get("relationshipType")
+                ),
+                None,
+            )
+            if state != "approved" or not relationship:
+                raise ValueError("Approved relationship does not match this candidate")
+        before = deepcopy(candidate)
+        linked_relationship_id = (
+            approved_relationship_id or candidate.get("approvedRelationshipId")
+            if state == "approved"
+            else None
+        )
+        candidate.update(
+            state=state,
+            decidedBy=actor_id if state != "pending" else None,
+            decidedAt=utc_now() if state != "pending" else None,
+            decisionNotes=str(notes or "")[:2000] if state != "pending" else "",
+            approvedRelationshipId=linked_relationship_id,
+            revision=current_revision + 1,
+        )
+        self._audit(
+            company_id,
+            actor_id,
+            "relationship_candidate",
+            candidate_id,
+            "reopened" if state == "pending" else state,
+            before,
+            candidate,
+            metadata={
+                "sourceMappingId": candidate.get("sourceMappingId"),
+                "relationshipType": candidate.get("relationshipType"),
+            },
+        )
+        self.save_state(self.state)
+        return deepcopy(candidate)
+
+    def approve_relationship_candidate(
+        self,
+        company_id: str,
+        candidate_id: str,
+        actor_id: str | None = None,
+        notes: str = "",
+        *,
+        expected_revision: int | None = None,
+        policy_id: str | None = None,
+        expected_policy_revision: int | None = None,
+        expected_connection_revision: int | None = None,
+        provider_parent_id: str | None = None,
+    ) -> tuple[dict, dict]:
+        """Atomically materialize or reuse an edge and approve its candidate."""
+
+        candidate = next(
+            (
+                item
+                for item in self.state.get("ciRelationshipCandidates", [])
+                if item.get("id") == candidate_id and item.get("companyId") == company_id
+            ),
+            None,
+        )
+        if not candidate:
+            raise ValueError("Relationship candidate not found")
+        current_revision = int(candidate.get("revision") or 1)
+        if expected_revision is not None and int(expected_revision) != current_revision:
+            raise ValueError("Relationship candidate changed; refresh it before deciding")
+        stored_context = _required_relationship_provider_context(candidate.get("evidence"))
+        supplied_context = _supplied_relationship_provider_context(
+            policy_id=policy_id,
+            expected_policy_revision=expected_policy_revision,
+            expected_connection_revision=expected_connection_revision,
+            provider_parent_id=provider_parent_id,
+        )
+        if supplied_context is not None and stored_context != supplied_context:
+            raise ValueError(
+                "Provider relationship context is stale: the candidate belongs to a "
+                "different provider generation. Run a new preview."
+            )
+        validated_context = self._require_state_provider_relationship_context(
+            str(candidate.get("provider") or ""),
+            company_id,
+            policy_id=str(stored_context["policyId"]),
+            expected_policy_revision=int(stored_context["policyRevision"]),
+            expected_connection_revision=int(stored_context["connectionRevision"]),
+            provider_parent_id=str(stored_context["providerParentId"]),
+        )
+        if validated_context != stored_context:
+            raise ValueError(
+                "Provider relationship context is stale: the candidate belongs to a "
+                "different provider generation. Run a new preview."
+            )
+        if not any(
+            item.get("id") == candidate.get("sourceMappingId")
+            and item.get("provider") == candidate.get("provider")
+            and item.get("companyId") == company_id
+            and item.get("providerParentId") == stored_context["providerParentId"]
+            and item.get("active", True)
+            for item in self.state.get("providerCiMappings", [])
+        ):
+            raise ValueError(
+                "Provider relationship context is stale: restore or refresh the source "
+                "provider mapping before approving this suggestion."
+            )
+        if candidate.get("retiredAt"):
+            raise ValueError("Refresh provider evidence before approving this suggestion")
+        from_ci_id = str(candidate.get("fromCiId") or "")
+        to_ci_id = str(candidate.get("toCiId") or "")
+        if not from_ci_id or not to_ci_id:
+            raise ValueError("Resolve both candidate endpoints before approval")
+        company_assets = {
+            str(item.get("id")): item
+            for item in self.state.get("assets", [])
+            if item.get("companyId") == company_id and not item.get("retiredAt")
+        }
+        if from_ci_id not in company_assets or to_ci_id not in company_assets:
+            raise ValueError("Both candidate endpoints must remain in this customer")
+        relationship_type = str(candidate.get("relationshipType") or "")
+        if relationship_type not in CANONICAL_RELATIONSHIP_TYPES:
+            raise ValueError("The provider proposed an unsupported relationship type")
+        raw_evidence = candidate.get("evidence")
+        evidence = deepcopy(raw_evidence) if isinstance(raw_evidence, dict) else {}
+        impact_policy = str(evidence.get("impactPolicy") or "required")
+        if impact_policy not in RELATIONSHIP_IMPACT_POLICIES:
+            impact_policy = "required"
+        all_relationships = self.state.setdefault("relationships", [])
+        relationships = all_relationships
+        relationship = _matching_relationship(
+            relationships,
+            from_ci_id,
+            to_ci_id,
+            relationship_type,
+        )
+        if (
+            not relationship
+            and relationship_type == "depends_on"
+            and _dependency_cycle(relationships, from_ci_id, to_ci_id)
+        ):
+            raise ValueError("That provider suggestion would create a dependency cycle")
+        state_before = deepcopy(self.state)
+        if not relationship:
+            relationship = {
+                "id": str(uuid.uuid4()),
+                "fromId": from_ci_id,
+                "toId": to_ci_id,
+                "type": relationship_type,
+                "impactPolicy": impact_policy,
+                "sourceMappingId": candidate.get("sourceMappingId") or None,
+                "confidence": float(candidate.get("confidence") or 0),
+                "evidence": {
+                    **evidence,
+                    "candidateId": candidate_id,
+                    "provider": candidate.get("provider"),
+                },
+                "provenance": "provider",
+            }
+            all_relationships.append(relationship)
+            self._audit(
+                company_id,
+                actor_id,
+                "relationship",
+                relationship["id"],
+                "created",
+                None,
+                relationship,
+            )
+        else:
+            relationship.setdefault("impactPolicy", "required")
+            relationship.setdefault("sourceMappingId", None)
+            relationship.setdefault("confidence", 1.0)
+            relationship.setdefault("evidence", {})
+            relationship.setdefault("provenance", "manual")
+        before = deepcopy(candidate)
+        candidate.update(
+            state="approved",
+            decidedBy=actor_id,
+            decidedAt=utc_now(),
+            decisionNotes=str(notes or "")[:2000],
+            approvedRelationshipId=relationship["id"],
+            revision=current_revision + 1,
+        )
+        self._audit(
+            company_id,
+            actor_id,
+            "relationship_candidate",
+            candidate_id,
+            "approved",
+            before,
+            candidate,
+            metadata={
+                "sourceMappingId": candidate.get("sourceMappingId"),
+                "relationshipType": relationship_type,
+            },
+        )
+        try:
+            self.save_state(self.state)
+        except Exception:
+            self.state.clear()
+            self.state.update(state_before)
+            raise
+        return deepcopy(candidate), deepcopy(relationship)
 
     def _retain_sync_runs(self) -> None:
         """Bound local history without ever discarding active preview work."""
@@ -5514,6 +8500,8 @@ class StateRepository:
         review_items: list[dict],
         preview_summary: dict,
         actor_id: str | None = None,
+        *,
+        presence_snapshot: dict[str, Any] | None = None,
     ) -> dict | None:
         """Publish review observations and complete their owned run as one state change."""
 
@@ -5595,6 +8583,12 @@ class StateRepository:
                 self.save_state(self.state)
                 return _public_sync_run(run)
 
+            if presence_snapshot is not None:
+                attributes = run.get("attributes") or {}
+                attributes["connectionRevision"] = int(
+                    _normalized_ci_presence_snapshot(presence_snapshot)["connectionRevision"]
+                )
+                run["attributes"] = attributes
             queue_summary = self._replace_ci_review_items_in_state(
                 policy_id,
                 company_id,
@@ -5602,6 +8596,15 @@ class StateRepository:
                 review_items,
                 actor_id,
             )
+            if presence_snapshot is not None:
+                attributes = run.get("attributes") or {}
+                self._apply_state_ci_presence_snapshot(
+                    str(run.get("type") or ""),
+                    policy,
+                    run_id,
+                    presence_snapshot,
+                    int(attributes.get("policyRevision") or 0),
+                )
             aggregate = deepcopy(preview_summary)
             aggregate["queueSummary"] = queue_summary
             summary = _sanitized_preview_summary(aggregate)
@@ -5957,7 +8960,6 @@ class StateRepository:
                 status="Healthy"
                 if stored.get("status") == "success"
                 else stored.get("status", "unknown"),
-                enabled=configured,
             )
             self._audit(
                 integration.get("companyId"),
@@ -6490,6 +9492,7 @@ class StateRepository:
         self.state.setdefault("passwordResets", [])
         self.state.setdefault("providerCompanyObservations", [])
         self.state.setdefault("providerCompanyMappings", [])
+        self.state.setdefault("integrationCiPresence", [])
         self.state["apiTokens"] = []
         self.save_state(self.state)
         return {
@@ -9964,7 +12967,8 @@ class PostgresCmdbRepository(StateRepository):
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, from_ci_id, to_ci_id, relationship_type, impact_policy
+                SELECT id, from_ci_id, to_ci_id, relationship_type, impact_policy,
+                       source_mapping_id, confidence, evidence, provenance
                 FROM ci_relationships
                 WHERE retired_at IS NULL
                 ORDER BY created_at, id
@@ -9972,49 +12976,150 @@ class PostgresCmdbRepository(StateRepository):
             )
             return [
                 {
-                    "id": str(item_id),
-                    "fromId": str(from_id),
-                    "toId": str(to_id),
-                    "type": relationship_type,
-                    "impactPolicy": impact_policy,
+                    "id": str(row[0]),
+                    "fromId": str(row[1]),
+                    "toId": str(row[2]),
+                    "type": row[3],
+                    "impactPolicy": row[4],
+                    "sourceMappingId": str(row[5]) if row[5] else None,
+                    "confidence": float(row[6]),
+                    "evidence": row[7] or {},
+                    "provenance": row[8],
                 }
-                for item_id, from_id, to_id, relationship_type, impact_policy in cursor.fetchall()
+                for row in cursor.fetchall()
             ]
 
     def create_relationship(
         self, relationship: dict, company_id: str, actor_id: str | None = None
     ) -> dict:
         relationship_uuid = canonical_uuid("relationship", relationship["id"])
+        evidence = deepcopy(relationship.get("evidence") or {})
+        if not isinstance(evidence, dict):
+            raise ValueError("Relationship evidence must be an object")
+        if len(json.dumps(evidence, separators=(",", ":")).encode("utf-8")) > 262_144:
+            raise ValueError("Relationship evidence is too large")
+        confidence = float(relationship.get("confidence", 1))
+        if confidence < 0 or confidence > 1:
+            raise ValueError("Relationship confidence must be between 0 and 1")
+        source_mapping_id = relationship.get("sourceMappingId") or None
+        provenance = str(
+            relationship.get("provenance") or ("provider" if source_mapping_id else "manual")
+        )
+        if provenance not in {"manual", "provider"}:
+            raise ValueError("Relationship provenance is invalid")
+        try:
+            from_ci_id = str(uuid.UUID(str(relationship["fromId"])))
+            to_ci_id = str(uuid.UUID(str(relationship["toId"])))
+            mapping_uuid = str(uuid.UUID(str(source_mapping_id))) if source_mapping_id else None
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("Relationship identity is invalid") from error
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT id FROM companies WHERE slug = %s", (company_id,))
             company_row = cursor.fetchone()
             if not company_row:
                 raise ValueError("Customer not found")
+            company_uuid = str(company_row[0])
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"ci_relationships:{company_uuid}",),
+            )
             cursor.execute(
                 """
-                INSERT INTO ci_relationships (id, company_id, from_ci_id, to_ci_id, relationship_type, impact_policy)
-                VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, %s)
+                SELECT count(*)
+                FROM configuration_items
+                WHERE company_id = %s::uuid
+                  AND id = ANY(%s::uuid[])
+                  AND retired_at IS NULL
+                """,
+                (company_uuid, [from_ci_id, to_ci_id]),
+            )
+            if int(cursor.fetchone()[0]) != 2:
+                raise ValueError("Relationship crosses the customer boundary")
+            if mapping_uuid:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM external_object_mappings mapping
+                    JOIN configuration_items source_ci
+                      ON source_ci.id = mapping.canonical_entity_id
+                     AND mapping.canonical_entity_type = 'configuration_item'
+                    WHERE mapping.id = %s::uuid
+                      AND source_ci.company_id = %s::uuid
+                      AND mapping.active = true
+                    """,
+                    (mapping_uuid, company_uuid),
+                )
+                if not cursor.fetchone():
+                    raise ValueError("Relationship source mapping is unavailable")
+            cursor.execute(
+                """
+                INSERT INTO ci_relationships (
+                    id, company_id, from_ci_id, to_ci_id, relationship_type,
+                    impact_policy, source_mapping_id, confidence, evidence,
+                    provenance
+                )
+                VALUES (
+                    %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, %s,
+                    %s::uuid, %s, %s::jsonb, %s
+                )
                 ON CONFLICT (from_ci_id, to_ci_id, relationship_type) DO UPDATE SET
                     company_id = EXCLUDED.company_id,
-                    impact_policy = EXCLUDED.impact_policy,
+                    impact_policy = CASE
+                        WHEN EXCLUDED.provenance = 'manual'
+                            OR ci_relationships.provenance <> 'manual'
+                        THEN EXCLUDED.impact_policy
+                        ELSE ci_relationships.impact_policy
+                    END,
+                    source_mapping_id = CASE
+                        WHEN EXCLUDED.provenance = 'manual' THEN NULL
+                        WHEN ci_relationships.provenance = 'manual'
+                            THEN ci_relationships.source_mapping_id
+                        ELSE EXCLUDED.source_mapping_id
+                    END,
+                    confidence = CASE
+                        WHEN EXCLUDED.provenance = 'manual'
+                            OR ci_relationships.provenance <> 'manual'
+                        THEN EXCLUDED.confidence
+                        ELSE ci_relationships.confidence
+                    END,
+                    evidence = CASE
+                        WHEN EXCLUDED.provenance = 'manual'
+                            OR ci_relationships.provenance <> 'manual'
+                        THEN EXCLUDED.evidence
+                        ELSE ci_relationships.evidence
+                    END,
+                    provenance = CASE
+                        WHEN EXCLUDED.provenance = 'manual' THEN 'manual'
+                        ELSE ci_relationships.provenance
+                    END,
                     retired_at = NULL
-                RETURNING id
+                RETURNING id, source_mapping_id, confidence, evidence,
+                          provenance, impact_policy
                 """,
                 (
                     relationship_uuid,
-                    str(company_row[0]),
-                    relationship["fromId"],
-                    relationship["toId"],
+                    company_uuid,
+                    from_ci_id,
+                    to_ci_id,
                     relationship["type"],
                     relationship.get("impactPolicy", "required"),
+                    mapping_uuid,
+                    confidence,
+                    json.dumps(evidence),
+                    provenance,
                 ),
             )
-            stored_id = str(cursor.fetchone()[0])
+            row = cursor.fetchone()
+            stored_id = str(row[0])
             reactivated = stored_id != relationship_uuid
             stored = {
                 **relationship,
                 "id": stored_id,
-                "impactPolicy": relationship.get("impactPolicy", "required"),
+                "sourceMappingId": str(row[1]) if row[1] else None,
+                "confidence": float(row[2]),
+                "evidence": row[3] or {},
+                "provenance": row[4],
+                "impactPolicy": row[5],
             }
             self._insert_audit(
                 cursor,
@@ -10508,6 +13613,619 @@ class PostgresCmdbRepository(StateRepository):
             "lifecycleChangedBy": str(row[17]) if row[17] else None,
         }
 
+    @staticmethod
+    def _integration_capability_snapshot_from_row(row: tuple) -> dict:
+        """Return one public, credential-free provider capability cache entry."""
+
+        return {
+            "id": str(row[0]),
+            "provider": PROVIDER_FROM_DB.get(row[1], row[1]),
+            "capabilityKey": row[2],
+            "status": row[3],
+            "summary": row[4] or {},
+            "schemaFingerprint": row[5],
+            "errorCategory": row[6] or "",
+            "checkedAt": PostgresCmdbRepository._timestamp(row[7]),
+            "expiresAt": PostgresCmdbRepository._timestamp(row[8]),
+            "stale": bool(row[9]),
+        }
+
+    def upsert_integration_capability_snapshot(
+        self,
+        kind: str,
+        capability_key: str,
+        snapshot: dict,
+        *,
+        ttl_seconds: int = 900,
+    ) -> dict:
+        """Cache one bounded provider capability result without raw API envelopes."""
+
+        if not isinstance(snapshot, dict):
+            raise ValueError("Integration capability snapshot must be an object")
+        key = str(capability_key or "").strip().casefold()
+        if not INTEGRATION_CACHE_KEY.fullmatch(key):
+            raise ValueError("Integration capability key is invalid")
+        status = str(snapshot.get("status") or "").strip().casefold()
+        if status not in INTEGRATION_CAPABILITY_STATUSES:
+            raise ValueError("Integration capability status is invalid")
+        summary, summary_fingerprint = _bounded_integration_cache_summary(
+            snapshot.get("summary") or {},
+            maximum_bytes=INTEGRATION_CAPABILITY_CACHE_MAX_BYTES,
+        )
+        schema_fingerprint = (
+            str(snapshot.get("schemaFingerprint") or summary_fingerprint).strip().casefold()
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", schema_fingerprint):
+            raise ValueError("Integration capability schema fingerprint is invalid")
+        error_category = str(snapshot.get("errorCategory") or "").strip()[:80]
+        ttl = _bounded_integration_cache_ttl(ttl_seconds)
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO integration_capability_snapshots (
+                    integration_connection_id, capability_key, status, summary,
+                    schema_fingerprint, error_category, checked_at, expires_at,
+                    created_at, updated_at
+                )
+                SELECT integration.id, %s, %s, %s::jsonb, %s, %s,
+                       now(), now() + make_interval(secs => %s), now(), now()
+                FROM integration_connections integration
+                WHERE integration.provider = %s
+                  AND integration.company_id IS NULL
+                ORDER BY integration.created_at
+                LIMIT 1
+                ON CONFLICT (integration_connection_id, capability_key)
+                DO UPDATE SET status = EXCLUDED.status,
+                    summary = EXCLUDED.summary,
+                    schema_fingerprint = EXCLUDED.schema_fingerprint,
+                    error_category = EXCLUDED.error_category,
+                    checked_at = EXCLUDED.checked_at,
+                    expires_at = EXCLUDED.expires_at,
+                    updated_at = now()
+                RETURNING id
+                """,
+                (
+                    key,
+                    status,
+                    json.dumps(summary),
+                    schema_fingerprint,
+                    error_category or None,
+                    ttl,
+                    provider,
+                ),
+            )
+            row = cursor.fetchone()
+        if not row:
+            raise ValueError("Integration connection not found")
+        stored = self.get_integration_capability_snapshot(kind, key, include_expired=True)
+        if not stored:
+            raise ValueError("Integration capability snapshot could not be loaded")
+        return stored
+
+    def get_integration_capability_snapshot(
+        self,
+        kind: str,
+        capability_key: str,
+        *,
+        include_expired: bool = False,
+    ) -> dict | None:
+        """Return one unexpired capability result for a root provider connection."""
+
+        key = str(capability_key or "").strip().casefold()
+        if not INTEGRATION_CACHE_KEY.fullmatch(key):
+            raise ValueError("Integration capability key is invalid")
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT snapshot.id, integration.provider, snapshot.capability_key,
+                       snapshot.status, snapshot.summary, snapshot.schema_fingerprint,
+                       snapshot.error_category, snapshot.checked_at, snapshot.expires_at,
+                       snapshot.expires_at <= now()
+                FROM integration_capability_snapshots snapshot
+                JOIN integration_connections integration
+                  ON integration.id = snapshot.integration_connection_id
+                WHERE integration.provider = %s
+                  AND integration.company_id IS NULL
+                  AND snapshot.capability_key = %s
+                  AND (%s OR snapshot.expires_at > now())
+                ORDER BY integration.created_at
+                LIMIT 1
+                """,
+                (provider, key, include_expired),
+            )
+            row = cursor.fetchone()
+        return self._integration_capability_snapshot_from_row(row) if row else None
+
+    def list_integration_capability_snapshots(
+        self,
+        kind: str,
+        *,
+        include_expired: bool = False,
+    ) -> list[dict]:
+        """Return bounded capability state for one root provider connection."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT snapshot.id, integration.provider, snapshot.capability_key,
+                       snapshot.status, snapshot.summary, snapshot.schema_fingerprint,
+                       snapshot.error_category, snapshot.checked_at, snapshot.expires_at,
+                       snapshot.expires_at <= now()
+                FROM integration_capability_snapshots snapshot
+                JOIN integration_connections integration
+                  ON integration.id = snapshot.integration_connection_id
+                WHERE integration.provider = %s
+                  AND integration.company_id IS NULL
+                  AND (%s OR snapshot.expires_at > now())
+                ORDER BY snapshot.capability_key
+                """,
+                (provider, include_expired),
+            )
+            rows = cursor.fetchall()
+        return [self._integration_capability_snapshot_from_row(row) for row in rows]
+
+    @staticmethod
+    def _integration_enrichment_preview_from_row(row: tuple) -> dict:
+        """Return one public tenant-scoped enrichment preview cache entry."""
+
+        return {
+            "id": str(row[0]),
+            "provider": PROVIDER_FROM_DB.get(row[1], row[1]),
+            "companyId": row[2],
+            "providerParentId": row[3],
+            "sourceNamespace": row[4],
+            "sourceServerId": row[5],
+            "sourceDeviceId": row[6],
+            "policyId": str(row[7]) if row[7] else None,
+            "syncRunId": str(row[8]) if row[8] else None,
+            "assetId": str(row[9]) if row[9] else None,
+            "sourceMappingId": str(row[10]) if row[10] else None,
+            "status": row[11],
+            "summary": row[12] or {},
+            "sourceFingerprint": row[13],
+            "observedAt": PostgresCmdbRepository._timestamp(row[14]),
+            "expiresAt": PostgresCmdbRepository._timestamp(row[15]),
+            "stale": bool(row[16]),
+        }
+
+    @staticmethod
+    def _integration_enrichment_preview_select() -> str:
+        """Return the fixed projection shared by cache lookups."""
+
+        return """
+            SELECT preview.id, integration.provider, company.slug,
+                   preview.provider_parent_id, preview.source_namespace,
+                   preview.source_server_id, preview.source_device_id,
+                   preview.policy_id, preview.sync_run_id, preview.canonical_ci_id,
+                   preview.source_mapping_id, preview.status, preview.summary,
+                   preview.source_fingerprint, preview.observed_at, preview.expires_at,
+                   preview.expires_at <= now()
+            FROM integration_enrichment_previews preview
+            JOIN integration_connections integration
+              ON integration.id = preview.integration_connection_id
+            JOIN companies company ON company.id = preview.company_id
+        """
+
+    @contextmanager
+    def integration_enrichment_scope_lock(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        source_server_id: str,
+    ) -> Iterator[None]:
+        """Serialize one cache publication scope across PostgreSQL application replicas."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        parent_id = _integration_cache_identifier(provider_parent_id, "Provider parent ID")
+        server_id = _integration_cache_identifier(source_server_id, "Source server ID")
+        scope_key = ":".join((provider, company_id, parent_id, server_id))
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (scope_key,),
+            )
+            yield
+
+    def upsert_integration_enrichment_preview(
+        self,
+        kind: str,
+        company_id: str,
+        preview: dict,
+        *,
+        ttl_seconds: int = 900,
+    ) -> dict:
+        """Cache one normalized GraphQL enrichment under collision-safe identity."""
+
+        if not isinstance(preview, dict):
+            raise ValueError("Integration enrichment preview must be an object")
+        namespace = str(preview.get("sourceNamespace") or "").strip().casefold()
+        if not INTEGRATION_SOURCE_NAMESPACE.fullmatch(namespace):
+            raise ValueError("Integration source namespace is invalid")
+        source_server_id = _integration_cache_identifier(
+            preview.get("sourceServerId"), "Source server ID"
+        )
+        source_device_id = _integration_cache_identifier(
+            preview.get("sourceDeviceId"), "Source device ID"
+        )
+        provider_parent_id = _integration_cache_identifier(
+            preview.get("providerParentId"), "Provider parent ID"
+        )
+        status = str(preview.get("status") or "").strip().casefold()
+        if status not in INTEGRATION_ENRICHMENT_STATUSES:
+            raise ValueError("Integration enrichment status is invalid")
+        summary, summary_fingerprint = _bounded_integration_cache_summary(
+            preview.get("summary") or {},
+            maximum_bytes=INTEGRATION_ENRICHMENT_CACHE_MAX_BYTES,
+        )
+        source_fingerprint = (
+            str(preview.get("sourceFingerprint") or summary_fingerprint).strip().casefold()
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", source_fingerprint):
+            raise ValueError("Integration enrichment source fingerprint is invalid")
+        policy_id = _integration_cache_optional_uuid(preview.get("policyId"), "Policy ID")
+        sync_run_id = _integration_cache_optional_uuid(preview.get("syncRunId"), "Sync run ID")
+        asset_id = _integration_cache_optional_uuid(
+            preview.get("assetId") or preview.get("canonicalCiId"),
+            "Configuration item ID",
+        )
+        source_mapping_id = _integration_cache_optional_uuid(
+            preview.get("sourceMappingId"), "Source mapping ID"
+        )
+        ttl = _bounded_integration_cache_ttl(ttl_seconds)
+        provider = PROVIDER_TO_DB.get(kind, kind)
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT integration.id, company.id
+                FROM integration_connections integration
+                CROSS JOIN companies company
+                WHERE integration.provider = %s
+                  AND integration.company_id IS NULL
+                  AND company.slug = %s
+                  AND company.status <> 'inactive'
+                ORDER BY integration.created_at
+                LIMIT 1
+                """,
+                (provider, company_id),
+            )
+            scope = cursor.fetchone()
+            if not scope:
+                raise ValueError("Integration connection or customer not found")
+            connection_uuid, company_uuid = scope
+            if policy_id:
+                cursor.execute(
+                    """
+                    SELECT 1 FROM integration_ci_policies
+                    WHERE id = %s::uuid
+                      AND integration_connection_id = %s::uuid
+                      AND company_id = %s::uuid
+                    """,
+                    (policy_id, connection_uuid, company_uuid),
+                )
+                if not cursor.fetchone():
+                    raise ValueError("Integration policy is unavailable for this customer")
+            if sync_run_id:
+                cursor.execute(
+                    """
+                    SELECT 1 FROM sync_runs
+                    WHERE id = %s::uuid
+                      AND integration_connection_id = %s::uuid
+                      AND (company_id IS NULL OR company_id = %s::uuid)
+                    """,
+                    (sync_run_id, connection_uuid, company_uuid),
+                )
+                if not cursor.fetchone():
+                    raise ValueError("Sync run is unavailable for this customer")
+            if asset_id:
+                cursor.execute(
+                    """
+                    SELECT 1 FROM configuration_items
+                    WHERE id = %s::uuid AND company_id = %s::uuid
+                      AND retired_at IS NULL
+                    """,
+                    (asset_id, company_uuid),
+                )
+                if not cursor.fetchone():
+                    raise ValueError("Configuration item is unavailable for this customer")
+            if source_mapping_id:
+                cursor.execute(
+                    """
+                    SELECT mapping.canonical_entity_id
+                    FROM external_object_mappings mapping
+                    JOIN configuration_items ci
+                      ON ci.id = mapping.canonical_entity_id
+                     AND mapping.canonical_entity_type = 'configuration_item'
+                    WHERE mapping.id = %s::uuid
+                      AND mapping.integration_connection_id = %s::uuid
+                      AND mapping.active = true
+                      AND ci.company_id = %s::uuid
+                      AND ci.retired_at IS NULL
+                    """,
+                    (source_mapping_id, connection_uuid, company_uuid),
+                )
+                mapping = cursor.fetchone()
+                if not mapping or (asset_id and str(mapping[0]) != asset_id):
+                    raise ValueError("Source mapping is unavailable for this customer asset")
+
+            cursor.execute(
+                """
+                INSERT INTO integration_enrichment_previews (
+                    integration_connection_id, company_id, policy_id, sync_run_id,
+                    source_namespace, source_server_id, source_device_id,
+                    provider_parent_id, canonical_ci_id, source_mapping_id, status,
+                    summary, source_fingerprint, observed_at, expires_at,
+                    created_at, updated_at
+                ) VALUES (
+                    %s::uuid, %s::uuid, %s::uuid, %s::uuid,
+                    %s, %s, %s, %s, %s::uuid, %s::uuid, %s,
+                    %s::jsonb, %s, now(), now() + make_interval(secs => %s),
+                    now(), now()
+                )
+                ON CONFLICT (
+                    integration_connection_id, company_id, source_namespace,
+                    source_server_id, source_device_id
+                ) DO UPDATE SET policy_id = EXCLUDED.policy_id,
+                    sync_run_id = EXCLUDED.sync_run_id,
+                    provider_parent_id = EXCLUDED.provider_parent_id,
+                    canonical_ci_id = EXCLUDED.canonical_ci_id,
+                    source_mapping_id = EXCLUDED.source_mapping_id,
+                    status = EXCLUDED.status,
+                    summary = EXCLUDED.summary,
+                    source_fingerprint = EXCLUDED.source_fingerprint,
+                    observed_at = EXCLUDED.observed_at,
+                    expires_at = EXCLUDED.expires_at,
+                    updated_at = now()
+                RETURNING id
+                """,
+                (
+                    connection_uuid,
+                    company_uuid,
+                    policy_id,
+                    sync_run_id,
+                    namespace,
+                    source_server_id,
+                    source_device_id,
+                    provider_parent_id,
+                    asset_id,
+                    source_mapping_id,
+                    status,
+                    json.dumps(summary),
+                    source_fingerprint,
+                    ttl,
+                ),
+            )
+            stored_id = str(cursor.fetchone()[0])
+
+        stored = self.get_integration_enrichment_preview(
+            kind,
+            company_id,
+            namespace,
+            source_server_id,
+            source_device_id,
+            include_expired=True,
+        )
+        if not stored or stored["id"] != stored_id:
+            raise ValueError("Integration enrichment preview could not be loaded")
+        return stored
+
+    def get_integration_enrichment_preview(
+        self,
+        kind: str,
+        company_id: str,
+        source_namespace: str,
+        source_server_id: str,
+        source_device_id: str,
+        *,
+        include_expired: bool = False,
+    ) -> dict | None:
+        """Return one cached enrichment constrained to a provider customer."""
+
+        namespace = str(source_namespace or "").strip().casefold()
+        if not INTEGRATION_SOURCE_NAMESPACE.fullmatch(namespace):
+            raise ValueError("Integration source namespace is invalid")
+        server_id = _integration_cache_identifier(source_server_id, "Source server ID")
+        device_id = _integration_cache_identifier(source_device_id, "Source device ID")
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                self._integration_enrichment_preview_select()
+                + """
+                WHERE integration.provider = %s
+                  AND integration.company_id IS NULL
+                  AND company.slug = %s
+                  AND preview.source_namespace = %s
+                  AND preview.source_server_id = %s
+                  AND preview.source_device_id = %s
+                  AND (%s OR preview.expires_at > now())
+                ORDER BY integration.created_at
+                LIMIT 1
+                """,
+                (provider, company_id, namespace, server_id, device_id, include_expired),
+            )
+            row = cursor.fetchone()
+        return self._integration_enrichment_preview_from_row(row) if row else None
+
+    def list_integration_enrichment_previews(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str | None = None,
+        *,
+        source_server_id: str | None = None,
+        include_expired: bool = False,
+        limit: int = 100,
+    ) -> list[dict]:
+        """List a bounded customer cache without crossing integration identities."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        parent_id = (
+            _integration_cache_identifier(provider_parent_id, "Provider parent ID")
+            if provider_parent_id is not None
+            else None
+        )
+        server_id = (
+            _integration_cache_identifier(source_server_id, "Source server ID")
+            if source_server_id is not None
+            else None
+        )
+        bounded_limit = max(1, min(int(limit), 25_000))
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                self._integration_enrichment_preview_select()
+                + """
+                WHERE integration.provider = %s
+                  AND integration.company_id IS NULL
+                  AND company.slug = %s
+                  AND (%s::text IS NULL OR preview.provider_parent_id = %s)
+                  AND (%s::text IS NULL OR preview.source_server_id = %s)
+                  AND (%s OR preview.expires_at > now())
+                ORDER BY preview.observed_at DESC, preview.id
+                LIMIT %s
+                """,
+                (
+                    provider,
+                    company_id,
+                    parent_id,
+                    parent_id,
+                    server_id,
+                    server_id,
+                    include_expired,
+                    bounded_limit,
+                ),
+            )
+            rows = cursor.fetchall()
+        return [self._integration_enrichment_preview_from_row(row) for row in rows]
+
+    def replace_integration_enrichment_generation(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        source_server_id: str,
+        generation_id: str | None,
+    ) -> int:
+        """Remove superseded rows after a complete tenant-scoped cache refresh."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        parent_id = _integration_cache_identifier(provider_parent_id, "Provider parent ID")
+        server_id = _integration_cache_identifier(source_server_id, "Source server ID")
+        retained_generation = str(generation_id or "") or None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM integration_enrichment_previews preview
+                USING integration_connections integration, companies company
+                WHERE preview.integration_connection_id = integration.id
+                  AND preview.company_id = company.id
+                  AND integration.provider = %s
+                  AND integration.company_id IS NULL
+                  AND company.slug = %s
+                  AND preview.provider_parent_id = %s
+                  AND preview.source_server_id = %s
+                  AND (
+                    %s::text IS NULL
+                    OR COALESCE(preview.summary->>'cacheGenerationId', '') <> %s
+                  )
+                """,
+                (
+                    provider,
+                    company_id,
+                    parent_id,
+                    server_id,
+                    retained_generation,
+                    retained_generation,
+                ),
+            )
+            return int(cursor.rowcount or 0)
+
+    def delete_integration_enrichment_generation(
+        self,
+        kind: str,
+        company_id: str,
+        provider_parent_id: str,
+        source_server_id: str,
+        generation_id: str,
+    ) -> int:
+        """Delete one unpublished tenant-scoped cache generation."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        parent_id = _integration_cache_identifier(provider_parent_id, "Provider parent ID")
+        server_id = _integration_cache_identifier(source_server_id, "Source server ID")
+        selected_generation = _integration_cache_identifier(generation_id, "Cache generation ID")
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM integration_enrichment_previews preview
+                USING integration_connections integration, companies company
+                WHERE preview.integration_connection_id = integration.id
+                  AND preview.company_id = company.id
+                  AND integration.provider = %s
+                  AND integration.company_id IS NULL
+                  AND company.slug = %s
+                  AND preview.provider_parent_id = %s
+                  AND preview.source_server_id = %s
+                  AND preview.summary->>'cacheGenerationId' = %s
+                """,
+                (
+                    provider,
+                    company_id,
+                    parent_id,
+                    server_id,
+                    selected_generation,
+                ),
+            )
+            return int(cursor.rowcount or 0)
+
+    def prune_integration_enrichment_previews(
+        self,
+        kind: str,
+        *,
+        max_entries: int = 5_000,
+    ) -> int:
+        """Delete expired rows without splitting a published cache generation."""
+
+        provider = PROVIDER_TO_DB.get(kind, kind)
+        del max_entries
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH scoped AS (
+                    SELECT preview.id, preview.expires_at,
+                           preview.summary->>'cacheGenerationId' AS generation_id
+                    FROM integration_enrichment_previews preview
+                    JOIN integration_connections integration
+                      ON integration.id = preview.integration_connection_id
+                    WHERE integration.provider = %s
+                      AND integration.company_id IS NULL
+                ), expired_generations AS (
+                    SELECT DISTINCT generation_id
+                    FROM scoped
+                    WHERE generation_id IS NOT NULL
+                      AND generation_id <> ''
+                      AND expires_at <= now()
+                ), doomed AS (
+                    SELECT scoped.id
+                    FROM scoped
+                    WHERE (
+                        (scoped.generation_id IS NULL OR scoped.generation_id = '')
+                        AND scoped.expires_at <= now()
+                    ) OR scoped.generation_id IN (
+                        SELECT generation_id FROM expired_generations
+                    )
+                )
+                DELETE FROM integration_enrichment_previews preview
+                USING doomed
+                WHERE preview.id = doomed.id
+                """,
+                (provider,),
+            )
+            return cursor.rowcount
+
     def ensure_integration_connection(
         self, kind: str, name: str, actor_id: str | None = None
     ) -> dict:
@@ -10959,7 +14677,7 @@ class PostgresCmdbRepository(StateRepository):
             )
             cursor.execute(
                 """
-                UPDATE integration_connections SET enabled = true,
+                UPDATE integration_connections SET
                     connection_status = 'verified', last_test_at = now(),
                     last_error = NULL, updated_at = now()
                 WHERE id = %s::uuid
@@ -11144,7 +14862,8 @@ class PostgresCmdbRepository(StateRepository):
                 """
                 SELECT mapping.id, mapping.external_id, mapping.external_name,
                        mapping.external_version, mapping.canonical_entity_id,
-                       mapping.first_seen_at, mapping.last_seen_at, mapping.last_synced_at
+                       mapping.first_seen_at, mapping.last_seen_at, mapping.last_synced_at,
+                       mapping.external_parent_id
                 FROM external_object_mappings mapping
                 JOIN integration_connections integration
                   ON integration.id = mapping.integration_connection_id
@@ -11173,10 +14892,900 @@ class PostgresCmdbRepository(StateRepository):
                     "firstSeenAt": self._timestamp(row[5]),
                     "lastSeenAt": self._timestamp(row[6]),
                     "lastSyncedAt": self._timestamp(row[7]) or None,
+                    "providerParentId": row[8] or None,
                     "active": True,
                 }
                 for row in cursor.fetchall()
             ]
+
+    def classify_provider_ci_mapping_import(
+        self,
+        kind: str,
+        company_id: str,
+        external_id: str,
+        provider_parent_id: str | None = None,
+    ) -> dict:
+        """Preflight one provider identity before any canonical import mutation."""
+
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT mapping.id, mapping.active, presence.state, company.slug,
+                       mapping.external_parent_id
+                FROM external_object_mappings mapping
+                JOIN integration_connections integration
+                  ON integration.id = mapping.integration_connection_id
+                JOIN configuration_items ci
+                  ON ci.id = mapping.canonical_entity_id
+                 AND mapping.canonical_entity_type = 'configuration_item'
+                JOIN companies company ON company.id = ci.company_id
+                LEFT JOIN integration_ci_presence presence
+                  ON presence.mapping_id = mapping.id
+                WHERE integration.provider = %s
+                  AND integration.company_id IS NULL
+                  AND mapping.external_object_type = 'configuration'
+                  AND mapping.external_id = %s
+                """,
+                (PROVIDER_TO_DB.get(kind, kind), external_id),
+            )
+            row = cursor.fetchone()
+        company_matches = bool(not row or row[3] == company_id)
+        provider_parent_matches = bool(
+            not row or not provider_parent_id or not row[4] or row[4] == provider_parent_id
+        )
+        decision, reason = _provider_ci_import_decision(
+            mapping_exists=row is not None,
+            mapping_active=bool(not row or row[1]),
+            lifecycle_state=str(row[2] or "") if row else None,
+            company_matches=company_matches,
+            provider_parent_matches=provider_parent_matches,
+        )
+        return {
+            "decision": decision,
+            "mappingId": str(row[0]) if row else None,
+            "companyMatches": company_matches,
+            "providerParentMatches": provider_parent_matches,
+            "reason": reason,
+        }
+
+    def _upsert_ci_presence_with_cursor(
+        self,
+        cursor: Any,
+        *,
+        policy_id: str,
+        company_uuid: str,
+        mapping: dict[str, Any],
+        provider_parent_id: str,
+        run_id: str,
+        snapshot: dict[str, Any],
+        state: str,
+        absence_count: int,
+        first_missing_at: str | None,
+        last_missing_at: str | None,
+        candidate_since: str | None,
+        last_observed_at: str | None,
+        evaluation_reason: str,
+    ) -> None:
+        """Upsert one mapping-keyed lifecycle row inside the caller's transaction."""
+
+        cursor.execute(
+            """
+            INSERT INTO integration_ci_presence (
+                id, policy_id, company_id, mapping_id, ci_id, external_id,
+                external_name, provider_parent_id, state, absence_count,
+                required_absences, minimum_missing_hours, first_missing_at,
+                last_missing_at, candidate_since, last_observed_at,
+                last_evaluated_at, last_evaluated_run_id, scope_mode,
+                provider_read_complete, evaluation_reason,
+                discovery_scope_fingerprint, policy_decision_fingerprint,
+                connection_revision, policy_revision, snapshot_started_at,
+                provider_read_completed_at, revision, created_at, updated_at
+            ) VALUES (
+                %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s,
+                %s, %s, %s, %s, %s, %s, %s::timestamptz,
+                %s::timestamptz, %s::timestamptz, %s::timestamptz,
+                %s::timestamptz, %s::uuid, %s, %s, %s, %s, %s,
+                %s, %s, %s::timestamptz, %s::timestamptz, 1, now(), now()
+            )
+            ON CONFLICT (mapping_id) DO UPDATE SET
+                policy_id = EXCLUDED.policy_id,
+                company_id = EXCLUDED.company_id,
+                ci_id = EXCLUDED.ci_id,
+                external_id = EXCLUDED.external_id,
+                external_name = EXCLUDED.external_name,
+                provider_parent_id = EXCLUDED.provider_parent_id,
+                state = EXCLUDED.state,
+                absence_count = EXCLUDED.absence_count,
+                required_absences = EXCLUDED.required_absences,
+                minimum_missing_hours = EXCLUDED.minimum_missing_hours,
+                first_missing_at = EXCLUDED.first_missing_at,
+                last_missing_at = EXCLUDED.last_missing_at,
+                candidate_since = EXCLUDED.candidate_since,
+                last_observed_at = EXCLUDED.last_observed_at,
+                last_evaluated_at = EXCLUDED.last_evaluated_at,
+                last_evaluated_run_id = EXCLUDED.last_evaluated_run_id,
+                scope_mode = EXCLUDED.scope_mode,
+                provider_read_complete = EXCLUDED.provider_read_complete,
+                evaluation_reason = EXCLUDED.evaluation_reason,
+                discovery_scope_fingerprint = EXCLUDED.discovery_scope_fingerprint,
+                policy_decision_fingerprint = EXCLUDED.policy_decision_fingerprint,
+                connection_revision = EXCLUDED.connection_revision,
+                policy_revision = EXCLUDED.policy_revision,
+                snapshot_started_at = EXCLUDED.snapshot_started_at,
+                provider_read_completed_at = EXCLUDED.provider_read_completed_at,
+                revision = integration_ci_presence.revision + 1,
+                updated_at = now()
+            """,
+            (
+                canonical_uuid("integration_ci_presence", str(mapping["id"])),
+                policy_id,
+                company_uuid,
+                mapping["id"],
+                mapping["assetId"],
+                mapping["externalId"],
+                mapping.get("externalName") or mapping["externalId"],
+                provider_parent_id,
+                state,
+                max(0, int(absence_count)),
+                snapshot["requiredAbsences"],
+                snapshot["minimumMissingHours"],
+                first_missing_at,
+                last_missing_at,
+                candidate_since,
+                last_observed_at,
+                snapshot["providerReadCompletedAt"] or utc_now(),
+                run_id,
+                snapshot["scopeMode"],
+                snapshot["providerReadComplete"],
+                evaluation_reason[:1000],
+                snapshot["discoveryScopeFingerprint"],
+                snapshot["policyDecisionFingerprint"],
+                snapshot["connectionRevision"],
+                snapshot["policyRevision"],
+                snapshot["snapshotStartedAt"],
+                snapshot["providerReadCompletedAt"],
+            ),
+        )
+
+    def _apply_postgres_ci_presence_snapshot(
+        self,
+        cursor: Any,
+        *,
+        kind: str,
+        policy_id: str,
+        company_uuid: str,
+        company_id: str,
+        provider_parent_id: str,
+        run_id: str,
+        presence_snapshot: dict[str, Any],
+        expected_policy_revision: int,
+    ) -> dict[str, int]:
+        """Evaluate one presence snapshot under existing preview row locks."""
+
+        snapshot = _normalized_ci_presence_snapshot(presence_snapshot)
+        counts = {state: 0 for state in CI_PRESENCE_STATES}
+        counts["skipped"] = 0
+        cursor.execute(
+            """
+            SELECT policy.revision, integration.revision, integration.id,
+                   policy.enabled, integration.enabled, integration.lifecycle_status
+            FROM integration_ci_policies policy
+            JOIN integration_connections integration
+              ON integration.id = policy.integration_connection_id
+            JOIN companies company ON company.id = policy.company_id
+            WHERE policy.id = %s::uuid
+              AND integration.provider = %s
+              AND company.id = %s::uuid
+              AND company.slug = %s
+              AND policy.external_parent_id = %s
+            FOR SHARE OF policy, integration
+            """,
+            (
+                policy_id,
+                PROVIDER_TO_DB.get(kind, kind),
+                company_uuid,
+                company_id,
+                provider_parent_id,
+            ),
+        )
+        revisions = cursor.fetchone()
+        if (
+            not snapshot["providerReadComplete"]
+            or not revisions
+            or snapshot["policyRevision"] != int(expected_policy_revision)
+            or snapshot["policyRevision"] != int(revisions[0] or 0)
+            or snapshot["connectionRevision"] != int(revisions[1] or 0)
+            or not bool(revisions[4])
+            or str(revisions[5] or "active") != "active"
+        ):
+            return counts
+        integration_uuid = str(revisions[2])
+        cursor.execute(
+            """
+            SELECT mapping.canonical_entity_id, mapping.last_synced_at
+            FROM external_object_mappings mapping
+            JOIN provider_company_observations observation
+              ON observation.integration_connection_id = mapping.integration_connection_id
+             AND observation.external_id = mapping.external_id
+            WHERE mapping.integration_connection_id = %s::uuid
+              AND mapping.external_object_type = 'company'
+              AND mapping.external_id = %s
+              AND mapping.canonical_entity_type = 'company'
+              AND mapping.active = true
+              AND observation.active = true
+              AND observation.deleted = false
+            FOR SHARE OF mapping, observation
+            """,
+            (integration_uuid, provider_parent_id),
+        )
+        company_mapping = cursor.fetchone()
+        snapshot_started = parse_timestamp(snapshot["snapshotStartedAt"])
+        company_mapping_changed = company_mapping[1] if company_mapping is not None else None
+        if (
+            not company_mapping
+            or str(company_mapping[0]) != company_uuid
+            or (
+                company_mapping_changed is not None
+                and snapshot_started is not None
+                and company_mapping_changed > snapshot_started
+            )
+        ):
+            return counts
+        if any(
+            item["providerParentId"] != provider_parent_id for item in snapshot["observedRecords"]
+        ):
+            raise ValueError("Presence snapshot includes a record outside the preview scope")
+        cursor.execute(
+            """
+            SELECT mapping.id, mapping.external_id, mapping.external_name,
+                   mapping.canonical_entity_id, mapping.external_parent_id,
+                   mapping.active, mapping.first_seen_at
+            FROM external_object_mappings mapping
+            JOIN integration_connections integration
+              ON integration.id = mapping.integration_connection_id
+            JOIN configuration_items ci
+              ON ci.id = mapping.canonical_entity_id
+             AND mapping.canonical_entity_type = 'configuration_item'
+            WHERE integration.provider = %s
+              AND integration.company_id IS NULL
+              AND mapping.external_object_type = 'configuration'
+              AND ci.company_id = %s::uuid
+            FOR UPDATE OF mapping
+            """,
+            (PROVIDER_TO_DB.get(kind, kind), company_uuid),
+        )
+        mappings = [
+            {
+                "id": str(row[0]),
+                "externalId": row[1],
+                "externalName": row[2] or "",
+                "assetId": str(row[3]),
+                "providerParentId": row[4] or "",
+                "active": bool(row[5]),
+                "firstSeenAt": self._timestamp(row[6]),
+            }
+            for row in cursor.fetchall()
+        ]
+        mapping_ids = [item["id"] for item in mappings]
+        presence_by_mapping: dict[str, dict[str, Any]] = {}
+        if mapping_ids:
+            cursor.execute(
+                """
+                SELECT id, mapping_id, policy_id, provider_parent_id, state,
+                       absence_count, first_missing_at, last_missing_at,
+                       candidate_since, last_observed_at, last_evaluated_at,
+                       last_evaluated_run_id, discovery_scope_fingerprint,
+                       revision
+                FROM integration_ci_presence
+                WHERE mapping_id = ANY(%s::uuid[])
+                FOR UPDATE
+                """,
+                (mapping_ids,),
+            )
+            presence_by_mapping = {
+                str(row[1]): {
+                    "id": str(row[0]),
+                    "mappingId": str(row[1]),
+                    "policyId": str(row[2]),
+                    "providerParentId": row[3],
+                    "state": row[4],
+                    "absenceCount": int(row[5] or 0),
+                    "firstMissingAt": self._timestamp(row[6]) or None,
+                    "lastMissingAt": self._timestamp(row[7]) or None,
+                    "candidateSince": self._timestamp(row[8]) or None,
+                    "lastObservedAt": self._timestamp(row[9]) or None,
+                    "lastEvaluatedAt": self._timestamp(row[10]) or None,
+                    "lastEvaluatedRunId": str(row[11]) if row[11] else None,
+                    "discoveryScopeFingerprint": str(row[12] or ""),
+                    "revision": int(row[13] or 1),
+                }
+                for row in cursor.fetchall()
+            }
+
+        observed = {item["externalId"]: item for item in snapshot["observedRecords"]}
+        started = parse_timestamp(snapshot["snapshotStartedAt"])
+        evaluated_at = snapshot["providerReadCompletedAt"] or utc_now()
+        evaluated = parse_timestamp(evaluated_at) or datetime.now(UTC)
+        for mapping in mappings:
+            row = presence_by_mapping.get(mapping["id"])
+            observed_record = observed.get(str(mapping["externalId"]))
+            if observed_record is not None:
+                if mapping["providerParentId"] and (
+                    mapping["providerParentId"] != provider_parent_id
+                ):
+                    counts["skipped"] += 1
+                    continue
+                cursor.execute(
+                    """
+                    UPDATE external_object_mappings
+                    SET external_parent_id = %s
+                    WHERE id = %s::uuid
+                      AND (external_parent_id IS NULL OR external_parent_id = '')
+                    """,
+                    (provider_parent_id, mapping["id"]),
+                )
+                mapping["externalName"] = (
+                    observed_record.get("externalName")
+                    or mapping.get("externalName")
+                    or mapping["externalId"]
+                )
+                next_state = "restore_ready" if not mapping["active"] else "observed"
+                self._upsert_ci_presence_with_cursor(
+                    cursor,
+                    policy_id=policy_id,
+                    company_uuid=company_uuid,
+                    mapping=mapping,
+                    provider_parent_id=provider_parent_id,
+                    run_id=run_id,
+                    snapshot=snapshot,
+                    state=next_state,
+                    absence_count=0,
+                    first_missing_at=None,
+                    last_missing_at=None,
+                    candidate_since=None,
+                    last_observed_at=evaluated_at,
+                    evaluation_reason=(
+                        "Provider observation returned for a retired mapping."
+                        if next_state == "restore_ready"
+                        else "Observed in the provider snapshot."
+                    ),
+                )
+                counts[next_state] += 1
+                continue
+
+            # An absent legacy mapping has no trustworthy parent scope.
+            if mapping["providerParentId"] != provider_parent_id:
+                counts["skipped"] += 1
+                continue
+            if row is not None and row.get("lastEvaluatedRunId") == run_id:
+                counts["skipped"] += 1
+                continue
+            first_seen = parse_timestamp(mapping.get("firstSeenAt"))
+            if started is not None and first_seen is not None and first_seen > started:
+                counts["skipped"] += 1
+                continue
+            if not mapping["active"]:
+                if row is None or row.get("state") != "restore_ready":
+                    counts["skipped"] += 1
+                    continue
+                self._upsert_ci_presence_with_cursor(
+                    cursor,
+                    policy_id=policy_id,
+                    company_uuid=company_uuid,
+                    mapping=mapping,
+                    provider_parent_id=provider_parent_id,
+                    run_id=run_id,
+                    snapshot=snapshot,
+                    state="retired",
+                    absence_count=0,
+                    first_missing_at=None,
+                    last_missing_at=None,
+                    candidate_since=None,
+                    last_observed_at=row.get("lastObservedAt"),
+                    evaluation_reason="The provider no longer reports the retired mapping.",
+                )
+                counts["retired"] += 1
+                continue
+
+            scope_changed = bool(
+                row
+                and row.get("discoveryScopeFingerprint")
+                and row.get("discoveryScopeFingerprint") != snapshot["discoveryScopeFingerprint"]
+            )
+            absence_count = 0 if scope_changed else int((row or {}).get("absenceCount") or 0)
+            first_missing_at = None if scope_changed else (row or {}).get("firstMissingAt")
+            last_observed_at = (row or {}).get("lastObservedAt")
+            if not snapshot["providerReadComplete"] or snapshot["scopeMode"] != "unfiltered":
+                next_state = "not_evaluated"
+                absence_count = 0
+                first_missing_at = None
+                last_missing_at = None
+                candidate_since = None
+                reason = (
+                    "Provider read was incomplete; absence was not evaluated."
+                    if not snapshot["providerReadComplete"]
+                    else "Provider-side filtering was active; absence was not evaluated."
+                )
+            else:
+                absence_count += 1
+                first_missing_at = first_missing_at or evaluated_at
+                first_missing = parse_timestamp(first_missing_at) or evaluated
+                elapsed_hours = max(0.0, (evaluated - first_missing).total_seconds() / 3600)
+                eligible = (
+                    absence_count >= snapshot["requiredAbsences"]
+                    and elapsed_hours >= snapshot["minimumMissingHours"]
+                )
+                next_state = "eligible" if eligible else "monitoring"
+                last_missing_at = evaluated_at
+                candidate_since = first_missing_at if eligible else None
+                reason = (
+                    "Required complete missing snapshots and minimum elapsed time were reached."
+                    if eligible
+                    else "Waiting for additional complete missing snapshots or elapsed time."
+                )
+            self._upsert_ci_presence_with_cursor(
+                cursor,
+                policy_id=policy_id,
+                company_uuid=company_uuid,
+                mapping=mapping,
+                provider_parent_id=provider_parent_id,
+                run_id=run_id,
+                snapshot=snapshot,
+                state=next_state,
+                absence_count=absence_count,
+                first_missing_at=first_missing_at,
+                last_missing_at=last_missing_at,
+                candidate_since=candidate_since,
+                last_observed_at=last_observed_at,
+                evaluation_reason=reason,
+            )
+            counts[next_state] += 1
+        return counts
+
+    def _ci_presence_from_row(self, row: tuple) -> dict[str, Any]:
+        """Normalize one joined lifecycle row to the frontend contract."""
+
+        current_policy = normalize_ci_policy(row[39] or {})
+        return _public_ci_presence(
+            {
+                "id": str(row[0]),
+                "provider": PROVIDER_FROM_DB.get(row[1], row[1]),
+                "companyId": row[2],
+                "companyName": row[3] or "",
+                "providerParentId": row[4],
+                "mappingId": str(row[5]),
+                "assetId": str(row[6]),
+                "assetName": row[7] or "",
+                "externalId": row[8],
+                "externalName": row[9] or "",
+                "state": row[10],
+                "mappingActive": bool(row[11]),
+                "absenceCount": int(row[12] or 0),
+                "requiredAbsences": int(row[13] or 3),
+                "minimumMissingHours": int(row[14] or 24),
+                "firstMissingAt": self._timestamp(row[15]) or None,
+                "lastMissingAt": self._timestamp(row[16]) or None,
+                "candidateSince": self._timestamp(row[17]) or None,
+                "lastObservedAt": self._timestamp(row[18]) or None,
+                "lastEvaluatedAt": self._timestamp(row[19]) or None,
+                "lastEvaluatedRunId": str(row[20]) if row[20] else None,
+                "scopeMode": row[21],
+                "providerReadComplete": bool(row[22]),
+                "evaluationReason": row[23] or "",
+                "discoveryScopeFingerprint": str(row[24] or ""),
+                "policyDecisionFingerprint": str(row[25] or ""),
+                "connectionRevision": int(row[26] or 0),
+                "policyRevision": int(row[27] or 0),
+                "snapshotStartedAt": self._timestamp(row[28]) or None,
+                "providerReadCompletedAt": self._timestamp(row[29]) or None,
+                "revision": int(row[30] or 1),
+                "reviewedBy": str(row[31]) if row[31] else None,
+                "retiredByName": row[32] or "",
+                "reviewedAt": self._timestamp(row[33]) or None,
+                "reviewNotes": row[34] or "",
+                "createdAt": self._timestamp(row[35]),
+                "updatedAt": self._timestamp(row[36]),
+                "policyExists": True,
+                "currentPolicyRevision": int(row[37] or 0),
+                "currentPolicyEnabled": bool(row[38]),
+                "currentPolicyFiltered": bool(current_policy.get("providerFilterId")),
+                "presenceEvidenceMaxAgeHours": _ci_presence_evidence_max_age_hours(current_policy),
+                "integrationExists": True,
+                "currentConnectionRevision": int(row[40] or 0),
+                "currentIntegrationEnabled": bool(row[41]),
+                "currentIntegrationLifecycle": row[42] or "active",
+                "providerCompanyMappingValid": bool(
+                    row[43] and row[44] and row[45] and row[47] and row[48] and not row[49]
+                ),
+                "providerCompanyMappingChangedAt": self._timestamp(row[46]) or None,
+            }
+        )
+
+    @staticmethod
+    def _ci_presence_select_sql() -> str:
+        """Return the fixed joined lifecycle projection used by list and actions."""
+
+        return """
+            SELECT presence.id, integration.provider, company.slug, company.name,
+                   presence.provider_parent_id, presence.mapping_id, presence.ci_id,
+                   ci.display_name, presence.external_id, presence.external_name,
+                   presence.state, mapping.active, presence.absence_count,
+                   presence.required_absences, presence.minimum_missing_hours,
+                   presence.first_missing_at, presence.last_missing_at,
+                   presence.candidate_since, presence.last_observed_at,
+                   presence.last_evaluated_at, presence.last_evaluated_run_id,
+                   presence.scope_mode, presence.provider_read_complete,
+                   presence.evaluation_reason,
+                   presence.discovery_scope_fingerprint,
+                   presence.policy_decision_fingerprint,
+                   presence.connection_revision, presence.policy_revision,
+                   presence.snapshot_started_at, presence.provider_read_completed_at,
+                   presence.revision, presence.reviewed_by, reviewer.email,
+                   presence.reviewed_at, presence.review_notes,
+                   presence.created_at, presence.updated_at,
+                   policy.revision, policy.enabled, policy.filter_policy,
+                   integration.revision, integration.enabled,
+                   integration.lifecycle_status, company_mapping.id,
+                   company_mapping.active,
+                   (
+                       company_mapping.canonical_entity_type = 'company'
+                       AND company_mapping.canonical_entity_id = presence.company_id
+                   ),
+                   company_mapping.last_synced_at, company_observation.id,
+                   company_observation.active, company_observation.deleted
+            FROM integration_ci_presence presence
+            JOIN integration_ci_policies policy ON policy.id = presence.policy_id
+            JOIN integration_connections integration
+              ON integration.id = policy.integration_connection_id
+            JOIN companies company ON company.id = presence.company_id
+            JOIN external_object_mappings mapping ON mapping.id = presence.mapping_id
+            JOIN configuration_items ci ON ci.id = presence.ci_id
+            LEFT JOIN users reviewer ON reviewer.id = presence.reviewed_by
+            LEFT JOIN external_object_mappings company_mapping
+              ON company_mapping.integration_connection_id = integration.id
+             AND company_mapping.external_object_type = 'company'
+             AND company_mapping.external_id = presence.provider_parent_id
+            LEFT JOIN provider_company_observations company_observation
+              ON company_observation.integration_connection_id = integration.id
+             AND company_observation.external_id = presence.provider_parent_id
+        """
+
+    def list_ci_presence_lifecycle(
+        self,
+        provider: str | None = None,
+        company_id: str | None = None,
+        company_ids: list[str] | None = None,
+        provider_parent_id: str | None = None,
+        state: str | None = None,
+        search: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Return a server-paged and tenant-filtered mapping lifecycle queue."""
+
+        if state is not None and state not in CI_PRESENCE_STATES:
+            raise ValueError("Presence lifecycle state is invalid")
+        database_provider = PROVIDER_TO_DB.get(provider, provider) if provider else None
+        restrict_companies = company_ids is not None
+        permitted_companies = sorted(set(company_ids or []))
+        needle = str(search or "").strip()
+        filters = (
+            database_provider,
+            database_provider,
+            company_id,
+            company_id,
+            restrict_companies,
+            permitted_companies,
+            provider_parent_id,
+            provider_parent_id,
+            state,
+            state,
+            needle,
+            needle,
+        )
+        where = """
+            WHERE (%s::text IS NULL OR integration.provider = %s)
+              AND (%s::text IS NULL OR company.slug = %s)
+              AND (%s = false OR company.slug = ANY(%s::text[]))
+              AND (%s::text IS NULL OR presence.provider_parent_id = %s)
+              AND (%s::text IS NULL OR presence.state = %s)
+              AND (%s = '' OR strpos(lower(concat_ws(' ', presence.external_name,
+                  presence.external_id, ci.display_name, company.name)), lower(%s)) > 0)
+        """
+        joins = """
+            FROM integration_ci_presence presence
+            JOIN integration_ci_policies policy ON policy.id = presence.policy_id
+            JOIN integration_connections integration
+              ON integration.id = policy.integration_connection_id
+            JOIN companies company ON company.id = presence.company_id
+            JOIN external_object_mappings mapping ON mapping.id = presence.mapping_id
+            JOIN configuration_items ci ON ci.id = presence.ci_id
+        """
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT count(*),
+                       count(*) FILTER (WHERE presence.state = 'observed'),
+                       count(*) FILTER (WHERE presence.state = 'monitoring'),
+                       count(*) FILTER (WHERE presence.state = 'eligible'),
+                       count(*) FILTER (WHERE presence.state = 'not_evaluated'),
+                       count(*) FILTER (WHERE presence.state = 'retired'),
+                       count(*) FILTER (WHERE presence.state = 'restore_ready')
+                {joins}
+                {where}
+                """,  # nosec B608 -- only fixed internal SQL fragments are composed.
+                filters,
+            )
+            aggregate = cursor.fetchone() or (0, 0, 0, 0, 0, 0, 0)
+            cursor.execute(
+                f"""
+                {self._ci_presence_select_sql()}
+                {where}
+                ORDER BY presence.updated_at DESC, presence.id
+                LIMIT %s OFFSET %s
+                """,  # nosec B608 -- only fixed internal SQL fragments are composed.
+                (*filters, max(1, min(int(limit or 50), 500)), max(0, int(offset or 0))),
+            )
+            items = [self._ci_presence_from_row(row) for row in cursor.fetchall()]
+        return {
+            "items": items,
+            "total": int(aggregate[0]),
+            "summary": {
+                "total": int(aggregate[0]),
+                "observed": int(aggregate[1]),
+                "monitoring": int(aggregate[2]),
+                "eligible": int(aggregate[3]),
+                "notEvaluated": int(aggregate[4]),
+                "retired": int(aggregate[5]),
+                "restoreReady": int(aggregate[6]),
+            },
+        }
+
+    def _change_ci_presence_mapping(
+        self,
+        presence_id: str,
+        expected_revision: int,
+        notes: str,
+        actor_id: str | None,
+        *,
+        action: str,
+    ) -> dict | None:
+        """Apply one optimistic retire or restore transition atomically."""
+
+        try:
+            parsed_id = str(uuid.UUID(presence_id))
+        except (TypeError, ValueError):
+            return None
+        review_notes = str(notes or "").strip()
+        if not review_notes:
+            raise ValueError("Review notes are required")
+        expected_state = "eligible" if action == "retire" else "restore_ready"
+        next_state = "retired" if action == "retire" else "observed"
+        expected_active = action == "retire"
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT policy.revision, policy.enabled, policy.filter_policy,
+                       integration.id, integration.revision, integration.enabled,
+                       integration.lifecycle_status, presence.company_id,
+                       presence.provider_parent_id, presence.policy_revision,
+                       presence.connection_revision, presence.provider_read_complete,
+                       presence.scope_mode, presence.snapshot_started_at,
+                        presence.state, presence.last_observed_at,
+                        presence.provider_read_completed_at
+                FROM integration_ci_presence presence
+                JOIN integration_ci_policies policy ON policy.id = presence.policy_id
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                WHERE presence.id = %s::uuid
+                FOR SHARE OF policy, integration
+                """,
+                (parsed_id,),
+            )
+            current = cursor.fetchone()
+            if not current:
+                return None
+            cursor.execute(
+                """
+                SELECT mapping.id, mapping.active,
+                       mapping.canonical_entity_type = 'company'
+                           AND mapping.canonical_entity_id = %s::uuid,
+                       mapping.last_synced_at, observation.id,
+                       observation.active, observation.deleted
+                FROM external_object_mappings mapping
+                JOIN provider_company_observations observation
+                  ON observation.integration_connection_id = mapping.integration_connection_id
+                 AND observation.external_id = mapping.external_id
+                WHERE mapping.integration_connection_id = %s::uuid
+                  AND mapping.external_object_type = 'company'
+                  AND mapping.external_id = %s
+                FOR SHARE OF mapping, observation
+                """,
+                (str(current[7]), str(current[3]), str(current[8])),
+            )
+            company_mapping = cursor.fetchone()
+            normalized_policy = normalize_ci_policy(current[2] or {})
+            stale_reason = _ci_presence_stale_evidence_reason(
+                {
+                    "providerReadComplete": bool(current[11]),
+                    "scopeMode": current[12],
+                    "policyRevision": int(current[9] or 0),
+                    "connectionRevision": int(current[10] or 0),
+                    "snapshotStartedAt": self._timestamp(current[13]) or None,
+                    "state": current[14],
+                    "lastObservedAt": self._timestamp(current[15]) or None,
+                    "providerReadCompletedAt": self._timestamp(current[16]) or None,
+                    "policyExists": True,
+                    "currentPolicyRevision": int(current[0] or 0),
+                    "currentPolicyEnabled": bool(current[1]),
+                    "currentPolicyFiltered": bool(normalized_policy.get("providerFilterId")),
+                    "presenceEvidenceMaxAgeHours": _ci_presence_evidence_max_age_hours(
+                        normalized_policy
+                    ),
+                    "integrationExists": True,
+                    "currentConnectionRevision": int(current[4] or 0),
+                    "currentIntegrationEnabled": bool(current[5]),
+                    "currentIntegrationLifecycle": current[6] or "active",
+                    "providerCompanyMappingValid": bool(
+                        company_mapping
+                        and company_mapping[1]
+                        and company_mapping[2]
+                        and company_mapping[4]
+                        and company_mapping[5]
+                        and not company_mapping[6]
+                    ),
+                    "providerCompanyMappingChangedAt": (
+                        self._timestamp(company_mapping[3]) if company_mapping is not None else None
+                    ),
+                }
+            )
+            if stale_reason:
+                raise ValueError(f"Presence evidence is stale: {stale_reason}")
+            cursor.execute(
+                f"""
+                {self._ci_presence_select_sql()}
+                WHERE presence.id = %s::uuid
+                FOR UPDATE OF presence, mapping
+                """,  # nosec B608 -- fixed internal projection only.
+                (parsed_id,),
+            )
+            selected = cursor.fetchone()
+            if not selected:
+                return None
+            before = self._ci_presence_from_row(selected)
+            if int(before["revision"]) != int(expected_revision):
+                raise ValueError("Presence lifecycle item changed; reload before saving")
+            if before.get("staleEvidenceReason"):
+                raise ValueError(f"Presence evidence is stale: {before['staleEvidenceReason']}")
+            if before["state"] != expected_state or before["mappingActive"] != expected_active:
+                raise ValueError(
+                    "Only an eligible active mapping can be retired"
+                    if action == "retire"
+                    else "Only a restore-ready retired mapping can be restored"
+                )
+            cursor.execute(
+                "UPDATE external_object_mappings SET active = %s WHERE id = %s::uuid",
+                (not expected_active, before["mappingId"]),
+            )
+            retired_candidates = 0
+            if action == "retire":
+                cursor.execute(
+                    """
+                    UPDATE ci_relationship_candidates
+                    SET retired_at = now(),
+                        revision = revision + 1,
+                        updated_at = now()
+                    WHERE source_mapping_id = %s::uuid
+                      AND state = 'pending'
+                      AND retired_at IS NULL
+                    """,
+                    (before["mappingId"],),
+                )
+                retired_candidates = int(cursor.rowcount or 0)
+            cursor.execute(
+                """
+                UPDATE integration_ci_presence
+                SET state = %s,
+                    absence_count = CASE WHEN %s = 'observed' THEN 0 ELSE absence_count END,
+                    first_missing_at = CASE WHEN %s = 'observed' THEN NULL ELSE first_missing_at END,
+                    last_missing_at = CASE WHEN %s = 'observed' THEN NULL ELSE last_missing_at END,
+                    candidate_since = CASE WHEN %s = 'observed' THEN NULL ELSE candidate_since END,
+                    evaluation_reason = %s,
+                    reviewed_by = %s::uuid,
+                    reviewed_at = now(),
+                    review_notes = %s,
+                    revision = revision + 1,
+                    updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (
+                    next_state,
+                    next_state,
+                    next_state,
+                    next_state,
+                    next_state,
+                    (
+                        "An administrator retired the immutable provider mapping."
+                        if action == "retire"
+                        else "An administrator restored the observed provider mapping."
+                    ),
+                    actor_id,
+                    review_notes[:2000],
+                    parsed_id,
+                ),
+            )
+            if action == "restore":
+                cursor.execute(
+                    """
+                    UPDATE integration_ci_review_items item
+                    SET state = 'resolved', reviewed_by = %s::uuid, reviewed_at = now()
+                    FROM integration_ci_presence presence
+                    WHERE presence.id = %s::uuid
+                      AND item.policy_id = presence.policy_id
+                      AND item.external_id = presence.external_id
+                      AND item.state = 'pending'
+                    """,
+                    (actor_id, parsed_id),
+                )
+            cursor.execute(
+                f"""
+                {self._ci_presence_select_sql()}
+                WHERE presence.id = %s::uuid
+                """,  # nosec B608 -- fixed internal projection only.
+                (parsed_id,),
+            )
+            after = self._ci_presence_from_row(cursor.fetchone())
+            self._insert_audit(
+                cursor,
+                before["companyId"],
+                actor_id,
+                "integration_ci_presence",
+                parsed_id,
+                "mapping_retired" if action == "retire" else "mapping_restored",
+                before,
+                after,
+                reason=review_notes[:2000],
+                metadata={
+                    "mappingId": before["mappingId"],
+                    "assetId": before["assetId"],
+                    "retiredPendingRelationshipCandidates": retired_candidates,
+                },
+            )
+        return after
+
+    def retire_ci_presence_mapping(
+        self,
+        presence_id: str,
+        expected_revision: int,
+        notes: str,
+        actor_id: str | None,
+    ) -> dict | None:
+        """Deactivate an eligible mapping without touching its canonical CI."""
+
+        return self._change_ci_presence_mapping(
+            presence_id,
+            expected_revision,
+            notes,
+            actor_id,
+            action="retire",
+        )
+
+    def restore_ci_presence_mapping(
+        self,
+        presence_id: str,
+        expected_revision: int,
+        notes: str,
+        actor_id: str | None,
+    ) -> dict | None:
+        """Reactivate an observed mapping after explicit administrator review."""
+
+        return self._change_ci_presence_mapping(
+            presence_id,
+            expected_revision,
+            notes,
+            actor_id,
+            action="restore",
+        )
 
     def get_ci_sync_policy(self, kind: str, company_id: str, provider_parent_id: str) -> dict:
         """Return one provider/customer CI policy from canonical PostgreSQL."""
@@ -11272,6 +15881,14 @@ class PostgresCmdbRepository(StateRepository):
                 "statusMode",
                 "includedStatusIds",
                 "excludedExternalIds",
+                "graphqlOrganizationIds",
+                "relationshipAutomationMode",
+                "relationshipAutoApproveTypes",
+                "relationshipMinConfidence",
+                "relationshipMinObservations",
+                "relationshipMaxEvidenceAgeHours",
+                "missingDeviceRequiredSnapshots",
+                "missingDeviceMinimumHours",
             )
         }
         filter_policy["enrichmentMode"] = str(normalized.get("enrichmentMode") or "balanced")
@@ -11666,14 +16283,6 @@ class PostgresCmdbRepository(StateRepository):
                 json.dumps(attributes),
             ),
         )
-        cursor.execute(
-            """
-            UPDATE integration_connections
-            SET enabled = true, updated_at = now()
-            WHERE id = %s::uuid
-            """,
-            (integration_id,),
-        )
         stored = {**deepcopy(run), "id": run_uuid}
         self._insert_audit(
             cursor,
@@ -11779,6 +16388,8 @@ class PostgresCmdbRepository(StateRepository):
         run: dict,
         review_items: list[dict],
         actor_id: str | None = None,
+        *,
+        presence_snapshot: dict[str, Any] | None = None,
     ) -> dict | None:
         """Atomically publish direct-preview evidence under its current policy lease."""
 
@@ -11811,7 +16422,12 @@ class PostgresCmdbRepository(StateRepository):
                 ),
             )
             owned = cursor.fetchone()
-            attributes = run.get("attributes") or {}
+            attributes = deepcopy(run.get("attributes") or {})
+            if presence_snapshot is not None:
+                attributes["connectionRevision"] = int(
+                    _normalized_ci_presence_snapshot(presence_snapshot)["connectionRevision"]
+                )
+                run = {**deepcopy(run), "attributes": attributes}
             if not owned or not self._ci_policy_preview_attributes_match(
                 attributes,
                 policy_id=policy_id,
@@ -11840,6 +16456,18 @@ class PostgresCmdbRepository(StateRepository):
                 review_items,
                 actor_id,
             )
+            if presence_snapshot is not None:
+                self._apply_postgres_ci_presence_snapshot(
+                    cursor,
+                    kind=kind,
+                    policy_id=policy_id,
+                    company_uuid=company_uuid,
+                    company_id=company_id,
+                    provider_parent_id=str(owned[3]),
+                    run_id=str(stored["id"]),
+                    presence_snapshot=presence_snapshot,
+                    expected_policy_revision=int(attributes.get("policyRevision") or 0),
+                )
             self._finish_ci_policy_preview_with_cursor(
                 cursor,
                 policy_id=policy_id,
@@ -12438,6 +17066,16 @@ class PostgresCmdbRepository(StateRepository):
                     "blockUnmappedTypes",
                     "statusMode",
                     "includedStatusIds",
+                    "providerFilterId",
+                    "enrichmentMode",
+                    "graphqlOrganizationIds",
+                    "relationshipAutomationMode",
+                    "relationshipAutoApproveTypes",
+                    "relationshipMinConfidence",
+                    "relationshipMinObservations",
+                    "relationshipMaxEvidenceAgeHours",
+                    "missingDeviceRequiredSnapshots",
+                    "missingDeviceMinimumHours",
                 )
             }
             filter_policy["excludedExternalIds"] = sorted(excluded_ids)
@@ -12855,6 +17493,641 @@ class PostgresCmdbRepository(StateRepository):
             )
             return cursor.rowcount
 
+    def _record_provider_ci_mapping_with_cursor(
+        self,
+        cursor: Any,
+        *,
+        kind: str,
+        company_id: str,
+        company_uuid: str,
+        connection_uuid: str,
+        record: dict,
+        asset_id: str,
+        actor_id: str | None,
+        selected_parent_id: str,
+        lifecycle_mapping: tuple | None,
+        before: dict | None,
+    ) -> dict:
+        """Persist a provider mapping using the caller's locked transaction."""
+
+        mapping_uuid = canonical_uuid(
+            "external_ci_mapping",
+            f"{connection_uuid}:{record['externalId']}",
+        )
+        payload_hash = hashlib.sha256(
+            json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        observation_uuid = canonical_uuid("ci_source_observation", f"{mapping_uuid}:{payload_hash}")
+        effective_parent_id = selected_parent_id or str(
+            (before or {}).get("providerParentId") or ""
+        )
+        cursor.execute(
+            """
+            INSERT INTO external_object_mappings (
+                id, integration_connection_id, external_object_type, external_id,
+                canonical_entity_type, canonical_entity_id, external_name,
+                external_version, external_parent_id, active,
+                first_seen_at, last_seen_at, last_synced_at
+            ) VALUES (
+                %s::uuid, %s::uuid, 'configuration', %s,
+                'configuration_item', %s::uuid, %s, %s, %s,
+                true, now(), now(), now()
+            )
+            ON CONFLICT (integration_connection_id, external_object_type, external_id)
+            DO UPDATE SET canonical_entity_type = 'configuration_item',
+                canonical_entity_id = EXCLUDED.canonical_entity_id,
+                external_name = EXCLUDED.external_name,
+                external_version = EXCLUDED.external_version,
+                external_parent_id = COALESCE(
+                    NULLIF(EXCLUDED.external_parent_id, ''),
+                    external_object_mappings.external_parent_id
+                ),
+                active = true, last_seen_at = now(), last_synced_at = now()
+            """,
+            (
+                mapping_uuid,
+                connection_uuid,
+                record["externalId"],
+                asset_id,
+                record.get("name") or None,
+                record.get("providerVersion") or None,
+                effective_parent_id or None,
+            ),
+        )
+        if lifecycle_mapping and lifecycle_mapping[2]:
+            cursor.execute(
+                """
+                SELECT policy.id, policy.revision, integration.revision
+                FROM integration_ci_policies policy
+                JOIN integration_connections integration
+                  ON integration.id = policy.integration_connection_id
+                WHERE policy.integration_connection_id = %s::uuid
+                  AND policy.company_id = %s::uuid
+                  AND policy.external_parent_id = %s
+                  AND policy.external_object_type = 'configuration'
+                """,
+                (connection_uuid, company_uuid, effective_parent_id),
+            )
+            selected_policy = cursor.fetchone()
+            if selected_policy:
+                cursor.execute(
+                    """
+                    UPDATE integration_ci_presence
+                    SET policy_id = %s::uuid,
+                        company_id = %s::uuid,
+                        ci_id = %s::uuid,
+                        external_id = %s,
+                        external_name = %s,
+                        provider_parent_id = %s,
+                        state = 'observed',
+                        absence_count = 0,
+                        first_missing_at = NULL,
+                        last_missing_at = NULL,
+                        candidate_since = NULL,
+                        last_observed_at = now(),
+                        last_evaluated_at = now(),
+                        last_evaluated_run_id = NULL,
+                        evaluation_reason =
+                            'Reviewed import observed and re-scoped this provider mapping.',
+                        discovery_scope_fingerprint = repeat('0', 64),
+                        policy_decision_fingerprint = repeat('0', 64),
+                        connection_revision = %s,
+                        policy_revision = %s,
+                        revision = revision + 1,
+                        updated_at = now()
+                    WHERE id = %s::uuid
+                    """,
+                    (
+                        str(selected_policy[0]),
+                        company_uuid,
+                        asset_id,
+                        record["externalId"],
+                        record.get("name") or record["externalId"],
+                        effective_parent_id,
+                        int(selected_policy[2] or 0),
+                        int(selected_policy[1] or 0),
+                        str(lifecycle_mapping[2]),
+                    ),
+                )
+                presence_after: dict[str, Any] | None = {
+                    "id": str(lifecycle_mapping[2]),
+                    "mappingId": mapping_uuid,
+                    "companyId": company_id,
+                    "assetId": asset_id,
+                    "providerParentId": effective_parent_id,
+                    "state": "observed",
+                    "revision": int(lifecycle_mapping[3] or 0) + 1,
+                }
+            else:
+                cursor.execute(
+                    "DELETE FROM integration_ci_presence WHERE id = %s::uuid",
+                    (str(lifecycle_mapping[2]),),
+                )
+                presence_after = None
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "integration_ci_presence",
+                str(lifecycle_mapping[2]),
+                "mapping_rescoped",
+                {
+                    "id": str(lifecycle_mapping[2]),
+                    "state": lifecycle_mapping[1],
+                    "revision": int(lifecycle_mapping[3] or 0),
+                },
+                presence_after,
+                metadata={"mappingId": mapping_uuid, "assetId": asset_id},
+            )
+        cursor.execute(
+            """
+            DELETE FROM ci_identifiers
+            WHERE source_mapping_id = %s::uuid AND ci_id <> %s::uuid
+            """,
+            (mapping_uuid, asset_id),
+        )
+        cursor.execute(
+            """
+            INSERT INTO ci_identifiers (
+                id, ci_id, company_id, ci_type, identifier_type,
+                identifier_value, verified_at, source_mapping_id
+            )
+            SELECT %s::uuid, ci.id, ci.company_id, ci.ci_type,
+                   'provider_native', %s, now(), %s::uuid
+            FROM configuration_items ci WHERE ci.id = %s::uuid
+            ON CONFLICT (ci_id, identifier_type, identifier_value)
+            DO UPDATE SET verified_at = now(), source_mapping_id = EXCLUDED.source_mapping_id
+            """,
+            (
+                canonical_uuid(
+                    "ci_identifier", f"{asset_id}:provider_native:{record['externalId']}"
+                ),
+                record["externalId"],
+                mapping_uuid,
+                asset_id,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO ci_source_observations (
+                id, ci_id, mapping_id, observed_at, payload_hash, fields
+            ) VALUES (%s::uuid, %s::uuid, %s::uuid, now(), %s, %s::jsonb)
+            ON CONFLICT (mapping_id, payload_hash)
+            DO UPDATE SET observed_at = now()
+            """,
+            (observation_uuid, asset_id, mapping_uuid, payload_hash, json.dumps(record)),
+        )
+        after = {
+            "id": mapping_uuid,
+            "provider": kind,
+            "companyId": company_id,
+            "externalId": record["externalId"],
+            "externalName": record.get("name", ""),
+            "externalVersion": record.get("providerVersion", ""),
+            "providerParentId": effective_parent_id or None,
+            "assetId": asset_id,
+            "active": True,
+        }
+        self._insert_audit(
+            cursor,
+            company_id,
+            actor_id,
+            "external_ci_mapping",
+            mapping_uuid,
+            (
+                "remapped"
+                if before and before.get("assetId") != asset_id
+                else ("source_observed" if before else "mapped")
+            ),
+            before,
+            after,
+            metadata={"provider": kind, "payloadHash": payload_hash},
+        )
+        return after
+
+    def apply_reviewed_provider_ci_import(
+        self,
+        kind: str,
+        company_id: str,
+        record: dict,
+        action: str,
+        *,
+        asset_id: str | None = None,
+        asset: dict | None = None,
+        changes: dict | None = None,
+        actor_id: str | None = None,
+        provider_parent_id: str | None = None,
+        policy_id: str | None = None,
+        review_item_id: str | None = None,
+        review_content_hash: str | None = None,
+        expected_policy_revision: int | None = None,
+        expected_connection_revision: int | None = None,
+    ) -> dict:
+        """Commit reviewed canonical and immutable-identity writes atomically."""
+
+        if action not in {"create", "update", "link"}:
+            raise ValueError("Provider import action is invalid")
+        if not isinstance(record, dict) or not str(record.get("externalId") or "").strip():
+            raise ValueError("Provider external identity is required")
+        selected_parent_id = str(provider_parent_id or record.get("providerParentId") or "").strip()
+        database_provider = PROVIDER_TO_DB.get(kind, kind)
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, enabled, lifecycle_status, revision
+                FROM integration_connections
+                WHERE provider = %s AND company_id IS NULL
+                ORDER BY created_at
+                LIMIT 1
+                FOR SHARE
+                """,
+                (database_provider,),
+            )
+            integration_row = cursor.fetchone()
+            if not integration_row:
+                raise ValueError("Integration connection not found")
+            if not bool(integration_row[1]) or str(integration_row[2] or "active") != "active":
+                raise ValueError("Integration connection is not active. Run a new preview.")
+            connection_uuid = str(integration_row[0])
+            cursor.execute("SELECT id FROM companies WHERE slug = %s FOR SHARE", (company_id,))
+            company_row = cursor.fetchone()
+            if not company_row:
+                raise ValueError("Customer not found")
+            company_uuid = str(company_row[0])
+            generation_supplied = (
+                expected_policy_revision is not None or expected_connection_revision is not None
+            )
+            if generation_supplied:
+                if (
+                    not policy_id
+                    or expected_policy_revision is None
+                    or expected_connection_revision is None
+                ):
+                    raise ValueError(
+                        "Reviewed provider generation is incomplete. Run a new preview."
+                    )
+                try:
+                    generation_policy_uuid = str(uuid.UUID(str(policy_id)))
+                except (TypeError, ValueError) as error:
+                    raise ValueError("CI policy identity is invalid") from error
+                cursor.execute(
+                    """
+                    SELECT revision
+                    FROM integration_ci_policies
+                    WHERE id = %s::uuid
+                      AND integration_connection_id = %s::uuid
+                      AND company_id = %s::uuid
+                      AND external_parent_id = %s
+                    FOR SHARE
+                    """,
+                    (
+                        generation_policy_uuid,
+                        connection_uuid,
+                        company_uuid,
+                        selected_parent_id,
+                    ),
+                )
+                generation_policy = cursor.fetchone()
+                if (
+                    not generation_policy
+                    or int(generation_policy[0] or 0) != int(expected_policy_revision)
+                    or int(integration_row[3] or 0) != int(expected_connection_revision)
+                ):
+                    raise ValueError("Reviewed provider generation is stale. Run a new preview.")
+            cursor.execute(
+                """
+                SELECT mapping.id
+                FROM external_object_mappings mapping
+                JOIN provider_company_observations observation
+                  ON observation.integration_connection_id = mapping.integration_connection_id
+                 AND observation.external_id = mapping.external_id
+                WHERE mapping.integration_connection_id = %s::uuid
+                  AND mapping.external_object_type = 'company'
+                  AND mapping.external_id = %s
+                  AND mapping.canonical_entity_type = 'company'
+                  AND mapping.canonical_entity_id = %s::uuid
+                  AND mapping.active = true
+                  AND observation.active = true
+                  AND observation.deleted = false
+                FOR SHARE OF mapping, observation
+                """,
+                (connection_uuid, selected_parent_id, company_uuid),
+            )
+            if not selected_parent_id or not cursor.fetchone():
+                raise ValueError(
+                    "The active provider customer mapping changed during review. Run a new preview."
+                )
+            review_guard_supplied = review_item_id is not None or review_content_hash is not None
+            parsed_review_item_id: str | None = None
+            parsed_policy_id: str | None = None
+            if review_guard_supplied:
+                if not review_item_id or not review_content_hash or not policy_id:
+                    raise ValueError("Reviewed queue evidence is incomplete. Run a new preview.")
+                try:
+                    parsed_review_item_id = str(uuid.UUID(str(review_item_id)))
+                    parsed_policy_id = str(uuid.UUID(str(policy_id)))
+                except (TypeError, ValueError) as error:
+                    raise ValueError("Reviewed queue evidence is invalid.") from error
+                cursor.execute(
+                    """
+                    SELECT item.id
+                    FROM integration_ci_review_items item
+                    JOIN integration_ci_policies policy ON policy.id = item.policy_id
+                    WHERE item.id = %s::uuid
+                      AND item.policy_id = %s::uuid
+                      AND policy.integration_connection_id = %s::uuid
+                      AND policy.company_id = %s::uuid
+                      AND policy.external_parent_id = %s
+                      AND item.external_id = %s
+                      AND item.state = 'pending'
+                      AND item.content_hash = %s
+                    FOR UPDATE OF item
+                    """,
+                    (
+                        parsed_review_item_id,
+                        parsed_policy_id,
+                        connection_uuid,
+                        company_uuid,
+                        selected_parent_id,
+                        record["externalId"],
+                        review_content_hash,
+                    ),
+                )
+                if not cursor.fetchone():
+                    raise ValueError("Reviewed queue item changed. Run a new preview.")
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"{connection_uuid}:configuration:{record['externalId']}",),
+            )
+            cursor.execute(
+                """
+                SELECT mapping.id, mapping.active, presence.state, presence.id,
+                       presence.revision, mapped_company.slug,
+                       mapping.external_parent_id, mapping.canonical_entity_id,
+                       mapping.external_name, mapping.external_version
+                FROM external_object_mappings mapping
+                LEFT JOIN configuration_items mapped_ci
+                  ON mapped_ci.id = mapping.canonical_entity_id
+                 AND mapping.canonical_entity_type = 'configuration_item'
+                LEFT JOIN companies mapped_company ON mapped_company.id = mapped_ci.company_id
+                LEFT JOIN integration_ci_presence presence ON presence.mapping_id = mapping.id
+                WHERE mapping.integration_connection_id = %s::uuid
+                  AND mapping.external_object_type = 'configuration'
+                  AND mapping.external_id = %s
+                FOR UPDATE OF mapping
+                """,
+                (connection_uuid, record["externalId"]),
+            )
+            mapping_row = cursor.fetchone()
+            lifecycle_mapping = (
+                (
+                    bool(mapping_row[1]),
+                    mapping_row[2],
+                    mapping_row[3],
+                    mapping_row[4],
+                    mapping_row[5],
+                    mapping_row[6],
+                )
+                if mapping_row
+                else None
+            )
+            before_mapping = (
+                {
+                    "id": str(mapping_row[0]),
+                    "provider": kind,
+                    "companyId": mapping_row[5],
+                    "externalId": record["externalId"],
+                    "externalName": mapping_row[8] or "",
+                    "externalVersion": mapping_row[9] or "",
+                    "providerParentId": mapping_row[6] or None,
+                    "assetId": str(mapping_row[7]) if mapping_row[7] else None,
+                    "active": bool(mapping_row[1]),
+                }
+                if mapping_row
+                else None
+            )
+            company_matches = bool(not mapping_row or mapping_row[5] == company_id)
+            parent_matches = bool(
+                not mapping_row
+                or not selected_parent_id
+                or not mapping_row[6]
+                or mapping_row[6] == selected_parent_id
+            )
+            decision, reason = _provider_ci_import_decision(
+                mapping_exists=mapping_row is not None,
+                mapping_active=bool(not mapping_row or mapping_row[1]),
+                lifecycle_state=str(mapping_row[2] or "") if mapping_row else None,
+                company_matches=company_matches,
+                provider_parent_matches=parent_matches,
+            )
+            if decision != "allow":
+                raise ValueError(reason)
+            if action == "create" and mapping_row:
+                raise ValueError("Provider identity is already mapped; refresh the import preview")
+
+            before_asset: dict | None = None
+            if action == "create":
+                if not isinstance(asset, dict) or asset.get("companyId") != company_id:
+                    raise ValueError("A same-customer canonical asset is required for create")
+                asset_uuid = canonical_uuid("configuration_item", asset["id"])
+                metadata = deepcopy(asset.get("metadata") or {})
+                attributes = self._asset_attributes(asset)
+                cursor.execute(
+                    """
+                    INSERT INTO configuration_items (
+                        id, company_id, ci_type, display_name, normalized_name,
+                        lifecycle_status, operational_status, attributes
+                    ) VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        asset_uuid,
+                        company_uuid,
+                        asset["type"],
+                        asset["name"],
+                        normalized_name(asset["name"]),
+                        metadata.get("lifecycle", "in_service"),
+                        metadata.get("operationalStatus", "unknown"),
+                        json.dumps(attributes),
+                    ),
+                )
+                stored_asset = {**deepcopy(asset), "id": asset_uuid}
+                self._insert_audit(
+                    cursor,
+                    company_id,
+                    actor_id,
+                    "configuration_item",
+                    asset_uuid,
+                    "created",
+                    None,
+                    stored_asset,
+                )
+                self._provider_import_failpoint("after_asset_write")
+                mapping = self._record_provider_ci_mapping_with_cursor(
+                    cursor,
+                    kind=kind,
+                    company_id=company_id,
+                    company_uuid=company_uuid,
+                    connection_uuid=connection_uuid,
+                    record=record,
+                    asset_id=asset_uuid,
+                    actor_id=actor_id,
+                    selected_parent_id=selected_parent_id,
+                    lifecycle_mapping=lifecycle_mapping,
+                    before=before_mapping,
+                )
+            else:
+                try:
+                    asset_uuid = str(uuid.UUID(str(asset_id)))
+                except (TypeError, ValueError) as error:
+                    raise ValueError("A canonical target is required for update or link") from error
+                cursor.execute(
+                    """
+                    SELECT ci.id, company.slug, ci.display_name, ci.ci_type,
+                           ci.lifecycle_status, ci.operational_status, ci.attributes,
+                           ci.updated_at
+                    FROM configuration_items ci
+                    JOIN companies company ON company.id = ci.company_id
+                    WHERE ci.id = %s::uuid
+                      AND ci.company_id = %s::uuid
+                      AND ci.retired_at IS NULL
+                    FOR UPDATE OF ci
+                    """,
+                    (asset_uuid, company_uuid),
+                )
+                asset_row = cursor.fetchone()
+                if not asset_row:
+                    raise ValueError("Configuration item is unavailable in this customer")
+                if action == "update" and (
+                    not mapping_row or str(mapping_row[7] or "") != asset_uuid
+                ):
+                    raise ValueError(
+                        "Provider update target no longer matches its immutable mapping. "
+                        "Run a new preview."
+                    )
+                before_asset = self._asset_from_row(asset_row)
+                # The mapping guard and write happen before an existing CI is
+                # updated, closing the preflight-to-write retirement race.
+                mapping = self._record_provider_ci_mapping_with_cursor(
+                    cursor,
+                    kind=kind,
+                    company_id=company_id,
+                    company_uuid=company_uuid,
+                    connection_uuid=connection_uuid,
+                    record=record,
+                    asset_id=asset_uuid,
+                    actor_id=actor_id,
+                    selected_parent_id=selected_parent_id,
+                    lifecycle_mapping=lifecycle_mapping,
+                    before=before_mapping,
+                )
+                if changes:
+                    stored_asset = {
+                        **before_asset,
+                        **deepcopy(changes),
+                        "updatedAt": utc_now(),
+                    }
+                    metadata = stored_asset.get("metadata") or {}
+                    attributes = self._asset_attributes(stored_asset)
+                    cursor.execute(
+                        """
+                        UPDATE configuration_items
+                        SET ci_type = %s,
+                            display_name = %s,
+                            normalized_name = %s,
+                            lifecycle_status = %s,
+                            operational_status = %s,
+                            attributes = %s::jsonb,
+                            updated_at = now()
+                        WHERE id = %s::uuid
+                          AND company_id = %s::uuid
+                          AND retired_at IS NULL
+                        """,
+                        (
+                            stored_asset["type"],
+                            stored_asset["name"],
+                            normalized_name(stored_asset["name"]),
+                            metadata.get("lifecycle", "in_service"),
+                            metadata.get("operationalStatus", "unknown"),
+                            json.dumps(attributes),
+                            asset_uuid,
+                            company_uuid,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError("Configuration item changed during import")
+                    self._insert_audit(
+                        cursor,
+                        company_id,
+                        actor_id,
+                        "configuration_item",
+                        asset_uuid,
+                        "updated",
+                        before_asset,
+                        stored_asset,
+                    )
+                else:
+                    stored_asset = before_asset
+                self._provider_import_failpoint("after_asset_write")
+
+            resolved = 0
+            if parsed_review_item_id is not None:
+                cursor.execute(
+                    """
+                    UPDATE integration_ci_review_items
+                    SET state = 'resolved', reviewed_by = %s::uuid, reviewed_at = now()
+                    WHERE id = %s::uuid
+                      AND policy_id = %s::uuid
+                      AND content_hash = %s
+                      AND state = 'pending'
+                    """,
+                    (
+                        actor_id,
+                        parsed_review_item_id,
+                        parsed_policy_id,
+                        review_content_hash,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Reviewed queue item changed. Run a new preview.")
+                resolved = 1
+            elif policy_id:
+                try:
+                    policy_uuid = str(uuid.UUID(str(policy_id)))
+                except (TypeError, ValueError) as error:
+                    raise ValueError("CI policy identity is invalid") from error
+                cursor.execute(
+                    """
+                    UPDATE integration_ci_review_items item
+                    SET state = 'resolved', reviewed_by = %s::uuid, reviewed_at = now()
+                    FROM integration_ci_policies policy
+                    WHERE item.policy_id = policy.id
+                      AND policy.id = %s::uuid
+                      AND policy.integration_connection_id = %s::uuid
+                      AND policy.company_id = %s::uuid
+                      AND (%s = '' OR policy.external_parent_id = %s)
+                      AND item.external_id = %s
+                      AND item.state <> 'resolved'
+                    """,
+                    (
+                        actor_id,
+                        policy_uuid,
+                        connection_uuid,
+                        company_uuid,
+                        selected_parent_id,
+                        selected_parent_id,
+                        record["externalId"],
+                    ),
+                )
+                resolved = int(cursor.rowcount or 0)
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return {
+            "action": action,
+            "asset": stored_asset,
+            "mapping": mapping,
+            "reviewItemsResolved": resolved,
+        }
+
     def record_provider_ci_mapping(
         self,
         kind: str,
@@ -12862,6 +18135,8 @@ class PostgresCmdbRepository(StateRepository):
         record: dict,
         asset_id: str,
         actor_id: str | None = None,
+        *,
+        provider_parent_id: str | None = None,
     ) -> dict:
         """Upsert provider identity and append a content-addressed observation."""
 
@@ -12884,32 +18159,79 @@ class PostgresCmdbRepository(StateRepository):
             json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         observation_uuid = canonical_uuid("ci_source_observation", f"{mapping_uuid}:{payload_hash}")
+        selected_parent_id = str(provider_parent_id or record.get("providerParentId") or "").strip()
         with self.connection_factory() as connection, connection.cursor() as cursor:
             cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"{connection_record['uuid']}:configuration:{record['externalId']}",),
+            )
+            cursor.execute(
                 """
-                SELECT ci.id FROM configuration_items ci
+                SELECT mapping.active, presence.state, presence.id, presence.revision,
+                       company.slug, mapping.external_parent_id
+                FROM external_object_mappings mapping
+                JOIN configuration_items ci
+                  ON ci.id = mapping.canonical_entity_id
+                 AND mapping.canonical_entity_type = 'configuration_item'
+                JOIN companies company ON company.id = ci.company_id
+                LEFT JOIN integration_ci_presence presence
+                  ON presence.mapping_id = mapping.id
+                WHERE mapping.integration_connection_id = %s::uuid
+                  AND mapping.external_object_type = 'configuration'
+                  AND mapping.external_id = %s
+                FOR UPDATE OF mapping
+                """,
+                (connection_record["uuid"], record["externalId"]),
+            )
+            lifecycle_mapping = cursor.fetchone()
+            if lifecycle_mapping:
+                company_matches = lifecycle_mapping[4] == company_id
+                parent_matches = bool(
+                    not selected_parent_id
+                    or not lifecycle_mapping[5]
+                    or lifecycle_mapping[5] == selected_parent_id
+                )
+                decision, reason = _provider_ci_import_decision(
+                    mapping_exists=True,
+                    mapping_active=bool(lifecycle_mapping[0]),
+                    lifecycle_state=str(lifecycle_mapping[1] or ""),
+                    company_matches=company_matches,
+                    provider_parent_matches=parent_matches,
+                )
+                if decision != "allow":
+                    raise ValueError(reason)
+            cursor.execute(
+                """
+                SELECT ci.id, ci.company_id FROM configuration_items ci
                 JOIN companies company ON company.id = ci.company_id
                 WHERE ci.id = %s::uuid AND company.slug = %s AND ci.retired_at IS NULL
                 """,
                 (asset_id, company_id),
             )
-            if not cursor.fetchone():
+            ci_row = cursor.fetchone()
+            if not ci_row:
                 raise ValueError("Configuration item is unavailable in this customer")
             cursor.execute(
                 """
                 INSERT INTO external_object_mappings (
                     id, integration_connection_id, external_object_type, external_id,
                     canonical_entity_type, canonical_entity_id, external_name,
-                    external_version, active, first_seen_at, last_seen_at, last_synced_at
+                    external_version, external_parent_id, active,
+                    first_seen_at, last_seen_at, last_synced_at
                 ) VALUES (
                     %s::uuid, %s::uuid, 'configuration', %s,
-                    'configuration_item', %s::uuid, %s, %s, true, now(), now(), now()
+                    'configuration_item', %s::uuid, %s, %s, %s,
+                    true, now(), now(), now()
                 )
                 ON CONFLICT (integration_connection_id, external_object_type, external_id)
                 DO UPDATE SET canonical_entity_type = 'configuration_item',
                     canonical_entity_id = EXCLUDED.canonical_entity_id,
                     external_name = EXCLUDED.external_name,
                     external_version = EXCLUDED.external_version,
+                    external_parent_id = COALESCE(
+                        NULLIF(EXCLUDED.external_parent_id, ''),
+                        external_object_mappings.external_parent_id
+                    ),
                     active = true, last_seen_at = now(), last_synced_at = now()
                 """,
                 (
@@ -12919,8 +18241,94 @@ class PostgresCmdbRepository(StateRepository):
                     asset_id,
                     record.get("name") or None,
                     record.get("providerVersion") or None,
+                    selected_parent_id or None,
                 ),
             )
+            if lifecycle_mapping and lifecycle_mapping[2]:
+                cursor.execute(
+                    """
+                    SELECT policy.id, policy.revision, integration.revision
+                    FROM integration_ci_policies policy
+                    JOIN integration_connections integration
+                      ON integration.id = policy.integration_connection_id
+                    WHERE policy.integration_connection_id = %s::uuid
+                      AND policy.company_id = %s::uuid
+                      AND policy.external_parent_id = %s
+                      AND policy.external_object_type = 'configuration'
+                    """,
+                    (connection_record["uuid"], str(ci_row[1]), selected_parent_id),
+                )
+                selected_policy = cursor.fetchone()
+                if selected_policy:
+                    cursor.execute(
+                        """
+                        UPDATE integration_ci_presence
+                        SET policy_id = %s::uuid,
+                            company_id = %s::uuid,
+                            ci_id = %s::uuid,
+                            external_id = %s,
+                            external_name = %s,
+                            provider_parent_id = %s,
+                            state = 'observed',
+                            absence_count = 0,
+                            first_missing_at = NULL,
+                            last_missing_at = NULL,
+                            candidate_since = NULL,
+                            last_observed_at = now(),
+                            last_evaluated_at = now(),
+                            last_evaluated_run_id = NULL,
+                            evaluation_reason =
+                                'Reviewed import observed and re-scoped this provider mapping.',
+                            discovery_scope_fingerprint = repeat('0', 64),
+                            policy_decision_fingerprint = repeat('0', 64),
+                            connection_revision = %s,
+                            policy_revision = %s,
+                            revision = revision + 1,
+                            updated_at = now()
+                        WHERE id = %s::uuid
+                        """,
+                        (
+                            str(selected_policy[0]),
+                            str(ci_row[1]),
+                            asset_id,
+                            record["externalId"],
+                            record.get("name") or record["externalId"],
+                            selected_parent_id,
+                            int(selected_policy[2] or 0),
+                            int(selected_policy[1] or 0),
+                            str(lifecycle_mapping[2]),
+                        ),
+                    )
+                    presence_after: dict[str, Any] | None = {
+                        "id": str(lifecycle_mapping[2]),
+                        "mappingId": mapping_uuid,
+                        "companyId": company_id,
+                        "assetId": asset_id,
+                        "providerParentId": selected_parent_id,
+                        "state": "observed",
+                        "revision": int(lifecycle_mapping[3] or 0) + 1,
+                    }
+                else:
+                    cursor.execute(
+                        "DELETE FROM integration_ci_presence WHERE id = %s::uuid",
+                        (str(lifecycle_mapping[2]),),
+                    )
+                    presence_after = None
+                self._insert_audit(
+                    cursor,
+                    company_id,
+                    actor_id,
+                    "integration_ci_presence",
+                    str(lifecycle_mapping[2]),
+                    "mapping_rescoped",
+                    {
+                        "id": str(lifecycle_mapping[2]),
+                        "state": lifecycle_mapping[1],
+                        "revision": int(lifecycle_mapping[3] or 0),
+                    },
+                    presence_after,
+                    metadata={"mappingId": mapping_uuid, "assetId": asset_id},
+                )
             cursor.execute(
                 """
                 DELETE FROM ci_identifiers
@@ -12966,6 +18374,7 @@ class PostgresCmdbRepository(StateRepository):
                 "externalId": record["externalId"],
                 "externalName": record.get("name", ""),
                 "externalVersion": record.get("providerVersion", ""),
+                "providerParentId": selected_parent_id or None,
                 "assetId": asset_id,
                 "active": True,
             }
@@ -12989,6 +18398,1462 @@ class PostgresCmdbRepository(StateRepository):
             for item in self.list_provider_ci_mappings(kind, company_id)
             if item["externalId"] == record["externalId"]
         )
+
+    def _require_provider_ci_mapping(
+        self,
+        cursor: Any,
+        kind: str,
+        company_id: str,
+        mapping_id: str,
+        asset_id: str | None = None,
+        provider_parent_id: str | None = None,
+    ) -> tuple[str, str]:
+        """Lock and return an active mapping constrained to one provider customer."""
+
+        try:
+            mapping_uuid = str(uuid.UUID(str(mapping_id)))
+            asset_uuid = str(uuid.UUID(str(asset_id))) if asset_id else None
+        except (TypeError, ValueError) as error:
+            raise ValueError("Provider mapping identity is invalid") from error
+        cursor.execute(
+            """
+            SELECT mapping.id, ci.id
+            FROM external_object_mappings mapping
+            JOIN integration_connections integration
+              ON integration.id = mapping.integration_connection_id
+            JOIN configuration_items ci
+              ON ci.id = mapping.canonical_entity_id
+             AND mapping.canonical_entity_type = 'configuration_item'
+            JOIN companies company ON company.id = ci.company_id
+            WHERE mapping.id = %s::uuid
+              AND integration.provider = %s
+              AND company.slug = %s
+              AND mapping.external_object_type = 'configuration'
+              AND mapping.active = true
+              AND ci.retired_at IS NULL
+              AND (%s::uuid IS NULL OR ci.id = %s::uuid)
+              AND (%s::text IS NULL OR mapping.external_parent_id = %s)
+            FOR UPDATE OF mapping
+            """,
+            (
+                mapping_uuid,
+                PROVIDER_TO_DB.get(kind, kind),
+                company_id,
+                asset_uuid,
+                asset_uuid,
+                provider_parent_id,
+                provider_parent_id,
+            ),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise ValueError("Provider mapping is unavailable for this customer asset")
+        return str(row[0]), str(row[1])
+
+    def replace_ci_inventory(
+        self,
+        kind: str,
+        company_id: str,
+        asset_id: str,
+        mapping_id: str,
+        collections: dict[str, Any],
+        *,
+        observed_at: str | None = None,
+        retention: int = 3,
+    ) -> dict:
+        """Replace canonical provider inventory and retain bounded snapshot history."""
+
+        source = (
+            collections.get("inventoryCollections")
+            if isinstance(collections, dict)
+            and isinstance(collections.get("inventoryCollections"), dict)
+            else collections
+        )
+        if not isinstance(source, dict):
+            raise ValueError("Inventory collections must be an object")
+        observed = observed_at or utc_now()
+        if not parse_timestamp(observed):
+            raise ValueError("Inventory observed timestamp is invalid")
+        keep = max(1, min(int(retention), 12))
+        normalized_collections: dict[str, Any] = {}
+        interfaces: list[dict[str, Any]] = []
+        for raw_type, raw_payload in source.items():
+            collection_type = _inventory_collection_type(raw_type)
+            if collection_type == "network_interfaces":
+                if not isinstance(raw_payload, list):
+                    raise ValueError("Network interface inventory must be an array")
+                if len(raw_payload) > INVENTORY_MAX_NETWORK_INTERFACES:
+                    raise ValueError("Network interface inventory contains too many items")
+                interfaces = [
+                    _normalized_interface(item, ordinal) for ordinal, item in enumerate(raw_payload)
+                ]
+                normalized_collections[collection_type] = [
+                    {key: value for key, value in item.items() if key != "fingerprint"}
+                    for item in interfaces
+                ]
+            else:
+                normalized_collections[collection_type] = raw_payload
+
+        summaries: dict[str, dict[str, Any]] = {}
+        stale_types: list[str] = []
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            mapping_uuid, asset_uuid = self._require_provider_ci_mapping(
+                cursor,
+                kind,
+                company_id,
+                mapping_id,
+                asset_id,
+            )
+            cursor.execute("SELECT id FROM companies WHERE slug = %s", (company_id,))
+            company_row = cursor.fetchone()
+            if not company_row:
+                raise ValueError("Customer not found")
+            company_uuid = str(company_row[0])
+
+            for collection_type, raw_payload in normalized_collections.items():
+                payload, item_count, fingerprint = _bounded_inventory_payload(raw_payload)
+                cursor.execute(
+                    """
+                    SELECT id, fingerprint, first_observed_at, last_observed_at
+                    FROM ci_inventory_snapshots
+                    WHERE source_mapping_id = %s::uuid
+                      AND collection_type = %s
+                      AND superseded_at IS NULL
+                    FOR UPDATE
+                    """,
+                    (mapping_uuid, collection_type),
+                )
+                current = cursor.fetchone()
+                incoming_time = parse_timestamp(observed)
+                current_time = parse_timestamp(current[3]) if current else None
+                is_stale = bool(current_time and incoming_time and incoming_time < current_time)
+                if is_stale:
+                    stale_types.append(collection_type)
+                    cursor.execute(
+                        """
+                        INSERT INTO ci_inventory_snapshots (
+                            id, company_id, ci_id, source_mapping_id,
+                            collection_type, fingerprint, payload, item_count,
+                            completeness, first_observed_at, last_observed_at,
+                            superseded_at
+                        ) VALUES (
+                            %s::uuid, %s::uuid, %s::uuid, %s::uuid,
+                            %s, %s, %s::jsonb, %s, 'unknown',
+                            %s::timestamptz, %s::timestamptz, %s::timestamptz
+                        )
+                        ON CONFLICT (
+                            source_mapping_id, collection_type, fingerprint
+                        ) DO UPDATE SET
+                            first_observed_at = LEAST(
+                                ci_inventory_snapshots.first_observed_at,
+                                EXCLUDED.first_observed_at
+                            ),
+                            last_observed_at = GREATEST(
+                                ci_inventory_snapshots.last_observed_at,
+                                EXCLUDED.last_observed_at
+                            )
+                        """,
+                        (
+                            canonical_uuid(
+                                "ci_inventory_snapshot",
+                                f"{mapping_uuid}:{collection_type}:{fingerprint}",
+                            ),
+                            company_uuid,
+                            asset_uuid,
+                            mapping_uuid,
+                            collection_type,
+                            fingerprint,
+                            json.dumps(payload),
+                            item_count,
+                            observed,
+                            observed,
+                            self._timestamp(current[2]) if current else observed,
+                        ),
+                    )
+                    summaries[collection_type] = {
+                        "fingerprint": str(current[1]) if current else fingerprint,
+                        "itemCount": item_count,
+                    }
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE ci_inventory_snapshots
+                        SET superseded_at = %s::timestamptz
+                        WHERE source_mapping_id = %s::uuid
+                          AND collection_type = %s
+                          AND superseded_at IS NULL
+                          AND fingerprint <> %s
+                        """,
+                        (observed, mapping_uuid, collection_type, fingerprint),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO ci_inventory_snapshots (
+                            id, company_id, ci_id, source_mapping_id,
+                            collection_type, fingerprint, payload, item_count,
+                            completeness, first_observed_at, last_observed_at,
+                            superseded_at
+                        ) VALUES (
+                            %s::uuid, %s::uuid, %s::uuid, %s::uuid,
+                            %s, %s, %s::jsonb, %s, 'unknown',
+                            %s::timestamptz, %s::timestamptz, NULL
+                        )
+                        ON CONFLICT (
+                            source_mapping_id, collection_type, fingerprint
+                        ) DO UPDATE SET
+                            company_id = EXCLUDED.company_id,
+                            ci_id = EXCLUDED.ci_id,
+                            payload = EXCLUDED.payload,
+                            item_count = EXCLUDED.item_count,
+                            first_observed_at = LEAST(
+                                ci_inventory_snapshots.first_observed_at,
+                                EXCLUDED.first_observed_at
+                            ),
+                            last_observed_at = GREATEST(
+                                ci_inventory_snapshots.last_observed_at,
+                                EXCLUDED.last_observed_at
+                            ),
+                            superseded_at = NULL
+                        """,
+                        (
+                            canonical_uuid(
+                                "ci_inventory_snapshot",
+                                f"{mapping_uuid}:{collection_type}:{fingerprint}",
+                            ),
+                            company_uuid,
+                            asset_uuid,
+                            mapping_uuid,
+                            collection_type,
+                            fingerprint,
+                            json.dumps(payload),
+                            item_count,
+                            observed,
+                            observed,
+                        ),
+                    )
+                    summaries[collection_type] = {
+                        "fingerprint": fingerprint,
+                        "itemCount": item_count,
+                    }
+                cursor.execute(
+                    """
+                    WITH ranked AS (
+                        SELECT id, row_number() OVER (
+                            ORDER BY
+                                (superseded_at IS NULL) DESC,
+                                last_observed_at DESC,
+                                id DESC
+                        ) AS ordinal
+                        FROM ci_inventory_snapshots
+                        WHERE source_mapping_id = %s::uuid
+                          AND collection_type = %s
+                    )
+                    DELETE FROM ci_inventory_snapshots snapshot
+                    USING ranked
+                    WHERE snapshot.id = ranked.id AND ranked.ordinal > %s
+                    """,
+                    (mapping_uuid, collection_type, keep),
+                )
+
+            if (
+                "network_interfaces" in normalized_collections
+                and "network_interfaces" not in stale_types
+            ):
+                interface_keys: list[str] = []
+                for interface in interfaces:
+                    interface_keys.append(interface["interfaceKey"])
+                    cursor.execute(
+                        """
+                        INSERT INTO ci_network_interfaces (
+                            id, company_id, ci_id, source_mapping_id,
+                            interface_key, name, description, mac_address,
+                            ip_addresses, gateways, dns_servers, dhcp_enabled,
+                            vlan_id, operational_state, speed_mbps, attributes,
+                            fingerprint, first_observed_at, last_observed_at,
+                            retired_at
+                        ) VALUES (
+                            %s::uuid, %s::uuid, %s::uuid, %s::uuid,
+                            %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb,
+                            %s, %s, %s, %s, %s::jsonb, %s,
+                            %s::timestamptz, %s::timestamptz, NULL
+                        )
+                        ON CONFLICT (source_mapping_id, interface_key)
+                        DO UPDATE SET
+                            company_id = EXCLUDED.company_id,
+                            ci_id = EXCLUDED.ci_id,
+                            name = EXCLUDED.name,
+                            description = EXCLUDED.description,
+                            mac_address = EXCLUDED.mac_address,
+                            ip_addresses = EXCLUDED.ip_addresses,
+                            gateways = EXCLUDED.gateways,
+                            dns_servers = EXCLUDED.dns_servers,
+                            dhcp_enabled = EXCLUDED.dhcp_enabled,
+                            vlan_id = EXCLUDED.vlan_id,
+                            operational_state = EXCLUDED.operational_state,
+                            speed_mbps = EXCLUDED.speed_mbps,
+                            attributes = EXCLUDED.attributes,
+                            fingerprint = EXCLUDED.fingerprint,
+                            first_observed_at = LEAST(
+                                ci_network_interfaces.first_observed_at,
+                                EXCLUDED.first_observed_at
+                            ),
+                            last_observed_at = EXCLUDED.last_observed_at,
+                            retired_at = NULL
+                        WHERE EXCLUDED.last_observed_at
+                              >= ci_network_interfaces.last_observed_at
+                        """,
+                        (
+                            canonical_uuid(
+                                "ci_network_interface",
+                                f"{mapping_uuid}:{interface['interfaceKey']}",
+                            ),
+                            company_uuid,
+                            asset_uuid,
+                            mapping_uuid,
+                            interface["interfaceKey"],
+                            interface["name"] or None,
+                            interface["description"] or None,
+                            interface["macAddress"] or None,
+                            json.dumps(interface["ipAddresses"]),
+                            json.dumps(interface["gateways"]),
+                            json.dumps(interface["dnsServers"]),
+                            interface["dhcpEnabled"],
+                            interface["vlanId"] or None,
+                            interface["operationalState"] or None,
+                            interface["speedMbps"],
+                            json.dumps(interface["attributes"]),
+                            interface["fingerprint"],
+                            observed,
+                            observed,
+                        ),
+                    )
+                cursor.execute(
+                    """
+                    UPDATE ci_network_interfaces
+                    SET retired_at = %s::timestamptz
+                    WHERE source_mapping_id = %s::uuid
+                      AND retired_at IS NULL
+                      AND last_observed_at <= %s::timestamptz
+                      AND interface_key <> ALL(%s::text[])
+                    """,
+                    (observed, mapping_uuid, observed, interface_keys),
+                )
+        return {
+            "companyId": company_id,
+            "assetId": asset_id,
+            "mappingId": mapping_id,
+            "observedAt": observed,
+            "collections": summaries,
+            "networkInterfaceCount": len(interfaces),
+            "staleCollections": stale_types,
+            "retention": keep,
+        }
+
+    def get_ci_inventory(
+        self,
+        company_id: str,
+        asset_id: str,
+        *,
+        collection_types: Iterable[str] | None = None,
+        include_history: bool = False,
+    ) -> dict:
+        """Return canonical technical inventory constrained to one customer CI."""
+
+        try:
+            asset_uuid = str(uuid.UUID(str(asset_id)))
+        except (TypeError, ValueError) as error:
+            raise ValueError("Configuration item identity is invalid") from error
+        selected = (
+            sorted({_inventory_collection_type(item) for item in collection_types})
+            if collection_types is not None
+            else []
+        )
+        snapshots: list[dict] = []
+        include_interfaces = not selected or "network_interfaces" in selected
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT snapshot.id, snapshot.collection_type, snapshot.fingerprint,
+                       snapshot.payload, snapshot.item_count, snapshot.completeness,
+                       snapshot.first_observed_at, snapshot.last_observed_at,
+                       snapshot.superseded_at, snapshot.source_mapping_id,
+                       integration.provider
+                FROM ci_inventory_snapshots snapshot
+                JOIN configuration_items ci ON ci.id = snapshot.ci_id
+                JOIN companies company
+                  ON company.id = snapshot.company_id
+                 AND company.id = ci.company_id
+                JOIN external_object_mappings mapping
+                  ON mapping.id = snapshot.source_mapping_id
+                JOIN integration_connections integration
+                  ON integration.id = mapping.integration_connection_id
+                WHERE company.slug = %s
+                  AND ci.id = %s::uuid
+                  AND ci.retired_at IS NULL
+                  AND (%s OR snapshot.superseded_at IS NULL)
+                  AND (%s = false OR snapshot.collection_type = ANY(%s::text[]))
+                ORDER BY snapshot.collection_type,
+                         snapshot.last_observed_at DESC, snapshot.id DESC
+                """,
+                (
+                    company_id,
+                    asset_uuid,
+                    include_history,
+                    bool(selected),
+                    selected,
+                ),
+            )
+            for row in cursor.fetchall():
+                snapshots.append(
+                    {
+                        "id": str(row[0]),
+                        "collectionType": row[1],
+                        "fingerprint": row[2],
+                        "payload": row[3],
+                        "itemCount": int(row[4]),
+                        "completeness": row[5],
+                        "firstObservedAt": self._timestamp(row[6]),
+                        "lastObservedAt": self._timestamp(row[7]),
+                        "supersededAt": self._timestamp(row[8]) or None,
+                        "mappingId": str(row[9]),
+                        "provider": PROVIDER_FROM_DB.get(row[10], row[10]),
+                    }
+                )
+            interfaces: list[dict] = []
+            if include_interfaces:
+                cursor.execute(
+                    """
+                    SELECT interface.id, interface.interface_key, interface.name,
+                           interface.description, interface.mac_address,
+                           interface.ip_addresses, interface.gateways,
+                           interface.dns_servers, interface.dhcp_enabled,
+                           interface.vlan_id, interface.operational_state,
+                           interface.speed_mbps, interface.attributes,
+                           interface.fingerprint, interface.first_observed_at,
+                           interface.last_observed_at, interface.retired_at,
+                           interface.source_mapping_id, integration.provider
+                    FROM ci_network_interfaces interface
+                    JOIN configuration_items ci ON ci.id = interface.ci_id
+                    JOIN companies company
+                      ON company.id = interface.company_id
+                     AND company.id = ci.company_id
+                    JOIN external_object_mappings mapping
+                      ON mapping.id = interface.source_mapping_id
+                    JOIN integration_connections integration
+                      ON integration.id = mapping.integration_connection_id
+                    WHERE company.slug = %s
+                      AND ci.id = %s::uuid
+                      AND ci.retired_at IS NULL
+                      AND (%s OR interface.retired_at IS NULL)
+                    ORDER BY interface.name, interface.interface_key
+                    """,
+                    (company_id, asset_uuid, include_history),
+                )
+                interfaces = [
+                    {
+                        "id": str(row[0]),
+                        "interfaceKey": row[1],
+                        "name": row[2] or "",
+                        "description": row[3] or "",
+                        "macAddress": row[4] or "",
+                        "ipAddresses": row[5] or [],
+                        "gateways": row[6] or [],
+                        "dnsServers": row[7] or [],
+                        "dhcpEnabled": row[8],
+                        "vlanId": row[9] or "",
+                        "operationalState": row[10] or "",
+                        "speedMbps": int(row[11]) if row[11] is not None else None,
+                        "attributes": row[12] or {},
+                        "fingerprint": row[13],
+                        "firstObservedAt": self._timestamp(row[14]),
+                        "lastObservedAt": self._timestamp(row[15]),
+                        "retiredAt": self._timestamp(row[16]) or None,
+                        "mappingId": str(row[17]),
+                        "provider": PROVIDER_FROM_DB.get(row[18], row[18]),
+                    }
+                    for row in cursor.fetchall()
+                ]
+        grouped: dict[str, list[dict]] = {}
+        for snapshot in snapshots:
+            grouped.setdefault(snapshot["collectionType"], []).append(snapshot)
+        return {
+            "companyId": company_id,
+            "assetId": asset_id,
+            "collections": grouped,
+            "networkInterfaces": interfaces,
+        }
+
+    @staticmethod
+    def _relationship_candidate_from_row(row: tuple) -> dict:
+        """Convert one canonical relationship candidate row to the API shape."""
+
+        return {
+            "id": str(row[0]),
+            "companyId": row[1],
+            "sourceMappingId": str(row[2]),
+            "provider": PROVIDER_FROM_DB.get(row[3], row[3]),
+            "candidateKey": row[4],
+            "fromCiId": str(row[5]) if row[5] else None,
+            "fromName": row[6] or "",
+            "toCiId": str(row[7]) if row[7] else None,
+            "toName": row[8] or "",
+            "fromExternalIdentity": row[9] or {},
+            "toExternalIdentity": row[10] or {},
+            "relationshipType": row[11],
+            "confidence": float(row[12]),
+            "evidence": row[13] or {},
+            "state": row[14],
+            "firstObservedAt": PostgresCmdbRepository._timestamp(row[15]),
+            "lastSeenAt": PostgresCmdbRepository._timestamp(row[16]),
+            "retiredAt": PostgresCmdbRepository._timestamp(row[17]) or None,
+            "decidedBy": str(row[18]) if row[18] else None,
+            "decidedAt": PostgresCmdbRepository._timestamp(row[19]) or None,
+            "decisionNotes": row[20] or "",
+            "approvedRelationshipId": str(row[21]) if row[21] else None,
+            "revision": int(row[22]),
+            "observationCount": int(row[23]),
+        }
+
+    def _require_postgres_provider_relationship_context(
+        self,
+        cursor: Any,
+        kind: str,
+        company_id: str,
+        *,
+        policy_id: str | None,
+        expected_policy_revision: int | None,
+        expected_connection_revision: int | None,
+        provider_parent_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Lock and validate one provider topology generation in the current transaction."""
+
+        supplied = any(
+            value is not None
+            for value in (
+                policy_id,
+                expected_policy_revision,
+                expected_connection_revision,
+                provider_parent_id,
+            )
+        )
+        if not supplied:
+            return None
+        if (
+            not policy_id
+            or expected_policy_revision is None
+            or expected_connection_revision is None
+            or not provider_parent_id
+        ):
+            raise ValueError(
+                "Provider relationship context is stale: the expected provider generation "
+                "is incomplete. Run a new preview."
+            )
+        try:
+            policy_uuid = str(uuid.UUID(str(policy_id)))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "Provider relationship context is stale: the CI policy identity is invalid."
+            ) from error
+        cursor.execute(
+            """
+            SELECT policy.revision, policy.enabled, integration.id,
+                   integration.revision, integration.enabled,
+                   integration.lifecycle_status, company.id
+            FROM integration_ci_policies policy
+            JOIN integration_connections integration
+              ON integration.id = policy.integration_connection_id
+            JOIN companies company ON company.id = policy.company_id
+            WHERE policy.id = %s::uuid
+              AND integration.provider = %s
+              AND integration.company_id IS NULL
+              AND company.slug = %s
+              AND policy.external_parent_id = %s
+            FOR SHARE OF policy, integration
+            """,
+            (
+                policy_uuid,
+                PROVIDER_TO_DB.get(kind, kind),
+                company_id,
+                provider_parent_id,
+            ),
+        )
+        current = cursor.fetchone()
+        reason = ""
+        if not current:
+            reason = "the CI policy is missing"
+        elif int(current[0] or 0) != int(expected_policy_revision):
+            reason = "the CI policy changed after discovery"
+        elif not bool(current[4]):
+            reason = "the integration is missing or disabled"
+        elif str(current[5] or "active") != "active":
+            reason = "the integration is not active"
+        elif int(current[3] or 0) != int(expected_connection_revision):
+            reason = "the integration settings changed after discovery"
+        if reason:
+            raise ValueError(
+                f"Provider relationship context is stale: {reason}. Run a new preview."
+            )
+        assert current is not None
+        cursor.execute(
+            """
+            SELECT mapping.id
+            FROM external_object_mappings mapping
+            JOIN provider_company_observations observation
+              ON observation.integration_connection_id = mapping.integration_connection_id
+             AND observation.external_id = mapping.external_id
+            WHERE mapping.integration_connection_id = %s::uuid
+              AND mapping.external_object_type = 'company'
+              AND mapping.external_id = %s
+              AND mapping.canonical_entity_type = 'company'
+              AND mapping.canonical_entity_id = %s::uuid
+              AND mapping.active = true
+              AND observation.active = true
+              AND observation.deleted = false
+            FOR SHARE OF mapping, observation
+            """,
+            (str(current[2]), provider_parent_id, str(current[6])),
+        )
+        if not cursor.fetchone():
+            raise ValueError(
+                "Provider relationship context is stale: the provider customer mapping "
+                "changed or is inactive. Run a new preview."
+            )
+        return {
+            "policyId": policy_uuid,
+            "policyRevision": int(expected_policy_revision),
+            "connectionRevision": int(expected_connection_revision),
+            "providerParentId": provider_parent_id,
+        }
+
+    def upsert_relationship_candidates(
+        self,
+        kind: str,
+        company_id: str,
+        source_mapping_id: str,
+        candidates: list[dict[str, Any]],
+        *,
+        observed_at: str | None = None,
+        policy_id: str | None = None,
+        expected_policy_revision: int | None = None,
+        expected_connection_revision: int | None = None,
+        provider_parent_id: str | None = None,
+    ) -> list[dict]:
+        """Replace one provider mapping's proposal set without changing topology."""
+
+        observed = observed_at or utc_now()
+        if not parse_timestamp(observed):
+            raise ValueError("Relationship candidate timestamp is invalid")
+        prepared: list[dict[str, Any]] = []
+        endpoint_ids: set[str] = set()
+        for value in candidates:
+            if not isinstance(value, dict):
+                raise ValueError("Relationship candidates must be objects")
+            try:
+                from_ci_id = (
+                    str(uuid.UUID(str(value["fromCiId"]))) if value.get("fromCiId") else None
+                )
+                to_ci_id = str(uuid.UUID(str(value["toCiId"]))) if value.get("toCiId") else None
+            except (TypeError, ValueError) as error:
+                raise ValueError("Relationship candidate endpoint is invalid") from error
+            from_external = deepcopy(value.get("fromExternalIdentity") or {})
+            to_external = deepcopy(value.get("toExternalIdentity") or {})
+            if not isinstance(from_external, dict) or not isinstance(to_external, dict):
+                raise ValueError("Relationship candidate identities must be objects")
+            if not from_ci_id and not from_external:
+                raise ValueError("Relationship candidate source identity is required")
+            if not to_ci_id and not to_external:
+                raise ValueError("Relationship candidate target identity is required")
+            if from_ci_id and from_ci_id == to_ci_id:
+                raise ValueError("Relationship candidate endpoints must be different")
+            relationship_type = str(
+                value.get("relationshipType") or value.get("type") or ""
+            ).strip()
+            if not relationship_type or len(relationship_type) > 80:
+                raise ValueError("Relationship candidate type is invalid")
+            confidence = float(value.get("confidence", 0))
+            if confidence < 0 or confidence > 1:
+                raise ValueError("Relationship candidate confidence must be between 0 and 1")
+            evidence = deepcopy(value.get("evidence") or {})
+            if not isinstance(evidence, dict):
+                raise ValueError("Relationship candidate evidence must be an object")
+            if len(json.dumps(evidence, separators=(",", ":")).encode("utf-8")) > 262_144:
+                raise ValueError("Relationship candidate evidence is too large")
+            endpoint_ids.update(item for item in (from_ci_id, to_ci_id) if item)
+            prepared.append(
+                {
+                    "candidateKey": _relationship_candidate_key(value),
+                    "fromCiId": from_ci_id,
+                    "toCiId": to_ci_id,
+                    "fromExternalIdentity": from_external,
+                    "toExternalIdentity": to_external,
+                    "relationshipType": relationship_type,
+                    "confidence": confidence,
+                    "evidence": evidence,
+                }
+            )
+
+        candidate_keys = [item["candidateKey"] for item in prepared]
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            provider_context = self._require_postgres_provider_relationship_context(
+                cursor,
+                kind,
+                company_id,
+                policy_id=policy_id,
+                expected_policy_revision=expected_policy_revision,
+                expected_connection_revision=expected_connection_revision,
+                provider_parent_id=provider_parent_id,
+            )
+            if provider_context is not None:
+                for candidate in prepared:
+                    candidate["evidence"]["providerContext"] = deepcopy(provider_context)
+            mapping_uuid, _source_asset_uuid = self._require_provider_ci_mapping(
+                cursor,
+                kind,
+                company_id,
+                source_mapping_id,
+                provider_parent_id=(
+                    str(provider_context["providerParentId"])
+                    if provider_context is not None
+                    else None
+                ),
+            )
+            cursor.execute("SELECT id FROM companies WHERE slug = %s", (company_id,))
+            company_row = cursor.fetchone()
+            if not company_row:
+                raise ValueError("Customer not found")
+            company_uuid = str(company_row[0])
+            if endpoint_ids:
+                cursor.execute(
+                    """
+                    SELECT ci.id
+                    FROM configuration_items ci
+                    JOIN companies company ON company.id = ci.company_id
+                    WHERE company.slug = %s
+                      AND ci.id = ANY(%s::uuid[])
+                      AND ci.retired_at IS NULL
+                    """,
+                    (company_id, sorted(endpoint_ids)),
+                )
+                available = {str(row[0]) for row in cursor.fetchall()}
+                if available != endpoint_ids:
+                    raise ValueError("Relationship candidate crosses the customer boundary")
+            for candidate in prepared:
+                candidate_id = canonical_uuid(
+                    "ci_relationship_candidate",
+                    f"{mapping_uuid}:{candidate['candidateKey']}",
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO ci_relationship_candidates (
+                        id, company_id, source_mapping_id, candidate_key,
+                        from_ci_id, to_ci_id, from_external_identity,
+                        to_external_identity, relationship_type, confidence,
+                        evidence, state, first_observed_at, last_seen_at,
+                        retired_at, updated_at
+                    ) VALUES (
+                        %s::uuid, %s::uuid, %s::uuid, %s,
+                        %s::uuid, %s::uuid, %s::jsonb, %s::jsonb,
+                        %s, %s, %s::jsonb, 'pending',
+                        %s::timestamptz, %s::timestamptz, NULL, now()
+                    )
+                    ON CONFLICT (source_mapping_id, candidate_key)
+                    DO UPDATE SET
+                        company_id = EXCLUDED.company_id,
+                        from_ci_id = EXCLUDED.from_ci_id,
+                        to_ci_id = EXCLUDED.to_ci_id,
+                        from_external_identity = EXCLUDED.from_external_identity,
+                        to_external_identity = EXCLUDED.to_external_identity,
+                        relationship_type = EXCLUDED.relationship_type,
+                        confidence = EXCLUDED.confidence,
+                        evidence = EXCLUDED.evidence,
+                        state = CASE
+                            WHEN ci_relationship_candidates.state IN ('ignored', 'rejected')
+                             AND lower(COALESCE(
+                                   ci_relationship_candidates.evidence
+                                     ->> 'evidenceFingerprint',
+                                   ''
+                                 )) ~ '^[0-9a-f]{64}$'
+                             AND lower(COALESCE(
+                                   EXCLUDED.evidence ->> 'evidenceFingerprint',
+                                   ''
+                                 )) ~ '^[0-9a-f]{64}$'
+                             AND lower(
+                                   ci_relationship_candidates.evidence
+                                     ->> 'evidenceFingerprint'
+                                 ) <> lower(
+                                   EXCLUDED.evidence ->> 'evidenceFingerprint'
+                                 )
+                            THEN 'pending'
+                            ELSE ci_relationship_candidates.state
+                        END,
+                        decided_by = CASE
+                            WHEN ci_relationship_candidates.state IN ('ignored', 'rejected')
+                             AND lower(COALESCE(
+                                   ci_relationship_candidates.evidence
+                                     ->> 'evidenceFingerprint',
+                                   ''
+                                 )) ~ '^[0-9a-f]{64}$'
+                             AND lower(COALESCE(
+                                   EXCLUDED.evidence ->> 'evidenceFingerprint',
+                                   ''
+                                 )) ~ '^[0-9a-f]{64}$'
+                             AND lower(
+                                   ci_relationship_candidates.evidence
+                                     ->> 'evidenceFingerprint'
+                                 ) <> lower(
+                                   EXCLUDED.evidence ->> 'evidenceFingerprint'
+                                 )
+                            THEN NULL
+                            ELSE ci_relationship_candidates.decided_by
+                        END,
+                        decided_at = CASE
+                            WHEN ci_relationship_candidates.state IN ('ignored', 'rejected')
+                             AND lower(COALESCE(
+                                   ci_relationship_candidates.evidence
+                                     ->> 'evidenceFingerprint',
+                                   ''
+                                 )) ~ '^[0-9a-f]{64}$'
+                             AND lower(COALESCE(
+                                   EXCLUDED.evidence ->> 'evidenceFingerprint',
+                                   ''
+                                 )) ~ '^[0-9a-f]{64}$'
+                             AND lower(
+                                   ci_relationship_candidates.evidence
+                                     ->> 'evidenceFingerprint'
+                                 ) <> lower(
+                                   EXCLUDED.evidence ->> 'evidenceFingerprint'
+                                 )
+                            THEN NULL
+                            ELSE ci_relationship_candidates.decided_at
+                        END,
+                        decision_notes = CASE
+                            WHEN ci_relationship_candidates.state IN ('ignored', 'rejected')
+                             AND lower(COALESCE(
+                                   ci_relationship_candidates.evidence
+                                     ->> 'evidenceFingerprint',
+                                   ''
+                                 )) ~ '^[0-9a-f]{64}$'
+                             AND lower(COALESCE(
+                                   EXCLUDED.evidence ->> 'evidenceFingerprint',
+                                   ''
+                                 )) ~ '^[0-9a-f]{64}$'
+                             AND lower(
+                                   ci_relationship_candidates.evidence
+                                     ->> 'evidenceFingerprint'
+                                 ) <> lower(
+                                   EXCLUDED.evidence ->> 'evidenceFingerprint'
+                                 )
+                            THEN NULL
+                            ELSE ci_relationship_candidates.decision_notes
+                        END,
+                        approved_relationship_id = CASE
+                            WHEN ci_relationship_candidates.state IN ('ignored', 'rejected')
+                             AND lower(COALESCE(
+                                   ci_relationship_candidates.evidence
+                                     ->> 'evidenceFingerprint',
+                                   ''
+                                 )) ~ '^[0-9a-f]{64}$'
+                             AND lower(COALESCE(
+                                   EXCLUDED.evidence ->> 'evidenceFingerprint',
+                                   ''
+                                 )) ~ '^[0-9a-f]{64}$'
+                             AND lower(
+                                   ci_relationship_candidates.evidence
+                                     ->> 'evidenceFingerprint'
+                                 ) <> lower(
+                                   EXCLUDED.evidence ->> 'evidenceFingerprint'
+                                 )
+                            THEN NULL
+                            ELSE ci_relationship_candidates.approved_relationship_id
+                        END,
+                        last_seen_at = EXCLUDED.last_seen_at,
+                        retired_at = NULL,
+                        revision = ci_relationship_candidates.revision + 1,
+                        observation_count = ci_relationship_candidates.observation_count + 1,
+                        updated_at = now()
+                    WHERE EXCLUDED.last_seen_at
+                          >= ci_relationship_candidates.last_seen_at
+                    """,
+                    (
+                        candidate_id,
+                        company_uuid,
+                        mapping_uuid,
+                        candidate["candidateKey"],
+                        candidate["fromCiId"],
+                        candidate["toCiId"],
+                        json.dumps(candidate["fromExternalIdentity"]),
+                        json.dumps(candidate["toExternalIdentity"]),
+                        candidate["relationshipType"],
+                        candidate["confidence"],
+                        json.dumps(candidate["evidence"]),
+                        observed,
+                        observed,
+                    ),
+                )
+            cursor.execute(
+                """
+                UPDATE ci_relationship_candidates
+                SET retired_at = %s::timestamptz,
+                    revision = revision + 1,
+                    updated_at = now()
+                WHERE source_mapping_id = %s::uuid
+                  AND retired_at IS NULL
+                  AND last_seen_at <= %s::timestamptz
+                  AND candidate_key <> ALL(%s::text[])
+                """,
+                (observed, mapping_uuid, observed, candidate_keys),
+            )
+        return self.list_relationship_candidates(
+            company_id,
+            provider=kind,
+            include_retired=False,
+        )
+
+    def list_relationship_candidates(
+        self,
+        company_id: str,
+        *,
+        state: str | None = None,
+        asset_id: str | None = None,
+        provider: str | None = None,
+        include_retired: bool = False,
+        limit: int = 250,
+    ) -> list[dict]:
+        """Return a bounded canonical relationship proposal queue."""
+
+        if state is not None and state not in RELATIONSHIP_CANDIDATE_STATES:
+            raise ValueError("Relationship candidate state is invalid")
+        try:
+            asset_uuid = str(uuid.UUID(str(asset_id))) if asset_id else None
+        except (TypeError, ValueError) as error:
+            raise ValueError("Configuration item identity is invalid") from error
+        database_provider = PROVIDER_TO_DB.get(provider, provider) if provider else None
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT candidate.id, company.slug, candidate.source_mapping_id,
+                       integration.provider, candidate.candidate_key,
+                       candidate.from_ci_id, from_ci.display_name,
+                       candidate.to_ci_id, to_ci.display_name,
+                       candidate.from_external_identity,
+                       candidate.to_external_identity,
+                       candidate.relationship_type, candidate.confidence,
+                       candidate.evidence, candidate.state,
+                       candidate.first_observed_at, candidate.last_seen_at,
+                       candidate.retired_at, candidate.decided_by,
+                       candidate.decided_at, candidate.decision_notes,
+                       candidate.approved_relationship_id,
+                       candidate.revision, candidate.observation_count
+                FROM ci_relationship_candidates candidate
+                JOIN companies company ON company.id = candidate.company_id
+                JOIN external_object_mappings mapping
+                  ON mapping.id = candidate.source_mapping_id
+                JOIN integration_connections integration
+                  ON integration.id = mapping.integration_connection_id
+                LEFT JOIN configuration_items from_ci
+                  ON from_ci.id = candidate.from_ci_id
+                 AND from_ci.company_id = candidate.company_id
+                LEFT JOIN configuration_items to_ci
+                  ON to_ci.id = candidate.to_ci_id
+                 AND to_ci.company_id = candidate.company_id
+                WHERE company.slug = %s
+                  AND mapping.active = true
+                  AND (%s::text IS NULL OR candidate.state = %s)
+                  AND (
+                      %s::uuid IS NULL
+                      OR candidate.from_ci_id = %s::uuid
+                      OR candidate.to_ci_id = %s::uuid
+                  )
+                  AND (%s::text IS NULL OR integration.provider = %s)
+                  AND (%s OR candidate.retired_at IS NULL)
+                ORDER BY candidate.last_seen_at DESC, candidate.id DESC
+                LIMIT %s
+                """,
+                (
+                    company_id,
+                    state,
+                    state,
+                    asset_uuid,
+                    asset_uuid,
+                    asset_uuid,
+                    database_provider,
+                    database_provider,
+                    include_retired,
+                    max(1, min(int(limit), 1_000)),
+                ),
+            )
+            return [self._relationship_candidate_from_row(row) for row in cursor.fetchall()]
+
+    def decide_relationship_candidate(
+        self,
+        company_id: str,
+        candidate_id: str,
+        state: str,
+        actor_id: str | None = None,
+        notes: str = "",
+        approved_relationship_id: str | None = None,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict:
+        """Audit a proposal decision without creating or retiring relationships."""
+
+        if state not in RELATIONSHIP_CANDIDATE_STATES:
+            raise ValueError("Relationship candidate state is invalid")
+        try:
+            candidate_uuid = str(uuid.UUID(str(candidate_id)))
+        except (TypeError, ValueError) as error:
+            raise ValueError("Relationship candidate identity is invalid") from error
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT candidate.id, company.slug, candidate.source_mapping_id,
+                       integration.provider, candidate.candidate_key,
+                       candidate.from_ci_id, from_ci.display_name,
+                       candidate.to_ci_id, to_ci.display_name,
+                       candidate.from_external_identity,
+                       candidate.to_external_identity,
+                       candidate.relationship_type, candidate.confidence,
+                       candidate.evidence, candidate.state,
+                       candidate.first_observed_at, candidate.last_seen_at,
+                       candidate.retired_at, candidate.decided_by,
+                       candidate.decided_at, candidate.decision_notes,
+                       candidate.approved_relationship_id,
+                       candidate.revision, candidate.observation_count,
+                       mapping.active
+                FROM ci_relationship_candidates candidate
+                JOIN companies company ON company.id = candidate.company_id
+                JOIN external_object_mappings mapping
+                  ON mapping.id = candidate.source_mapping_id
+                JOIN integration_connections integration
+                  ON integration.id = mapping.integration_connection_id
+                LEFT JOIN configuration_items from_ci
+                  ON from_ci.id = candidate.from_ci_id
+                 AND from_ci.company_id = candidate.company_id
+                LEFT JOIN configuration_items to_ci
+                  ON to_ci.id = candidate.to_ci_id
+                 AND to_ci.company_id = candidate.company_id
+                WHERE company.slug = %s AND candidate.id = %s::uuid
+                FOR UPDATE OF candidate, mapping
+                """,
+                (company_id, candidate_uuid),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("Relationship candidate not found")
+            if state == "approved" and not bool(row[24]):
+                raise ValueError("Restore the provider mapping before approving this suggestion")
+            before = self._relationship_candidate_from_row(row)
+            if expected_revision is not None and int(expected_revision) != int(before["revision"]):
+                raise ValueError("Relationship candidate changed; refresh it before deciding")
+            if state == "approved" and (not before.get("fromCiId") or not before.get("toCiId")):
+                raise ValueError("Resolve both candidate endpoints before approval")
+            approved_relationship_uuid = None
+            if approved_relationship_id:
+                try:
+                    approved_relationship_uuid = str(uuid.UUID(str(approved_relationship_id)))
+                except (TypeError, ValueError) as error:
+                    raise ValueError("Approved relationship identity is invalid") from error
+                if state != "approved":
+                    raise ValueError("Only approved candidates can link a relationship")
+                cursor.execute(
+                    """
+                    SELECT relationship.id
+                    FROM ci_relationships relationship
+                    JOIN companies company ON company.id = relationship.company_id
+                    WHERE company.slug = %s
+                      AND relationship.id = %s::uuid
+                      AND relationship.from_ci_id = %s::uuid
+                      AND relationship.to_ci_id = %s::uuid
+                      AND relationship.relationship_type = %s
+                      AND relationship.retired_at IS NULL
+                    """,
+                    (
+                        company_id,
+                        approved_relationship_uuid,
+                        before["fromCiId"],
+                        before["toCiId"],
+                        before["relationshipType"],
+                    ),
+                )
+                if not cursor.fetchone():
+                    raise ValueError("Approved relationship does not match this candidate")
+            linked_relationship_id = (
+                approved_relationship_uuid or before.get("approvedRelationshipId")
+                if state == "approved"
+                else None
+            )
+            decided_at = utc_now() if state != "pending" else None
+            decision_notes = str(notes or "")[:2000] if state != "pending" else ""
+            actor_uuid = None
+            if actor_id:
+                try:
+                    actor_uuid = str(uuid.UUID(str(actor_id)))
+                except (TypeError, ValueError):
+                    cursor.execute(
+                        "SELECT id FROM users WHERE attributes->>'legacyId' = %s LIMIT 1",
+                        (actor_id,),
+                    )
+                    actor_row = cursor.fetchone()
+                    actor_uuid = str(actor_row[0]) if actor_row else None
+            cursor.execute(
+                """
+                UPDATE ci_relationship_candidates
+                SET state = %s,
+                    decided_by = %s::uuid,
+                    decided_at = %s::timestamptz,
+                    decision_notes = %s,
+                    approved_relationship_id = %s::uuid,
+                    revision = revision + 1,
+                    updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (
+                    state,
+                    actor_uuid if state != "pending" else None,
+                    decided_at,
+                    decision_notes,
+                    linked_relationship_id,
+                    candidate_uuid,
+                ),
+            )
+            after = {
+                **before,
+                "state": state,
+                "decidedBy": actor_uuid if state != "pending" else None,
+                "decidedAt": decided_at,
+                "decisionNotes": decision_notes,
+                "approvedRelationshipId": linked_relationship_id,
+                "revision": int(before["revision"]) + 1,
+            }
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "relationship_candidate",
+                candidate_uuid,
+                "reopened" if state == "pending" else state,
+                before,
+                after,
+                metadata={
+                    "sourceMappingId": before["sourceMappingId"],
+                    "relationshipType": before["relationshipType"],
+                },
+            )
+        return after
+
+    def approve_relationship_candidate(
+        self,
+        company_id: str,
+        candidate_id: str,
+        actor_id: str | None = None,
+        notes: str = "",
+        *,
+        expected_revision: int | None = None,
+        policy_id: str | None = None,
+        expected_policy_revision: int | None = None,
+        expected_connection_revision: int | None = None,
+        provider_parent_id: str | None = None,
+    ) -> tuple[dict, dict]:
+        """Materialize and approve one locked candidate in a single transaction."""
+
+        try:
+            candidate_uuid = str(uuid.UUID(str(candidate_id)))
+        except (TypeError, ValueError) as error:
+            raise ValueError("Relationship candidate identity is invalid") from error
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT candidate.id, company.slug, candidate.source_mapping_id,
+                       integration.provider, candidate.candidate_key,
+                       candidate.from_ci_id, from_ci.display_name,
+                       candidate.to_ci_id, to_ci.display_name,
+                       candidate.from_external_identity,
+                       candidate.to_external_identity,
+                       candidate.relationship_type, candidate.confidence,
+                       candidate.evidence, candidate.state,
+                       candidate.first_observed_at, candidate.last_seen_at,
+                       candidate.retired_at, candidate.decided_by,
+                       candidate.decided_at, candidate.decision_notes,
+                       candidate.approved_relationship_id,
+                       candidate.revision, candidate.observation_count,
+                       mapping.active
+                FROM ci_relationship_candidates candidate
+                JOIN companies company ON company.id = candidate.company_id
+                JOIN external_object_mappings mapping
+                  ON mapping.id = candidate.source_mapping_id
+                JOIN integration_connections integration
+                  ON integration.id = mapping.integration_connection_id
+                LEFT JOIN configuration_items from_ci
+                  ON from_ci.id = candidate.from_ci_id
+                 AND from_ci.company_id = candidate.company_id
+                LEFT JOIN configuration_items to_ci
+                  ON to_ci.id = candidate.to_ci_id
+                 AND to_ci.company_id = candidate.company_id
+                WHERE company.slug = %s AND candidate.id = %s::uuid
+                FOR UPDATE OF candidate, mapping
+                """,
+                (company_id, candidate_uuid),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("Relationship candidate not found")
+            if not bool(row[24]):
+                raise ValueError("Restore the provider mapping before approving this suggestion")
+            before = self._relationship_candidate_from_row(row)
+            if expected_revision is not None and int(expected_revision) != int(before["revision"]):
+                raise ValueError("Relationship candidate changed; refresh it before deciding")
+            stored_context = _required_relationship_provider_context(before.get("evidence"))
+            supplied_context = _supplied_relationship_provider_context(
+                policy_id=policy_id,
+                expected_policy_revision=expected_policy_revision,
+                expected_connection_revision=expected_connection_revision,
+                provider_parent_id=provider_parent_id,
+            )
+            if supplied_context is not None and stored_context != supplied_context:
+                raise ValueError(
+                    "Provider relationship context is stale: the candidate belongs to a "
+                    "different provider generation. Run a new preview."
+                )
+            validated_context = self._require_postgres_provider_relationship_context(
+                cursor,
+                str(before.get("provider") or ""),
+                company_id,
+                policy_id=str(stored_context["policyId"]),
+                expected_policy_revision=int(stored_context["policyRevision"]),
+                expected_connection_revision=int(stored_context["connectionRevision"]),
+                provider_parent_id=str(stored_context["providerParentId"]),
+            )
+            if validated_context != stored_context:
+                raise ValueError(
+                    "Provider relationship context is stale: the candidate belongs to a "
+                    "different provider generation. Run a new preview."
+                )
+            self._require_provider_ci_mapping(
+                cursor,
+                str(before.get("provider") or ""),
+                company_id,
+                str(before.get("sourceMappingId") or ""),
+                provider_parent_id=str(stored_context["providerParentId"]),
+            )
+            if before.get("retiredAt"):
+                raise ValueError("Refresh provider evidence before approving this suggestion")
+            from_ci_id = str(before.get("fromCiId") or "")
+            to_ci_id = str(before.get("toCiId") or "")
+            if not from_ci_id or not to_ci_id:
+                raise ValueError("Resolve both candidate endpoints before approval")
+            relationship_type = str(before.get("relationshipType") or "")
+            if relationship_type not in CANONICAL_RELATIONSHIP_TYPES:
+                raise ValueError("The provider proposed an unsupported relationship type")
+            evidence = deepcopy(before.get("evidence") or {})
+            if not isinstance(evidence, dict):
+                raise ValueError("Relationship evidence must be an object")
+            impact_policy = str(evidence.get("impactPolicy") or "required")
+            if impact_policy not in RELATIONSHIP_IMPACT_POLICIES:
+                impact_policy = "required"
+            relationship_evidence = {
+                **evidence,
+                "candidateId": candidate_id,
+                "provider": before.get("provider"),
+            }
+            if (
+                len(json.dumps(relationship_evidence, separators=(",", ":")).encode("utf-8"))
+                > 262_144
+            ):
+                raise ValueError("Relationship evidence is too large")
+            confidence = float(before.get("confidence") or 0)
+            if confidence < 0 or confidence > 1:
+                raise ValueError("Relationship confidence must be between 0 and 1")
+            cursor.execute("SELECT id FROM companies WHERE slug = %s", (company_id,))
+            company_row = cursor.fetchone()
+            if not company_row:
+                raise ValueError("Customer not found")
+            company_uuid = str(company_row[0])
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"ci_relationships:{company_uuid}",),
+            )
+            cursor.execute(
+                """
+                SELECT id
+                FROM configuration_items
+                WHERE company_id = %s::uuid
+                  AND id = ANY(%s::uuid[])
+                  AND retired_at IS NULL
+                """,
+                (company_uuid, [from_ci_id, to_ci_id]),
+            )
+            if {str(item[0]) for item in cursor.fetchall()} != {from_ci_id, to_ci_id}:
+                raise ValueError("Both candidate endpoints must remain in this customer")
+            cursor.execute(
+                """
+                SELECT id, from_ci_id, to_ci_id, relationship_type, impact_policy,
+                       source_mapping_id, confidence, evidence, provenance
+                FROM ci_relationships
+                WHERE company_id = %s::uuid AND retired_at IS NULL
+                FOR UPDATE
+                """,
+                (company_uuid,),
+            )
+            relationships = [
+                {
+                    "id": str(item[0]),
+                    "fromId": str(item[1]),
+                    "toId": str(item[2]),
+                    "type": item[3],
+                    "impactPolicy": item[4],
+                    "sourceMappingId": str(item[5]) if item[5] else None,
+                    "confidence": float(item[6]),
+                    "evidence": item[7] or {},
+                    "provenance": item[8],
+                }
+                for item in cursor.fetchall()
+            ]
+            relationship = _matching_relationship(
+                relationships,
+                from_ci_id,
+                to_ci_id,
+                relationship_type,
+            )
+            if (
+                not relationship
+                and relationship_type == "depends_on"
+                and _dependency_cycle(relationships, from_ci_id, to_ci_id)
+            ):
+                raise ValueError("That provider suggestion would create a dependency cycle")
+            if not relationship:
+                relationship_uuid = str(uuid.uuid4())
+                cursor.execute(
+                    """
+                    INSERT INTO ci_relationships (
+                        id, company_id, from_ci_id, to_ci_id, relationship_type,
+                        impact_policy, source_mapping_id, confidence, evidence,
+                        provenance
+                    ) VALUES (
+                        %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, %s,
+                        %s::uuid, %s, %s::jsonb, 'provider'
+                    )
+                    ON CONFLICT (from_ci_id, to_ci_id, relationship_type) DO UPDATE SET
+                        company_id = EXCLUDED.company_id,
+                        impact_policy = CASE
+                            WHEN ci_relationships.provenance <> 'manual'
+                                THEN EXCLUDED.impact_policy
+                            ELSE ci_relationships.impact_policy
+                        END,
+                        source_mapping_id = CASE
+                            WHEN ci_relationships.provenance = 'manual'
+                                THEN ci_relationships.source_mapping_id
+                            ELSE EXCLUDED.source_mapping_id
+                        END,
+                        confidence = CASE
+                            WHEN ci_relationships.provenance <> 'manual'
+                                THEN EXCLUDED.confidence
+                            ELSE ci_relationships.confidence
+                        END,
+                        evidence = CASE
+                            WHEN ci_relationships.provenance <> 'manual'
+                                THEN EXCLUDED.evidence
+                            ELSE ci_relationships.evidence
+                        END,
+                        provenance = ci_relationships.provenance,
+                        retired_at = NULL
+                    RETURNING id, source_mapping_id, confidence, evidence,
+                              provenance, impact_policy
+                    """,
+                    (
+                        relationship_uuid,
+                        company_uuid,
+                        from_ci_id,
+                        to_ci_id,
+                        relationship_type,
+                        impact_policy,
+                        before["sourceMappingId"],
+                        confidence,
+                        json.dumps(relationship_evidence),
+                    ),
+                )
+                stored_row = cursor.fetchone()
+                stored_id = str(stored_row[0])
+                reactivated = stored_id != relationship_uuid
+                relationship = {
+                    "id": stored_id,
+                    "fromId": from_ci_id,
+                    "toId": to_ci_id,
+                    "type": relationship_type,
+                    "impactPolicy": stored_row[5],
+                    "sourceMappingId": str(stored_row[1]) if stored_row[1] else None,
+                    "confidence": float(stored_row[2]),
+                    "evidence": stored_row[3] or {},
+                    "provenance": stored_row[4],
+                }
+                self._insert_audit(
+                    cursor,
+                    company_id,
+                    actor_id,
+                    "relationship",
+                    stored_id,
+                    "reactivated" if reactivated else "created",
+                    {**relationship, "retired": True} if reactivated else None,
+                    relationship,
+                )
+            actor_uuid = None
+            if actor_id:
+                try:
+                    actor_uuid = str(uuid.UUID(str(actor_id)))
+                except (TypeError, ValueError):
+                    cursor.execute(
+                        "SELECT id FROM users WHERE attributes->>'legacyId' = %s LIMIT 1",
+                        (actor_id,),
+                    )
+                    actor_row = cursor.fetchone()
+                    actor_uuid = str(actor_row[0]) if actor_row else None
+            decided_at = utc_now()
+            decision_notes = str(notes or "")[:2000]
+            cursor.execute(
+                """
+                UPDATE ci_relationship_candidates
+                SET state = 'approved',
+                    decided_by = %s::uuid,
+                    decided_at = %s::timestamptz,
+                    decision_notes = %s,
+                    approved_relationship_id = %s::uuid,
+                    revision = revision + 1,
+                    updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (
+                    actor_uuid,
+                    decided_at,
+                    decision_notes,
+                    relationship["id"],
+                    candidate_uuid,
+                ),
+            )
+            after = {
+                **before,
+                "state": "approved",
+                "decidedBy": actor_uuid,
+                "decidedAt": decided_at,
+                "decisionNotes": decision_notes,
+                "approvedRelationshipId": relationship["id"],
+                "revision": int(before["revision"]) + 1,
+            }
+            self._insert_audit(
+                cursor,
+                company_id,
+                actor_id,
+                "relationship_candidate",
+                candidate_uuid,
+                "approved",
+                before,
+                after,
+                metadata={
+                    "sourceMappingId": before["sourceMappingId"],
+                    "relationshipType": relationship_type,
+                },
+            )
+        self._refresh_state_mirror()
+        self.save_state(self.state)
+        return after, relationship
 
     def get_msp_branding(self) -> dict:
         with self.connection_factory() as connection, connection.cursor() as cursor:
@@ -14780,6 +21645,8 @@ class PostgresCmdbRepository(StateRepository):
         review_items: list[dict],
         preview_summary: dict,
         actor_id: str | None = None,
+        *,
+        presence_snapshot: dict[str, Any] | None = None,
     ) -> dict | None:
         """Publish review observations and terminal evidence in one transaction."""
 
@@ -14789,7 +21656,7 @@ class PostgresCmdbRepository(StateRepository):
             cursor.execute(
                 """
                 SELECT run.cancel_requested_at, run.progress, run.policy_id,
-                       company.slug, integration.provider, run.attributes,
+                       company.slug, company.id, integration.provider, run.attributes,
                        run.lease_until, policy.lease_owner, policy.lease_until,
                        policy.external_parent_id
                 FROM sync_runs run
@@ -14815,6 +21682,7 @@ class PostgresCmdbRepository(StateRepository):
                 previous_progress,
                 policy_uuid,
                 company_id,
+                company_uuid,
                 provider,
                 attributes,
                 _run_lease_until,
@@ -14823,6 +21691,13 @@ class PostgresCmdbRepository(StateRepository):
                 provider_parent_id,
             ) = owned
             attributes = attributes if isinstance(attributes, dict) else {}
+            if presence_snapshot is not None:
+                attributes = {
+                    **attributes,
+                    "connectionRevision": int(
+                        _normalized_ci_presence_snapshot(presence_snapshot)["connectionRevision"]
+                    ),
+                }
             if (
                 str(attributes.get("companyId") or "") != str(company_id)
                 or str(attributes.get("providerCompanyId") or "") != str(provider_parent_id)
@@ -14881,6 +21756,18 @@ class PostgresCmdbRepository(StateRepository):
                 review_items,
                 actor_id,
             )
+            if presence_snapshot is not None:
+                self._apply_postgres_ci_presence_snapshot(
+                    cursor,
+                    kind=PROVIDER_FROM_DB.get(provider, provider),
+                    policy_id=str(policy_uuid),
+                    company_uuid=str(company_uuid),
+                    company_id=str(company_id),
+                    provider_parent_id=str(provider_parent_id),
+                    run_id=run_id,
+                    presence_snapshot=presence_snapshot,
+                    expected_policy_revision=int(attributes.get("policyRevision") or 0),
+                )
             aggregate = deepcopy(preview_summary)
             aggregate["queueSummary"] = queue_summary
             summary = _sanitized_preview_summary(aggregate)
@@ -14925,7 +21812,16 @@ class PostgresCmdbRepository(StateRepository):
                     review_count,
                     json.dumps(progress),
                     message,
-                    json.dumps({"resultSummary": summary}),
+                    json.dumps(
+                        {
+                            "resultSummary": summary,
+                            **(
+                                {"connectionRevision": attributes["connectionRevision"]}
+                                if "connectionRevision" in attributes
+                                else {}
+                            ),
+                        }
+                    ),
                     run_id,
                     bounded_owner,
                 ),
@@ -15344,10 +22240,6 @@ class PostgresCmdbRepository(StateRepository):
                         }
                     ),
                 ),
-            )
-            cursor.execute(
-                "UPDATE integration_connections SET enabled = %s, updated_at = now() WHERE id = %s::uuid",
-                (configured, integration_uuid),
             )
             company_slug = None
             if company_uuid:

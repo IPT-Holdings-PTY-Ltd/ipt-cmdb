@@ -135,6 +135,140 @@ export type AssetMetadata = {
   redundancyRole: string;
 };
 
+export type AssetInventoryRecord = Record<string, unknown>;
+
+export type AssetHardwareInventory = {
+  manufacturer?: string;
+  model?: string;
+  serialNumber?: string;
+  systemUuid?: string;
+  bios?: AssetInventoryRecord;
+  processors?: AssetInventoryRecord[];
+  memoryModules?: AssetInventoryRecord[];
+  physicalDisks?: AssetInventoryRecord[];
+  logicalVolumes?: AssetInventoryRecord[];
+};
+
+export type AssetNetworkInterface = AssetInventoryRecord & {
+  name?: string;
+  description?: string;
+  macAddress?: string;
+  ipAddresses?: string[];
+  gateway?: string;
+  gateways?: string[];
+  dnsServers?: string[];
+  dhcpEnabled?: boolean;
+};
+
+export type AssetNetworkInventory = {
+  hostname?: string;
+  interfaces?: AssetNetworkInterface[];
+};
+
+export type AssetOperatingSystemInventory = {
+  name?: string;
+  version?: string;
+  architecture?: string;
+  installDate?: string;
+  lastBoot?: string;
+  capabilities?: AssetInventoryRecord[];
+};
+
+export type AssetSoftwareItem = AssetInventoryRecord & {
+  name?: string;
+  displayName?: string;
+  publisher?: string;
+  version?: string;
+  installDate?: string;
+};
+
+export type AssetSoftwareInventory = {
+  applications?: AssetSoftwareItem[];
+  roles?: AssetSoftwareItem[];
+  features?: AssetSoftwareItem[];
+  patches?: AssetSoftwareItem[];
+  summary?: AssetInventoryRecord;
+};
+
+export type AssetClassificationEvidence = {
+  proposedType?: string;
+  confidence?: number;
+  evidence?: string[];
+};
+
+export type AssetVirtualizationInventory = {
+  role?: string;
+  kind?: string;
+  platform?: string;
+  hostName?: string;
+  clusterName?: string;
+  powerState?: string;
+  classification?: AssetClassificationEvidence;
+  confidence?: number | string;
+  evidence?: string[];
+};
+
+export type AssetMonitoringInventory = {
+  lastAgentCheckIn?: string;
+  serviceSummary?: AssetInventoryRecord;
+  activeIssueSummary?: AssetInventoryRecord;
+  inventoryCollectedAt?: string;
+  maintenanceWindows?: AssetInventoryRecord[];
+  observations?: AssetInventoryRecord[];
+};
+
+export type AssetLifecycleInventory = {
+  warrantyExpiryDate?: string;
+  leaseExpiryDate?: string;
+  expectedReplacementDate?: string;
+  purchaseDate?: string;
+  cost?: string | number;
+  location?: string;
+  assetTag?: string;
+};
+
+export type AssetSourceEvidence = {
+  provider?: string;
+  coverage?: Record<string, unknown>;
+  observedAt?: string;
+  fingerprint?: string;
+  partialErrors?: string[];
+  snapshots?: AssetInventoryRecord[];
+};
+
+export type AssetFields = Record<string, unknown> & {
+  hardware?: AssetHardwareInventory;
+  network?: AssetNetworkInventory;
+  operatingSystem?: string | AssetOperatingSystemInventory;
+  software?: AssetSoftwareInventory;
+  virtualization?: AssetVirtualizationInventory;
+  monitoring?: AssetMonitoringInventory;
+  lifecycle?: AssetLifecycleInventory;
+  sourceEvidence?: AssetSourceEvidence;
+};
+
+export type AssetInventoryCollections = Record<string, AssetInventoryRecord[]> & {
+  network_interfaces?: AssetNetworkInterface[];
+  applications?: AssetSoftwareItem[];
+  memory_modules?: AssetInventoryRecord[];
+  physical_disks?: AssetInventoryRecord[];
+  logical_volumes?: AssetInventoryRecord[];
+  processors?: AssetInventoryRecord[];
+  server_roles?: AssetSoftwareItem[];
+  server_features?: AssetSoftwareItem[];
+  os_capabilities?: AssetInventoryRecord[];
+  maintenance_windows?: AssetInventoryRecord[];
+};
+
+export type AssetInventoryPayload = {
+  assetId: string;
+  companyId?: string;
+  observedAt?: string;
+  collections?: AssetInventoryCollections;
+  networkInterfaces?: AssetNetworkInterface[];
+  snapshots?: AssetInventoryRecord[];
+};
+
 export type Asset = {
   id: string;
   companyId: string;
@@ -144,7 +278,8 @@ export type Asset = {
   source: string;
   externalId?: string | null;
   lastSeen?: string;
-  fields: Record<string, unknown>;
+  fields: AssetFields;
+  inventoryCollections?: AssetInventoryCollections;
   metadata: AssetMetadata;
   responsibilities?: ContactResponsibility[];
 };
@@ -155,6 +290,18 @@ export type Relationship = {
   toId: string;
   type: string;
   impactPolicy: 'required' | 'degraded' | 'redundant' | 'informational';
+  provenance?: 'manual' | 'provider';
+  sourceMappingId?: string | null;
+  confidence?: number;
+  evidence?: {
+    provider?: string;
+    candidateId?: string;
+    messages?: string[];
+    impactPolicy?: string;
+    freshness?: string;
+    observedAt?: string;
+    [key: string]: unknown;
+  };
 };
 
 export type AccessGroup = {
@@ -257,6 +404,153 @@ export type NcentralConnection = {
   lifecycleChangedAt?: string | null;
   lifecycleChangedBy?: string | null;
   discoveryPolicy: { excludedExternalIds: string[] };
+};
+
+export type NcentralGraphqlCapabilityStatus =
+  | 'available'
+  | 'unavailable'
+  | 'forbidden'
+  | 'schema_gated'
+  | 'not_tested'
+  | 'error';
+
+export type NcentralGraphqlCapability = {
+  key: string;
+  label?: string;
+  status: NcentralGraphqlCapabilityStatus;
+  summary?: string;
+  checkedAt?: string | null;
+  expiresAt?: string | null;
+  stale?: boolean;
+};
+
+export type NcentralGraphqlCacheState = {
+  status: 'empty' | 'fresh' | 'stale' | 'refreshing' | 'partial' | 'scope_changed'
+    | 'configuration_changed' | 'error';
+  providerAssetCount?: number;
+  eligibleDeviceCount?: number;
+  deviceCount?: number;
+  unmatchedDeviceCount?: number;
+  pagesRead?: number;
+  complete?: boolean;
+  lastRefreshedAt?: string | null;
+  expiresAt?: string | null;
+  message?: string;
+};
+
+/**
+ * Public GraphQL configuration. The API must never populate graphqlApiToken;
+ * that field exists only in the write request sent from the setup form.
+ */
+export type NcentralGraphqlConfig = {
+  graphqlEnabled: boolean;
+  graphqlEndpoint: string;
+  graphqlPageSize: number;
+  graphqlServerId: string;
+  configured: boolean;
+  credentialSource: 'environment' | 'encrypted_database' | 'not_configured';
+  managedByEnvironment: boolean;
+  hasCredentials?: boolean;
+  connectionStatus?: 'disabled' | 'not_configured' | 'configured' | 'verified' | 'error';
+  lastTestAt?: string | null;
+  lastError?: string;
+  revision?: number;
+  capabilities?: NcentralGraphqlCapability[];
+  capability?: {
+    reachable?: boolean;
+    candidateCount?: number;
+    truncated?: boolean;
+    testedAt?: string | null;
+    status?: 'supported' | 'unsupported' | 'unavailable' | 'error';
+    errorCategory?: string;
+    checkedAt?: string | null;
+    expiresAt?: string | null;
+    stale?: boolean;
+  };
+  queries?: Array<{
+    key: string;
+    label: string;
+    description: string;
+    paginated: boolean;
+    customerScoped: boolean;
+    readOnly: boolean;
+  }>;
+  cache?: NcentralGraphqlCacheState;
+};
+
+export type NcentralGraphqlTestResult = {
+  reachable: boolean;
+  credentialSource: string;
+  customerCandidates: Array<{ id: string; name: string; typeName: string }>;
+  candidateCount: number;
+  truncated: boolean;
+  readOnly: boolean;
+  writesAttempted: boolean;
+};
+
+export type NcentralGraphqlFieldGroup = {
+  key: string;
+  label?: string;
+  devicesWithData?: number;
+  fieldCount?: number;
+  status?: NcentralGraphqlCapabilityStatus;
+};
+
+export type NcentralGraphqlPreview = {
+  companyId: string;
+  providerCompanyId: string;
+  queryKey: 'asset_identity' | 'asset_inventory';
+  organizationIds: string[];
+  totalCount: number;
+  items: Array<{
+    graphqlAssetId: string;
+    name: string;
+    customer: { id: string; name: string };
+    site: { id: string; name: string } | null;
+    serviceOrganization: { id: string; name: string } | null;
+    sourceIdentity: {
+      provider: 'ncentral';
+      namespace: 'nable_graphql_asset';
+      externalId: string;
+    };
+    restIdentity: {
+      provider: 'ncentral';
+      namespace: 'ncentral_rest_device';
+      serverId: string;
+      deviceId: string;
+      crosswalkKey: string;
+    } | null;
+    summary: {
+      description?: string;
+      operatingSystem?: {
+        name?: string;
+        version?: string;
+        type?: string;
+        architecture?: string;
+        buildNumber?: string;
+        installedOn?: string;
+      };
+      system?: {
+        hostname?: string;
+        manufacturer?: string;
+        model?: string;
+        serialNumber?: string;
+        memoryTotalSizeBytes?: number;
+      };
+      cpu?: Array<{ name: string; cores: number }>;
+      agent?: { status?: string; statusChangedAt?: string };
+      lastBootedAt?: string;
+      externalIpAddress?: string;
+    };
+  }>;
+  truncated: boolean;
+  refreshed?: boolean;
+  credentialSource: string;
+  customerOnly?: boolean;
+  readOnly?: boolean;
+  writesAttempted?: boolean;
+  message?: string;
+  cache?: NcentralGraphqlCacheState;
 };
 
 export type NcentralDiscoveryPreview = {
@@ -467,6 +761,14 @@ export type ConnectWiseCiPolicy = {
   typeMappings: Record<string, string>;
   blockUnmappedTypes: boolean;
   enrichmentMode?: 'fast' | 'balanced' | 'full';
+  relationshipAutomationMode?: 'review' | 'auto_explicit';
+  relationshipAutoApproveTypes?: string[];
+  relationshipMinConfidence?: number;
+  relationshipMinObservations?: number;
+  relationshipMaxEvidenceAgeHours?: number;
+  missingDeviceRequiredSnapshots?: number;
+  missingDeviceMinimumHours?: number;
+  graphqlOrganizationIds?: string[];
   statusMode: 'all' | 'selected';
   includedStatusIds: string[];
   excludedExternalIds: string[];
@@ -607,6 +909,56 @@ export type IntegrationObjectSuppression = {
 
 export type IntegrationObjectSuppressionQueue = {
   items: IntegrationObjectSuppression[];
+  total: number;
+};
+
+export type MissingDeviceLifecycleState =
+  | 'observed'
+  | 'monitoring'
+  | 'eligible'
+  | 'not_evaluated'
+  | 'retired'
+  | 'restore_ready';
+
+export type MissingDeviceLifecycleCandidate = {
+  id: string;
+  mappingId: string;
+  provider: string;
+  companyId: string;
+  companyName: string;
+  providerParentId: string;
+  externalId: string;
+  externalName: string;
+  assetId: string;
+  assetName: string;
+  state: MissingDeviceLifecycleState;
+  consecutiveCompleteAbsences: number;
+  requiredAbsences: number;
+  firstAbsentAt?: string | null;
+  lastObservedAt?: string | null;
+  lastEvaluatedAt?: string | null;
+  reappearedAt?: string | null;
+  retiredAt?: string | null;
+  retiredByName?: string | null;
+  retirementNotes?: string | null;
+  revision: number;
+  actionAllowed: boolean;
+  actionReason: string;
+};
+
+export type MissingDeviceLifecycleSummary = {
+  observed: number;
+  monitoring: number;
+  eligible: number;
+  notEvaluated: number;
+  retired: number;
+  restoreReady: number;
+  total: number;
+};
+
+export type MissingDeviceLifecycleQueue = {
+  summary: MissingDeviceLifecycleSummary;
+  items: MissingDeviceLifecycleCandidate[];
   total: number;
 };
 

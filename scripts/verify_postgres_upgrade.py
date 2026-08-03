@@ -112,6 +112,16 @@ def main() -> None:
             "ncentral", "N-central", user_id
         )
         assert ncentral_connection["type"] == "ncentral"
+        graphql_capability = repository.upsert_integration_capability_snapshot(
+            "ncentral",
+            "graphql.asset_inventory",
+            {
+                "status": "supported",
+                "summary": {"readOnly": True, "source": "upgrade_verification"},
+            },
+            ttl_seconds=300,
+        )
+        assert graphql_capability["status"] == "supported"
         failed_test = repository.mark_integration_test(
             "ncentral",
             "error",
@@ -210,6 +220,34 @@ def main() -> None:
                 """,
                 (company_id, company_id),
             )
+        ncentral_mapping = repository.record_provider_ci_mapping(
+            "ncentral",
+            "acme",
+            {
+                "externalId": "upgrade-device-101",
+                "name": "Reconnect source",
+                "providerVersion": "upgrade-verification",
+            },
+            "00000000-0000-4000-8000-000000000101",
+            user_id,
+        )
+        graphql_preview = repository.upsert_integration_enrichment_preview(
+            "ncentral",
+            "acme",
+            {
+                "providerParentId": "101",
+                "sourceNamespace": "nable_graphql_asset",
+                "sourceServerId": "upgrade-server",
+                "sourceDeviceId": "upgrade-device-101",
+                "policyId": ncentral_policy["id"],
+                "assetId": "00000000-0000-4000-8000-000000000101",
+                "sourceMappingId": ncentral_mapping["id"],
+                "status": "ready",
+                "summary": {"identityMatch": "server_device_id"},
+            },
+            ttl_seconds=300,
+        )
+        assert graphql_preview["sourceServerId"] == "upgrade-server"
         first_relationship = repository.create_relationship(
             {
                 "id": "00000000-0000-4000-8000-000000000201",
@@ -271,7 +309,8 @@ def main() -> None:
             f"Upgrade verified: versions={','.join(versions)} "
             "customer_branding=preserved legacy_state=retired "
             "relationship_reconnect=verified email_outbox=verified "
-            "worker_telemetry=verified ncentral_install=verified"
+            "worker_telemetry=verified ncentral_install=verified "
+            "graphql_cache=verified"
         )
     finally:
         with (

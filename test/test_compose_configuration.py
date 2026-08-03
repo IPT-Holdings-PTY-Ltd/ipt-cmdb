@@ -12,6 +12,12 @@ NCENTRAL_ENVIRONMENT = {
     "NCENTRAL_USER_API_TOKEN_FILE": "${NCENTRAL_USER_API_TOKEN_FILE:-}",
     "NCENTRAL_API_TOKEN": "${NCENTRAL_API_TOKEN:-}",
     "NCENTRAL_PAGE_SIZE": "${NCENTRAL_PAGE_SIZE:-250}",
+    "NCENTRAL_GRAPHQL_ENABLED": "${NCENTRAL_GRAPHQL_ENABLED:-false}",
+    "NCENTRAL_GRAPHQL_ENDPOINT": ("${NCENTRAL_GRAPHQL_ENDPOINT:-https://api.n-able.com/graphql}"),
+    "NCENTRAL_GRAPHQL_API_TOKEN": "${NCENTRAL_GRAPHQL_API_TOKEN:-}",
+    "NCENTRAL_GRAPHQL_API_TOKEN_FILE": "${NCENTRAL_GRAPHQL_API_TOKEN_FILE:-}",
+    "NCENTRAL_GRAPHQL_PAGE_SIZE": "${NCENTRAL_GRAPHQL_PAGE_SIZE:-100}",
+    "NCENTRAL_GRAPHQL_SERVER_ID": "${NCENTRAL_GRAPHQL_SERVER_ID:-}",
 }
 LOCAL_LOGIN_ENVIRONMENT = {
     "FORWARDED_ALLOW_IPS": "${FORWARDED_ALLOW_IPS:-}",
@@ -104,10 +110,32 @@ class ComposeNcentralEnvironmentTests(unittest.TestCase):
             "NCENTRAL_USER_API_TOKEN",
             "NCENTRAL_USER_API_TOKEN_FILE",
             "NCENTRAL_API_TOKEN",
+            "NCENTRAL_GRAPHQL_API_TOKEN",
+            "NCENTRAL_GRAPHQL_API_TOKEN_FILE",
         ):
             with self.subTest(key=key):
                 self.assertIn(key, values)
                 self.assertEqual(values[key], "")
+        self.assertEqual(values["NCENTRAL_GRAPHQL_ENABLED"], "false")
+        self.assertEqual(values["NCENTRAL_GRAPHQL_PAGE_SIZE"], "100")
+        self.assertEqual(values["NCENTRAL_GRAPHQL_SERVER_ID"], "")
+        self.assertEqual(
+            values["NCENTRAL_GRAPHQL_ENDPOINT"],
+            "https://api.n-able.com/graphql",
+        )
+        self.assertEqual(values["NCENTRAL_GRAPHQL_PAGE_SIZE"], "100")
+        self.assertEqual(values["NCENTRAL_GRAPHQL_SERVER_ID"], "")
+
+    def test_local_secret_folder_is_excluded_from_container_build_context(self) -> None:
+        """Prevent locally staged provider tokens from entering an image layer."""
+
+        ignored = {
+            line.strip().rstrip("/")
+            for line in (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+        self.assertIn("appliance-secrets", ignored)
 
 
 class AuthenticationDeploymentContractTests(unittest.TestCase):
