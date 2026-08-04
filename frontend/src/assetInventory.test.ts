@@ -3,7 +3,7 @@ import {
   buildAssetTechnicalInventory,
   mergeAssetInventoryPayload,
 } from './assetInventory';
-import type { Asset, AssetInventoryPayload } from './types';
+import type { Asset, AssetInventoryCollections, AssetInventoryPayload } from './types';
 
 function asset(changes: Partial<Asset> = {}): Asset {
   return {
@@ -194,6 +194,92 @@ describe('asset technical inventory', () => {
       server_roles: 1,
     });
     expect(inventory.sourceEvidence.snapshots).toEqual(payload.snapshots);
+  });
+
+  it('accepts object-shaped provider collections alongside record lists', () => {
+    const collections: AssetInventoryCollections = {
+      hardware: { manufacturer: 'Dell', model: 'PowerEdge R750' },
+      operating_system: {
+        name: 'Windows Server 2025',
+        capabilities: [{ name: 'PowerShellVersion', value: '5.1' }],
+      },
+      software: {
+        count: 1,
+        items: [{ name: 'Windows Admin Center', version: '2.0' }],
+        roles: [{ name: 'Hyper-V' }],
+        features: [{ name: 'Failover Clustering' }],
+        patches: [{ name: 'KB5000001' }],
+      },
+      monitoring: {
+        maintenanceWindows: [{ name: 'Sunday maintenance' }],
+        observations: [{ name: 'Agent healthy' }],
+      },
+      lifecycle: { warrantyExpiryDate: '2028-08-04' },
+      virtualization: { kind: 'hypervisor_host', platform: 'Hyper-V' },
+      network_interfaces: [{ name: 'vEthernet (Management)' }],
+    };
+
+    const merged = mergeAssetInventoryPayload(asset(), {
+      assetId: 'asset-1',
+      collections,
+    });
+
+    expect(merged.fields.hardware).toMatchObject({
+      manufacturer: 'Dell',
+      model: 'PowerEdge R750',
+    });
+    expect(merged.fields.operatingSystem).toMatchObject({ name: 'Windows Server 2025' });
+    expect(merged.fields.software).toMatchObject({
+      applications: [{ name: 'Windows Admin Center', version: '2.0' }],
+      roles: [{ name: 'Hyper-V' }],
+      features: [{ name: 'Failover Clustering' }],
+      patches: [{ name: 'KB5000001' }],
+    });
+    expect(merged.fields.monitoring).toMatchObject({
+      maintenanceWindows: [{ name: 'Sunday maintenance' }],
+      observations: [{ name: 'Agent healthy' }],
+    });
+    expect(merged.fields.lifecycle).toMatchObject({ warrantyExpiryDate: '2028-08-04' });
+    expect(merged.fields.virtualization).toMatchObject({
+      kind: 'hypervisor_host',
+      platform: 'Hyper-V',
+    });
+    expect(merged.fields.sourceEvidence).toMatchObject({
+      coverage: {
+        hardware: 1,
+        operating_system: 1,
+        software: 1,
+        monitoring: 1,
+        lifecycle: 1,
+        virtualization: 1,
+        network_interfaces: 1,
+      },
+    });
+  });
+
+  it('does not mistake a direct inventory row payload for a repository snapshot', () => {
+    const merged = mergeAssetInventoryPayload(asset(), {
+      assetId: 'asset-1',
+      collections: {
+        applications: [
+          {
+            name: 'Collector agent',
+            version: '4.0',
+            payload: { channel: 'stable' },
+          },
+        ],
+      },
+    });
+
+    expect(merged.fields.software).toMatchObject({
+      applications: [
+        {
+          name: 'Collector agent',
+          version: '4.0',
+          payload: { channel: 'stable' },
+        },
+      ],
+    });
   });
 
   it('leaves the asset unchanged for an inventory payload belonging to another asset', () => {

@@ -55,6 +55,14 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ### Fixed
 
+- Modelled direct provider inventory objects separately from persisted snapshot arrays,
+  preserving nested OS, software and monitoring collections and avoiding false snapshot
+  detection for ordinary rows that happen to contain a `payload` field.
+- Consolidated separator- and case-insensitive credential detection across inventory,
+  audit, cache and runtime-log boundaries, including nested arrays, credential-bearing
+  URLs and private-key blocks, with fail-closed repository validation.
+- Converted the remaining function-only relationship and technical-inventory tests to
+  `unittest.TestCase` so the documented CI and pre-push command actually executes them.
 - Made balanced N-central detail enrichment retain its bounded rotation cursor, so
   larger estates advance beyond the first 25 devices on successive successful previews.
 - Prevented partial N-central and GraphQL reads from replacing previously collected
@@ -87,6 +95,9 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ### Security
 
+- Consolidated credential-field detection across audit, integration-cache and technical
+  inventory boundaries; recursively strips separator/casing variants and strong secret
+  scalar formats, while repository persistence now rejects unsanitized inventory data.
 - Stopped trusting caller-supplied `X-Forwarded-For` values unless the immediate peer
   is an explicitly configured proxy.
 - Added dummy PBKDF2 work for unknown, disabled and non-local identities to reduce

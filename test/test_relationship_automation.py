@@ -1,5 +1,6 @@
 """Tests for opt-in relationship automation policy evaluation."""
 
+import unittest
 from datetime import UTC, datetime
 
 from src.cmdb.relationship_automation import relationship_auto_approval_decision
@@ -40,40 +41,40 @@ def _policy(**overrides: object) -> dict:
     return policy
 
 
-def test_explicit_repeated_fresh_identity_is_eligible() -> None:
-    decision = relationship_auto_approval_decision(_candidate(), _policy(), now=NOW)
+class RelationshipAutomationTests(unittest.TestCase):
+    """Verify opt-in relationship automation policy decisions."""
 
-    assert decision["eligible"] is True
-    assert decision["reasons"] == []
+    def test_explicit_repeated_fresh_identity_is_eligible(self) -> None:
+        decision = relationship_auto_approval_decision(_candidate(), _policy(), now=NOW)
 
+        self.assertTrue(decision["eligible"])
+        self.assertEqual(decision["reasons"], [])
 
-def test_review_only_policy_never_auto_approves() -> None:
-    decision = relationship_auto_approval_decision(
-        _candidate(),
-        _policy(relationshipAutomationMode="review"),
-        now=NOW,
-    )
+    def test_review_only_policy_never_auto_approves(self) -> None:
+        decision = relationship_auto_approval_decision(
+            _candidate(),
+            _policy(relationshipAutomationMode="review"),
+            now=NOW,
+        )
 
-    assert decision["eligible"] is False
-    assert "automation_not_enabled" in decision["reasons"]
+        self.assertFalse(decision["eligible"])
+        self.assertIn("automation_not_enabled", decision["reasons"])
 
+    def test_heuristic_or_single_observation_requires_review(self) -> None:
+        candidate = _candidate(
+            observationCount=1,
+            evidence={"detector": {"key": "network_proximity", "version": 1}},
+        )
+        decision = relationship_auto_approval_decision(candidate, _policy(), now=NOW)
 
-def test_heuristic_or_single_observation_requires_review() -> None:
-    candidate = _candidate(
-        observationCount=1,
-        evidence={"detector": {"key": "network_proximity", "version": 1}},
-    )
-    decision = relationship_auto_approval_decision(candidate, _policy(), now=NOW)
+        self.assertFalse(decision["eligible"])
+        self.assertIn("insufficient_observations", decision["reasons"])
+        self.assertIn("detector_not_auto_approvable", decision["reasons"])
 
-    assert decision["eligible"] is False
-    assert "insufficient_observations" in decision["reasons"]
-    assert "detector_not_auto_approvable" in decision["reasons"]
+    def test_stale_or_unresolved_evidence_requires_review(self) -> None:
+        candidate = _candidate(toCiId=None, lastSeenAt="2026-07-20T11:30:00Z")
+        decision = relationship_auto_approval_decision(candidate, _policy(), now=NOW)
 
-
-def test_stale_or_unresolved_evidence_requires_review() -> None:
-    candidate = _candidate(toCiId=None, lastSeenAt="2026-07-20T11:30:00Z")
-    decision = relationship_auto_approval_decision(candidate, _policy(), now=NOW)
-
-    assert decision["eligible"] is False
-    assert "unresolved_endpoint" in decision["reasons"]
-    assert "evidence_too_old" in decision["reasons"]
+        self.assertFalse(decision["eligible"])
+        self.assertIn("unresolved_endpoint", decision["reasons"])
+        self.assertIn("evidence_too_old", decision["reasons"])

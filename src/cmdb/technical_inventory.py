@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
+from src.cmdb.sensitive import is_sensitive_field_name, is_sensitive_scalar
+
 COLLECTION_LIMITS = {
     "network_interfaces": 128,
     "processors": 32,
@@ -33,18 +35,8 @@ PROVIDER_COLLECTION_LIMITS = {
     "lifecycle": 1,
     "virtualization": 1,
 }
-SENSITIVE_KEYS = {
-    "credential",
-    "credentials",
-    "executable",
-    "executablename",
-    "licensekey",
-    "password",
-    "remotecontroluri",
-    "secret",
-    "token",
-    "useraccount",
-}
+MAX_SANITIZE_DEPTH = 12
+_DROP_VALUE = object()
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
@@ -65,30 +57,41 @@ def _rows(value: object) -> list[Mapping[str, Any]]:
     ]
 
 
-def _safe_row(row: Mapping[str, Any]) -> dict[str, Any]:
+def _safe_value(value: Any, depth: int) -> Any:
+    """Recursively sanitize one JSON-like inventory value."""
+
+    if depth > MAX_SANITIZE_DEPTH:
+        return _DROP_VALUE
+    if isinstance(value, Mapping):
+        nested = _safe_row(value, depth)
+        return nested if nested else _DROP_VALUE
+    if isinstance(value, list):
+        values = [
+            safe
+            for item in value[:128]
+            if (safe := _safe_value(item, depth + 1)) is not _DROP_VALUE
+        ]
+        return values if values else _DROP_VALUE
+    if isinstance(value, (str, int, float, bool)):
+        return _DROP_VALUE if is_sensitive_scalar(value) else deepcopy(value)
+    return _DROP_VALUE
+
+
+def _safe_row(row: Mapping[str, Any], depth: int = 0) -> dict[str, Any]:
     """Recursively remove credential-like fields and empty values."""
 
+    if depth > MAX_SANITIZE_DEPTH:
+        return {}
     safe: dict[str, Any] = {}
     for raw_key, raw_value in row.items():
         key = str(raw_key)
-        if key.casefold().replace("_", "") in SENSITIVE_KEYS:
+        if is_sensitive_field_name(key):
             continue
         if raw_value in (None, ""):
             continue
-        if isinstance(raw_value, Mapping):
-            nested = _safe_row(raw_value)
-            if nested:
-                safe[key] = nested
-        elif isinstance(raw_value, list):
-            values = [
-                _safe_row(item) if isinstance(item, Mapping) else deepcopy(item)
-                for item in raw_value[:128]
-            ]
-            values = [item for item in values if item not in (None, "", {}, [])]
-            if values:
-                safe[key] = values
-        elif isinstance(raw_value, (str, int, float, bool)):
-            safe[key] = deepcopy(raw_value)
+        sanitized = _safe_value(raw_value, depth + 1)
+        if sanitized is not _DROP_VALUE:
+            safe[key] = sanitized
     return safe
 
 

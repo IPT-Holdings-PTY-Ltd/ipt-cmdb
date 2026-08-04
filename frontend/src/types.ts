@@ -247,7 +247,30 @@ export type AssetFields = Record<string, unknown> & {
   sourceEvidence?: AssetSourceEvidence;
 };
 
-export type AssetInventoryCollections = Record<string, AssetInventoryRecord[]> & {
+export type AssetInventoryCollectionPayload = AssetInventoryRecord | AssetInventoryRecord[];
+
+export type AssetInventorySnapshot = AssetInventoryRecord & {
+  id?: string;
+  collectionType: string;
+  fingerprint: string;
+  payload: AssetInventoryCollectionPayload;
+  itemCount: number;
+  completeness?: string;
+  firstObservedAt?: string;
+  lastObservedAt?: string;
+  supersededAt?: string | null;
+  mappingId?: string;
+  provider?: string;
+};
+
+export type ProviderAssetInventoryCollections = {
+  [collectionType: string]: AssetInventoryCollectionPayload | undefined;
+  hardware?: AssetInventoryRecord;
+  operating_system?: AssetInventoryRecord;
+  software?: AssetInventoryRecord;
+  monitoring?: AssetInventoryRecord;
+  lifecycle?: AssetInventoryRecord;
+  virtualization?: AssetInventoryRecord;
   network_interfaces?: AssetNetworkInterface[];
   applications?: AssetSoftwareItem[];
   memory_modules?: AssetInventoryRecord[];
@@ -260,11 +283,17 @@ export type AssetInventoryCollections = Record<string, AssetInventoryRecord[]> &
   maintenance_windows?: AssetInventoryRecord[];
 };
 
+export type PersistedAssetInventoryCollections = {
+  [collectionType: string]: AssetInventorySnapshot[] | undefined;
+};
+
+export type AssetInventoryCollections = ProviderAssetInventoryCollections;
+
 export type AssetInventoryPayload = {
   assetId: string;
   companyId?: string;
   observedAt?: string;
-  collections?: AssetInventoryCollections;
+  collections?: PersistedAssetInventoryCollections | ProviderAssetInventoryCollections;
   networkInterfaces?: AssetNetworkInterface[];
   snapshots?: AssetInventoryRecord[];
 };
@@ -279,7 +308,7 @@ export type Asset = {
   externalId?: string | null;
   lastSeen?: string;
   fields: AssetFields;
-  inventoryCollections?: AssetInventoryCollections;
+  inventoryCollections?: ProviderAssetInventoryCollections;
   metadata: AssetMetadata;
   responsibilities?: ContactResponsibility[];
 };

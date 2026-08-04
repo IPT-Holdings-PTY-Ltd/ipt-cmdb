@@ -3,6 +3,7 @@ import type {
   AssetClassificationEvidence,
   AssetInventoryPayload,
   AssetInventoryRecord,
+  AssetInventorySnapshot,
   AssetSourceEvidence,
 } from './types';
 
@@ -412,9 +413,16 @@ function inventoryCollectionPayload(
   const value = collections[key];
   if (!Array.isArray(value)) return value;
   const entries = recordList(value);
-  const snapshot = entries.find(entry => 'payload' in entry && !entry.supersededAt)
-    || entries.find(entry => 'payload' in entry);
+  const snapshots = entries.filter(isInventorySnapshot);
+  const snapshot = snapshots.find(entry => !entry.supersededAt) || snapshots[0];
   return snapshot ? snapshot.payload : value;
+}
+
+function isInventorySnapshot(value: unknown): value is AssetInventorySnapshot {
+  const record = asRecord(value);
+  return Object.prototype.hasOwnProperty.call(record, 'payload')
+    && typeof record.collectionType === 'string'
+    && typeof record.fingerprint === 'string';
 }
 
 function inventoryCollectionRecords(
@@ -436,17 +444,31 @@ function preferInventoryCollection(
 function inventorySnapshotSummaries(collections: AssetInventoryRecord): AssetInventoryRecord[] {
   return Object.entries(collections).flatMap(([collectionType, value]) =>
     recordList(value)
-      .filter(record => 'payload' in record)
-      .map(({ payload: _payload, ...record }) => ({ collectionType, ...record }) as AssetInventoryRecord));
+      .filter(isInventorySnapshot)
+      .map(({ payload: _payload, ...record }) => ({
+        ...record,
+        collectionType: String(record.collectionType || collectionType),
+      }) as AssetInventoryRecord));
 }
 
 function inventoryCoverage(collections: AssetInventoryRecord) {
   return Object.fromEntries(Object.entries(collections).map(([key, value]) => {
     const entries = recordList(value);
-    const current = entries.find(entry => !entry.supersededAt) || entries[0];
+    const snapshots = entries.filter(isInventorySnapshot);
+    const current = snapshots.find(entry => !entry.supersededAt) || snapshots[0];
+    const direct = asRecord(value);
+    const directCount = Number(direct.count);
     const count = current && Number.isFinite(Number(current.itemCount))
       ? Number(current.itemCount)
-      : inventoryCollectionRecords(collections, [key]).length;
+      : snapshots.length
+        ? inventoryCollectionRecords(collections, [key]).length
+        : Array.isArray(value)
+          ? entries.length
+          : Number.isFinite(directCount)
+            ? directCount
+            : Object.keys(direct).length
+              ? 1
+              : 0;
     return [key, count];
   }));
 }
@@ -522,7 +544,8 @@ export function mergeAssetInventoryPayload(
         capabilities: preferInventoryCollection(
           collections,
           ['os_capabilities'],
-          asRecord(fields.operatingSystem).capabilities,
+          persistedOperatingSystem.capabilities
+            || asRecord(fields.operatingSystem).capabilities,
         ),
       },
       network: {
@@ -554,13 +577,21 @@ export function mergeAssetInventoryPayload(
             ['applications'],
             software.applications,
           ),
-        roles: preferInventoryCollection(collections, ['server_roles'], software.roles),
+        roles: preferInventoryCollection(
+          collections,
+          ['server_roles'],
+          persistedSoftware.roles || software.roles,
+        ),
         features: preferInventoryCollection(
           collections,
           ['server_features'],
-          software.features,
+          persistedSoftware.features || software.features,
         ),
-        patches: preferInventoryCollection(collections, ['patches'], software.patches),
+        patches: preferInventoryCollection(
+          collections,
+          ['patches'],
+          persistedSoftware.patches || software.patches,
+        ),
       },
       monitoring: {
         ...monitoring,
@@ -568,12 +599,12 @@ export function mergeAssetInventoryPayload(
         maintenanceWindows: preferInventoryCollection(
           collections,
           ['maintenance_windows'],
-          monitoring.maintenanceWindows,
+          persistedMonitoring.maintenanceWindows || monitoring.maintenanceWindows,
         ),
         observations: preferInventoryCollection(
           collections,
           ['monitoring'],
-          monitoring.observations,
+          persistedMonitoring.observations || monitoring.observations,
         ),
       },
       lifecycle: {

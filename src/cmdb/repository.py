@@ -37,6 +37,11 @@ from src.cmdb.integration_reconciliation import (
     normalize_ci_policy,
 )
 from src.cmdb.notifications import DEFAULT_NOTIFICATION_RULES, DEFAULT_NOTIFICATION_TEMPLATES
+from src.cmdb.sensitive import (
+    contains_sensitive_data,
+    is_sensitive_field_name,
+    is_sensitive_scalar,
+)
 
 CMDB_NAMESPACE = uuid.UUID("a12d44c4-64a7-4d6f-b829-3a8b691f0fa4")
 PROVIDER_TO_DB = {
@@ -288,16 +293,20 @@ def _bounded_integration_cache_summary(value: Any, *, maximum_bytes: int) -> tup
                 key = re.sub(r"[^a-z0-9]", "", str(raw_key).casefold())
                 if key in {"data", "errors"}:
                     raise ValueError("Raw GraphQL response envelopes cannot be cached")
-                if key in INTEGRATION_CACHE_SENSITIVE_KEYS or key.endswith(
-                    (
-                        "apikey",
-                        "authorization",
-                        "cookie",
-                        "credential",
-                        "password",
-                        "privatekey",
-                        "secret",
-                        "token",
+                if (
+                    is_sensitive_field_name(raw_key)
+                    or key in INTEGRATION_CACHE_SENSITIVE_KEYS
+                    or key.endswith(
+                        (
+                            "apikey",
+                            "authorization",
+                            "cookie",
+                            "credential",
+                            "password",
+                            "privatekey",
+                            "secret",
+                            "token",
+                        )
                     )
                 ):
                     raise ValueError("Integration cache summary contains a sensitive field")
@@ -308,6 +317,8 @@ def _bounded_integration_cache_summary(value: Any, *, maximum_bytes: int) -> tup
                 raise ValueError("Integration cache summary contains too many entries")
             for child in item:
                 inspect(child, depth + 1)
+        elif is_sensitive_scalar(item):
+            raise ValueError("Integration cache summary contains sensitive data")
 
     inspect(value)
     summary = deepcopy(value)
@@ -376,6 +387,8 @@ def _bounded_inventory_payload(value: Any) -> tuple[Any, int, str]:
 
     if not isinstance(value, (dict, list)):
         raise ValueError("Inventory collection payload must be an object or array")
+    if contains_sensitive_data(value):
+        raise ValueError("Inventory collection payload contains sensitive data")
     item_count = len(value) if isinstance(value, list) else 1
     if item_count > INVENTORY_MAX_COLLECTION_ITEMS:
         raise ValueError("Inventory collection contains too many items")
@@ -7175,11 +7188,15 @@ class StateRepository:
             else:
                 normalized_collections[collection_type] = raw_payload
 
+        bounded_collections = {
+            collection_type: _bounded_inventory_payload(raw_payload)
+            for collection_type, raw_payload in normalized_collections.items()
+        }
         stored_snapshots = self.state.setdefault("ciInventorySnapshots", [])
         current_snapshots: dict[str, dict] = {}
         stale_types: list[str] = []
-        for collection_type, raw_payload in normalized_collections.items():
-            payload, item_count, fingerprint = _bounded_inventory_payload(raw_payload)
+        for collection_type, bounded_payload in bounded_collections.items():
+            payload, item_count, fingerprint = bounded_payload
             current = next(
                 (
                     item

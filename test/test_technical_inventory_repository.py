@@ -171,6 +171,38 @@ class TechnicalInventoryStateRepositoryTests(unittest.TestCase):
         )
         self.assertEqual(retired["retiredAt"], "2026-07-31T10:00:00Z")
 
+    def test_inventory_persistence_rejects_sensitive_payloads_atomically(self):
+        invalid_collections = (
+            {
+                "hardware": {"manufacturer": "Dell"},
+                "software": {"apiToken": "reusable-token"},
+            },
+            {"hardware": {"headers": ["Bearer reusable-token"]}},
+            {
+                "network_interfaces": [
+                    {
+                        "id": "nic-secret",
+                        "name": "Ethernet",
+                        "attributes": {"password": "reusable-password"},
+                    }
+                ]
+            },
+        )
+
+        for collections in invalid_collections:
+            with self.subTest(collections=collections):
+                with self.assertRaisesRegex(ValueError, "contains sensitive data"):
+                    self.repository.replace_ci_inventory(
+                        "ncentral",
+                        "acme",
+                        "host",
+                        "mapping-host",
+                        collections,
+                        observed_at="2026-07-31T08:00:00Z",
+                    )
+                self.assertEqual(self.state.get("ciInventorySnapshots", []), [])
+                self.assertEqual(self.state.get("ciNetworkInterfaces", []), [])
+
     def test_stale_inventory_evidence_never_rolls_back_current_inventory(self):
         self.repository.replace_ci_inventory(
             "ncentral",
