@@ -1,3 +1,4 @@
+import ArchiveOutlined from '@mui/icons-material/ArchiveOutlined';
 import CheckCircleOutlined from '@mui/icons-material/CheckCircleOutlined';
 import CompareArrowsOutlined from '@mui/icons-material/CompareArrowsOutlined';
 import DeleteOutlined from '@mui/icons-material/DeleteOutlined';
@@ -7,18 +8,19 @@ import RuleOutlined from '@mui/icons-material/RuleOutlined';
 import VisibilityOffOutlined from '@mui/icons-material/VisibilityOffOutlined';
 import {
   Alert, Autocomplete, Box, Button, Card, CardContent, Checkbox, Chip, CircularProgress,
-  Dialog, DialogActions, DialogContent, DialogTitle, FormControl, Grid, InputLabel,
+  Dialog, DialogActions, DialogContent, DialogTitle, FormControl, FormControlLabel, Grid, InputLabel,
   MenuItem, Paper, Select, Stack, Tab, Table, TableBody, TableCell, TableContainer,
   TableHead, TablePagination, TableRow, Tabs, TextField, Typography,
 } from '@mui/material';
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Navigate } from 'react-router';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Navigate, useSearchParams } from 'react-router';
 import { apiFetch, getSession } from './session';
 import { Title } from './ui';
 import type {
   Asset, CiReviewItem, FieldAuthorityCatalogue, FieldAuthorityRule,
   IntegrationObjectSuppression, IntegrationObjectSuppressionQueue,
-  IntegrationReconciliationQueue,
+  IntegrationReconciliationQueue, MissingDeviceLifecycleCandidate,
+  MissingDeviceLifecycleQueue, MissingDeviceLifecycleState,
 } from './types';
 import { useWorkspace } from './workspace';
 
@@ -26,8 +28,23 @@ const emptyQueue: IntegrationReconciliationQueue = {
   items: [], total: 0, summary: { create: 0, update: 0, link: 0, conflict: 0 },
 };
 const emptySuppressions: IntegrationObjectSuppressionQueue = { items: [], total: 0 };
+const emptyLifecycleQueue: MissingDeviceLifecycleQueue = {
+  summary: {
+    observed: 0,
+    monitoring: 0,
+    eligible: 0,
+    notEvaluated: 0,
+    retired: 0,
+    restoreReady: 0,
+    total: 0,
+  },
+  items: [], total: 0,
+};
 const words = (value: string) => value.replaceAll('_', ' ').replace(/\b\w/g, letter => letter.toUpperCase());
 const jsonValue = (value: unknown) => value == null || value === '' ? '—' : typeof value === 'object' ? JSON.stringify(value) : String(value);
+const missingDeviceStates: MissingDeviceLifecycleState[] = [
+  'observed', 'monitoring', 'eligible', 'not_evaluated', 'retired', 'restore_ready',
+];
 
 function valueAt(source: Record<string, unknown> | Asset | null, path: string): unknown {
   if (!source) return undefined;
@@ -44,11 +61,343 @@ function Metric({ label, value, color }: { label: string; value: number; color: 
   </CardContent></Card>;
 }
 
+export type MissingDeviceLifecycleRequest = {
+  provider: string;
+  companyId: string;
+  providerParentId: string;
+  state: string;
+  search: string;
+  limit: number;
+  offset: number;
+};
+
+type MissingDeviceLifecycleDecision = {
+  candidate: MissingDeviceLifecycleCandidate;
+  action: 'retire' | 'restore';
+};
+
+type LoadMissingDeviceLifecycle = (
+  request: MissingDeviceLifecycleRequest,
+  signal?: AbortSignal,
+) => Promise<MissingDeviceLifecycleQueue>;
+
+type DecideMissingDeviceLifecycle = (
+  candidateId: string,
+  action: 'retire' | 'restore',
+  request: { expectedRevision: number; notes: string },
+) => Promise<MissingDeviceLifecycleCandidate>;
+
+async function loadMissingDeviceLifecycle(
+  request: MissingDeviceLifecycleRequest,
+  signal?: AbortSignal,
+): Promise<MissingDeviceLifecycleQueue> {
+  const params = new URLSearchParams({ provider: request.provider });
+  if (request.companyId) params.set('companyId', request.companyId);
+  if (request.providerParentId) params.set('providerParentId', request.providerParentId);
+  if (request.state) params.set('state', request.state);
+  if (request.search) params.set('search', request.search);
+  params.set('limit', String(request.limit));
+  params.set('offset', String(request.offset));
+  return apiFetch<MissingDeviceLifecycleQueue>(
+    `/api/integration-reconciliation/lifecycle-candidates?${params.toString()}`,
+    { signal },
+  );
+}
+
+async function decideMissingDeviceLifecycle(
+  candidateId: string,
+  action: 'retire' | 'restore',
+  request: { expectedRevision: number; notes: string },
+): Promise<MissingDeviceLifecycleCandidate> {
+  return apiFetch<MissingDeviceLifecycleCandidate>(
+    `/api/integration-reconciliation/lifecycle-candidates/${encodeURIComponent(candidateId)}/${action}`,
+    { method: 'POST', body: JSON.stringify(request) },
+  );
+}
+
+function lifecycleStateLabel(state: MissingDeviceLifecycleState): string {
+  if (state === 'eligible') return 'Eligible to retire source';
+  if (state === 'retired') return 'Source retired';
+  if (state === 'restore_ready') return 'Source ready to restore';
+  return words(state === 'not_evaluated' ? 'not evaluated' : state);
+}
+
+function lifecycleStateColor(
+  state: MissingDeviceLifecycleState,
+): 'default' | 'info' | 'warning' | 'error' | 'success' {
+  if (state === 'eligible') return 'warning';
+  if (state === 'restore_ready') return 'success';
+  if (state === 'retired') return 'default';
+  if (state === 'monitoring') return 'info';
+  return state === 'not_evaluated' ? 'default' : 'success';
+}
+
+function lifecycleClock(value?: string | null): string {
+  if (!value) return 'Not recorded';
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toLocaleString() : value;
+}
+
+export function MissingDeviceLifecycleWorkbench({
+  companies,
+  canManage,
+  initialCompanyId = '',
+  initialProviderParentId = '',
+  loadCandidates = loadMissingDeviceLifecycle,
+  decideCandidate = decideMissingDeviceLifecycle,
+}: {
+  companies: Array<{ id: string; name: string }>;
+  canManage: boolean;
+  initialCompanyId?: string;
+  initialProviderParentId?: string;
+  loadCandidates?: LoadMissingDeviceLifecycle;
+  decideCandidate?: DecideMissingDeviceLifecycle;
+}) {
+  const [queue, setQueue] = useState(emptyLifecycleQueue);
+  const [companyId, setCompanyId] = useState(initialCompanyId);
+  const [providerParentId, setProviderParentId] = useState(initialProviderParentId);
+  const [state, setState] = useState('');
+  const [searchInput, setSearchInput] = useState('');
+  const [search, setSearch] = useState('');
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(25);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [decision, setDecision] = useState<MissingDeviceLifecycleDecision | null>(null);
+  const [decisionNotes, setDecisionNotes] = useState('');
+  const [decisionConfirmed, setDecisionConfirmed] = useState(false);
+  const [decisionBusy, setDecisionBusy] = useState(false);
+  const requestNumber = useRef(0);
+  const requestController = useRef<AbortController | null>(null);
+
+  const load = useCallback(async () => {
+    const currentRequest = ++requestNumber.current;
+    requestController.current?.abort();
+    const controller = new AbortController();
+    requestController.current = controller;
+    setLoading(true);
+    setError('');
+    try {
+      const result = await loadCandidates({
+        provider: 'ncentral', companyId, providerParentId, state, search,
+        limit: rowsPerPage, offset: page * rowsPerPage,
+      }, controller.signal);
+      if (currentRequest === requestNumber.current && !controller.signal.aborted) setQueue(result);
+    } catch (cause) {
+      if (currentRequest === requestNumber.current && !controller.signal.aborted) {
+        setError(cause instanceof Error ? cause.message : 'Missing-device evidence could not be loaded.');
+      }
+    } finally {
+      if (currentRequest === requestNumber.current) setLoading(false);
+    }
+  }, [companyId, loadCandidates, page, providerParentId, rowsPerPage, search, state]);
+
+  useEffect(() => {
+    void load();
+    return () => requestController.current?.abort();
+  }, [load]);
+
+  function openDecision(
+    candidate: MissingDeviceLifecycleCandidate,
+    action: 'retire' | 'restore',
+  ) {
+    setDecision({ candidate, action });
+    setDecisionNotes('');
+    setDecisionConfirmed(false);
+    setError('');
+  }
+
+  async function submitDecision() {
+    if (!decision || decisionNotes.trim().length < 4 || !decisionConfirmed) return;
+    setDecisionBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      await decideCandidate(decision.candidate.id, decision.action, {
+        expectedRevision: decision.candidate.revision,
+        notes: decisionNotes.trim(),
+      });
+      setNotice(
+        `${decision.candidate.externalName} N-central source link was ${decision.action === 'retire' ? 'retired' : 'restored'} with audited decision notes.`,
+      );
+      setDecision(null);
+      setDecisionNotes('');
+      setDecisionConfirmed(false);
+      await load();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'The lifecycle decision could not be saved.');
+      await load();
+    } finally {
+      setDecisionBusy(false);
+    }
+  }
+
+  const summaryMetrics = [
+    ['Observed', queue.summary.observed, '#50d5b9'],
+    ['Monitoring', queue.summary.monitoring, '#7997ff'],
+    ['Ready to retire source', queue.summary.eligible, '#f1d372'],
+    ['Not evaluated', queue.summary.notEvaluated, '#8ea0b8'],
+    ['Retired sources', queue.summary.retired, '#9aa4b5'],
+    ['Ready to restore source', queue.summary.restoreReady, '#71d3a8'],
+  ] as const;
+
+  return <Stack spacing={2} sx={{ p: 2 }}>
+    <Stack direction={{ xs: 'column', md: 'row' }} spacing={1.5}
+      sx={{ alignItems: { md: 'center' }, justifyContent: 'space-between' }}>
+      <Box>
+        <Typography variant="h5">Missing-device lifecycle</Typography>
+        <Typography variant="body2" color="text.secondary">
+          Review evidence from complete N-central observations. A source link is never deactivated
+          from one stale timestamp or an incomplete preview; the canonical CI remains active.
+        </Typography>
+      </Box>
+      <Chip label={`${queue.summary.total} tracked source identities`} variant="outlined" />
+    </Stack>
+    {error && <Alert severity="error">{error}</Alert>}
+    {notice && <Alert severity="success" onClose={() => setNotice('')}>{notice}</Alert>}
+    <Grid container spacing={1.25} aria-label="Missing-device lifecycle summary">
+      {summaryMetrics.map(([label, value, color]) => <Grid key={label}
+        size={{ xs: 6, sm: 4, lg: 2 }}>
+        <Paper variant="outlined" sx={{ p: 1.25, borderTop: `3px solid ${color}` }}>
+          <Typography variant="h6">{value}</Typography>
+          <Typography variant="caption" color="text.secondary">{label}</Typography>
+        </Paper>
+      </Grid>)}
+    </Grid>
+    <Box className="reconciliation-filter">
+      <TextField size="small" label="Search device, provider ID or reason" value={searchInput}
+        onChange={event => setSearchInput(event.target.value)}
+        onKeyDown={event => {
+          if (event.key === 'Enter') { setPage(0); setSearch(searchInput.trim()); }
+        }} />
+      <FormControl size="small"><InputLabel>Customer</InputLabel>
+        <Select label="Customer" value={companyId} onChange={event => {
+          setCompanyId(event.target.value); setPage(0);
+        }}>
+          <MenuItem value="">All permitted customers</MenuItem>
+          {companies.map(item => <MenuItem key={item.id} value={item.id}>{item.name}</MenuItem>)}
+        </Select>
+      </FormControl>
+      <FormControl size="small"><InputLabel>Lifecycle state</InputLabel>
+        <Select label="Lifecycle state" value={state} onChange={event => {
+          setState(event.target.value); setPage(0);
+        }}>
+          <MenuItem value="">All states</MenuItem>
+          {missingDeviceStates.map(value => <MenuItem key={value} value={value}>
+            {lifecycleStateLabel(value)}
+          </MenuItem>)}
+        </Select>
+      </FormControl>
+      {providerParentId && <Chip label={`N-central customer ${providerParentId}`}
+        onDelete={() => { setProviderParentId(''); setPage(0); }} />}
+      <Button color="inherit" onClick={() => { setPage(0); setSearch(searchInput.trim()); }}>
+        Apply search
+      </Button>
+      <Button variant="outlined" disabled={loading} onClick={() => void load()}>
+        {loading ? 'Refreshing…' : 'Refresh evidence'}
+      </Button>
+    </Box>
+    {loading && !queue.items.length ? <Stack sx={{ py: 5, alignItems: 'center' }} spacing={1.5}>
+      <CircularProgress size={28} /><Typography color="text.secondary">Loading lifecycle evidence…</Typography>
+    </Stack> : <TableContainer><Table size="small" aria-label="Missing-device lifecycle candidates">
+      <TableHead><TableRow><TableCell>Customer</TableCell><TableCell>Asset and source identity</TableCell>
+        <TableCell>Lifecycle evidence</TableCell><TableCell>Evidence clock</TableCell>
+        <TableCell align="right">Action</TableCell></TableRow></TableHead>
+      <TableBody>{queue.items.map(item => {
+        const nextAction = item.state === 'eligible'
+          ? 'retire'
+          : item.state === 'restore_ready' ? 'restore' : null;
+        return <TableRow key={item.id} hover>
+          <TableCell>{item.companyName || item.companyId}</TableCell>
+          <TableCell><Typography sx={{ fontWeight: 800 }}>{item.assetName || item.externalName}</Typography>
+            <Typography variant="body2">{item.externalName}</Typography>
+            <Typography variant="caption" color="text.secondary">
+              {words(item.provider)} · immutable ID {item.externalId}
+            </Typography>
+          </TableCell>
+          <TableCell sx={{ maxWidth: 360 }}><Chip size="small" color={lifecycleStateColor(item.state)}
+            label={lifecycleStateLabel(item.state)} />
+            <Typography variant="body2" sx={{ mt: .75 }}>{item.actionReason}</Typography>
+            <Typography variant="caption" color="text.secondary">
+              Complete absences {item.consecutiveCompleteAbsences}/{item.requiredAbsences}
+            </Typography>
+            {item.retiredByName && <Typography variant="caption" sx={{ display: 'block' }}
+              color="text.secondary">Source retired by {item.retiredByName}</Typography>}
+            {item.retirementNotes && <Typography variant="caption" sx={{ display: 'block' }}
+              color="text.secondary">{item.retirementNotes}</Typography>}
+          </TableCell>
+          <TableCell><Typography variant="caption" color="text.secondary">Last observed</Typography>
+            <Typography variant="body2">{lifecycleClock(item.lastObservedAt)}</Typography>
+            <Typography variant="caption" color="text.secondary">Missing since</Typography>
+            <Typography variant="body2">{lifecycleClock(item.firstAbsentAt)}</Typography>
+            <Typography variant="caption" color="text.secondary">Last evaluated</Typography>
+            <Typography variant="body2">{lifecycleClock(item.lastEvaluatedAt)}</Typography>
+            {item.retiredAt && <><Typography variant="caption" color="text.secondary">
+              Source retired
+            </Typography><Typography variant="body2">{lifecycleClock(item.retiredAt)}</Typography></>}
+            {item.reappearedAt && <><Typography variant="caption" color="text.secondary">
+              Reappeared
+            </Typography><Typography variant="body2">{lifecycleClock(item.reappearedAt)}</Typography></>}
+          </TableCell>
+          <TableCell align="right">{nextAction ? <Stack spacing={.5} sx={{ alignItems: 'flex-end' }}>
+            <Button size="small" color={nextAction === 'retire' ? 'warning' : 'success'}
+              variant="outlined" startIcon={nextAction === 'retire' ? <ArchiveOutlined /> : <RestoreOutlined />}
+              disabled={!canManage || !item.actionAllowed || decisionBusy}
+              onClick={() => openDecision(item, nextAction)}>
+              {nextAction === 'retire' ? 'Retire N-central source' : 'Restore source link'}
+            </Button>
+            {(!canManage || !item.actionAllowed) && <Typography variant="caption" color="text.secondary">
+              {!canManage ? 'Platform administrator approval required' : item.actionReason}
+            </Typography>}
+          </Stack> : <Typography variant="caption" color="text.secondary">No action required</Typography>}</TableCell>
+        </TableRow>;
+      })}</TableBody>
+    </Table></TableContainer>}
+    {!loading && !queue.items.length && <Alert severity="success">
+      No missing-device lifecycle records match these filters.
+    </Alert>}
+    <TablePagination component="div" count={queue.total} page={page}
+      rowsPerPage={rowsPerPage} rowsPerPageOptions={[10, 25, 50, 100]}
+      onPageChange={(_, nextPage) => setPage(nextPage)}
+      onRowsPerPageChange={event => {
+        setRowsPerPage(Number(event.target.value)); setPage(0);
+      }} />
+
+    <Dialog open={Boolean(decision)} onClose={() => { if (!decisionBusy) setDecision(null); }}
+      maxWidth="sm" fullWidth>
+      <DialogTitle>{decision?.action === 'retire'
+        ? 'Retire N-central source identity' : 'Restore N-central source link'}</DialogTitle>
+      <DialogContent><Stack spacing={2} sx={{ mt: 1 }}>
+        <Alert severity={decision?.action === 'retire' ? 'warning' : 'info'}>
+          {decision?.action === 'retire'
+            ? `The N-central source link for ${decision.candidate.assetName} will be deactivated. The canonical CI, its relationships and other source identities remain active and untouched.`
+            : `The N-central source link for ${decision?.candidate.assetName} will be reactivated after current evidence confirmed that the device reappeared. The canonical CI is not changed.`}
+        </Alert>
+        <TextField required multiline minRows={3} label="Decision notes" value={decisionNotes}
+          onChange={event => setDecisionNotes(event.target.value)}
+          helperText="Required and stored with the audited lifecycle decision" />
+        <FormControlLabel control={<Checkbox checked={decisionConfirmed}
+          onChange={(_, checked) => setDecisionConfirmed(checked)} />}
+          label="I reviewed the current customer scope and understand this changes only the N-central source link." />
+      </Stack></DialogContent>
+      <DialogActions><Button disabled={decisionBusy} onClick={() => setDecision(null)}>Cancel</Button>
+        <Button variant="contained" color={decision?.action === 'retire' ? 'warning' : 'success'}
+          disabled={decisionBusy || decisionNotes.trim().length < 4 || !decisionConfirmed}
+          onClick={() => void submitDecision()}>
+          {decisionBusy ? 'Saving…' : decision?.action === 'retire' ? 'Confirm retirement' : 'Confirm restore'}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  </Stack>;
+}
+
 export function ReconciliationPage() {
   const workspace = useWorkspace();
+  const [searchParams] = useSearchParams();
   const role = getSession()?.user.role;
   const canManage = role === 'platform_admin';
-  const [tab, setTab] = useState(0);
+  const [tab, setTab] = useState(searchParams.get('tab') === 'missing' ? 2 : 0);
   const [queue, setQueue] = useState(emptyQueue);
   const [suppressions, setSuppressions] = useState(emptySuppressions);
   const [catalogue, setCatalogue] = useState<FieldAuthorityCatalogue | null>(null);
@@ -320,6 +669,7 @@ export function ReconciliationPage() {
       <Tabs value={tab} onChange={(_, value) => { setTab(value); setSelected([]); }}>
         <Tab icon={<CompareArrowsOutlined />} iconPosition="start" label={`Review queue (${queue.total})`} />
         <Tab icon={<VisibilityOffOutlined />} iconPosition="start" label={`Ignored (${suppressions.total})`} />
+        <Tab icon={<ArchiveOutlined />} iconPosition="start" label="Missing devices" />
         <Tab icon={<RuleOutlined />} iconPosition="start" label={`Field authority (${displayedRules.length})`} />
       </Tabs>
       {tab === 0 && <>
@@ -377,7 +727,13 @@ export function ReconciliationPage() {
         {!suppressions.items.length && busy !== 'suppressions' && <Alert severity="success" sx={{ m: 2 }}>No ignored configurations match these filters.</Alert>}
         <TablePagination component="div" count={suppressions.total} page={suppressionPage} rowsPerPage={rowsPerPage} rowsPerPageOptions={[10, 25, 50, 100]} onPageChange={(_, value) => setSuppressionPage(value)} onRowsPerPageChange={event => { setRowsPerPage(Number(event.target.value)); setSuppressionPage(0); }} />
       </>}
-      {tab === 2 && <>
+      {tab === 2 && <MissingDeviceLifecycleWorkbench
+        companies={workspace.companies}
+        canManage={canManage}
+        initialCompanyId={searchParams.get('companyId') || ''}
+        initialProviderParentId={searchParams.get('providerParentId') || ''}
+      />}
+      {tab === 3 && <>
         <Stack direction={{ xs: 'column', md: 'row' }} spacing={1.5} sx={{ p: 2, alignItems: { md: 'center' }, justifyContent: 'space-between' }}>
           <Box><Typography variant="h5">Canonical field authority</Typography><Typography variant="body2" color="text.secondary">Rules are evaluated in previews and enforced again during import. Lower priority numbers win.</Typography></Box>
           {canManage && <Stack direction="row" spacing={1}><Button variant="outlined" onClick={() => { setPresetCompanyId(companyId || workspace.companies[0]?.id || ''); setPresetKey('balanced_msp'); }}>Apply baseline</Button><Button variant="contained" onClick={() => setAuthority({ companyId: companyId || workspace.companies[0]?.id || '', ciType: '*', fieldName: 'name', provider: 'connectwise', priority: 20 })}>Add rule</Button></Stack>}

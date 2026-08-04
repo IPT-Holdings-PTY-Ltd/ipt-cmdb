@@ -79,6 +79,25 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
                     "type": "ncentral",
                     "enabled": True,
                     "lifecycleStatus": "active",
+                    "revision": 1,
+                }
+            ],
+            "providerCompanyObservations": [
+                {
+                    "id": "ncentral-company-101",
+                    "provider": "ncentral",
+                    "externalId": "101",
+                    "name": "Acme Manufacturing",
+                    "active": True,
+                }
+            ],
+            "providerCompanyMappings": [
+                {
+                    "id": "ncentral-company-map-101",
+                    "provider": "ncentral",
+                    "externalId": "101",
+                    "companyId": "acme",
+                    "active": True,
                 }
             ],
             "syncRuns": [],
@@ -458,6 +477,26 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
         self.assertIsNotNone(claimed)
         assert claimed is not None
         observed_policy: dict = {}
+        observed_presence_snapshots: list[dict | None] = []
+        publish_preview = self.repository.publish_and_complete_ci_preview_run
+        presence_snapshot = {
+            "observedRecords": [],
+            "providerReadComplete": True,
+            "providerFilterId": "managed-servers",
+            "scopeMode": "provider_filtered",
+            "discoveryScopeFingerprint": "a" * 64,
+            "policyDecisionFingerprint": "b" * 64,
+            "connectionRevision": 1,
+            "policyRevision": self.policy["revision"],
+            "snapshotStartedAt": "2026-08-03T08:00:00Z",
+            "providerReadCompletedAt": "2026-08-03T08:00:05Z",
+            "requiredAbsences": 3,
+            "minimumMissingHours": 24,
+        }
+
+        def publish_with_snapshot(*args, **kwargs):
+            observed_presence_snapshots.append(deepcopy(kwargs.get("presence_snapshot")))
+            return publish_preview(*args, **kwargs)
 
         def preview(
             company_id: str,
@@ -501,6 +540,11 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
                     "conflict": 0,
                 },
                 "items": [],
+                "presenceSummary": {
+                    "providerReadComplete": True,
+                    "observedCount": 0,
+                },
+                "_presenceSnapshot": deepcopy(presence_snapshot),
                 "enrichment": {
                     "mode": policy_override["enrichmentMode"],
                     "assetDetailsRequested": 0,
@@ -511,6 +555,12 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
         with (
             patch.object(backend_main, "REPOSITORY", self.repository),
             patch.object(backend_main, "_ncentral_device_preview", side_effect=preview),
+            patch.object(
+                self.repository,
+                "publish_and_complete_ci_preview_run",
+                side_effect=publish_with_snapshot,
+            ),
+            patch.object(backend_main, "_observe_ncentral_relationships") as observe,
         ):
             backend_main._execute_queued_ncentral_preview(
                 claimed,
@@ -523,7 +573,222 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
         self.assertEqual(changed_policy["enrichmentMode"], "full")
         self.assertEqual(observed_policy["enrichmentMode"], "balanced")
         self.assertEqual(observed_policy["revision"], self.policy["revision"])
+        self.assertEqual(observed_presence_snapshots, [presence_snapshot])
+        self.assertNotIn("observedRecords", str(terminal))
         self.assertEqual(terminal["status"], "success")
+        self.assertTrue(terminal["previewSummary"]["relationshipSummary"]["skippedStalePolicy"])
+        self.assertIn(
+            "policy changed",
+            terminal["previewSummary"]["relationshipSummary"]["message"],
+        )
+        observe.assert_not_called()
+
+    def test_connection_change_or_disable_skips_relationship_persistence(self) -> None:
+        """Topology evidence must use the same active connection generation as discovery."""
+
+        for scenario in ("revision", "disabled", "mapping"):
+            with self.subTest(scenario=scenario):
+                connection = self.state["integrations"][0]
+                connection.update(enabled=True, lifecycleStatus="active", revision=1)
+                queued = self._queue()
+                worker_id = f"worker-{scenario}"
+                claimed = self.repository.claim_ci_preview_run(worker_id)
+                self.assertIsNotNone(claimed)
+                assert claimed is not None
+
+                def preview(
+                    company_id: str,
+                    provider_company_id: str,
+                    *,
+                    progress_callback,
+                    cancel_requested,
+                    policy_override,
+                    scenario: str = scenario,
+                    connection: dict = connection,
+                ) -> dict:
+                    del progress_callback, cancel_requested
+                    if scenario == "revision":
+                        connection["revision"] = 2
+                    elif scenario == "disabled":
+                        connection["enabled"] = False
+                    else:
+                        self.state["providerCompanyMappings"][0]["active"] = False
+                    return {
+                        "companyId": company_id,
+                        "companyName": "Acme Manufacturing",
+                        "providerCompanyId": provider_company_id,
+                        "providerCompanyName": "Acme Manufacturing",
+                        "credentialSource": "configured",
+                        "readOnly": True,
+                        "writesAttempted": False,
+                        "discovered": 1,
+                        "included": 1,
+                        "excluded": 0,
+                        "counts": {
+                            "create": 0,
+                            "update": 0,
+                            "link": 0,
+                            "unchanged": 1,
+                            "conflict": 0,
+                        },
+                        "items": [_review_item("7001", action="unchanged")],
+                        "appliedPolicy": deepcopy(policy_override),
+                        "presenceSummary": {"connectionRevision": 1},
+                        "_presenceSnapshot": {
+                            "observedRecords": [],
+                            "providerReadComplete": True,
+                            "providerFilterId": "managed-servers",
+                            "scopeMode": "provider_filtered",
+                            "discoveryScopeFingerprint": "a" * 64,
+                            "policyDecisionFingerprint": "b" * 64,
+                            "connectionRevision": 1,
+                            "policyRevision": policy_override["revision"],
+                            "snapshotStartedAt": "2026-08-03T08:00:00Z",
+                            "providerReadCompletedAt": "2026-08-03T08:00:05Z",
+                            "requiredAbsences": 3,
+                            "minimumMissingHours": 24,
+                        },
+                        "enrichment": {},
+                    }
+
+                with (
+                    patch.object(backend_main, "REPOSITORY", self.repository),
+                    patch.object(backend_main, "_ncentral_device_preview", side_effect=preview),
+                    patch.object(backend_main, "_observe_ncentral_relationships") as observe,
+                ):
+                    backend_main._execute_queued_ncentral_preview(claimed, worker_id)
+
+                terminal = self.repository.get_sync_run(queued["id"], company_ids={"acme"})
+                self.assertIsNotNone(terminal)
+                assert terminal is not None
+                relationship = terminal["previewSummary"]["relationshipSummary"]
+                self.assertTrue(relationship["skippedStalePolicy"])
+                expected = {
+                    "revision": "connection changed",
+                    "disabled": "disabled",
+                    "mapping": "customer mapping changed",
+                }[scenario]
+                self.assertIn(expected, relationship["message"])
+                observe.assert_not_called()
+
+    def test_cancel_requested_after_discovery_blocks_relationship_persistence(self) -> None:
+        """A fresh cancellation check must win before relationship side effects."""
+
+        queued = self._queue()
+        claimed = self.repository.claim_ci_preview_run("worker-cancel")
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+
+        def preview(
+            company_id: str,
+            provider_company_id: str,
+            *,
+            progress_callback,
+            cancel_requested,
+            policy_override,
+        ) -> dict:
+            del progress_callback
+            self.assertEqual((company_id, provider_company_id), ("acme", "101"))
+            self.assertFalse(cancel_requested())
+            self.repository.request_sync_run_cancel(queued["id"], "operator")
+            return {
+                "companyId": company_id,
+                "companyName": "Acme Manufacturing",
+                "providerCompanyId": provider_company_id,
+                "providerCompanyName": "Acme Manufacturing",
+                "credentialSource": "configured",
+                "readOnly": True,
+                "writesAttempted": False,
+                "discovered": 1,
+                "included": 1,
+                "excluded": 0,
+                "counts": {
+                    "create": 0,
+                    "update": 0,
+                    "link": 0,
+                    "unchanged": 1,
+                    "conflict": 0,
+                },
+                "items": [_review_item("7001", action="unchanged")],
+                "appliedPolicy": deepcopy(policy_override),
+                "enrichment": {},
+            }
+
+        with (
+            patch.object(backend_main, "REPOSITORY", self.repository),
+            patch.object(backend_main, "_ncentral_device_preview", side_effect=preview),
+            patch.object(backend_main, "_observe_ncentral_relationships") as observe,
+            self.assertRaises(backend_main.NcentralOperationCancelled),
+        ):
+            backend_main._execute_queued_ncentral_preview(
+                claimed,
+                "worker-cancel",
+            )
+
+        observe.assert_not_called()
+        self.assertEqual(self.state.get("integrationRelationshipCandidates", []), [])
+
+    def test_lost_lease_after_discovery_blocks_relationship_persistence(self) -> None:
+        """A reclaimed queue lease must be detected before topology evidence is written."""
+
+        queued = self._queue()
+        claimed = self.repository.claim_ci_preview_run("worker-stale")
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+
+        def preview(
+            company_id: str,
+            provider_company_id: str,
+            *,
+            progress_callback,
+            cancel_requested,
+            policy_override,
+        ) -> dict:
+            del progress_callback, cancel_requested
+            raw_run = next(item for item in self.state["syncRuns"] if item["id"] == queued["id"])
+            raw_run["leaseOwner"] = "worker-new"
+            raw_policy = next(
+                item
+                for item in self.state["integrationCiPolicies"]
+                if item["id"] == self.policy["id"]
+            )
+            raw_policy["leaseOwner"] = "worker-new"
+            return {
+                "companyId": company_id,
+                "companyName": "Acme Manufacturing",
+                "providerCompanyId": provider_company_id,
+                "providerCompanyName": "Acme Manufacturing",
+                "credentialSource": "configured",
+                "readOnly": True,
+                "writesAttempted": False,
+                "discovered": 1,
+                "included": 1,
+                "excluded": 0,
+                "counts": {
+                    "create": 0,
+                    "update": 0,
+                    "link": 0,
+                    "unchanged": 1,
+                    "conflict": 0,
+                },
+                "items": [_review_item("7001", action="unchanged")],
+                "appliedPolicy": deepcopy(policy_override),
+                "enrichment": {},
+            }
+
+        with (
+            patch.object(backend_main, "REPOSITORY", self.repository),
+            patch.object(backend_main, "_ncentral_device_preview", side_effect=preview),
+            patch.object(backend_main, "_observe_ncentral_relationships") as observe,
+            self.assertRaises(backend_main._IntegrationPreviewLeaseLost),
+        ):
+            backend_main._execute_queued_ncentral_preview(
+                claimed,
+                "worker-stale",
+            )
+
+        observe.assert_not_called()
+        self.assertEqual(self.state.get("integrationRelationshipCandidates", []), [])
 
     def test_terminal_result_is_aggregate_only_and_review_items_are_run_scoped(self) -> None:
         first = self._queue()
@@ -543,6 +808,13 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
                     "unchanged": 0,
                     "conflict": 0,
                 },
+                "enrichment": {
+                    "mode": "balanced",
+                    "assetDetailsRequested": 25,
+                    "offset": 25,
+                    "nextOffset": 50,
+                    "bounded": True,
+                },
                 "items": [{"token": "secret-provider-payload"}],
                 "accessToken": "secret-provider-token",
                 "message": "Preview completed without writes.",
@@ -554,6 +826,8 @@ class StateRepositoryNcentralPreviewQueueTests(unittest.TestCase):
         self.assertEqual(first_terminal["status"], "success")
         self.assertEqual(first_terminal["progress"]["percent"], 100)
         self.assertEqual(first_terminal["previewSummary"]["counts"]["create"], 1)
+        self.assertEqual(first_terminal["previewSummary"]["enrichment"]["offset"], 25)
+        self.assertEqual(first_terminal["previewSummary"]["enrichment"]["nextOffset"], 50)
         self.assertNotIn("items", first_terminal["previewSummary"])
         self.assertNotIn("accessToken", first_terminal["previewSummary"])
         raw_first = next(item for item in self.state["syncRuns"] if item["id"] == first["id"])

@@ -120,11 +120,34 @@ class MigrationTests(unittest.TestCase):
                 "2026.07.28.1",
                 "2026.07.29.1",
                 "2026.07.29.2",
+                "2026.07.31.1",
+                "2026.07.31.2",
+                "2026.07.31.3",
+                "2026.08.03.1",
             ],
         )
-        self.assertEqual(latest_schema_version(ROOT), "2026.07.29.2")
+        self.assertEqual(latest_schema_version(ROOT), "2026.08.03.1")
         self.assertTrue(all(len(item.checksum) == 64 for item in plan))
         self.assertRegex(schema_history_sha256(ROOT), r"^[0-9a-f]{64}$")
+
+    def test_relationship_candidate_guard_migration_has_no_auto_approval_policy(self):
+        migration = (
+            ROOT / "db" / "migrations" / "2026.07.31.3__atomic_relationship_candidate_approval.sql"
+        ).read_text(encoding="utf-8")
+        self.assertIn("revision bigint NOT NULL DEFAULT 1", migration)
+        self.assertIn("observation_count bigint NOT NULL DEFAULT 1", migration)
+        self.assertNotIn("auto_approve", migration.casefold())
+
+    def test_ci_presence_lifecycle_is_mapping_keyed_and_never_deletes_assets(self):
+        migration = (
+            ROOT / "db" / "migrations" / "2026.08.03.1__integration_ci_presence_lifecycle.sql"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(migration.casefold().split())
+        self.assertIn("unique (mapping_id)", normalized)
+        self.assertIn("required_absences integer not null default 3", normalized)
+        self.assertIn("minimum_missing_hours integer not null default 24", normalized)
+        self.assertNotIn("delete from configuration_items", normalized)
+        self.assertNotIn("source_disabled", normalized)
 
     def test_migrations_apply_once_and_reject_checksum_drift(self):
         history = {}
@@ -164,6 +187,10 @@ class MigrationTests(unittest.TestCase):
                 "2026.07.28.1",
                 "2026.07.29.1",
                 "2026.07.29.2",
+                "2026.07.31.1",
+                "2026.07.31.2",
+                "2026.07.31.3",
+                "2026.08.03.1",
             ],
         )
         self.assertEqual(apply_migrations(factory, ROOT), [])

@@ -5,7 +5,7 @@
 | Provider | Current repository capability | Not yet implemented |
 |---|---|---|
 | ConnectWise PSA (formerly Manage) | Encrypted or environment-managed setup, connection test, paginated company discovery, explicit customer mapping, saved CI type/status policy, lease-safe continuous previews, governed canonical imports and audited sync evidence | Ticket publishing |
-| N-central | Encrypted/environment/secret-file setup, User-API token exchange, explicit customer mapping, native device filters, reviewed device reconciliation and lease-safe continuous previews | Provider device writes |
+| N-central | Encrypted/environment/secret-file setup, User-API token exchange, explicit customer mapping, native device filters, reviewed device reconciliation, lease-safe continuous previews and optional Customer-scoped N-able GraphQL enrichment | Provider device writes and generic hypervisor topology not exposed by source APIs |
 | Passportal | Root connection placeholder and metadata-only policy | Approved owner/folder/asset metadata association |
 
 The application must not ingest Passportal passwords, secure notes, OTP seeds or credential values.
@@ -57,7 +57,7 @@ separately when decommissioning the external credential.
 
 Reviewed built-in adapters register a capability manifest containing provider identity, supported scopes, authentication modes, prerequisites, discovery filters and bounded operations. Operations declare a direction (`input`, `output`, `bidirectional`, `trigger` or `action`), entity type, implementation status, provider-write behaviour and approval requirement.
 
-The setup UI consumes the public manifest rather than duplicating provider capability descriptions. Provider code implements the shared `test_connection`, `discovery_options`, `discover`, `apply_filters` and `preview` boundary. `discovery_options` must be bounded and responsive so menus can populate independently from a full sync. ConnectWise and N-central are the reference adapters. New providers should reuse the registry and contract tests rather than add ungoverned provider writes directly to the web application.
+The setup UI consumes the public manifest rather than duplicating provider capability descriptions. Provider code implements the shared `test_connection`, `discovery_options`, `discover`, `apply_filters` and `preview` boundary. `discovery_options` must be bounded and responsive so menus can populate independently from a full sync. ConnectWise and N-central are the reference adapters. N-central's optional GraphQL path uses a compiled query catalogue rather than accepting browser-supplied query text, and its cache is keyed by immutable source and tenant identities. New providers should reuse the registry and contract tests rather than add ungoverned provider writes directly to the web application.
 
 Arbitrary runtime package installation is not supported. Adapters are reviewed, compiled application code so a provider cannot supply executable frontend JavaScript or bypass tenancy, secret handling and audit controls.
 

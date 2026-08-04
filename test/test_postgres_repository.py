@@ -338,10 +338,23 @@ class PostgresRepositoryContractTests(unittest.TestCase):
             "connectwise",
             "acme",
             "42",
-            {"syncMode": "continuous_preview", "enabled": True},
+            {
+                "syncMode": "continuous_preview",
+                "enabled": True,
+                "relationshipAutomationMode": "auto_explicit",
+                "relationshipAutoApproveTypes": ["hosts"],
+                "relationshipMinConfidence": 0.99,
+                "relationshipMinObservations": 3,
+                "relationshipMaxEvidenceAgeHours": 24,
+            },
             expected_revision=0,
             actor_id=actor_id,
         )
+        self.assertEqual(ci_policy["relationshipAutomationMode"], "auto_explicit")
+        self.assertEqual(ci_policy["relationshipAutoApproveTypes"], ["hosts"])
+        self.assertEqual(ci_policy["relationshipMinConfidence"], 0.99)
+        self.assertEqual(ci_policy["relationshipMinObservations"], 3)
+        self.assertEqual(ci_policy["relationshipMaxEvidenceAgeHours"], 24)
         claimed_policy = repository.claim_due_ci_sync_policy(
             "connectwise",
             "contract-worker-a",
@@ -430,6 +443,7 @@ class PostgresRepositoryContractTests(unittest.TestCase):
             )["active"]
         )
         self.assertTrue(repository.unmap_provider_company("connectwise", "42", actor_id))
+        repository.map_provider_company("connectwise", "42", "acme", actor_id)
 
         assets = repository.list_assets()
         sage = next(item for item in assets if item["name"] == "Sage 200")
@@ -437,6 +451,318 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         self.assertEqual(sage["responsibilities"][0]["contactName"], "Finance Owner")
         self.assertEqual(repository.list_contacts("acme")[0]["responsibilityCount"], 1)
         self.assertEqual(repository.list_relationships()[0]["fromId"], sage["id"])
+        source_mapping = repository.record_provider_ci_mapping(
+            "connectwise",
+            "acme",
+            {
+                "externalId": "configuration-501",
+                "name": "SQL01",
+                "providerVersion": "inventory-v1",
+                "providerParentId": "42",
+            },
+            sql01["id"],
+            actor_id,
+        )
+        first_inventory = repository.replace_ci_inventory(
+            "connectwise",
+            "acme",
+            sql01["id"],
+            source_mapping["id"],
+            {
+                "hardware": {"manufacturer": "Contoso", "model": "Virtual Machine"},
+                "network_interfaces": [
+                    {
+                        "id": "interface-1",
+                        "name": "Ethernet",
+                        "macAddress": "00:11:22:33:44:55",
+                        "ipAddresses": ["10.0.0.20"],
+                    }
+                ],
+            },
+            observed_at="2026-07-31T08:00:00Z",
+            retention=2,
+        )
+        self.assertEqual(first_inventory["networkInterfaceCount"], 1)
+        repository.replace_ci_inventory(
+            "connectwise",
+            "acme",
+            sql01["id"],
+            source_mapping["id"],
+            {
+                "hardware": {"manufacturer": "Contoso", "model": "Virtual Machine v2"},
+                "network_interfaces": [],
+            },
+            observed_at="2026-07-31T09:00:00Z",
+            retention=2,
+        )
+        technical_inventory = repository.get_ci_inventory(
+            "acme",
+            sql01["id"],
+            include_history=True,
+        )
+        self.assertEqual(len(technical_inventory["collections"]["hardware"]), 2)
+        self.assertEqual(len(technical_inventory["networkInterfaces"]), 1)
+        self.assertEqual(
+            technical_inventory["networkInterfaces"][0]["retiredAt"],
+            "2026-07-31T09:00:00Z",
+        )
+
+        repository.ensure_integration_connection("ncentral", "N-central", actor_id)
+        capability = repository.upsert_integration_capability_snapshot(
+            "ncentral",
+            "graphql.asset_inventory",
+            {
+                "status": "supported",
+                "summary": {
+                    "readOnly": True,
+                    "availableFields": ["ncentralDevice", "systemInfo", "networkInterfaces"],
+                },
+            },
+            ttl_seconds=300,
+        )
+        self.assertFalse(capability["stale"])
+        self.assertEqual(
+            repository.get_integration_capability_snapshot("ncentral", "graphql.asset_inventory")[
+                "status"
+            ],
+            "supported",
+        )
+        ncentral_mapping = repository.record_provider_ci_mapping(
+            "ncentral",
+            "acme",
+            {
+                "externalId": "42",
+                "name": "SQL01",
+                "providerVersion": "rest-device-v1",
+            },
+            sql01["id"],
+            actor_id,
+        )
+        ncentral_policy = repository.update_ci_sync_policy(
+            "ncentral",
+            "acme",
+            "101",
+            {"syncMode": "manual", "enabled": False},
+            expected_revision=0,
+            actor_id=actor_id,
+        )
+        first_enrichment = repository.upsert_integration_enrichment_preview(
+            "ncentral",
+            "acme",
+            {
+                "providerParentId": "101",
+                "sourceNamespace": "nable_graphql_asset",
+                "sourceServerId": "server-a",
+                "sourceDeviceId": "42",
+                "policyId": ncentral_policy["id"],
+                "assetId": sql01["id"],
+                "sourceMappingId": ncentral_mapping["id"],
+                "status": "ready",
+                "summary": {
+                    "identityMatch": "server_device_id",
+                    "inventory": {"biosAvailable": True, "networkInterfaceCount": 1},
+                },
+            },
+            ttl_seconds=300,
+        )
+        second_enrichment = repository.upsert_integration_enrichment_preview(
+            "ncentral",
+            "acme",
+            {
+                "providerParentId": "101",
+                "sourceNamespace": "nable_graphql_asset",
+                "sourceServerId": "server-b",
+                "sourceDeviceId": "42",
+                "policyId": ncentral_policy["id"],
+                "assetId": sql01["id"],
+                "sourceMappingId": ncentral_mapping["id"],
+                "status": "partial",
+                "summary": {"identityMatch": "server_device_id"},
+            },
+            ttl_seconds=300,
+        )
+        self.assertNotEqual(first_enrichment["id"], second_enrichment["id"])
+        cached_enrichments = repository.list_integration_enrichment_previews(
+            "ncentral",
+            "acme",
+            "101",
+        )
+        self.assertEqual(
+            {item["sourceServerId"] for item in cached_enrichments},
+            {"server-a", "server-b"},
+        )
+        self.assertEqual(
+            repository.get_integration_enrichment_preview(
+                "ncentral",
+                "acme",
+                "nable_graphql_asset",
+                "server-a",
+                "42",
+            )["assetId"],
+            sql01["id"],
+        )
+        with self.connection_factory() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_enrichment_previews
+                SET observed_at = now() - interval '2 seconds',
+                    expires_at = now() - interval '1 second'
+                WHERE id = %s::uuid
+                """,
+                (first_enrichment["id"],),
+            )
+        self.assertIsNone(
+            repository.get_integration_enrichment_preview(
+                "ncentral",
+                "acme",
+                "nable_graphql_asset",
+                "server-a",
+                "42",
+            )
+        )
+        self.assertEqual(repository.prune_integration_enrichment_previews("ncentral"), 1)
+
+        relationship_count = len(repository.list_relationships())
+        current_connection = repository.get_integration_connection("connectwise")
+        assert current_connection is not None
+        candidate_values = [
+            {
+                "fromCiId": sql01["id"],
+                "toCiId": sage["id"],
+                "relationshipType": "hosts",
+                "confidence": 0.95,
+                "evidence": {"rule": "contract_test"},
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "CI policy changed"):
+            repository.upsert_relationship_candidates(
+                "connectwise",
+                "acme",
+                source_mapping["id"],
+                candidate_values,
+                observed_at="2026-07-31T08:30:00Z",
+                policy_id=ci_policy["id"],
+                expected_policy_revision=ci_policy["revision"],
+                expected_connection_revision=current_connection["revision"],
+                provider_parent_id="42",
+            )
+        current_policy = repository.get_ci_sync_policy("connectwise", "acme", "42")
+        assert current_policy is not None
+        self.assertEqual(current_policy["id"], ci_policy["id"])
+        self.assertGreater(current_policy["revision"], ci_policy["revision"])
+        relationship_context = {
+            "policy_id": current_policy["id"],
+            "expected_policy_revision": current_policy["revision"],
+            "expected_connection_revision": current_connection["revision"],
+            "provider_parent_id": "42",
+        }
+        candidate = repository.upsert_relationship_candidates(
+            "connectwise",
+            "acme",
+            source_mapping["id"],
+            candidate_values,
+            observed_at="2026-07-31T09:00:00Z",
+            **relationship_context,
+        )[0]
+        self.assertEqual(candidate["revision"], 1)
+        self.assertEqual(candidate["observationCount"], 1)
+        self.assertEqual(len(repository.list_relationships()), relationship_count)
+        candidate = repository.upsert_relationship_candidates(
+            "connectwise",
+            "acme",
+            source_mapping["id"],
+            candidate_values,
+            observed_at="2026-07-31T09:30:00Z",
+            **relationship_context,
+        )[0]
+        self.assertEqual(candidate["revision"], 2)
+        self.assertEqual(candidate["observationCount"], 2)
+        with self.assertRaisesRegex(ValueError, "changed; refresh"):
+            repository.approve_relationship_candidate(
+                "acme",
+                candidate["id"],
+                actor_id,
+                "Stale PostgreSQL review",
+                expected_revision=1,
+            )
+        self.assertEqual(len(repository.list_relationships()), relationship_count)
+        decided_candidate, materialized_relationship = repository.approve_relationship_candidate(
+            "acme",
+            candidate["id"],
+            actor_id,
+            "Verified in the PostgreSQL contract test",
+            expected_revision=candidate["revision"],
+        )
+        self.assertEqual(materialized_relationship["provenance"], "provider")
+        self.assertEqual(materialized_relationship["sourceMappingId"], source_mapping["id"])
+        self.assertEqual(decided_candidate["state"], "approved")
+        self.assertEqual(decided_candidate["revision"], 3)
+        self.assertEqual(decided_candidate["observationCount"], 2)
+        self.assertEqual(
+            decided_candidate["approvedRelationshipId"],
+            materialized_relationship["id"],
+        )
+        self.assertEqual(len(repository.list_relationships()), relationship_count + 1)
+        repository.upsert_relationship_candidates(
+            "connectwise",
+            "acme",
+            source_mapping["id"],
+            [],
+            observed_at="2026-07-31T10:00:00Z",
+            **relationship_context,
+        )
+        retired_candidate = repository.list_relationship_candidates(
+            "acme",
+            include_retired=True,
+        )[0]
+        self.assertEqual(retired_candidate["state"], "approved")
+        self.assertEqual(retired_candidate["retiredAt"], "2026-07-31T10:00:00Z")
+        self.assertEqual(retired_candidate["revision"], 4)
+        self.assertEqual(retired_candidate["observationCount"], 2)
+        self.assertEqual(len(repository.list_relationships()), relationship_count + 1)
+
+        manual_relationship = repository.create_relationship(
+            {
+                "id": str(uuid.uuid4()),
+                "fromId": sql01["id"],
+                "toId": sage["id"],
+                "type": "managed_by",
+                "impactPolicy": "informational",
+            },
+            "acme",
+            actor_id,
+        )
+        manual_candidate = repository.upsert_relationship_candidates(
+            "connectwise",
+            "acme",
+            source_mapping["id"],
+            [
+                {
+                    "fromCiId": sql01["id"],
+                    "toCiId": sage["id"],
+                    "relationshipType": "managed_by",
+                    "confidence": 0.88,
+                    "evidence": {"impactPolicy": "required"},
+                }
+            ],
+            observed_at="2026-07-31T11:00:00Z",
+            **relationship_context,
+        )[0]
+        manual_decision, preserved_manual = repository.approve_relationship_candidate(
+            "acme",
+            manual_candidate["id"],
+            actor_id,
+            "Manual edge remains authoritative",
+            expected_revision=manual_candidate["revision"],
+        )
+        self.assertEqual(preserved_manual["id"], manual_relationship["id"])
+        self.assertEqual(preserved_manual["provenance"], "manual")
+        self.assertIsNone(preserved_manual["sourceMappingId"])
+        self.assertEqual(preserved_manual["impactPolicy"], "informational")
+        self.assertEqual(
+            manual_decision["approvedRelationshipId"],
+            manual_relationship["id"],
+        )
         self.assertEqual(
             repository.get_change(repository.list_changes()[0]["id"])["number"], "CHG-2026-0001"
         )

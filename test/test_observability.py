@@ -10,6 +10,7 @@ from src.cmdb.observability import (
     JsonLogFormatter,
     TextLogFormatter,
     configure_logging,
+    sanitize_log_text,
 )
 
 
@@ -76,6 +77,30 @@ class ObservabilityTests(unittest.TestCase):
             self.assertNotIn(secret, rendered)
         self.assertIn("[REDACTED]", rendered)
         self.assertNotIn("arbitrary_payload", rendered)
+
+    def test_log_redaction_uses_normalized_credential_names_and_scalar_formats(self):
+        fullwidth_api_token = "\uff21\uff30\uff29\uff34\uff4f\uff4b\uff45\uff4e"
+        rendered = sanitize_log_text(
+            f"apiToken=camel-secret client.secret='dotted-secret' "
+            '"refresh-token": "json-secret" '
+            f"{fullwidth_api_token}=unicode-secret "
+            "redis://:uri-secret@cache.internal/0 "
+            "-----BEGIN PRIVATE KEY-----\npem-secret\n-----END PRIVATE KEY-----"
+        )
+
+        for secret in (
+            "camel-secret",
+            "dotted-secret",
+            "json-secret",
+            "unicode-secret",
+            "uri-secret",
+            "pem-secret",
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, rendered)
+        self.assertIn("apiToken=[REDACTED]", rendered)
+        self.assertIn("redis://:[REDACTED]@", rendered)
+        self.assertIn("[REDACTED PRIVATE KEY]", rendered)
 
     def test_exception_logging_retains_type_and_stack_without_message(self):
         secret = "exception-secret-value"

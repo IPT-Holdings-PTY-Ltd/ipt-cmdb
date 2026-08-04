@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from src.cmdb.audit import current_audit_context
+from src.cmdb.sensitive import is_sensitive_field_name
 
 _MANAGED_HANDLER_ATTRIBUTE = "_cmdb_observability_handler"
 _MAX_LOG_TEXT = 16_384
@@ -33,17 +34,20 @@ _ALLOWED_EXTRA_FIELDS = (
     "worker_id",
     "processed",
 )
-_URI_USERINFO = re.compile(
-    r"(?i)\b(?P<scheme>postgres(?:ql)?|https?)://(?P<user>[^/\s:@]+):[^@\s/]+@"
-)
+_URI_USERINFO = re.compile(r"(?i)\b(?P<scheme>[a-z][a-z0-9+.-]*)://(?P<user>[^/\s:@]*):[^@\s/]+@")
 _AUTHORIZATION_VALUE = re.compile(r"(?i)\b(?P<scheme>Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+")
-_JWT_VALUE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
-_SENSITIVE_ASSIGNMENT = re.compile(
-    r"""(?ix)
-    \b(
-        password|secret|token|authorization|cookie|credential|api[_-]?key|
-        client[_-]?secret|connection[_-]?string|database[_-]?url
-    )\b
+_JWT_VALUE = re.compile(r"\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+_PRIVATE_KEY_BLOCK = re.compile(
+    r"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----.*?"
+    r"-----END(?: [A-Z0-9]+)? PRIVATE KEY-----",
+    re.IGNORECASE | re.DOTALL,
+)
+_FIELD_ASSIGNMENT = re.compile(
+    r"""(?x)
+    (?<![\w.-])
+    (?P<quote>["']?)
+    (?P<key>[\w.-]{1,80})
+    (?P=quote)
     \s*[:=]\s*
     (?:
         "(?:\\.|[^"])*" |
@@ -52,6 +56,15 @@ _SENSITIVE_ASSIGNMENT = re.compile(
     )
     """
 )
+
+
+def _redact_sensitive_assignment(match: re.Match[str]) -> str:
+    """Redact one assignment when its normalized field name is sensitive."""
+
+    if not is_sensitive_field_name(match.group("key")):
+        return match.group(0)
+    quote = match.group("quote")
+    return f"{quote}{match.group('key')}{quote}=[REDACTED]"
 
 
 def _configured_level() -> int:
@@ -73,6 +86,7 @@ def sanitize_log_text(value: Any) -> str:
     """Redact common credential forms and bound a value before logging it."""
 
     text = str(value)
+    text = _PRIVATE_KEY_BLOCK.sub("[REDACTED PRIVATE KEY]", text)
     text = _URI_USERINFO.sub(
         lambda match: f"{match.group('scheme')}://{match.group('user')}:[REDACTED]@",
         text,
@@ -82,10 +96,7 @@ def sanitize_log_text(value: Any) -> str:
         text,
     )
     text = _JWT_VALUE.sub("[REDACTED JWT]", text)
-    text = _SENSITIVE_ASSIGNMENT.sub(
-        lambda match: f"{match.group(1)}=[REDACTED]",
-        text,
-    )
+    text = _FIELD_ASSIGNMENT.sub(_redact_sensitive_assignment, text)
     if len(text) > _MAX_LOG_TEXT:
         return f"{text[:_MAX_LOG_TEXT]}… [truncated]"
     return text

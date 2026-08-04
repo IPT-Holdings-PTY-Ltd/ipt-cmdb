@@ -24,10 +24,10 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote, urlparse
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.staticfiles import StaticFiles
@@ -74,6 +74,7 @@ from src.cmdb.integration_reconciliation import (
     ci_sync_retry_delay_minutes,
     configuration_catalogue,
     normalize_ci_policy,
+    provider_change_plan,
     reconcile_configuration_items,
 )
 from src.cmdb.integrations import provider_registry
@@ -94,6 +95,20 @@ from src.cmdb.mfa import (
     recovery_codes,
     verify_totp,
 )
+from src.cmdb.nable_graphql import (
+    DEFAULT_GRAPHQL_ENDPOINT,
+    NableGraphqlClient,
+    NableGraphqlConfigurationError,
+    NableGraphqlRequestError,
+    merge_graphql_enrichment,
+    normalize_customer_scope,
+    normalize_graphql_api_token,
+    normalize_graphql_endpoint,
+    normalize_graphql_server_id,
+)
+from src.cmdb.nable_graphql import (
+    query_catalogue as nable_graphql_query_catalogue,
+)
 from src.cmdb.ncentral import (
     NcentralClient,
     NcentralConfigurationError,
@@ -103,12 +118,15 @@ from src.cmdb.ncentral import (
 from src.cmdb.ncentral import (
     normalize_base_url as normalize_ncentral_base_url,
 )
+from src.cmdb.ncentral_relationships import add_ncentral_network_dependency_hints
 from src.cmdb.notifications import (
     notification_candidates,
     notification_dedupe_key,
     render_notification_template,
     resolve_notification_recipients,
 )
+from src.cmdb.relationship_automation import relationship_auto_approval_decision
+from src.cmdb.relationship_candidates import build_relationship_candidates
 from src.cmdb.reports import (
     build_report,
     render_csv,
@@ -124,6 +142,7 @@ from src.cmdb.repository import (
     hash_password,
     integration_connection_audit_value,
 )
+from src.cmdb.technical_inventory import technical_inventory_collections
 from src.cmdb.version import release_metadata
 from src.cmdb.worker_runtime import PeriodicWorker, process_role, run_periodic_worker
 
@@ -1023,6 +1042,14 @@ class RelationshipCreateRequest(BaseModel):
     impactPolicy: str = "required"
 
 
+class RelationshipCandidateDecisionRequest(BaseModel):
+    """Validate an explicit decision on provider relationship evidence."""
+
+    decision: str = Field(pattern="^(approve|reject|ignore)$")
+    notes: str = Field(min_length=4, max_length=2000)
+    expectedRevision: int | None = Field(default=None, ge=1)
+
+
 class DataQualityExceptionRequest(BaseModel):
     """Validate a governed data-quality exception."""
 
@@ -1068,6 +1095,13 @@ class IntegrationReviewBulkDismissRequest(BaseModel):
 class IntegrationSuppressionRestoreRequest(BaseModel):
     """Restore one durable provider-object exclusion with governed notes."""
 
+    notes: str = Field(min_length=4, max_length=2000)
+
+
+class CiPresenceLifecycleDecisionRequest(BaseModel):
+    """Validate a revision-safe provider-presence lifecycle decision."""
+
+    expectedRevision: int = Field(ge=1)
     notes: str = Field(min_length=4, max_length=2000)
 
 
@@ -1170,6 +1204,17 @@ class NcentralConfigurationRequest(BaseModel):
     expectedRevision: int | None = Field(default=None, ge=1)
 
 
+class NcentralGraphqlConfigurationRequest(BaseModel):
+    """Configure the optional N-able GraphQL read transport."""
+
+    graphqlEnabled: bool = False
+    graphqlEndpoint: str = Field(default=DEFAULT_GRAPHQL_ENDPOINT, max_length=500)
+    graphqlApiToken: str = Field(default="", max_length=12000)
+    graphqlPageSize: int = Field(default=100, ge=1, le=100)
+    graphqlServerId: str = Field(default="", max_length=160)
+    expectedRevision: int | None = Field(default=None, ge=1)
+
+
 class NcentralOrganizationMappingRequest(BaseModel):
     """Validate an explicit N-central customer to CMDB-customer mapping."""
 
@@ -1189,6 +1234,22 @@ class NcentralDevicePreviewRequest(BaseModel):
     providerCompanyId: str = Field(min_length=1, max_length=160)
 
 
+class NcentralGraphqlScopeRequest(NcentralDevicePreviewRequest):
+    """Select one customer policy for a saved-scope GraphQL operation."""
+
+    queryKey: str = Field(
+        default="asset_inventory",
+        pattern="^(asset_identity|asset_inventory|patch_installations)$",
+    )
+    limit: int = Field(default=25, ge=1, le=500)
+
+
+class NcentralGraphqlServerCandidatesRequest(NcentralDevicePreviewRequest):
+    """Bound one identity-only N-central source-server detection read."""
+
+    limit: int = Field(default=100, ge=1, le=500)
+
+
 class NcentralDevicePolicyRequest(NcentralDevicePreviewRequest):
     """Validate device filters, type mappings and continuous preview settings."""
 
@@ -1200,7 +1261,18 @@ class NcentralDevicePolicyRequest(NcentralDevicePreviewRequest):
     statusMode: str = Field(default="all", pattern="^(all|selected)$")
     includedStatusIds: list[str] = Field(default_factory=list, max_length=500)
     excludedExternalIds: list[str] = Field(default_factory=list, max_length=1000)
+    graphqlOrganizationIds: list[str] | None = Field(default=None, max_length=100)
     enrichmentMode: str = Field(default="balanced", pattern="^(fast|balanced|full)$")
+    relationshipAutomationMode: str = Field(
+        default="review",
+        pattern="^(review|auto_explicit)$",
+    )
+    relationshipAutoApproveTypes: list[str] = Field(default_factory=list, max_length=20)
+    relationshipMinConfidence: float = Field(default=0.98, ge=0.5, le=1)
+    relationshipMinObservations: int = Field(default=2, ge=2, le=10)
+    relationshipMaxEvidenceAgeHours: int = Field(default=72, ge=1, le=720)
+    missingDeviceRequiredSnapshots: int = Field(default=3, ge=2, le=10)
+    missingDeviceMinimumHours: int = Field(default=24, ge=1, le=720)
     syncMode: str = Field(default="manual", pattern="^(manual|continuous_preview)$")
     intervalMinutes: int = Field(default=360, ge=15, le=10080)
     enabled: bool = False
@@ -1219,6 +1291,13 @@ class NcentralDeviceLinkRequest(NcentralDevicePreviewRequest):
 
     externalId: str = Field(min_length=1, max_length=160)
     assetId: str = Field(min_length=1, max_length=100)
+
+
+class NcentralCapabilityProbeRequest(NcentralDevicePreviewRequest):
+    """Select an optional immutable device identity for a redacted capability probe."""
+
+    externalId: str = Field(default="", max_length=160)
+    sampleLimit: int = Field(default=3, ge=1, le=3)
 
 
 class BrandingRequest(BaseModel):
@@ -4177,6 +4256,25 @@ def get_asset(asset_id: str, request: Request) -> dict:
     return core.asset_view(_asset_for_user(asset_id, current_user(request)))
 
 
+@api.get("/api/assets/{asset_id}/inventory", tags=["assets"])
+def get_asset_inventory(
+    asset_id: str,
+    request: Request,
+    includeHistory: bool = False,
+) -> dict:
+    """Return tenant-scoped current technical inventory and optional history."""
+
+    asset = _asset_for_user(asset_id, current_user(request))
+    try:
+        return REPOSITORY.get_ci_inventory(
+            asset["companyId"],
+            asset["id"],
+            include_history=includeHistory,
+        )
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+
+
 @api.post("/api/assets", status_code=201, tags=["assets"])
 def create_asset(payload: AssetCreateRequest, request: Request) -> dict:
     user = current_user(request)
@@ -4384,6 +4482,121 @@ def delete_relationship(relationship_id: str, request: Request) -> dict:
     if not deleted:
         raise HTTPException(404, "Relationship not found")
     return {"deletedId": relationship_id}
+
+
+@api.get("/api/relationship-candidates", tags=["relationships"])
+def list_relationship_candidates(
+    request: Request,
+    companyId: str | None = None,
+    state: str | None = None,
+    assetId: str | None = None,
+    provider: str | None = None,
+    includeRetired: bool = False,
+    limit: int = 250,
+) -> list[dict]:
+    """List explainable provider suggestions without materializing relationships."""
+
+    user = current_user(request)
+    if companyId:
+        companies = [_company_for_user(companyId, user)]
+    else:
+        _require_role(
+            user,
+            {"platform_admin", "msp_operator"},
+            "Choose a customer or use an MSP role",
+        )
+        companies = [
+            company for company in REPOSITORY.list_companies() if core.allowed(user, company["id"])
+        ]
+    try:
+        candidates = [
+            {
+                **item,
+                "companyName": company["name"],
+            }
+            for company in companies
+            for item in REPOSITORY.list_relationship_candidates(
+                company["id"],
+                state=state,
+                asset_id=assetId,
+                provider=provider,
+                include_retired=includeRetired,
+                limit=limit,
+            )
+        ]
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return sorted(
+        candidates,
+        key=lambda item: (item.get("lastSeenAt") or "", item.get("id") or ""),
+        reverse=True,
+    )[: max(1, min(limit, 1_000))]
+
+
+@api.post(
+    "/api/relationship-candidates/{candidate_id}/decision",
+    tags=["relationships"],
+)
+def decide_relationship_candidate(
+    candidate_id: str,
+    payload: RelationshipCandidateDecisionRequest,
+    request: Request,
+) -> dict:
+    """Approve, reject or ignore a provider suggestion under an explicit review gate."""
+
+    user = current_user(request)
+    candidate = next(
+        (
+            item
+            for company in REPOSITORY.list_companies()
+            if core.allowed(user, company["id"])
+            for item in REPOSITORY.list_relationship_candidates(
+                company["id"],
+                include_retired=True,
+                limit=1_000,
+            )
+            if item.get("id") == candidate_id
+        ),
+        None,
+    )
+    if not candidate:
+        raise HTTPException(404, "Relationship candidate not found")
+    company_id = str(candidate["companyId"])
+    _company_for_user(company_id, user, require_manage=True)
+    expected_revision = (
+        payload.expectedRevision
+        if payload.expectedRevision is not None
+        else int(candidate.get("revision") or 1)
+    )
+    if payload.decision != "approve":
+        state = "rejected" if payload.decision == "reject" else "ignored"
+        try:
+            with core.LOCK:
+                return REPOSITORY.decide_relationship_candidate(
+                    company_id,
+                    candidate_id,
+                    state,
+                    user["id"],
+                    payload.notes,
+                    expected_revision=expected_revision,
+                )
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+    try:
+        with core.LOCK:
+            decision, relationship = REPOSITORY.approve_relationship_candidate(
+                company_id,
+                candidate_id,
+                user["id"],
+                payload.notes,
+                expected_revision=expected_revision,
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return {
+        **decision,
+        "approvedRelationship": relationship,
+    }
 
 
 def _quality_company_scope(
@@ -4666,6 +4879,123 @@ def restore_ignored_integration_object(
     if not restored:
         raise HTTPException(409, "The ignored configuration has already been restored")
     return restored
+
+
+@api.get(
+    "/api/integration-reconciliation/lifecycle-candidates",
+    tags=["integrations"],
+)
+def list_integration_presence_lifecycle(
+    request: Request,
+    provider: Literal["connectwise", "ncentral"] | None = Query(default=None),
+    companyId: str | None = Query(default=None, max_length=100),
+    providerParentId: str | None = Query(default=None, max_length=160),
+    state: Literal[
+        "observed",
+        "monitoring",
+        "eligible",
+        "not_evaluated",
+        "retired",
+        "restore_ready",
+    ]
+    | None = Query(default=None),
+    search: str = Query(default="", max_length=200),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=25_000),
+) -> dict:
+    """List tenant-scoped source-presence evidence without raw snapshot identities."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    permitted_company_ids: set[str] | None = None
+    if companyId:
+        _company_for_user(companyId, user)
+    elif user.get("role") != "platform_admin":
+        permitted_company_ids = {
+            company["id"]
+            for company in REPOSITORY.list_companies()
+            if core.allowed(user, company["id"])
+        }
+        if not permitted_company_ids:
+            return {
+                "items": [],
+                "total": 0,
+                "summary": {
+                    "observed": 0,
+                    "monitoring": 0,
+                    "eligible": 0,
+                    "notEvaluated": 0,
+                    "retired": 0,
+                    "restoreReady": 0,
+                    "total": 0,
+                },
+            }
+    return REPOSITORY.list_ci_presence_lifecycle(
+        provider=provider,
+        company_id=companyId,
+        company_ids=(sorted(permitted_company_ids) if permitted_company_ids is not None else None),
+        provider_parent_id=providerParentId,
+        state=state,
+        search=search.strip(),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@api.post(
+    "/api/integration-reconciliation/lifecycle-candidates/{presence_id}/retire",
+    tags=["integrations"],
+)
+def retire_integration_presence_mapping(
+    presence_id: str,
+    payload: CiPresenceLifecycleDecisionRequest,
+    request: Request,
+) -> dict:
+    """Explicitly retire one eligible provider source link with an audit reason."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    try:
+        with core.LOCK:
+            stored = REPOSITORY.retire_ci_presence_mapping(
+                presence_id,
+                payload.expectedRevision,
+                payload.notes.strip(),
+                user["id"],
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    if not stored:
+        raise HTTPException(404, "Missing-device lifecycle candidate not found")
+    return stored
+
+
+@api.post(
+    "/api/integration-reconciliation/lifecycle-candidates/{presence_id}/restore",
+    tags=["integrations"],
+)
+def restore_integration_presence_mapping(
+    presence_id: str,
+    payload: CiPresenceLifecycleDecisionRequest,
+    request: Request,
+) -> dict:
+    """Restore one re-observed provider source link with an audit reason."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    try:
+        with core.LOCK:
+            stored = REPOSITORY.restore_ci_presence_mapping(
+                presence_id,
+                payload.expectedRevision,
+                payload.notes.strip(),
+                user["id"],
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    if not stored:
+        raise HTTPException(404, "Missing-device lifecycle candidate not found")
+    return stored
 
 
 @api.patch("/api/reconciliation-candidates/{candidate_id}", tags=["integrations"])
@@ -5086,8 +5416,7 @@ def _connectwise_connection_public() -> dict:
         environment_error = ""
     source = "environment" if environment else "encrypted_database"
     public_configuration = {**configuration, **(environment or {})}
-    has_stored = bool(connection.get("credentialsEncrypted"))
-    configured = bool(environment) or has_stored
+    configured = bool(environment) or bool(connection.get("credentialsEncrypted"))
     lifecycle = connection.get("lifecycleStatus", "active")
     return {
         "id": connection.get("id", "connectwise"),
@@ -5254,17 +5583,78 @@ def _ncentral_environment_configuration() -> dict | None:
     }
 
 
-def _ncentral_stored_configuration() -> tuple[dict, dict]:
-    """Decrypt the permanent User-API token only inside the provider boundary."""
+def _ncentral_graphql_environment_token() -> str:
+    """Read the optional GraphQL bearer from one environment source."""
 
-    connection = REPOSITORY.get_integration_connection("ncentral")
-    if not connection:
-        raise NcentralConfigurationError("N-central integration connection is unavailable")
-    configuration = deepcopy(connection.get("configuration") or {})
+    direct = str(os.getenv("NCENTRAL_GRAPHQL_API_TOKEN") or "").strip()
+    token_file = str(os.getenv("NCENTRAL_GRAPHQL_API_TOKEN_FILE") or "").strip()
+    if direct and token_file:
+        raise NableGraphqlConfigurationError(
+            "Configure either NCENTRAL_GRAPHQL_API_TOKEN or "
+            "NCENTRAL_GRAPHQL_API_TOKEN_FILE, not both"
+        )
+    if not token_file:
+        return direct
+    path = Path(token_file)
+    try:
+        if path.stat().st_size > 12000:
+            raise NableGraphqlConfigurationError("N-able GraphQL token secret file is too large")
+        return path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise NableGraphqlConfigurationError(
+            "N-able GraphQL token secret file cannot be read by this container"
+        ) from error
+
+
+def _environment_boolean(name: str, *, default: bool) -> bool:
+    """Parse a strict deployment boolean without accepting ambiguous values."""
+
+    value = str(os.getenv(name) or "").strip().casefold()
+    if not value:
+        return default
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise NableGraphqlConfigurationError(f"{name} must be true or false")
+
+
+def _ncentral_graphql_environment_configuration() -> dict | None:
+    """Return optional environment-managed GraphQL settings and bearer token."""
+
+    token = _ncentral_graphql_environment_token()
+    if not token:
+        if _environment_boolean("NCENTRAL_GRAPHQL_ENABLED", default=False):
+            raise NableGraphqlConfigurationError(
+                "NCENTRAL_GRAPHQL_ENABLED requires an N-able GraphQL API token"
+            )
+        # Compose forwards endpoint/default and enabled=false on every install.
+        # Neither setting owns the wizard unless a real secret source exists.
+        return None
+    endpoint_value = str(os.getenv("NCENTRAL_GRAPHQL_ENDPOINT") or "").strip()
+    enabled = _environment_boolean("NCENTRAL_GRAPHQL_ENABLED", default=bool(token))
+    try:
+        page_size = int(os.getenv("NCENTRAL_GRAPHQL_PAGE_SIZE", "100"))
+    except ValueError as error:
+        raise NableGraphqlConfigurationError(
+            "NCENTRAL_GRAPHQL_PAGE_SIZE must be a number"
+        ) from error
+    return {
+        "graphqlEnabled": enabled,
+        "graphqlEndpoint": normalize_graphql_endpoint(endpoint_value or DEFAULT_GRAPHQL_ENDPOINT),
+        "graphqlApiToken": token,
+        "graphqlPageSize": page_size,
+        "graphqlServerId": normalize_graphql_server_id(os.getenv("NCENTRAL_GRAPHQL_SERVER_ID")),
+    }
+
+
+def _ncentral_stored_credentials(connection: dict) -> dict[str, Any]:
+    """Decrypt the shared REST and GraphQL credential envelope."""
+
     encrypted = str(connection.get("credentialsEncrypted") or "")
     nonce = str(connection.get("credentialsNonce") or "")
     if not encrypted or not nonce:
-        raise NcentralConfigurationError("N-central User-API token is not configured")
+        return {}
     try:
         credentials = json.loads(decrypt_secret(encrypted, nonce, "integration:ncentral"))
     except (MfaConfigurationError, json.JSONDecodeError) as error:
@@ -5273,6 +5663,19 @@ def _ncentral_stored_configuration() -> tuple[dict, dict]:
         ) from error
     if not isinstance(credentials, dict):
         raise NcentralConfigurationError("Stored N-central credentials are invalid")
+    return credentials
+
+
+def _ncentral_stored_configuration() -> tuple[dict, dict]:
+    """Decrypt the permanent User-API token only inside the provider boundary."""
+
+    connection = REPOSITORY.get_integration_connection("ncentral")
+    if not connection:
+        raise NcentralConfigurationError("N-central integration connection is unavailable")
+    configuration = deepcopy(connection.get("configuration") or {})
+    credentials = _ncentral_stored_credentials(connection)
+    if not str(credentials.get("userApiToken") or "").strip():
+        raise NcentralConfigurationError("N-central User-API token is not configured")
     return connection, {**configuration, **credentials}
 
 
@@ -5285,6 +5688,37 @@ def _ncentral_effective_configuration() -> tuple[dict, str]:
         return environment, "environment"
     _connection, stored = _ncentral_stored_configuration()
     return stored, "encrypted_database"
+
+
+def _ncentral_graphql_effective_configuration(*, require_enabled: bool = True) -> tuple[dict, str]:
+    """Load GraphQL settings without exposing its bearer token.
+
+    Asset enrichment requires the saved enablement flag. The bounded,
+    read-only Customer catalogue test may validate an already stored
+    credential before enrichment is enabled so setup can be completed in a
+    deliberate order.
+    """
+
+    _require_integration_active("ncentral")
+    environment = _ncentral_graphql_environment_configuration()
+    if environment:
+        if require_enabled and not environment.get("graphqlEnabled"):
+            raise NableGraphqlConfigurationError("N-able GraphQL enrichment is disabled")
+        return environment, "environment"
+    connection = REPOSITORY.get_integration_connection("ncentral")
+    if not connection:
+        raise NableGraphqlConfigurationError("N-central integration connection is unavailable")
+    configuration = deepcopy(connection.get("configuration") or {})
+    if require_enabled and not configuration.get("graphqlEnabled"):
+        raise NableGraphqlConfigurationError("N-able GraphQL enrichment is disabled")
+    try:
+        credentials = _ncentral_stored_credentials(connection)
+    except NcentralConfigurationError as error:
+        raise NableGraphqlConfigurationError(str(error)) from error
+    token = str(credentials.get("graphqlApiToken") or "").strip()
+    if not token:
+        raise NableGraphqlConfigurationError("N-able GraphQL API token is not configured")
+    return {**configuration, "graphqlApiToken": token}, "encrypted_database"
 
 
 def _ncentral_public_failure(error: Exception, operation: str) -> str:
@@ -5330,8 +5764,16 @@ def _ncentral_connection_public() -> dict:
     else:
         environment_error = ""
     public_configuration = {**configuration, **(environment or {})}
-    has_stored = bool(connection.get("credentialsEncrypted"))
-    configured = bool(environment) or has_stored
+    stored_rest_token = False
+    stored_credential_error = ""
+    if connection.get("credentialsEncrypted"):
+        try:
+            stored_rest_token = bool(
+                str(_ncentral_stored_credentials(connection).get("userApiToken") or "").strip()
+            )
+        except NcentralConfigurationError:
+            stored_credential_error = "Stored N-central credentials cannot be decrypted"
+    configured = bool(environment) or stored_rest_token
     lifecycle = connection.get("lifecycleStatus", "active")
     discovery_policy = configuration.get("discoveryPolicy") or {}
     return {
@@ -5355,15 +5797,99 @@ def _ncentral_connection_public() -> dict:
         else "not_configured",
         "managedByEnvironment": bool(environment) or bool(environment_error),
         "connectionStatus": (
-            "error" if environment_error else connection.get("connectionStatus", "not_configured")
+            "error"
+            if environment_error or stored_credential_error
+            else connection.get("connectionStatus", "not_configured")
         ),
         "lastTestAt": connection.get("lastTestAt"),
-        "lastError": environment_error or connection.get("lastError", ""),
+        "lastError": environment_error
+        or stored_credential_error
+        or connection.get("lastError", ""),
         "revision": int(connection.get("revision") or 1),
         "lifecycleStatus": lifecycle,
         "lifecycleReason": connection.get("lifecycleReason", ""),
         "lifecycleChangedAt": connection.get("lifecycleChangedAt"),
         "lifecycleChangedBy": connection.get("lifecycleChangedBy"),
+        "graphql": _ncentral_graphql_connection_public(connection),
+    }
+
+
+def _ncentral_graphql_connection_public(connection: dict | None = None) -> dict:
+    """Expose GraphQL configuration and capability metadata without its token."""
+
+    stored_connection = connection or REPOSITORY.get_integration_connection("ncentral") or {}
+    configuration = deepcopy(stored_connection.get("configuration") or {})
+    try:
+        environment = _ncentral_graphql_environment_configuration()
+    except NableGraphqlConfigurationError as error:
+        LOGGER.warning("N-able GraphQL environment configuration is invalid")
+        environment = None
+        environment_error = str(error)
+    else:
+        environment_error = ""
+    stored_token = False
+    stored_error = ""
+    if stored_connection.get("credentialsEncrypted"):
+        try:
+            stored_token = bool(
+                str(_ncentral_stored_credentials(stored_connection).get("graphqlApiToken") or "")
+            )
+        except NcentralConfigurationError:
+            stored_error = "Stored N-able GraphQL credentials cannot be decrypted"
+    effective = {**configuration, **(environment or {})}
+    enabled = bool(effective.get("graphqlEnabled", False))
+    configured = bool(environment and environment.get("graphqlApiToken")) or stored_token
+    source = (
+        "environment"
+        if environment
+        else ("encrypted_database" if stored_token else "not_configured")
+    )
+    try:
+        snapshot = REPOSITORY.get_integration_capability_snapshot(
+            "ncentral", "graphql.connection", include_expired=True
+        )
+    except ValueError:
+        LOGGER.warning("Stored N-able GraphQL capability metadata is invalid")
+        snapshot = None
+    if snapshot:
+        snapshot_summary = snapshot.get("summary")
+        capability = {
+            **deepcopy(snapshot_summary if isinstance(snapshot_summary, dict) else {}),
+            "status": snapshot.get("status"),
+            "errorCategory": snapshot.get("errorCategory") or "",
+            "checkedAt": snapshot.get("checkedAt"),
+            "expiresAt": snapshot.get("expiresAt"),
+            "stale": bool(snapshot.get("stale")),
+        }
+    else:
+        capability = deepcopy(configuration.get("graphqlCapability") or {})
+    capability_error = (
+        str(capability.get("errorCategory") or "")
+        if capability.get("status") in {"error", "unavailable"}
+        else ""
+    )
+    return {
+        "graphqlEnabled": enabled,
+        "graphqlEndpoint": str(effective.get("graphqlEndpoint") or DEFAULT_GRAPHQL_ENDPOINT),
+        "graphqlPageSize": int(effective.get("graphqlPageSize") or 100),
+        "graphqlServerId": str(effective.get("graphqlServerId") or ""),
+        "configured": configured,
+        "hasCredentials": configured,
+        "credentialSource": source,
+        "managedByEnvironment": bool(environment) or bool(environment_error),
+        "connectionStatus": (
+            "error"
+            if environment_error or stored_error
+            else ("configured" if configured else "not_configured")
+        ),
+        "lastTestAt": capability.get("checkedAt") or capability.get("testedAt"),
+        "lastError": environment_error
+        or stored_error
+        or capability_error
+        or str(configuration.get("graphqlLastError") or ""),
+        "capability": capability,
+        "queries": nable_graphql_query_catalogue(),
+        "revision": int(stored_connection.get("revision") or 1),
     }
 
 
@@ -5480,6 +6006,2178 @@ def get_ncentral_configuration(request: Request) -> dict:
     return _ncentral_connection_public()
 
 
+@api.get("/api/integrations/ncentral/graphql/config", tags=["integrations"])
+def get_ncentral_graphql_configuration(request: Request) -> dict:
+    """Return token-safe N-able GraphQL settings and static query metadata."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    return _ncentral_graphql_connection_public()
+
+
+@api.put("/api/integrations/ncentral/graphql/config", tags=["integrations"])
+def update_ncentral_graphql_configuration(
+    payload: NcentralGraphqlConfigurationRequest,
+    request: Request,
+) -> dict:
+    """Encrypt the GraphQL bearer in the existing N-central credential envelope."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    public = _ncentral_graphql_connection_public()
+    if public.get("managedByEnvironment"):
+        raise HTTPException(409, "N-able GraphQL settings are managed by container configuration")
+    try:
+        endpoint = normalize_graphql_endpoint(payload.graphqlEndpoint)
+        server_id = normalize_graphql_server_id(payload.graphqlServerId)
+        graphql_token = normalize_graphql_api_token(
+            payload.graphqlApiToken,
+            allow_empty=True,
+        )
+    except NableGraphqlConfigurationError as error:
+        raise HTTPException(400, str(error)) from error
+    with core.LOCK:
+        REPOSITORY.ensure_integration_connection("ncentral", "N-central", user["id"])
+    current = REPOSITORY.get_integration_connection("ncentral") or {}
+    encrypted = str(current.get("credentialsEncrypted") or "")
+    nonce = str(current.get("credentialsNonce") or "")
+    try:
+        credential_bundle = _ncentral_stored_credentials(current)
+    except NcentralConfigurationError as error:
+        raise HTTPException(409, str(error)) from error
+    if graphql_token:
+        credential_bundle["graphqlApiToken"] = graphql_token
+        try:
+            encryption_key()
+            encrypted, nonce = encrypt_secret(
+                json.dumps(credential_bundle),
+                "integration:ncentral",
+            )
+        except MfaConfigurationError as error:
+            raise HTTPException(
+                503, "Configure MFA_ENCRYPTION_KEY before storing integration credentials"
+            ) from error
+    if payload.graphqlEnabled and not credential_bundle.get("graphqlApiToken"):
+        raise HTTPException(400, "Enter the N-able GraphQL API token before enabling it")
+    configuration = deepcopy(current.get("configuration") or {})
+    configuration.update(
+        {
+            "graphqlEnabled": payload.graphqlEnabled,
+            "graphqlEndpoint": endpoint,
+            "graphqlPageSize": payload.graphqlPageSize,
+            "graphqlServerId": server_id,
+            "graphqlLastError": "",
+        }
+    )
+    try:
+        with core.LOCK:
+            REPOSITORY.update_integration_connection(
+                "ncentral",
+                {
+                    "configuration": configuration,
+                    "credentialsEncrypted": encrypted,
+                    "credentialsNonce": nonce,
+                    "expectedRevision": payload.expectedRevision,
+                },
+                user["id"],
+            )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return _ncentral_graphql_connection_public()
+
+
+def _ncentral_graphql_public_failure(error: Exception) -> str:
+    """Return a stable provider error while logging only its exception type."""
+
+    LOGGER.exception("N-able GraphQL read failed (%s)", type(error).__name__)
+    if isinstance(error, NableGraphqlRequestError) and error.status_code in {401, 403}:
+        return (
+            "N-able GraphQL rejected the saved API token or its access scope. "
+            "Verify the token and retry."
+        )
+    if isinstance(error, NableGraphqlConfigurationError):
+        return "N-able GraphQL is disabled or its configuration is incomplete."
+    return "N-able GraphQL could not complete the bounded read operation."
+
+
+def _record_ncentral_graphql_capability(
+    *,
+    status: str,
+    summary: dict[str, Any],
+    error_category: str = "",
+) -> None:
+    """Persist bounded, token-free GraphQL test metadata without masking the test."""
+
+    try:
+        connection = REPOSITORY.get_integration_connection("ncentral") or {}
+        tested_revision = int(connection.get("revision") or 1)
+        with core.LOCK:
+            REPOSITORY.upsert_integration_capability_snapshot(
+                "ncentral",
+                "graphql.connection",
+                {
+                    "status": status,
+                    "summary": {**summary, "connectionRevision": tested_revision},
+                    "errorCategory": error_category,
+                },
+                ttl_seconds=900,
+            )
+    except (TypeError, ValueError):
+        LOGGER.warning("N-able GraphQL capability metadata could not be persisted", exc_info=True)
+
+
+def _record_ncentral_rest_capability(
+    *,
+    status: str,
+    summary: dict[str, Any],
+    error_category: str = "",
+) -> None:
+    """Persist a revision-bound, credential-free REST connection test result."""
+
+    try:
+        connection = REPOSITORY.get_integration_connection("ncentral") or {}
+        tested_revision = int(connection.get("revision") or 1)
+        with core.LOCK:
+            REPOSITORY.upsert_integration_capability_snapshot(
+                "ncentral",
+                "rest.connection",
+                {
+                    "status": status,
+                    "summary": {**summary, "connectionRevision": tested_revision},
+                    "errorCategory": error_category,
+                },
+                ttl_seconds=86_400,
+            )
+    except (TypeError, ValueError):
+        LOGGER.warning("N-central REST capability metadata could not be persisted", exc_info=True)
+
+
+def _ncentral_graphql_saved_scope(company_id: str, provider_company_id: str) -> list[str]:
+    """Load only explicitly saved GraphQL Customer IDs for one mapped REST customer."""
+
+    _ncentral_mapped_company(company_id, provider_company_id)
+    policy = REPOSITORY.get_ci_sync_policy("ncentral", company_id, provider_company_id)
+    organization_ids = normalize_ci_policy(policy).get("graphqlOrganizationIds") or []
+    if not organization_ids:
+        raise HTTPException(
+            409,
+            "Select and save the GraphQL Customer organization before reading asset data",
+        )
+    return list(organization_ids)
+
+
+def _ncentral_graphql_cached_asset(
+    row: dict[str, Any],
+    *,
+    organization_ids: set[str],
+    server_id: str,
+) -> dict[str, Any] | None:
+    """Rebuild one merge-safe asset solely from normalized tenant cache fields."""
+
+    summary = row.get("summary")
+    if not isinstance(summary, dict) or summary.get("queryKey") != "asset_inventory":
+        return None
+    customer_id = str(summary.get("graphqlCustomerId") or "")
+    graphql_asset_id = str(summary.get("graphqlAssetId") or "")
+    source_identity = summary.get("sourceIdentity")
+    inventory = summary.get("inventory")
+    row_server_id = str(row.get("sourceServerId") or "")
+    device_id = str(row.get("sourceDeviceId") or "")
+    if (
+        customer_id not in organization_ids
+        or row_server_id != server_id
+        or not graphql_asset_id
+        or not device_id
+        or not isinstance(source_identity, dict)
+        or source_identity.get("namespace") != "nable_graphql_asset"
+        or source_identity.get("externalId") != graphql_asset_id
+        or not isinstance(inventory, dict)
+    ):
+        return None
+    return {
+        "graphqlAssetId": graphql_asset_id,
+        "name": str(summary.get("assetName") or "")[:240],
+        "customer": {
+            "id": customer_id,
+            "name": str(summary.get("graphqlCustomerName") or "")[:240],
+        },
+        "site": None,
+        "serviceOrganization": None,
+        "sourceIdentity": deepcopy(source_identity),
+        "restIdentity": {
+            "provider": "ncentral",
+            "namespace": "ncentral_rest_device",
+            "serverId": row_server_id,
+            "deviceId": device_id,
+            "crosswalkKey": f"{row_server_id}:{device_id}",
+        },
+        "summary": deepcopy(inventory),
+    }
+
+
+def _ncentral_reviewed_graphql_evidence_status(
+    record: dict[str, Any],
+    cached_assets: list[dict[str, Any]],
+    *,
+    server_id: str,
+    organization_ids: set[str],
+) -> str:
+    """Classify reviewed GraphQL evidence against the current published cache.
+
+    Pending review rows can outlive a cache generation or a saved Customer-scope
+    correction.  Direct linking must therefore distinguish a REST-only review
+    record from GraphQL evidence that is still proven by the current, fresh,
+    tenant-scoped cache.
+    """
+
+    raw_fields = record.get("fields")
+    raw_metadata = record.get("metadata")
+    fields = raw_fields if isinstance(raw_fields, dict) else {}
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    reviewed_asset_id = str(fields.get("nableGraphqlAssetId") or "")
+    reviewed_server_id = str(fields.get("nableGraphqlServerId") or "")
+    reviewed_source = metadata.get("nableGraphqlSourceIdentity")
+    has_evidence = bool(
+        reviewed_asset_id
+        or reviewed_server_id
+        or isinstance(reviewed_source, dict)
+        or metadata.get("nableGraphql")
+        or metadata.get("nableGraphqlRestFingerprint")
+    )
+    if not has_evidence:
+        return "absent"
+    if (
+        not server_id
+        or reviewed_server_id != server_id
+        or not reviewed_asset_id
+        or not isinstance(reviewed_source, dict)
+        or reviewed_source.get("provider") != "ncentral"
+        or reviewed_source.get("namespace") != "nable_graphql_asset"
+        or str(reviewed_source.get("externalId") or "") != reviewed_asset_id
+    ):
+        return "unverified"
+
+    reviewed_device_id = str(record.get("externalId") or "")
+    for asset in cached_assets:
+        rest_identity = asset.get("restIdentity")
+        source_identity = asset.get("sourceIdentity")
+        customer = asset.get("customer")
+        if (
+            isinstance(rest_identity, dict)
+            and rest_identity.get("serverId") == server_id
+            and str(rest_identity.get("deviceId") or "") == reviewed_device_id
+            and str(asset.get("graphqlAssetId") or "") == reviewed_asset_id
+            and isinstance(source_identity, dict)
+            and source_identity.get("provider") == "ncentral"
+            and source_identity.get("namespace") == "nable_graphql_asset"
+            and str(source_identity.get("externalId") or "") == reviewed_asset_id
+            and isinstance(customer, dict)
+            and str(customer.get("id") or "") in organization_ids
+        ):
+            return "current"
+    return "unverified"
+
+
+def _ncentral_graphql_generation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only the newest fully published cache generation.
+
+    Legacy cache rows did not carry a generation identifier. They remain readable
+    until the first complete refresh, after which removed or out-of-scope assets
+    from an older generation can no longer leak into reconciliation. New rows are
+    invisible until a final generation marker is written, which makes overlapping
+    or interrupted refreshes fail closed without overwriting the current cache.
+    """
+
+    generated_rows = [
+        (row, summary, str(summary.get("cacheGenerationId") or ""))
+        for row in rows
+        if isinstance((summary := row.get("summary")), dict)
+        and str(summary.get("cacheGenerationId") or "")
+    ]
+    if not generated_rows:
+        return rows
+    legacy_rows = [
+        row
+        for row in rows
+        if not (
+            isinstance((summary := row.get("summary")), dict)
+            and str(summary.get("cacheGenerationId") or "")
+        )
+    ]
+    published_generations = {
+        generation_id
+        for _row, summary, generation_id in generated_rows
+        if bool(summary.get("cachePublished"))
+        or (
+            "cachePublished" not in summary
+            and summary.get("queryKey") == "asset_inventory"
+            and bool(summary.get("cacheComplete"))
+        )
+    }
+    latest_generation = next(
+        (
+            generation_id
+            for _row, _summary, generation_id in generated_rows
+            if generation_id in published_generations
+        ),
+        "",
+    )
+    if not latest_generation:
+        # An interrupted first generation-based refresh must not hide the last
+        # legacy cache. Its existing scope and TTL checks still decide whether
+        # the legacy rows are usable.
+        return legacy_rows
+    return [
+        row for row, _summary, generation_id in generated_rows if generation_id == latest_generation
+    ]
+
+
+def _ncentral_graphql_scope_fingerprint(organization_ids: list[str] | set[str]) -> str:
+    """Fingerprint the exact saved Customer organization scope without exposing it."""
+
+    normalized = sorted({str(value).strip() for value in organization_ids if str(value).strip()})
+    return hashlib.sha256(json.dumps(normalized, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _ncentral_graphql_cache_ttl_seconds(policy: dict[str, Any]) -> int:
+    """Keep GraphQL evidence fresh through at least one complete sync interval."""
+
+    try:
+        interval_seconds = int(policy.get("intervalMinutes") or 360) * 60
+    except (TypeError, ValueError):
+        interval_seconds = 6 * 60 * 60
+    # Manual policies still need a practical review/import window. Continuous
+    # policies retain two intervals and both remain inside the repository's
+    # seven-day cache safety boundary.
+    return min(7 * 24 * 60 * 60, max(24 * 60 * 60, interval_seconds * 2))
+
+
+def _ncentral_graphql_cache_metadata(
+    rows: list[dict[str, Any]],
+    *,
+    organization_ids: set[str],
+    server_id: str,
+) -> dict[str, Any]:
+    """Summarize one current cache generation without exposing provider payloads."""
+
+    if not rows:
+        return {
+            "providerAssetCount": 0,
+            "eligibleDeviceCount": 0,
+            "unmatchedDeviceCount": 0,
+            "pagesRead": 0,
+            "complete": False,
+            "scopeFingerprint": "",
+        }
+    metadata_row = next(
+        (
+            row
+            for row in rows
+            if isinstance(row.get("summary"), dict) and bool(row["summary"].get("cachePublished"))
+        ),
+        rows[0],
+    )
+    summary = metadata_row.get("summary")
+    safe = summary if isinstance(summary, dict) else {}
+
+    def count(key: str, fallback: int = 0) -> int:
+        raw_value = safe.get(key)
+        if raw_value is None or raw_value == "":
+            raw_value = fallback
+        try:
+            return max(0, int(raw_value))
+        except (TypeError, ValueError):
+            return max(0, fallback)
+
+    asset_rows = [
+        row
+        for row in rows
+        if isinstance((row_summary := row.get("summary")), dict)
+        and row_summary.get("queryKey") == "asset_inventory"
+    ]
+    eligible_device_count = count("cacheEligibleDeviceCount", len(asset_rows))
+    valid_asset_count = 0
+    graphql_asset_ids: set[str] = set()
+    rest_device_ids: set[str] = set()
+    invalid_asset_row = False
+    for row in asset_rows:
+        asset = _ncentral_graphql_cached_asset(
+            row,
+            organization_ids=organization_ids,
+            server_id=server_id,
+        )
+        if not asset:
+            invalid_asset_row = True
+            continue
+        rest_identity = asset["restIdentity"]
+        device_id = str(rest_identity["deviceId"])
+        graphql_asset_id = str(asset["graphqlAssetId"])
+        if device_id in rest_device_ids or graphql_asset_id in graphql_asset_ids:
+            invalid_asset_row = True
+            continue
+        rest_device_ids.add(device_id)
+        graphql_asset_ids.add(graphql_asset_id)
+        valid_asset_count += 1
+    generated_summaries = [
+        row_summary
+        for row in rows
+        if isinstance((row_summary := row.get("summary")), dict)
+        and str(row_summary.get("cacheGenerationId") or "")
+    ]
+    uses_explicit_publication = any(
+        "cachePublished" in row_summary for row_summary in generated_summaries
+    )
+    published_marker_count = sum(
+        1
+        for row_summary in generated_summaries
+        if row_summary.get("queryKey") == "asset_inventory_cache_generation"
+        and bool(row_summary.get("cachePublished"))
+    )
+    publication_is_valid = not uses_explicit_publication or published_marker_count == 1
+    cache_complete = (
+        bool(safe.get("cacheComplete", False))
+        and publication_is_valid
+        and not invalid_asset_row
+        and valid_asset_count == eligible_device_count
+    )
+    return {
+        "providerAssetCount": count("cacheProviderAssetCount", len(asset_rows)),
+        "eligibleDeviceCount": eligible_device_count,
+        "unmatchedDeviceCount": count("cacheUnmatchedDeviceCount"),
+        "pagesRead": count("cachePagesRead"),
+        "complete": cache_complete,
+        "scopeFingerprint": str(safe.get("cacheScopeFingerprint") or ""),
+    }
+
+
+def _ncentral_graphql_cached_read(
+    payload: NcentralGraphqlScopeRequest,
+    *,
+    include_expired: bool,
+) -> dict[str, Any]:
+    """Read bounded enrichment cache without making any provider request."""
+
+    _require_integration_active("ncentral")
+    organization_ids = _ncentral_graphql_saved_scope(payload.companyId, payload.providerCompanyId)
+    public = _ncentral_graphql_connection_public()
+    server_id = str(public.get("graphqlServerId") or "").strip()
+    if payload.queryKey == "patch_installations" or not server_id:
+        return {
+            "queryKey": payload.queryKey,
+            "organizationIds": organization_ids,
+            "totalCount": 0,
+            "items": [],
+            "truncated": False,
+            "companyId": payload.companyId,
+            "providerCompanyId": payload.providerCompanyId,
+            "credentialSource": public.get("credentialSource"),
+            "readOnly": True,
+            "writesAttempted": False,
+            "cache": {
+                "status": "empty",
+                "deviceCount": 0,
+                "lastRefreshedAt": None,
+                "expiresAt": None,
+                "message": (
+                    "Patch evidence is refreshed live and is not stored in the asset cache."
+                    if payload.queryKey == "patch_installations"
+                    else "No eligible cached asset enrichment is available."
+                ),
+            },
+        }
+    rows = REPOSITORY.list_integration_enrichment_previews(
+        "ncentral",
+        payload.companyId,
+        payload.providerCompanyId,
+        source_server_id=server_id,
+        include_expired=include_expired,
+        limit=25_000,
+    )
+    rows = _ncentral_graphql_generation_rows(rows)
+    allowed = set(organization_ids)
+    all_items = [
+        item
+        for row in rows
+        if (
+            item := _ncentral_graphql_cached_asset(
+                row,
+                organization_ids=allowed,
+                server_id=server_id,
+            )
+        )
+    ]
+    cache_metadata = _ncentral_graphql_cache_metadata(
+        rows,
+        organization_ids=allowed,
+        server_id=server_id,
+    )
+    scope_matches = cache_metadata["scopeFingerprint"] == _ncentral_graphql_scope_fingerprint(
+        organization_ids
+    )
+    if not scope_matches and rows:
+        all_items = []
+    items = all_items[: payload.limit]
+    stale = any(bool(row.get("stale")) for row in rows)
+    observed = sorted(str(row.get("observedAt") or "") for row in rows if row.get("observedAt"))
+    expiries = sorted(str(row.get("expiresAt") or "") for row in rows if row.get("expiresAt"))
+    return {
+        "queryKey": payload.queryKey,
+        "organizationIds": organization_ids,
+        "totalCount": len(all_items),
+        "items": items,
+        "truncated": len(all_items) > len(items),
+        "companyId": payload.companyId,
+        "providerCompanyId": payload.providerCompanyId,
+        "credentialSource": public.get("credentialSource"),
+        "readOnly": True,
+        "writesAttempted": False,
+        "cache": {
+            "status": (
+                "scope_changed"
+                if rows and not scope_matches
+                else ("stale" if rows and stale else ("fresh" if items else "empty"))
+            ),
+            "deviceCount": len(all_items),
+            **cache_metadata,
+            "complete": bool(cache_metadata["complete"] and scope_matches and not stale),
+            "lastRefreshedAt": observed[-1] if observed else None,
+            "expiresAt": expiries[0] if expiries else None,
+            "message": (
+                "The saved GraphQL Customer scope changed; refresh the full-scope cache."
+                if rows and not scope_matches
+                else (
+                    "Showing expired cache evidence; run refresh before using it for a change."
+                    if rows and stale
+                    else (
+                        "Showing current cached asset enrichment."
+                        if items
+                        else "No eligible cached asset enrichment is available."
+                    )
+                )
+            ),
+        },
+    }
+
+
+def _ncentral_setup_status() -> dict[str, Any]:
+    """Build a provider-call-free readiness assessment from persisted N-central state."""
+
+    action_path = "/admin/integrations/ncentral"
+
+    def action(key: str, label: str) -> dict[str, str]:
+        return {"key": key, "label": label, "path": action_path}
+
+    gates: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+
+    def add_gate(
+        key: str,
+        label: str,
+        status: str,
+        detail: str,
+        next_action: dict[str, str],
+        *,
+        required: bool = True,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        gate: dict[str, Any] = {
+            "key": key,
+            "label": label,
+            "status": status,
+            "required": required,
+            "detail": detail,
+            "action": next_action,
+        }
+        if evidence:
+            gate["evidence"] = evidence
+        gates.append(gate)
+        issue = {"gate": key, "message": detail, "action": next_action}
+        if status == "blocked" and required:
+            blockers.append(issue)
+        elif status == "warning":
+            warnings.append(issue)
+
+    def capability_state(
+        snapshot: dict[str, Any] | None,
+        current_revision: int,
+    ) -> str:
+        if not snapshot:
+            return "never_tested"
+        if str(snapshot.get("status") or "") != "supported":
+            return "failed"
+        summary = snapshot.get("summary")
+        tested_revision = snapshot.get("connectionRevision")
+        if tested_revision is None and isinstance(summary, dict):
+            tested_revision = summary.get("connectionRevision")
+        if tested_revision is None:
+            return "legacy_unknown_revision"
+        try:
+            if int(tested_revision) != current_revision:
+                return "stale_revision"
+        except (TypeError, ValueError):
+            return "legacy_unknown_revision"
+        if snapshot.get("stale"):
+            return "expired"
+        return "current"
+
+    stored_connection = REPOSITORY.get_integration_connection("ncentral")
+    public = _ncentral_connection_public()
+    revision = int(public.get("revision") or 1)
+    installed = stored_connection is not None
+    active = installed and public.get("lifecycleStatus") == "active"
+    enabled = bool(public.get("enabled"))
+    configured = bool(public.get("configured"))
+    add_gate(
+        "connection_installed",
+        "Integration installed",
+        "passed" if installed else "blocked",
+        (
+            "The N-central integration connection exists."
+            if installed
+            else "Install and save the N-central integration before running discovery."
+        ),
+        action("install_connection", "Install N-central"),
+        evidence={"installed": installed},
+    )
+    add_gate(
+        "connection_active",
+        "Integration lifecycle active",
+        "passed" if active else "blocked",
+        (
+            "The integration lifecycle is active."
+            if active
+            else "Reactivate or reinstall the N-central integration."
+        ),
+        action("activate_connection", "Reactivate integration"),
+        evidence={"lifecycleStatus": public.get("lifecycleStatus")},
+    )
+    add_gate(
+        "connection_enabled",
+        "Connection enabled",
+        "passed" if enabled else "blocked",
+        (
+            "N-central provider operations are enabled."
+            if enabled
+            else "Enable the N-central connection before running provider operations."
+        ),
+        action("enable_connection", "Enable connection"),
+        evidence={"enabled": enabled},
+    )
+    add_gate(
+        "rest_credentials",
+        "REST credentials configured",
+        "passed" if configured else "blocked",
+        (
+            f"REST credentials are available from {public.get('credentialSource')}."
+            if configured
+            else "Save a valid N-central User-API credential or configure the container secret."
+        ),
+        action("configure_connection", "Configure connection"),
+        evidence={
+            "configured": configured,
+            "credentialSource": public.get("credentialSource"),
+        },
+    )
+
+    try:
+        rest_snapshot = REPOSITORY.get_integration_capability_snapshot(
+            "ncentral", "rest.connection", include_expired=True
+        )
+    except ValueError:
+        LOGGER.warning("Stored N-central REST capability metadata is invalid")
+        rest_snapshot = None
+    rest_state = capability_state(rest_snapshot, revision)
+    rest_details = {
+        "current": "The current saved connection revision passed its read-only REST test.",
+        "expired": (
+            "The current saved connection revision passed, but the validation has expired; "
+            "retest before relying on unattended sync."
+        ),
+        "stale_revision": "The connection changed after its last successful REST test.",
+        "legacy_unknown_revision": (
+            "The existing successful REST test is not bound to the current connection revision."
+        ),
+        "failed": "The most recent REST connection test failed.",
+        "never_tested": "The saved REST connection has not passed a revision-bound test.",
+    }
+    rest_gate_status = (
+        "passed"
+        if rest_state == "current"
+        else ("warning" if rest_state == "expired" else "blocked")
+    )
+    add_gate(
+        "rest_connection_test",
+        "Current revision tested",
+        rest_gate_status,
+        rest_details[rest_state],
+        action("test_connection", "Test current connection"),
+        evidence={
+            "state": rest_state,
+            "connectionRevision": revision,
+            "checkedAt": (rest_snapshot or {}).get("checkedAt"),
+            "expiresAt": (rest_snapshot or {}).get("expiresAt"),
+        },
+    )
+
+    provider_companies = REPOSITORY.list_provider_companies("ncentral")
+    active_companies = [item for item in provider_companies if item.get("active", True)]
+    mapped_companies = [item for item in active_companies if item.get("mappedCompanyId")]
+    unmapped_count = len(active_companies) - len(mapped_companies)
+    add_gate(
+        "customer_discovery",
+        "Customers discovered",
+        "passed" if active_companies else "blocked",
+        (
+            f"{len(active_companies)} active N-central customer organization(s) are known."
+            if active_companies
+            else "Run customer discovery to build the tenant mapping queue."
+        ),
+        action("discover_customers", "Discover customers"),
+        evidence={"discoveredCustomers": len(active_companies)},
+    )
+    mapping_status = (
+        "blocked" if not mapped_companies else ("warning" if unmapped_count else "passed")
+    )
+    add_gate(
+        "customer_mapping",
+        "Customer mappings reviewed",
+        mapping_status,
+        (
+            "No active N-central customer is mapped to a CMDB customer."
+            if not mapped_companies
+            else (
+                f"{len(mapped_companies)} mapped and {unmapped_count} still require an explicit "
+                "mapping or exclusion."
+                if unmapped_count
+                else f"All {len(mapped_companies)} active customer mapping(s) are reviewed."
+            )
+        ),
+        action("map_customers", "Review customer mappings"),
+        evidence={"mappedCustomers": len(mapped_companies), "unmappedCustomers": unmapped_count},
+    )
+
+    saved_policies = REPOSITORY.list_ci_sync_policies("ncentral")
+    policy_by_scope = {
+        (str(policy.get("companyId") or ""), str(policy.get("providerParentId") or "")): policy
+        for policy in saved_policies
+        if policy.get("id")
+    }
+    customer_states: list[dict[str, Any]] = []
+    missing_policy_count = 0
+    failing_policy_count = 0
+    continuous_policies: list[dict[str, Any]] = []
+    for company in mapped_companies:
+        company_id = str(company.get("mappedCompanyId") or "")
+        provider_company_id = str(company.get("externalId") or "")
+        policy = policy_by_scope.get((company_id, provider_company_id))
+        normalized = normalize_ci_policy(policy)
+        scope_count = len(normalized.get("graphqlOrganizationIds") or [])
+        if not policy:
+            missing_policy_count += 1
+        elif int(policy.get("consecutiveFailures") or 0) > 0:
+            failing_policy_count += 1
+        if (
+            policy
+            and normalized.get("enabled")
+            and normalized.get("syncMode") == "continuous_preview"
+        ):
+            continuous_policies.append(policy)
+        customer_states.append(
+            {
+                "companyId": company_id,
+                "companyName": str(company.get("mappedCompanyName") or ""),
+                "providerCompanyId": provider_company_id,
+                "providerCompanyName": str(company.get("name") or ""),
+                "policySaved": bool(policy),
+                "policyEnabled": bool(normalized.get("enabled")) if policy else False,
+                "syncMode": str(normalized.get("syncMode") or "manual"),
+                "graphqlScopeCount": scope_count,
+            }
+        )
+    policy_status = (
+        "blocked" if missing_policy_count else ("warning" if failing_policy_count else "passed")
+    )
+    add_gate(
+        "device_policies",
+        "Device policies saved",
+        policy_status,
+        (
+            f"Save a device policy for {missing_policy_count} mapped customer(s)."
+            if missing_policy_count
+            else (
+                f"{failing_policy_count} saved device policy/policies are in retry backoff."
+                if failing_policy_count
+                else f"All {len(mapped_companies)} mapped customer(s) have a saved policy."
+            )
+        ),
+        action("save_device_policies", "Review device policies"),
+        evidence={
+            "savedPolicies": len(saved_policies),
+            "missingPolicies": missing_policy_count,
+            "failingPolicies": failing_policy_count,
+        },
+    )
+
+    graphql_value = public.get("graphql")
+    graphql: dict[str, Any] = graphql_value if isinstance(graphql_value, dict) else {}
+    graphql_enabled = bool(graphql.get("graphqlEnabled"))
+    graphql_configured = bool(graphql.get("configured"))
+    if graphql_enabled:
+        graphql_configuration_status = "passed" if graphql_configured else "blocked"
+        graphql_configuration_detail = (
+            "GraphQL enrichment is enabled and its credential is available."
+            if graphql_configured
+            else "GraphQL enrichment is enabled but its credential is unavailable."
+        )
+    elif graphql_configured:
+        graphql_configuration_status = "warning"
+        graphql_configuration_detail = (
+            "GraphQL credentials are configured, but GraphQL enrichment is disabled."
+        )
+    else:
+        graphql_configuration_status = "not_applicable"
+        graphql_configuration_detail = "GraphQL enrichment is optional and is not configured."
+    add_gate(
+        "graphql_configuration",
+        "GraphQL enrichment configured",
+        graphql_configuration_status,
+        graphql_configuration_detail,
+        action("configure_graphql", "Configure GraphQL enrichment"),
+        required=graphql_enabled,
+        evidence={"enabled": graphql_enabled, "configured": graphql_configured},
+    )
+
+    capability_value = graphql.get("capability")
+    capability: dict[str, Any] | None = (
+        capability_value if isinstance(capability_value, dict) else None
+    )
+    graphql_state = capability_state(capability, revision) if graphql_enabled else "not_applicable"
+    graphql_details = {
+        "current": "GraphQL capability is supported for the current connection revision.",
+        "expired": "GraphQL capability passed but its short-lived validation has expired.",
+        "stale_revision": "GraphQL was tested before the current connection revision was saved.",
+        "legacy_unknown_revision": (
+            "The existing GraphQL test is not bound to the current connection revision."
+        ),
+        "failed": "The most recent GraphQL capability test failed.",
+        "never_tested": "GraphQL has not passed a revision-bound capability test.",
+        "not_applicable": "GraphQL enrichment is disabled, so no capability test is required.",
+    }
+    graphql_capability_status = (
+        "not_applicable"
+        if not graphql_enabled
+        else (
+            "passed"
+            if graphql_state == "current"
+            else ("warning" if graphql_state == "expired" else "blocked")
+        )
+    )
+    add_gate(
+        "graphql_capability",
+        "GraphQL capability current",
+        graphql_capability_status,
+        graphql_details[graphql_state],
+        action("test_graphql", "Test GraphQL connection"),
+        required=graphql_enabled,
+        evidence={
+            "state": graphql_state,
+            "checkedAt": (capability or {}).get("checkedAt"),
+            "expiresAt": (capability or {}).get("expiresAt"),
+        },
+    )
+
+    graphql_server_id = str(graphql.get("graphqlServerId") or "").strip()
+    add_gate(
+        "graphql_server_binding",
+        "GraphQL source server bound",
+        (
+            "not_applicable"
+            if not graphql_enabled
+            else ("passed" if graphql_server_id else "blocked")
+        ),
+        (
+            "GraphQL enrichment is disabled, so no source-server binding is required."
+            if not graphql_enabled
+            else (
+                "The immutable N-central source-server identity is saved."
+                if graphql_server_id
+                else "Detect and save the immutable N-central source-server identity."
+            )
+        ),
+        action("detect_graphql_server", "Detect source server"),
+        required=graphql_enabled,
+        evidence={"configured": bool(graphql_server_id)},
+    )
+
+    scoped_customer_count = sum(
+        int(state.get("graphqlScopeCount") or 0) > 0 for state in customer_states
+    )
+    unscoped_customer_count = len(customer_states) - scoped_customer_count
+    add_gate(
+        "graphql_customer_scope",
+        "GraphQL customer scope saved",
+        (
+            "not_applicable"
+            if not graphql_enabled
+            else ("passed" if not unscoped_customer_count else "warning")
+        ),
+        (
+            "GraphQL enrichment is disabled, so customer scopes are not required."
+            if not graphql_enabled
+            else (
+                f"All {scoped_customer_count} mapped customer scope(s) are saved."
+                if not unscoped_customer_count
+                else (
+                    f"{scoped_customer_count} mapped customer(s) have a saved GraphQL scope; "
+                    f"{unscoped_customer_count} remain REST-only."
+                )
+            )
+        ),
+        action("select_graphql_scope", "Review GraphQL customer scopes"),
+        required=False,
+        evidence={
+            "scopedCustomers": scoped_customer_count,
+            "restOnlyCustomers": unscoped_customer_count,
+        },
+    )
+
+    cache_states: list[dict[str, Any]] = []
+    if graphql_enabled and graphql_server_id and active and enabled:
+        for state in customer_states:
+            if not state["policySaved"] or not state["graphqlScopeCount"]:
+                continue
+            try:
+                cached = _ncentral_graphql_cached_read(
+                    NcentralGraphqlScopeRequest(
+                        companyId=state["companyId"],
+                        providerCompanyId=state["providerCompanyId"],
+                        queryKey="asset_inventory",
+                        limit=1,
+                    ),
+                    include_expired=True,
+                )
+                cache_value = cached.get("cache")
+                cache: dict[str, Any] = cache_value if isinstance(cache_value, dict) else {}
+                cache_states.append(
+                    {
+                        "companyId": state["companyId"],
+                        "providerCompanyId": state["providerCompanyId"],
+                        "status": str(cache.get("status") or "empty"),
+                        "complete": bool(cache.get("complete")),
+                        "deviceCount": int(cache.get("deviceCount") or 0),
+                        "providerAssetCount": int(cache.get("providerAssetCount") or 0),
+                        "eligibleDeviceCount": int(cache.get("eligibleDeviceCount") or 0),
+                        "lastRefreshedAt": cache.get("lastRefreshedAt"),
+                        "expiresAt": cache.get("expiresAt"),
+                    }
+                )
+            except (HTTPException, TypeError, ValueError):
+                LOGGER.warning(
+                    "Stored N-central GraphQL cache readiness could not be evaluated for %s",
+                    state["companyId"],
+                )
+                cache_states.append(
+                    {
+                        "companyId": state["companyId"],
+                        "providerCompanyId": state["providerCompanyId"],
+                        "status": "unavailable",
+                        "complete": False,
+                        "deviceCount": 0,
+                    }
+                )
+    unhealthy_cache_count = sum(
+        state.get("status") != "fresh" or not state.get("complete") for state in cache_states
+    )
+    if not graphql_enabled or not scoped_customer_count:
+        cache_status = "not_applicable"
+        cache_detail = (
+            "GraphQL enrichment is disabled, so no enrichment cache is required."
+            if not graphql_enabled
+            else "No mapped customer currently has a saved GraphQL scope."
+        )
+    elif len(cache_states) < scoped_customer_count:
+        cache_status = "warning"
+        cache_detail = "Some scoped customer caches could not be evaluated from saved state."
+    elif unhealthy_cache_count:
+        cache_status = "warning"
+        cache_detail = (
+            f"{unhealthy_cache_count} of {len(cache_states)} scoped customer cache(s) need a "
+            "full refresh."
+        )
+    else:
+        cache_status = "passed"
+        cache_detail = f"All {len(cache_states)} scoped customer enrichment cache(s) are current."
+    add_gate(
+        "graphql_cache",
+        "GraphQL enrichment cache current",
+        cache_status,
+        cache_detail,
+        action("refresh_graphql_cache", "Refresh GraphQL enrichment"),
+        required=False,
+        evidence={"scopedCustomers": scoped_customer_count, "customers": cache_states},
+    )
+
+    if continuous_policies:
+        worker_scheduled = _worker_flag("INTEGRATION_WORKER_ENABLED")
+        worker = _worker_runtime_summary(
+            "integrations", worker_scheduled, _integration_worker_interval()
+        )
+        worker_ready = worker_scheduled and bool(worker.get("workerHealthy"))
+        worker_status = "passed" if worker_ready else "blocked"
+        worker_detail = (
+            f"The integration worker is healthy for {len(continuous_policies)} continuous policy/policies."
+            if worker_ready
+            else (
+                "Enable the integration worker for saved continuous-preview policies."
+                if not worker_scheduled
+                else "The integration worker heartbeat is missing or stale."
+            )
+        )
+        worker_evidence = {
+            "continuousPolicies": len(continuous_policies),
+            "workerConfigured": worker_scheduled,
+            "workerHealthy": bool(worker.get("workerHealthy")),
+            "executionMode": worker.get("executionMode"),
+            "heartbeatAgeSeconds": worker.get("heartbeatAgeSeconds"),
+        }
+    else:
+        worker_status = "not_applicable"
+        worker_detail = "No saved policy uses continuous preview; manual previews remain available."
+        worker_evidence = {"continuousPolicies": 0}
+    add_gate(
+        "continuous_worker",
+        "Continuous worker ready",
+        worker_status,
+        worker_detail,
+        action("configure_worker", "Review continuous worker"),
+        required=bool(continuous_policies),
+        evidence=worker_evidence,
+    )
+
+    recommended_action = (
+        blockers[0]["action"]
+        if blockers
+        else (warnings[0]["action"] if warnings else action("run_preview", "Run a device preview"))
+    )
+    return {
+        "provider": "ncentral",
+        "overallStatus": "blocked" if blockers else ("needs_attention" if warnings else "ready"),
+        "generatedAt": core.now(),
+        "connectionRevision": revision,
+        "gates": gates,
+        "blockers": blockers,
+        "warnings": warnings,
+        "recommendedNextAction": recommended_action,
+        "customers": customer_states,
+    }
+
+
+@api.get("/api/integrations/ncentral/setup-status", tags=["integrations"])
+def get_ncentral_setup_status(request: Request) -> dict[str, Any]:
+    """Return the platform administrator's provider-call-free setup checklist."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    return _ncentral_setup_status()
+
+
+NCENTRAL_DIAGNOSTIC_REASONS = (
+    "enriched",
+    "graphql_only",
+    "graphql_missing",
+    "stale_cache_evidence",
+    "cache_unavailable",
+    "filtered_excluded",
+    "ignored",
+    "rest_only",
+    "not_yet_evaluated",
+)
+
+
+def _ncentral_diagnostic_provider_company(
+    company_id: str,
+    provider_company_id: str,
+) -> dict[str, Any]:
+    """Resolve one exact active customer mapping for persisted diagnostics."""
+
+    mappings = [
+        item
+        for item in REPOSITORY.list_provider_companies("ncentral")
+        if item.get("active", True) and item.get("mappedCompanyId") == company_id
+    ]
+    if provider_company_id:
+        mapping = next(
+            (item for item in mappings if str(item.get("externalId") or "") == provider_company_id),
+            None,
+        )
+        if not mapping:
+            raise HTTPException(
+                409,
+                "Choose an N-central customer explicitly mapped to this CMDB customer",
+            )
+        return mapping
+    if not mappings:
+        raise HTTPException(409, "Map an N-central customer before viewing diagnostics")
+    if len(mappings) > 1:
+        raise HTTPException(
+            409,
+            "Choose the N-central provider customer because this CMDB customer has multiple mappings",
+        )
+    return mappings[0]
+
+
+def _ncentral_enrichment_diagnostics(
+    company_id: str,
+    provider_company_id: str,
+    *,
+    reason: str = "",
+    search: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Classify bounded devices using only persisted, tenant-scoped N-central evidence."""
+
+    company = _company(company_id)
+    provider_company = _ncentral_diagnostic_provider_company(
+        company_id,
+        provider_company_id,
+    )
+    provider_company_id = str(provider_company.get("externalId") or "")
+    policy = REPOSITORY.get_ci_sync_policy(
+        "ncentral",
+        company_id,
+        provider_company_id,
+    )
+    normalized_policy = normalize_ci_policy(policy)
+    excluded_ids = set(normalized_policy.get("excludedExternalIds") or [])
+
+    suppression_items: list[dict[str, Any]] = []
+    suppression_total = 0
+    for suppression_offset in range(0, 1000, 250):
+        suppression_result = REPOSITORY.query_integration_object_suppressions(
+            kind="ncentral",
+            company_id=company_id,
+            active=True,
+            limit=250,
+            offset=suppression_offset,
+        )
+        try:
+            suppression_total = max(
+                suppression_total,
+                int(suppression_result.get("total") or 0),
+            )
+        except (TypeError, ValueError):
+            suppression_total = len(suppression_items)
+        page = suppression_result.get("items")
+        page_items = (
+            [item for item in page if isinstance(item, dict)] if isinstance(page, list) else []
+        )
+        suppression_items.extend(page_items)
+        if len(page_items) < 250 or len(suppression_items) >= suppression_total:
+            break
+    suppression_truncated = suppression_total > len(suppression_items)
+    suppressions = [
+        item
+        for item in suppression_items or []
+        if isinstance(item, dict) and str(item.get("providerParentId") or "") == provider_company_id
+    ]
+    mappings = REPOSITORY.list_provider_ci_mappings("ncentral", company_id)
+    active_company_mappings = [
+        item
+        for item in REPOSITORY.list_provider_companies("ncentral")
+        if item.get("active", True) and item.get("mappedCompanyId") == company_id
+    ]
+    if len(active_company_mappings) > 1 and mappings:
+        raise HTTPException(
+            409,
+            (
+                "N-central CI mappings for this customer predate provider-parent scoping. "
+                "Resolve the multiple active customer mappings before viewing device diagnostics."
+            ),
+        )
+    reviews = [
+        item
+        for item in REPOSITORY.list_ci_review_items("ncentral", company_id, None, 1000)
+        if str(item.get("providerParentId") or "") == provider_company_id
+    ]
+    assets = {
+        str(asset.get("id") or ""): asset
+        for asset in REPOSITORY.list_assets()
+        if asset.get("companyId") == company_id and not asset.get("retiredAt")
+    }
+
+    graphql = _ncentral_graphql_connection_public()
+    graphql_enabled = bool(graphql.get("graphqlEnabled"))
+    graphql_configured = bool(graphql.get("configured"))
+    server_id = str(graphql.get("graphqlServerId") or "").strip()
+    organization_ids = list(normalized_policy.get("graphqlOrganizationIds") or [])
+    cache_rows = REPOSITORY.list_integration_enrichment_previews(
+        "ncentral",
+        company_id,
+        provider_company_id,
+        source_server_id=server_id or None,
+        include_expired=True,
+        limit=25_000,
+    )
+    cache_rows = _ncentral_graphql_generation_rows(cache_rows)
+    generation_stale = any(bool(row.get("stale")) for row in cache_rows)
+    cache_metadata = _ncentral_graphql_cache_metadata(
+        cache_rows,
+        organization_ids=set(organization_ids),
+        server_id=server_id,
+    )
+    scope_matches = bool(cache_rows) and (
+        cache_metadata["scopeFingerprint"] == _ncentral_graphql_scope_fingerprint(organization_ids)
+    )
+    cache_complete = bool(
+        cache_rows and cache_metadata["complete"] and scope_matches and not generation_stale
+    )
+    cache_observed = sorted(
+        str(row.get("observedAt") or "") for row in cache_rows if row.get("observedAt")
+    )
+    cache_expiries = sorted(
+        str(row.get("expiresAt") or "") for row in cache_rows if row.get("expiresAt")
+    )
+    if not graphql_enabled:
+        freshness_status = "rest_only"
+        freshness_reason = "GraphQL enrichment is disabled; REST inventory remains available."
+    elif not graphql_configured:
+        freshness_status = "not_configured"
+        freshness_reason = "GraphQL enrichment is enabled but its credential is unavailable."
+    elif not organization_ids:
+        freshness_status = "not_scoped"
+        freshness_reason = "No GraphQL Customer organization is saved for this policy."
+    elif not server_id:
+        freshness_status = "server_missing"
+        freshness_reason = "The immutable N-central source-server identity is not configured."
+    elif not cache_rows:
+        freshness_status = "empty"
+        freshness_reason = "No persisted GraphQL enrichment generation has been evaluated yet."
+    elif generation_stale:
+        freshness_status = "stale"
+        freshness_reason = "The persisted GraphQL enrichment generation has expired."
+    elif not scope_matches:
+        freshness_status = "scope_changed"
+        freshness_reason = "The saved GraphQL Customer scope differs from the cached generation."
+    elif not cache_metadata["complete"]:
+        freshness_status = "incomplete"
+        freshness_reason = "The persisted GraphQL generation is incomplete and cannot be trusted."
+    elif int(cache_metadata["unmatchedDeviceCount"]):
+        freshness_status = "partial"
+        freshness_reason = (
+            "The current GraphQL generation is usable, but some provider assets had no unique "
+            "configured REST server/device crosswalk."
+        )
+    else:
+        freshness_status = "fresh"
+        freshness_reason = "The current complete GraphQL generation is safe for diagnostics."
+
+    preview_runs = REPOSITORY.list_sync_runs(
+        kind="ncentral",
+        operation="device_preview",
+        company_id=company_id,
+        limit=50,
+    )
+    scoped_preview_runs: list[dict[str, Any]] = []
+    for run in preview_runs:
+        raw_attributes = run.get("attributes")
+        attributes: dict[str, Any] = raw_attributes if isinstance(raw_attributes, dict) else {}
+        run_provider_company_id = str(
+            run.get("providerCompanyId") or attributes.get("providerCompanyId") or ""
+        )
+        if run_provider_company_id == provider_company_id:
+            scoped_preview_runs.append(run)
+    scoped_preview_runs.sort(
+        key=lambda run: str(
+            run.get("finishedAt") or run.get("requestedAt") or run.get("startedAt") or ""
+        ),
+        reverse=True,
+    )
+    latest_preview = scoped_preview_runs[0] if scoped_preview_runs else None
+    raw_latest_attributes = latest_preview.get("attributes") if latest_preview else None
+    latest_attributes: dict[str, Any] = (
+        raw_latest_attributes if isinstance(raw_latest_attributes, dict) else {}
+    )
+    raw_preview_summary = (
+        latest_preview.get("previewSummary")
+        if latest_preview and isinstance(latest_preview.get("previewSummary"), dict)
+        else latest_attributes.get("previewSummary") or latest_attributes.get("resultSummary")
+    )
+    preview_summary: dict[str, Any] = (
+        raw_preview_summary if isinstance(raw_preview_summary, dict) else {}
+    )
+    raw_preview_counts = preview_summary.get("counts")
+    preview_counts: dict[str, Any] = (
+        raw_preview_counts if isinstance(raw_preview_counts, dict) else {}
+    )
+    raw_exclusion_reasons = preview_summary.get("exclusionReasons")
+    preview_exclusion_reasons: dict[str, Any] = (
+        raw_exclusion_reasons if isinstance(raw_exclusion_reasons, dict) else {}
+    )
+    latest_preview_public = (
+        {
+            "id": str(latest_preview.get("id") or ""),
+            "status": str(latest_preview.get("status") or ""),
+            "finishedAt": latest_preview.get("finishedAt"),
+            "discovered": max(
+                0,
+                int(preview_summary.get("discovered") or latest_preview.get("discovered") or 0),
+            ),
+            "included": max(0, int(preview_summary.get("included") or 0)),
+            "excluded": max(0, int(preview_summary.get("excluded") or 0)),
+            "exclusionReasons": {
+                str(key)[:120]: max(0, int(value or 0))
+                for key, value in list(preview_exclusion_reasons.items())[:50]
+            },
+            "counts": {
+                key: max(0, int(preview_counts.get(key) or 0))
+                for key in ("create", "update", "link", "unchanged", "conflict")
+            },
+        }
+        if latest_preview
+        else None
+    )
+
+    cache_by_device: dict[str, list[dict[str, Any]]] = {}
+    current_assets_by_device: dict[str, dict[str, Any]] = {}
+    allowed_organizations = set(organization_ids)
+    for cache_row in cache_rows:
+        summary = cache_row.get("summary")
+        if not isinstance(summary, dict) or summary.get("queryKey") != "asset_inventory":
+            continue
+        external_id = str(cache_row.get("sourceDeviceId") or "")
+        if not external_id:
+            continue
+        cache_by_device.setdefault(external_id, []).append(cache_row)
+        cached_asset = _ncentral_graphql_cached_asset(
+            cache_row,
+            organization_ids=allowed_organizations,
+            server_id=server_id,
+        )
+        if cached_asset and external_id not in current_assets_by_device:
+            current_assets_by_device[external_id] = cached_asset
+
+    devices: dict[str, dict[str, Any]] = {}
+
+    def device(external_id: Any) -> dict[str, Any] | None:
+        bounded_id = str(external_id or "").strip()[:160]
+        if not bounded_id or bounded_id == "__cache_generation__":
+            return None
+        return devices.setdefault(bounded_id, {"externalId": bounded_id})
+
+    for source_mapping in mappings:
+        target = device(source_mapping.get("externalId"))
+        if target is not None:
+            target["mapping"] = source_mapping
+    for source_review in reviews:
+        target = device(source_review.get("externalId"))
+        if target is not None and "review" not in target:
+            target["review"] = source_review
+    for source_suppression in suppressions:
+        target = device(source_suppression.get("externalId"))
+        if target is not None:
+            target["suppression"] = source_suppression
+    for external_id in excluded_ids:
+        device(external_id)
+    for external_id, device_cache_rows in cache_by_device.items():
+        target = device(external_id)
+        if target is not None:
+            target["cacheRows"] = device_cache_rows
+
+    reason_labels = {
+        "enriched": "Enriched",
+        "graphql_only": "GraphQL only",
+        "graphql_missing": "GraphQL missing",
+        "stale_cache_evidence": "Stale cache evidence",
+        "cache_unavailable": "Cache unavailable",
+        "filtered_excluded": "Filtered or excluded",
+        "ignored": "Ignored",
+        "rest_only": "REST only",
+        "not_yet_evaluated": "Not yet evaluated",
+    }
+    rows: list[dict[str, Any]] = []
+    for external_id, evidence in devices.items():
+        mapping_value = evidence.get("mapping")
+        mapping: dict[str, Any] = mapping_value if isinstance(mapping_value, dict) else {}
+        review_value = evidence.get("review")
+        review: dict[str, Any] = review_value if isinstance(review_value, dict) else {}
+        suppression_value = evidence.get("suppression")
+        suppression: dict[str, Any] = (
+            suppression_value if isinstance(suppression_value, dict) else {}
+        )
+        matching_cache_value = evidence.get("cacheRows")
+        matching_cache_rows: list[dict[str, Any]] = (
+            [item for item in matching_cache_value if isinstance(item, dict)]
+            if isinstance(matching_cache_value, list)
+            else []
+        )
+        current_asset = current_assets_by_device.get(external_id)
+        if suppression:
+            row_reason = "ignored"
+            detail = "An administrator actively suppressed this immutable provider identity."
+            next_action = {"key": "restore_ignored", "label": "Review ignored device"}
+        elif external_id in excluded_ids:
+            row_reason = "filtered_excluded"
+            detail = "The immutable REST identity is excluded by the saved policy."
+            next_action = {"key": "edit_policy", "label": "Review saved policy"}
+        elif not graphql_enabled:
+            row_reason = "rest_only"
+            detail = "GraphQL enrichment is disabled; this device remains REST-managed."
+            next_action = {"key": "none", "label": "No action required"}
+        elif cache_complete and current_asset and (mapping or review):
+            row_reason = "enriched"
+            detail = "A current published GraphQL row matches this REST device identity."
+            next_action = {"key": "none", "label": "No action required"}
+        elif cache_complete and current_asset:
+            row_reason = "graphql_only"
+            detail = (
+                "A current GraphQL crosswalk exists without persisted REST mapping or review "
+                "evidence; the device may be outside the saved native filter."
+            )
+            next_action = {"key": "review_scope", "label": "Review native filter scope"}
+        elif freshness_status in {"stale", "scope_changed", "incomplete"}:
+            if matching_cache_rows:
+                row_reason = "stale_cache_evidence"
+                detail = "A cache row exists, but its generation is not current and complete."
+            else:
+                row_reason = "cache_unavailable"
+                detail = "The current cache generation cannot determine enrichment coverage."
+            next_action = {"key": "refresh_graphql", "label": "Refresh GraphQL cache"}
+        elif cache_complete:
+            row_reason = "graphql_missing"
+            detail = "The current complete GraphQL generation has no row for this REST identity."
+            next_action = {"key": "review_identity", "label": "Review device identity"}
+        else:
+            row_reason = "not_yet_evaluated"
+            detail = "No usable GraphQL generation has evaluated this REST identity yet."
+            next_action = (
+                {"key": "run_preview", "label": "Run device preview"}
+                if freshness_status == "empty"
+                else {"key": "review_scope", "label": "Review GraphQL setup"}
+            )
+
+        asset_id = str(review.get("assetId") or mapping.get("assetId") or "")
+        asset = assets.get(asset_id) or {}
+        device_name = str(
+            review.get("externalName")
+            or mapping.get("externalName")
+            or suppression.get("externalName")
+            or (current_asset or {}).get("name")
+            or external_id
+        )[:240]
+        last_seen_values = sorted(
+            str(value) for value in (review.get("lastSeenAt"), mapping.get("lastSeenAt")) if value
+        )
+        row_cache_observed = sorted(
+            str(item.get("observedAt") or "")
+            for item in matching_cache_rows
+            if item.get("observedAt")
+        )
+        row_cache_expiries = sorted(
+            str(item.get("expiresAt") or "")
+            for item in matching_cache_rows
+            if item.get("expiresAt")
+        )
+        rows.append(
+            {
+                "externalId": external_id,
+                "name": device_name,
+                "type": str(review.get("providerTypeName") or "")[:120],
+                "status": str(review.get("providerStatusName") or "")[:120],
+                "assetId": asset_id or None,
+                "assetName": str(review.get("assetName") or asset.get("name") or "")[:240],
+                "reason": row_reason,
+                "reasonLabel": reason_labels[row_reason],
+                "detail": detail,
+                "nextAction": next_action,
+                "mapped": bool(mapping),
+                "reviewState": str(review.get("state") or ""),
+                "reviewAction": str(review.get("action") or ""),
+                "lastSeenAt": last_seen_values[-1] if last_seen_values else None,
+                "cacheObservedAt": row_cache_observed[-1] if row_cache_observed else None,
+                "cacheExpiresAt": row_cache_expiries[0] if row_cache_expiries else None,
+            }
+        )
+
+    rows.sort(key=lambda row: (str(row.get("name") or "").casefold(), row["externalId"]))
+    reason_counts = {
+        diagnostic_reason: sum(row["reason"] == diagnostic_reason for row in rows)
+        for diagnostic_reason in NCENTRAL_DIAGNOSTIC_REASONS
+    }
+    selected_reason = str(reason or "").strip().casefold()
+    needle = str(search or "").strip().casefold()[:200]
+    filtered_rows = [
+        row
+        for row in rows
+        if (not selected_reason or row["reason"] == selected_reason)
+        and (
+            not needle
+            or needle
+            in " ".join(
+                str(row.get(key) or "")
+                for key in ("externalId", "name", "type", "status", "assetName")
+            ).casefold()
+        )
+    ]
+    bounded_limit = max(1, min(int(limit), 250))
+    bounded_offset = max(0, min(int(offset), 25_000))
+    items = filtered_rows[bounded_offset : bounded_offset + bounded_limit]
+    eligible_devices = len(rows) - reason_counts["filtered_excluded"] - reason_counts["ignored"]
+    evaluated_devices = sum(
+        reason_counts[key]
+        for key in (
+            "enriched",
+            "graphql_only",
+            "graphql_missing",
+            "stale_cache_evidence",
+        )
+    )
+    enriched_devices = reason_counts["enriched"]
+    return {
+        "provider": "ncentral",
+        "company": {"id": company["id"], "name": company.get("name") or company["id"]},
+        "providerCompany": {
+            "id": provider_company_id,
+            "name": provider_company.get("name") or provider_company_id,
+        },
+        "readOnly": True,
+        "generatedAt": core.now(),
+        "summary": {
+            "knownDevices": len(rows),
+            "returnedDevices": len(items),
+            "mappedDevices": sum(bool(row["mapped"]) for row in rows),
+            "reviewedDevices": sum(bool(row["reviewState"]) for row in rows),
+            "reasonCounts": reason_counts,
+            "unmatchedIdentities": int(cache_metadata["unmatchedDeviceCount"]),
+            "activeSuppressions": len(suppressions),
+            "suppressionsTruncated": suppression_truncated,
+        },
+        "freshness": {
+            "status": freshness_status,
+            "reason": freshness_reason,
+            "enabled": graphql_enabled,
+            "configured": graphql_configured,
+            "scopeConfigured": bool(organization_ids),
+            "serverConfigured": bool(server_id),
+            "complete": cache_complete,
+            "scopeMatches": scope_matches,
+            "lastRefreshedAt": cache_observed[-1] if cache_observed else None,
+            "expiresAt": cache_expiries[0] if cache_expiries else None,
+            "providerAssetCount": int(cache_metadata["providerAssetCount"]),
+            "eligibleDeviceCount": int(cache_metadata["eligibleDeviceCount"]),
+            "unmatchedDeviceCount": int(cache_metadata["unmatchedDeviceCount"]),
+        },
+        "coverage": {
+            "eligibleDevices": eligible_devices,
+            "evaluatedDevices": evaluated_devices,
+            "enrichedDevices": enriched_devices,
+            "enrichedPercent": (
+                round(enriched_devices * 100 / eligible_devices, 1) if eligible_devices else 0.0
+            ),
+        },
+        "filters": {
+            "reason": selected_reason,
+            "status": selected_reason,
+            "search": needle,
+            "limit": bounded_limit,
+            "offset": bounded_offset,
+        },
+        "total": len(filtered_rows),
+        "items": items,
+        "latestPreview": latest_preview_public,
+        "limitations": [
+            (
+                "Successful bounded REST detail reads are not retained as per-device completion "
+                "flags, so this view reports persisted reconciliation and GraphQL evidence only."
+            ),
+            (
+                "Native N-central device-filter exclusions are retained as latest-preview "
+                "aggregates; individual excluded identities are not persisted."
+            ),
+            (
+                "Missing-device evidence advances only after an atomic, complete provider "
+                "snapshot. Filtered or failed runs never imply absence; retirement is an "
+                "explicit administrator decision that deactivates only the source link."
+            ),
+            (
+                "GraphQL assets without a unique configured REST server/device crosswalk are "
+                "retained only as an aggregate count; raw unmatched provider identities are "
+                "deliberately not persisted."
+            ),
+            *(
+                [
+                    "Active suppression diagnostics are capped at 1,000 records; the response "
+                    "reports when additional suppressions were omitted."
+                ]
+                if suppression_truncated
+                else []
+            ),
+        ],
+    }
+
+
+@api.get("/api/integrations/ncentral/enrichment-diagnostics", tags=["integrations"])
+def get_ncentral_enrichment_diagnostics(
+    request: Request,
+    companyId: str = "",
+    providerCompanyId: str = "",
+    reason: str = "",
+    status: str = "",
+    search: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Return an MSP-authorized, customer-scoped persisted coverage diagnosis."""
+
+    user = current_user(request)
+    _require_role(
+        user,
+        {"platform_admin", "msp_operator"},
+        "MSP access required",
+    )
+    company_id = str(companyId).strip()
+    if not company_id:
+        raise HTTPException(400, "companyId is required")
+    _company_for_user(company_id, user)
+    selected_reason = str(reason or status).strip().casefold()
+    if reason and status and reason.strip().casefold() != status.strip().casefold():
+        raise HTTPException(400, "reason and status filters must match")
+    if selected_reason and selected_reason not in NCENTRAL_DIAGNOSTIC_REASONS:
+        raise HTTPException(400, "Choose a valid enrichment diagnostic status")
+    return _ncentral_enrichment_diagnostics(
+        company_id,
+        str(providerCompanyId or "").strip(),
+        reason=selected_reason,
+        search=search,
+        limit=limit,
+        offset=offset,
+    )
+
+
+def _cache_ncentral_graphql_assets(
+    payload: NcentralGraphqlScopeRequest,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Publish one tenant cache generation under a cross-replica single-flight lock."""
+
+    if payload.queryKey != "asset_inventory":
+        return _cache_ncentral_graphql_assets_locked(payload, result)
+    public = _ncentral_graphql_connection_public()
+    server_id = str(public.get("graphqlServerId") or "").strip()
+    if not server_id:
+        return {
+            "status": "error",
+            "deviceCount": 0,
+            "providerAssetCount": len(result.get("items") or []),
+            "eligibleDeviceCount": 0,
+            "unmatchedDeviceCount": len(result.get("items") or []),
+            "pagesRead": max(0, int(result.get("pagesRead") or 0)),
+            "complete": False,
+            "lastRefreshedAt": None,
+            "expiresAt": None,
+            "message": "Detect and save the immutable N-central source-server ID first.",
+        }
+    with REPOSITORY.integration_enrichment_scope_lock(
+        "ncentral",
+        payload.companyId,
+        payload.providerCompanyId,
+        server_id,
+    ):
+        return _cache_ncentral_graphql_assets_locked(
+            payload,
+            result,
+            locked_server_id=server_id,
+        )
+
+
+def _cache_ncentral_graphql_assets_locked(
+    payload: NcentralGraphqlScopeRequest,
+    result: dict[str, Any],
+    *,
+    locked_server_id: str | None = None,
+) -> dict[str, Any]:
+    """Stage then publish normalized assets with an exact REST identity crosswalk."""
+
+    if payload.queryKey != "asset_inventory":
+        return {
+            "status": "empty",
+            "deviceCount": 0,
+            "unmatchedDeviceCount": len(result.get("items") or []),
+            "lastRefreshedAt": None,
+            "expiresAt": None,
+            "message": ("This read-only query is not stored in the asset enrichment cache."),
+        }
+    policy = REPOSITORY.get_ci_sync_policy("ncentral", payload.companyId, payload.providerCompanyId)
+    organization_ids = set(policy.get("graphqlOrganizationIds") or [])
+    public = _ncentral_graphql_connection_public()
+    server_id = str(public.get("graphqlServerId") or "").strip()
+    stored: list[dict[str, Any]] = []
+    unmatched = 0
+    generation_id = str(uuid.uuid4())
+    raw_items = list(result.get("items") or [])[:10_000]
+    try:
+        provider_asset_count = max(len(raw_items), int(result.get("totalCount") or 0))
+    except (TypeError, ValueError):
+        provider_asset_count = len(raw_items)
+    if locked_server_id is not None and server_id != locked_server_id:
+        return {
+            "status": "configuration_changed",
+            "deviceCount": 0,
+            "stagedDeviceCount": 0,
+            "providerAssetCount": provider_asset_count,
+            "eligibleDeviceCount": 0,
+            "unmatchedDeviceCount": 0,
+            "pagesRead": max(0, int(result.get("pagesRead") or 0)),
+            "complete": False,
+            "lastRefreshedAt": None,
+            "expiresAt": None,
+            "message": (
+                "The configured N-central source-server ID changed while the cache refresh "
+                "was starting. No rows were published; run the refresh again."
+            ),
+        }
+    result_scope = normalize_customer_scope(result.get("organizationIds") or [])
+    if _ncentral_graphql_scope_fingerprint(result_scope) != _ncentral_graphql_scope_fingerprint(
+        organization_ids
+    ):
+        return {
+            "status": "scope_changed",
+            "deviceCount": 0,
+            "stagedDeviceCount": 0,
+            "providerAssetCount": provider_asset_count,
+            "eligibleDeviceCount": 0,
+            "unmatchedDeviceCount": 0,
+            "pagesRead": max(0, int(result.get("pagesRead") or 0)),
+            "complete": False,
+            "lastRefreshedAt": None,
+            "expiresAt": None,
+            "message": (
+                "The saved GraphQL Customer scope changed while data was being read. "
+                "No cache rows were published; run the refresh again."
+            ),
+        }
+    if bool(result.get("truncated")):
+        return {
+            "status": "partial",
+            "deviceCount": 0,
+            "stagedDeviceCount": 0,
+            "providerAssetCount": provider_asset_count,
+            "eligibleDeviceCount": 0,
+            "unmatchedDeviceCount": 0,
+            "pagesRead": max(0, int(result.get("pagesRead") or 0)),
+            "complete": False,
+            "lastRefreshedAt": None,
+            "expiresAt": None,
+            "message": (
+                "N-able GraphQL reached the 10,000-asset safety limit. Narrow the saved "
+                "Customer scope before refreshing; the current published cache was retained."
+            ),
+        }
+    candidates: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            unmatched += 1
+            continue
+        identity = item.get("restIdentity")
+        customer = item.get("customer")
+        source_identity = item.get("sourceIdentity")
+        inventory = item.get("summary")
+        if (
+            not isinstance(identity, dict)
+            or identity.get("serverId") != server_id
+            or not str(identity.get("deviceId") or "")
+            or not isinstance(customer, dict)
+            or customer.get("id") not in organization_ids
+            or not isinstance(source_identity, dict)
+            or not isinstance(inventory, dict)
+        ):
+            unmatched += 1
+            continue
+        candidates.append(item)
+
+    device_claims: dict[str, int] = {}
+    for item in candidates:
+        device_id = str(item["restIdentity"]["deviceId"])
+        device_claims[device_id] = device_claims.get(device_id, 0) + 1
+    conflicting_device_ids = {
+        device_id for device_id, claim_count in device_claims.items() if claim_count > 1
+    }
+    prepared = [
+        item
+        for item in candidates
+        if str(item["restIdentity"]["deviceId"]) not in conflicting_device_ids
+    ]
+    unmatched += sum(device_claims[device_id] for device_id in conflicting_device_ids)
+
+    provider_complete = not bool(result.get("truncated"))
+    scope_fingerprint = _ncentral_graphql_scope_fingerprint(organization_ids)
+    refresh_metadata = {
+        "cacheGenerationId": generation_id,
+        "cacheProviderAssetCount": provider_asset_count,
+        "cacheEligibleDeviceCount": len(prepared),
+        "cacheUnmatchedDeviceCount": unmatched,
+        "cachePagesRead": max(0, int(result.get("pagesRead") or 0)),
+        "cacheComplete": False,
+        "cachePublished": False,
+        "cacheScopeFingerprint": scope_fingerprint,
+    }
+    ttl_seconds = _ncentral_graphql_cache_ttl_seconds(policy)
+    generation_namespace = f"nable_graphql_asset_{generation_id.replace('-', '')}"
+    for item in prepared:
+        identity = item["restIdentity"]
+        customer = item["customer"]
+        source_identity = item["sourceIdentity"]
+        inventory = item["summary"]
+        try:
+            cached = REPOSITORY.upsert_integration_enrichment_preview(
+                "ncentral",
+                payload.companyId,
+                {
+                    "providerParentId": payload.providerCompanyId,
+                    "sourceNamespace": generation_namespace,
+                    "sourceServerId": server_id,
+                    "sourceDeviceId": str(identity["deviceId"]),
+                    "policyId": policy.get("id") or None,
+                    "status": "ready" if inventory else "partial",
+                    "summary": {
+                        "queryKey": "asset_inventory",
+                        "graphqlAssetId": item.get("graphqlAssetId"),
+                        "assetName": item.get("name") or "",
+                        "graphqlCustomerId": customer.get("id"),
+                        "graphqlCustomerName": customer.get("name") or "",
+                        "sourceIdentity": deepcopy(source_identity),
+                        "inventory": deepcopy(inventory),
+                        **refresh_metadata,
+                    },
+                },
+                ttl_seconds=ttl_seconds,
+            )
+        except ValueError:
+            LOGGER.warning("Normalized N-able GraphQL enrichment could not be cached")
+            unmatched += 1
+            continue
+        stored.append(cached)
+    generation_marker: dict[str, Any] | None = None
+    if provider_complete and len(stored) == len(prepared):
+        try:
+            generation_marker = REPOSITORY.upsert_integration_enrichment_preview(
+                "ncentral",
+                payload.companyId,
+                {
+                    "providerParentId": payload.providerCompanyId,
+                    "sourceNamespace": (f"nable_graphql_cache_{generation_id.replace('-', '')}"),
+                    "sourceServerId": server_id,
+                    "sourceDeviceId": "__cache_generation__",
+                    "policyId": policy.get("id") or None,
+                    "status": "ready",
+                    "summary": {
+                        "queryKey": "asset_inventory_cache_generation",
+                        **refresh_metadata,
+                        "cacheComplete": True,
+                        "cachePublished": True,
+                    },
+                },
+                ttl_seconds=ttl_seconds,
+            )
+        except ValueError:
+            LOGGER.warning("The empty N-able GraphQL cache generation could not be recorded")
+    cache_complete = (
+        provider_complete and len(stored) == len(prepared) and generation_marker is not None
+    )
+    if cache_complete:
+        REPOSITORY.replace_integration_enrichment_generation(
+            "ncentral",
+            payload.companyId,
+            payload.providerCompanyId,
+            server_id,
+            generation_id,
+        )
+    else:
+        REPOSITORY.delete_integration_enrichment_generation(
+            "ncentral",
+            payload.companyId,
+            payload.providerCompanyId,
+            server_id,
+            generation_id,
+        )
+    cache_rows = [*stored, *([generation_marker] if generation_marker else [])]
+    observed = sorted(
+        str(row.get("observedAt") or "") for row in cache_rows if row.get("observedAt")
+    )
+    expiries = sorted(str(row.get("expiresAt") or "") for row in cache_rows if row.get("expiresAt"))
+    return {
+        "status": ("fresh" if stored else "empty") if cache_complete else "error",
+        "deviceCount": len(stored) if cache_complete else 0,
+        "stagedDeviceCount": len(stored),
+        "providerAssetCount": provider_asset_count,
+        "eligibleDeviceCount": len(prepared),
+        "unmatchedDeviceCount": unmatched,
+        "pagesRead": refresh_metadata["cachePagesRead"],
+        "complete": cache_complete,
+        "generationId": generation_id,
+        "lastRefreshedAt": observed[-1] if observed else None,
+        "expiresAt": expiries[0] if expiries else None,
+        "message": (
+            (
+                f"Cached {len(stored)} eligible asset enrichments; "
+                f"{unmatched} live items had no unique configured server/device crosswalk."
+            )
+            if cache_complete
+            else (
+                "The new GraphQL cache generation could not be published completely. "
+                "Its staged rows were removed and the previous published generation was retained."
+            )
+        ),
+    }
+
+
+def _ncentral_graphql_asset_read(payload: NcentralGraphqlScopeRequest) -> dict[str, Any]:
+    """Execute a full cache refresh or one separately bounded static query."""
+
+    organization_ids = _ncentral_graphql_saved_scope(payload.companyId, payload.providerCompanyId)
+    configuration, source = _ncentral_graphql_effective_configuration()
+    client = NableGraphqlClient(configuration)
+    result = (
+        client.patch_installations(
+            organization_ids=organization_ids,
+            limit=payload.limit,
+        )
+        if payload.queryKey == "patch_installations"
+        else (
+            client.full_asset_inventory(
+                organization_ids=organization_ids,
+                maximum=10_000,
+            )
+            if payload.queryKey == "asset_inventory"
+            else client.assets(
+                payload.queryKey,
+                organization_ids=organization_ids,
+                limit=payload.limit,
+            )
+        )
+    )
+    return {
+        **result,
+        "companyId": payload.companyId,
+        "providerCompanyId": payload.providerCompanyId,
+        "credentialSource": source,
+        "readOnly": True,
+        "writesAttempted": False,
+    }
+
+
+def _ncentral_graphql_server_candidate_read(
+    payload: NcentralGraphqlServerCandidatesRequest,
+) -> dict[str, Any]:
+    """Corroborate scoped GraphQL server IDs against mapped REST device IDs.
+
+    The provider-native device IDs are retained only in process memory. The
+    response exposes aggregate evidence and never persists or enables a
+    candidate automatically.
+    """
+
+    organization_ids = _ncentral_graphql_saved_scope(payload.companyId, payload.providerCompanyId)
+    graphql_configuration, _graphql_source = _ncentral_graphql_effective_configuration(
+        require_enabled=False
+    )
+    observed = NableGraphqlClient(graphql_configuration).source_server_candidates(
+        organization_ids=organization_ids,
+        limit=payload.limit,
+    )
+    raw_candidates = observed.get("candidates")
+    if not isinstance(raw_candidates, list):
+        raise NableGraphqlRequestError(
+            "N-able GraphQL returned invalid source-server candidate evidence"
+        )
+
+    normalized_candidates: list[tuple[str, set[str]]] = []
+    for raw in raw_candidates:
+        if not isinstance(raw, dict):
+            raise NableGraphqlRequestError(
+                "N-able GraphQL returned invalid source-server candidate evidence"
+            )
+        server_id = normalize_graphql_server_id(raw.get("serverId"))
+        raw_device_ids = raw.get("deviceIds")
+        if not server_id or not isinstance(raw_device_ids, list):
+            raise NableGraphqlRequestError(
+                "N-able GraphQL returned invalid source-server candidate evidence"
+            )
+        device_ids = {
+            str(value or "").strip() for value in raw_device_ids if str(value or "").strip()
+        }
+        if not device_ids:
+            raise NableGraphqlRequestError(
+                "N-able GraphQL returned invalid source-server candidate evidence"
+            )
+        normalized_candidates.append((server_id, device_ids))
+
+    rest_device_ids: set[str] = set()
+    if normalized_candidates:
+        rest_configuration, _rest_source = _ncentral_effective_configuration()
+        rest_records = _ncentral_client(rest_configuration).discover_devices(
+            payload.providerCompanyId,
+            enrich_limit=0,
+        )
+        rest_device_ids = {
+            str(record.get("externalId") or "").strip()
+            for record in rest_records
+            if isinstance(record, dict) and str(record.get("externalId") or "").strip()
+        }
+    candidates: list[dict[str, str | int]] = [
+        {
+            "serverId": server_id,
+            "graphqlDeviceCount": len(device_ids),
+            "restDeviceMatchCount": len(device_ids & rest_device_ids),
+        }
+        for server_id, device_ids in normalized_candidates
+    ]
+    candidates.sort(
+        key=lambda item: (
+            -int(item["restDeviceMatchCount"]),
+            -int(item["graphqlDeviceCount"]),
+            str(item["serverId"]),
+        )
+    )
+    truncated = bool(observed.get("truncated"))
+    safe_candidate = (
+        candidates[0]
+        if len(candidates) == 1 and int(candidates[0]["restDeviceMatchCount"]) > 0 and not truncated
+        else None
+    )
+    confidence = (
+        "exact" if safe_candidate else ("ambiguous" if truncated or len(candidates) > 1 else "none")
+    )
+    return {
+        "companyId": payload.companyId,
+        "providerCompanyId": payload.providerCompanyId,
+        "candidates": candidates,
+        "recommendedServerId": safe_candidate["serverId"] if safe_candidate else None,
+        "confidence": confidence,
+        "truncated": truncated,
+        "readOnly": True,
+        "writesAttempted": False,
+    }
+
+
+@api.post(
+    "/api/integrations/ncentral/graphql/server-candidates",
+    tags=["integrations"],
+)
+def detect_ncentral_graphql_server_candidates(
+    payload: NcentralGraphqlServerCandidatesRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Detect aggregate source-server evidence without changing configuration."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    try:
+        return _ncentral_graphql_server_candidate_read(payload)
+    except HTTPException:
+        raise
+    except (NableGraphqlConfigurationError, NableGraphqlRequestError) as error:
+        raise HTTPException(502, _ncentral_graphql_public_failure(error)) from error
+    except (NcentralConfigurationError, NcentralRequestError) as error:
+        raise HTTPException(
+            502,
+            _ncentral_public_failure(error, "GraphQL source-server detection"),
+        ) from error
+
+
+@api.post("/api/integrations/ncentral/graphql/test", tags=["integrations"])
+def test_ncentral_graphql_connection(
+    request: Request,
+    payload: NcentralDevicePreviewRequest | None = None,
+) -> dict:
+    """Verify the bearer and return bounded Customer candidates for explicit mapping."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin"}, "Platform administrator access required")
+    if payload:
+        _ncentral_mapped_company(payload.companyId, payload.providerCompanyId)
+    try:
+        configuration, source = _ncentral_graphql_effective_configuration(require_enabled=False)
+        result = NableGraphqlClient(configuration).test_connection()
+    except (NableGraphqlConfigurationError, NableGraphqlRequestError) as error:
+        error_category = (
+            "configuration"
+            if isinstance(error, NableGraphqlConfigurationError)
+            else (
+                "authorization"
+                if isinstance(error, NableGraphqlRequestError) and error.status_code in {401, 403}
+                else "provider_unavailable"
+            )
+        )
+        _record_ncentral_graphql_capability(
+            status="error",
+            summary={"readOnly": True, "reachable": False},
+            error_category=error_category,
+        )
+        raise HTTPException(502, _ncentral_graphql_public_failure(error)) from error
+    _record_ncentral_graphql_capability(
+        status="supported",
+        summary={
+            "readOnly": True,
+            "reachable": True,
+            "candidateCount": int(result.get("candidateCount") or 0),
+            "queryKeys": [item["key"] for item in nable_graphql_query_catalogue()],
+        },
+    )
+    return {
+        **result,
+        "credentialSource": source,
+        "readOnly": True,
+        "writesAttempted": False,
+    }
+
+
+@api.post("/api/integrations/ncentral/graphql/preview", tags=["integrations"])
+def preview_ncentral_graphql_assets(
+    payload: NcentralGraphqlScopeRequest,
+    request: Request,
+) -> dict:
+    """Preview cached GraphQL evidence without making a provider request."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _company_for_user(payload.companyId, user)
+    try:
+        return _ncentral_graphql_cached_read(payload, include_expired=True)
+    except HTTPException:
+        raise
+    except (NableGraphqlConfigurationError, NableGraphqlRequestError) as error:
+        raise HTTPException(502, _ncentral_graphql_public_failure(error)) from error
+
+
+@api.post("/api/integrations/ncentral/graphql/refresh", tags=["integrations"])
+def refresh_ncentral_graphql_assets(
+    payload: NcentralGraphqlScopeRequest,
+    request: Request,
+) -> dict:
+    """Refresh the complete saved Customer scope; provider mutations are not implemented."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    _company_for_user(payload.companyId, user)
+    try:
+        result = _ncentral_graphql_asset_read(payload)
+        cache = _cache_ncentral_graphql_assets(payload, result)
+        full_items = list(result.get("items") or [])
+        sample_items = full_items[: payload.limit]
+        return {
+            **result,
+            "items": sample_items,
+            "truncated": bool(result.get("truncated")) or len(full_items) > len(sample_items),
+            "cache": cache,
+            "refreshed": bool(cache.get("complete")),
+        }
+    except HTTPException:
+        raise
+    except (NableGraphqlConfigurationError, NableGraphqlRequestError) as error:
+        raise HTTPException(502, _ncentral_graphql_public_failure(error)) from error
+
+
 @api.put("/api/integrations/ncentral/config", tags=["integrations"])
 def update_ncentral_configuration(payload: NcentralConfigurationRequest, request: Request) -> dict:
     """Encrypt the permanent token; never store temporary access tokens."""
@@ -5499,18 +8197,23 @@ def update_ncentral_configuration(payload: NcentralConfigurationRequest, request
     reinstalling = current.get("lifecycleStatus", "active") == "removed"
     encrypted = str(current.get("credentialsEncrypted") or "")
     nonce = str(current.get("credentialsNonce") or "")
+    try:
+        credential_bundle = _ncentral_stored_credentials(current)
+    except NcentralConfigurationError as error:
+        raise HTTPException(409, str(error)) from error
     if payload.userApiToken:
         try:
             encryption_key()
+            credential_bundle["userApiToken"] = payload.userApiToken.strip()
             encrypted, nonce = encrypt_secret(
-                json.dumps({"userApiToken": payload.userApiToken.strip()}),
+                json.dumps(credential_bundle),
                 "integration:ncentral",
             )
-        except MfaConfigurationError as error:
+        except (MfaConfigurationError, NcentralConfigurationError) as error:
             raise HTTPException(
                 503, "Configure MFA_ENCRYPTION_KEY before storing integration credentials"
             ) from error
-    if not encrypted:
+    if not str(credential_bundle.get("userApiToken") or "").strip():
         raise HTTPException(400, "Enter the N-central User-API token")
     try:
         with core.LOCK:
@@ -5518,6 +8221,7 @@ def update_ncentral_configuration(payload: NcentralConfigurationRequest, request
                 "ncentral",
                 {
                     "configuration": {
+                        **deepcopy(current.get("configuration") or {}),
                         "baseUrl": base_url,
                         "pageSize": payload.pageSize,
                         "discoveryPolicy": (
@@ -5559,9 +8263,31 @@ def test_ncentral_connection(request: Request) -> dict:
         result = _ncentral_adapter().test_connection(configuration)
     except (NcentralConfigurationError, NcentralRequestError) as error:
         detail = _ncentral_public_failure(error, "connection test")
+        error_category = (
+            "configuration"
+            if isinstance(error, NcentralConfigurationError)
+            else (
+                "authorization"
+                if isinstance(error, NcentralRequestError) and error.status_code in {401, 403}
+                else "provider_unavailable"
+            )
+        )
+        _record_ncentral_rest_capability(
+            status="error",
+            summary={"readOnly": True, "reachable": False},
+            error_category=error_category,
+        )
         with core.LOCK:
             REPOSITORY.mark_integration_test("ncentral", "error", detail, user["id"])
         raise HTTPException(502, detail) from error
+    _record_ncentral_rest_capability(
+        status="supported",
+        summary={
+            "readOnly": True,
+            "reachable": True,
+            "accessibleOrganizations": int(result.get("accessibleOrganizations") or 0),
+        },
+    )
     with core.LOCK:
         REPOSITORY.mark_integration_test(
             "ncentral",
@@ -5573,6 +8299,49 @@ def test_ncentral_connection(request: Request) -> dict:
         **result,
         "credentialSource": source,
         "message": "Token exchange and organization read permission verified",
+    }
+
+
+@api.post("/api/integrations/ncentral/capabilities", tags=["integrations"])
+def probe_ncentral_capabilities(
+    payload: NcentralCapabilityProbeRequest,
+    request: Request,
+) -> dict:
+    """Probe value-free inventory response shapes within one mapped customer."""
+
+    user = current_user(request)
+    _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
+    mapped = _ncentral_mapped_company(payload.companyId, payload.providerCompanyId)
+    try:
+        configuration, source = _ncentral_effective_configuration()
+        result = _ncentral_client(configuration).probe_device_capabilities(
+            payload.providerCompanyId,
+            device_id=payload.externalId,
+            sample_size=payload.sampleLimit,
+        )
+    except (NcentralConfigurationError, NcentralRequestError) as error:
+        raise HTTPException(
+            502,
+            _ncentral_public_failure(error, "inventory capability check"),
+        ) from error
+    return {
+        **result,
+        "companyId": payload.companyId,
+        "companyName": next(
+            (
+                company.get("name")
+                for company in REPOSITORY.list_companies()
+                if company.get("id") == payload.companyId
+            ),
+            payload.companyId,
+        ),
+        "providerCompanyId": payload.providerCompanyId,
+        "providerCompanyName": mapped.get("name") or payload.providerCompanyId,
+        "credentialSource": source,
+        "message": (
+            "Read-only capability check completed. Only response shape and access status "
+            "were returned; provider values and credentials were not retained."
+        ),
     }
 
 
@@ -5735,6 +8504,280 @@ def _ncentral_mapped_company(company_id: str, provider_company_id: str) -> dict:
     return mapped
 
 
+def _ncentral_saved_enrichment_offset(company_id: str, provider_company_id: str) -> int:
+    """Resume REST detail collection after the last successfully published window."""
+
+    try:
+        runs = REPOSITORY.list_sync_runs(
+            kind="ncentral",
+            operation="device_preview",
+            company_id=company_id,
+            limit=50,
+        )
+    except (TypeError, ValueError):
+        LOGGER.warning("Could not read the previous N-central enrichment cursor")
+        return 0
+    ordered = sorted(
+        runs,
+        key=lambda item: (
+            str(item.get("finishedAt") or item.get("requestedAt") or item.get("startedAt") or ""),
+            str(item.get("id") or ""),
+        ),
+        reverse=True,
+    )
+    for run in ordered:
+        if str(run.get("status") or "") not in {"success", "succeeded", "review_required"}:
+            continue
+        attributes = run.get("attributes")
+        safe_attributes = attributes if isinstance(attributes, dict) else {}
+        if (
+            str(run.get("providerCompanyId") or safe_attributes.get("providerCompanyId") or "")
+            != provider_company_id
+        ):
+            continue
+        candidates: list[Any] = [safe_attributes.get("enrichment")]
+        for container in (
+            run.get("previewSummary"),
+            safe_attributes.get("previewSummary"),
+            safe_attributes.get("resultSummary"),
+        ):
+            if isinstance(container, dict):
+                candidates.append(container.get("enrichment"))
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                return max(0, int(candidate.get("nextOffset") or 0))
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def _ncentral_graphql_enrichment_context(
+    company_id: str,
+    provider_company_id: str,
+    policy: dict[str, Any],
+    *,
+    rest_device_count: int,
+    refresh_when_due: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return current GraphQL assets plus an operator-visible coverage explanation."""
+
+    public = _ncentral_graphql_connection_public()
+    scope = list(policy.get("graphqlOrganizationIds") or [])
+    server_id = str(public.get("graphqlServerId") or "").strip()
+    diagnostics: dict[str, Any] = {
+        "status": "empty",
+        "reason": "No GraphQL enrichment cache is available for this customer.",
+        "enabled": bool(public.get("graphqlEnabled")),
+        "configured": bool(public.get("configured")),
+        "deviceCount": 0,
+        "providerAssetCount": 0,
+        "eligibleDeviceCount": 0,
+        "unmatchedDeviceCount": 0,
+        "pagesRead": 0,
+        "complete": False,
+        "lastRefreshedAt": None,
+        "expiresAt": None,
+        "refreshed": False,
+    }
+    if not diagnostics["enabled"]:
+        diagnostics.update(
+            status="disabled",
+            reason=(
+                "GraphQL credentials may be saved, but enrichment is disabled. "
+                "Enable it before running reconciliation."
+            ),
+        )
+        return [], diagnostics
+    if not diagnostics["configured"]:
+        diagnostics.update(
+            status="not_configured",
+            reason="GraphQL is enabled but no usable credential is configured.",
+        )
+        return [], diagnostics
+    if not scope:
+        diagnostics.update(
+            status="not_scoped",
+            reason="Select and save at least one GraphQL Customer organization.",
+        )
+        return [], diagnostics
+    if not server_id:
+        diagnostics.update(
+            status="server_missing",
+            reason="Detect and save the immutable N-central source-server ID.",
+        )
+        return [], diagnostics
+
+    rows = REPOSITORY.list_integration_enrichment_previews(
+        "ncentral",
+        company_id,
+        provider_company_id,
+        source_server_id=server_id,
+        include_expired=True,
+        limit=25_000,
+    )
+    rows = _ncentral_graphql_generation_rows(rows)
+    generation_stale = any(bool(row.get("stale")) for row in rows)
+    fresh_rows = rows if rows and not generation_stale else []
+    metadata = _ncentral_graphql_cache_metadata(
+        rows,
+        organization_ids=set(scope),
+        server_id=server_id,
+    )
+    current_scope_fingerprint = _ncentral_graphql_scope_fingerprint(scope)
+    scope_matches = metadata["scopeFingerprint"] == current_scope_fingerprint
+    refresh_due = not fresh_rows or not metadata["complete"] or not scope_matches
+    refresh_error = ""
+    refresh_result: dict[str, Any] | None = None
+    if refresh_when_due and refresh_due:
+        payload = NcentralGraphqlScopeRequest(
+            companyId=company_id,
+            providerCompanyId=provider_company_id,
+            queryKey="asset_inventory",
+            limit=min(max(rest_device_count, 1), 500),
+        )
+        try:
+            result = _ncentral_graphql_asset_read(payload)
+            refresh_result = _cache_ncentral_graphql_assets(payload, result)
+            if not bool(refresh_result.get("complete")):
+                refresh_error = str(refresh_result.get("message") or "").strip() or (
+                    "The GraphQL cache refresh did not publish a complete generation."
+                )
+                refresh_result = None
+            elif int(refresh_result.get("deviceCount") or 0) > 0:
+                rows = REPOSITORY.list_integration_enrichment_previews(
+                    "ncentral",
+                    company_id,
+                    provider_company_id,
+                    source_server_id=server_id,
+                    include_expired=True,
+                    limit=25_000,
+                )
+                rows = _ncentral_graphql_generation_rows(rows)
+                generation_stale = any(bool(row.get("stale")) for row in rows)
+                fresh_rows = rows if rows and not generation_stale else []
+                metadata = _ncentral_graphql_cache_metadata(
+                    rows,
+                    organization_ids=set(scope),
+                    server_id=server_id,
+                )
+                scope_matches = metadata["scopeFingerprint"] == current_scope_fingerprint
+            else:
+                # A valid empty generation supersedes prior cache rows even though
+                # there is no per-device row on which to persist its generation ID.
+                rows = []
+                fresh_rows = []
+                metadata = {
+                    "providerAssetCount": int(refresh_result.get("providerAssetCount") or 0),
+                    "eligibleDeviceCount": int(refresh_result.get("eligibleDeviceCount") or 0),
+                    "unmatchedDeviceCount": int(refresh_result.get("unmatchedDeviceCount") or 0),
+                    "pagesRead": int(refresh_result.get("pagesRead") or 0),
+                    "complete": bool(refresh_result.get("complete")),
+                    "scopeFingerprint": current_scope_fingerprint,
+                }
+                scope_matches = bool(refresh_result.get("complete"))
+            if not refresh_error:
+                diagnostics["refreshed"] = True
+        except (NableGraphqlConfigurationError, NableGraphqlRequestError, HTTPException) as error:
+            LOGGER.warning(
+                "Optional N-able GraphQL cache refresh failed for %s: %s",
+                company_id,
+                type(error).__name__,
+            )
+            refresh_error = _ncentral_graphql_public_failure(error)
+
+    selected_rows = fresh_rows if scope_matches else []
+    allowed = set(scope)
+    assets = [
+        asset
+        for row in selected_rows
+        if (
+            asset := _ncentral_graphql_cached_asset(
+                row,
+                organization_ids=allowed,
+                server_id=server_id,
+            )
+        )
+    ]
+    observed = sorted(
+        str(row.get("observedAt") or "") for row in selected_rows if row.get("observedAt")
+    )
+    expiries = sorted(
+        str(row.get("expiresAt") or "") for row in selected_rows if row.get("expiresAt")
+    )
+    diagnostics.update(
+        deviceCount=len(assets),
+        providerAssetCount=metadata["providerAssetCount"],
+        eligibleDeviceCount=metadata["eligibleDeviceCount"],
+        unmatchedDeviceCount=metadata["unmatchedDeviceCount"],
+        pagesRead=metadata["pagesRead"],
+        complete=metadata["complete"],
+        scopeMatches=scope_matches,
+        lastRefreshedAt=observed[-1] if observed else None,
+        expiresAt=expiries[0] if expiries else None,
+    )
+    if refresh_result:
+        diagnostics.update(
+            providerAssetCount=int(refresh_result.get("providerAssetCount") or 0),
+            eligibleDeviceCount=int(refresh_result.get("eligibleDeviceCount") or 0),
+            unmatchedDeviceCount=int(refresh_result.get("unmatchedDeviceCount") or 0),
+            pagesRead=int(refresh_result.get("pagesRead") or 0),
+            complete=bool(refresh_result.get("complete")),
+        )
+    if refresh_error:
+        diagnostics.update(
+            status="error",
+            reason=(
+                f"{refresh_error} Existing current cache evidence was retained."
+                if assets
+                else refresh_error
+            ),
+        )
+    elif assets:
+        unmatched_count = int(diagnostics["unmatchedDeviceCount"] or 0)
+        refreshed = bool(diagnostics["refreshed"])
+        diagnostics.update(
+            status=(
+                ("refreshed_with_gaps" if refreshed else "fresh_with_gaps")
+                if unmatched_count
+                else ("refreshed" if refreshed else "fresh")
+            ),
+            reason=(
+                (
+                    f"Matched {len(assets)} current GraphQL asset enrichments to REST device "
+                    f"IDs; {unmatched_count} provider asset(s) lacked a unique configured "
+                    "server/device crosswalk."
+                )
+                if unmatched_count
+                else (
+                    f"Matched {len(assets)} current GraphQL asset enrichments to REST device IDs."
+                )
+            ),
+        )
+    elif rows and not fresh_rows:
+        diagnostics.update(
+            status="expired",
+            reason="The GraphQL cache expired and was not used for reconciliation.",
+        )
+    elif not scope_matches and rows:
+        diagnostics.update(
+            status="scope_changed",
+            reason=(
+                "The saved GraphQL Customer scope changed. Refresh the full-scope cache "
+                "before reconciliation can use enrichment."
+            ),
+        )
+    elif metadata["unmatchedDeviceCount"]:
+        diagnostics.update(
+            status="unmatched",
+            reason=(
+                "GraphQL returned assets, but none had an exact configured server/device crosswalk."
+            ),
+        )
+    return assets, diagnostics
+
+
 def _ncentral_device_context(
     company_id: str,
     provider_company_id: str,
@@ -5744,6 +8787,11 @@ def _ncentral_device_context(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
     policy_override: dict[str, Any] | None = None,
+    priority_external_ids: set[str] | None = None,
+    enrichment_offset: int | None = None,
+    refresh_graphql: bool = False,
+    enrichment_diagnostics: dict[str, Any] | None = None,
+    connection_generation: dict[str, int] | None = None,
 ) -> tuple[dict, list[dict], str, dict, list[dict]]:
     """Validate mapping and read a saved, provider-filtered device scope."""
 
@@ -5773,17 +8821,145 @@ def _ncentral_device_context(
         if enrich_limit is None
         else enrich_limit
     )
+    selected_offset = (
+        max(0, int(enrichment_offset))
+        if enrichment_offset is not None
+        else (
+            _ncentral_saved_enrichment_offset(company_id, provider_company_id)
+            if selected_enrichment and not priority_external_ids
+            else 0
+        )
+    )
     discovery_options: dict[str, Any] = {
         "filter_id": str(policy.get("providerFilterId") or ""),
         "enrich_limit": selected_enrichment,
+        "enrichment_offset": selected_offset,
     }
     if progress_callback is not None:
         discovery_options["progress_callback"] = progress_callback
     if cancel_requested is not None:
         discovery_options["cancel_requested"] = cancel_requested
+    if priority_external_ids:
+        discovery_options["priority_external_ids"] = priority_external_ids
+    connection_revision = int(_ncentral_connection_public().get("revision") or 0)
+    if connection_generation is not None:
+        connection_generation.clear()
+        connection_generation["revision"] = connection_revision
     records = client.discover_devices(provider_company_id, **discovery_options)
+    for record in records:
+        # Preserve the immutable provider tenant boundary on every record that can
+        # reach reconciliation or import. GraphQL enrichment may replace or merge
+        # other attributes, but it must never be the source of this scope identity.
+        record["providerParentId"] = provider_company_id
+    cached_assets, graphql_diagnostics = _ncentral_graphql_enrichment_context(
+        company_id,
+        provider_company_id,
+        policy,
+        rest_device_count=len(records),
+        refresh_when_due=refresh_graphql,
+    )
+    graphql_server_id = str(_ncentral_graphql_connection_public().get("graphqlServerId") or "")
+    if cached_assets and graphql_server_id:
+        records = merge_graphql_enrichment(
+            records,
+            cached_assets,
+            server_id=graphql_server_id,
+        )
+    if enrichment_diagnostics is not None:
+        enrichment_diagnostics.clear()
+        enrichment_diagnostics.update(
+            graphql=graphql_diagnostics,
+            restOffset=selected_offset,
+        )
     filters = client.list_device_filters() if include_filters else []
     return mapped, records, source, policy, filters
+
+
+def _ncentral_presence_snapshot(
+    records: list[dict[str, Any]],
+    policy: dict[str, Any],
+    *,
+    company_id: str,
+    provider_company_id: str,
+    connection_revision: int,
+    snapshot_started_at: str,
+    provider_read_completed_at: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build private provider-presence evidence plus its aggregate public summary."""
+
+    normalized_policy = normalize_ci_policy(policy)
+    provider_filter_id = str(normalized_policy.get("providerFilterId") or "")[:160]
+    scope_mode = "provider_filtered" if provider_filter_id else "unfiltered"
+    try:
+        required_absences = max(
+            2,
+            min(int(normalized_policy.get("missingDeviceRequiredSnapshots") or 3), 10),
+        )
+    except (TypeError, ValueError):
+        required_absences = 3
+    try:
+        minimum_missing_hours = max(
+            1,
+            min(int(normalized_policy.get("missingDeviceMinimumHours") or 24), 720),
+        )
+    except (TypeError, ValueError):
+        minimum_missing_hours = 24
+
+    observed_records: list[dict[str, str]] = []
+    observed_ids: set[str] = set()
+    for record in records:
+        external_id = str(record.get("externalId") or "").strip()[:160]
+        if not external_id or external_id in observed_ids:
+            continue
+        observed_ids.add(external_id)
+        observed_records.append(
+            {
+                "externalId": external_id,
+                "externalName": str(record.get("name") or external_id).strip()[:240],
+                "providerParentId": provider_company_id[:160],
+            }
+        )
+
+    discovery_material = {
+        "provider": "ncentral",
+        "companyId": company_id,
+        "providerParentId": provider_company_id,
+        "providerFilterId": provider_filter_id,
+        "connectionRevision": max(0, int(connection_revision)),
+    }
+    policy_material = {
+        "typeMode": normalized_policy.get("typeMode"),
+        "includedTypeIds": sorted(normalized_policy.get("includedTypeIds") or []),
+        "statusMode": normalized_policy.get("statusMode"),
+        "includedStatusIds": sorted(normalized_policy.get("includedStatusIds") or []),
+        "excludedExternalIds": sorted(normalized_policy.get("excludedExternalIds") or []),
+        "requiredAbsences": required_absences,
+        "minimumMissingHours": minimum_missing_hours,
+    }
+
+    def fingerprint(material: dict[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    snapshot = {
+        "observedRecords": observed_records,
+        "providerReadComplete": True,
+        "providerFilterId": provider_filter_id,
+        "scopeMode": scope_mode,
+        "discoveryScopeFingerprint": fingerprint(discovery_material),
+        "policyDecisionFingerprint": fingerprint(policy_material),
+        "connectionRevision": max(0, int(connection_revision)),
+        "policyRevision": max(0, int(policy.get("revision") or 0)),
+        "snapshotStartedAt": snapshot_started_at,
+        "providerReadCompletedAt": provider_read_completed_at,
+        "requiredAbsences": required_absences,
+        "minimumMissingHours": minimum_missing_hours,
+    }
+    summary = {key: deepcopy(value) for key, value in snapshot.items() if key != "observedRecords"}
+    summary["observedCount"] = len(observed_records)
+    summary["providerFilterApplied"] = bool(provider_filter_id)
+    return snapshot, summary
 
 
 def _ncentral_device_preview(
@@ -5793,9 +8969,13 @@ def _ncentral_device_preview(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
     policy_override: dict[str, Any] | None = None,
+    priority_external_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Read, filter and classify N-central devices for one customer."""
 
+    snapshot_started_at = core.now()
+    runtime_enrichment: dict[str, Any] = {}
+    connection_generation: dict[str, int] = {}
     mapped, records, source, policy, _filters = _ncentral_device_context(
         company_id,
         provider_company_id,
@@ -5804,6 +8984,21 @@ def _ncentral_device_preview(
         progress_callback=progress_callback,
         cancel_requested=cancel_requested,
         policy_override=policy_override,
+        priority_external_ids=priority_external_ids,
+        refresh_graphql=True,
+        enrichment_diagnostics=runtime_enrichment,
+        connection_generation=connection_generation,
+    )
+    connection_revision = int(connection_generation.get("revision") or 0)
+    provider_read_completed_at = core.now()
+    presence_snapshot, presence_summary = _ncentral_presence_snapshot(
+        records,
+        policy,
+        company_id=company_id,
+        provider_company_id=provider_company_id,
+        connection_revision=connection_revision,
+        snapshot_started_at=snapshot_started_at,
+        provider_read_completed_at=provider_read_completed_at,
     )
     if cancel_requested and cancel_requested():
         raise NcentralOperationCancelled("N-central preview was cancelled")
@@ -5859,6 +9054,15 @@ def _ncentral_device_preview(
                 ),
             }
         )
+    rest_limit = min(
+        len(records),
+        {"fast": 0, "balanced": 25, "full": 250}.get(
+            str(policy.get("enrichmentMode") or "balanced"),
+            25,
+        ),
+    )
+    rest_offset = max(0, int(runtime_enrichment.get("restOffset") or 0))
+    next_offset = (rest_offset + rest_limit) % len(records) if records and rest_limit else 0
     return {
         "companyId": company_id,
         "companyName": mapped.get("mappedCompanyName") or company_id,
@@ -5877,20 +9081,19 @@ def _ncentral_device_preview(
         "appliedPolicy": policy,
         "counts": counts,
         "items": items,
+        "presenceSummary": presence_summary,
+        "_presenceSnapshot": presence_snapshot,
         "enrichment": {
             "mode": policy.get("enrichmentMode", "balanced"),
-            "assetDetailsRequested": min(
-                len(records),
-                {"fast": 0, "balanced": 25, "full": 250}.get(
-                    str(policy.get("enrichmentMode") or "balanced"),
-                    25,
-                ),
-            ),
+            "assetDetailsRequested": rest_limit,
+            "offset": rest_offset,
+            "nextOffset": next_offset,
             "bounded": True,
             "reason": (
-                "Deep hardware and network evidence follows the saved enrichment profile "
-                "and uses bounded provider concurrency"
+                "Deep REST hardware and network evidence follows a rotating saved-policy "
+                "window and uses bounded provider concurrency."
             ),
+            "graphql": deepcopy(runtime_enrichment.get("graphql") or {}),
         },
     }
 
@@ -6105,13 +9308,17 @@ def _execute_ncentral_device_preview(
         _progress: dict[str, Any] | None = None,
         *,
         force: bool = False,
+        lock_held: bool = False,
     ) -> None:
         nonlocal last_renewed_at
         now = time.monotonic()
         if not force and now - last_renewed_at < 30:
             return
-        with core.LOCK:
+        if lock_held:
             renewed = REPOSITORY.renew_ci_sync_policy_run(policy_id, lease_owner)
+        else:
+            with core.LOCK:
+                renewed = REPOSITORY.renew_ci_sync_policy_run(policy_id, lease_owner)
         if not renewed:
             raise _IntegrationPreviewLeaseLost("N-central preview lease is no longer owned")
         last_renewed_at = now
@@ -6122,14 +9329,70 @@ def _execute_ncentral_device_preview(
         provider_company_id,
         progress_callback=renew_policy_lease,
     )
+    presence_snapshot = preview.pop("_presenceSnapshot", None)
+    expected_connection_revision = int(
+        (presence_snapshot or {}).get("connectionRevision")
+        or (preview.get("presenceSummary") or {}).get("connectionRevision")
+        or 0
+    )
+    renew_policy_lease(force=True)
+    with core.LOCK:
+        relationship_context_current, relationship_skip_message = (
+            _ncentral_relationship_context_status(
+                company_id,
+                provider_company_id,
+                preview["appliedPolicy"],
+                expected_connection_revision,
+            )
+        )
+
+        def require_relationship_persistence_permission() -> None:
+            _require_ncentral_relationship_context(
+                company_id,
+                provider_company_id,
+                preview["appliedPolicy"],
+                expected_connection_revision,
+            )
+            renew_policy_lease(force=True, lock_held=True)
+
+        if relationship_context_current:
+            relationship_summary = _observe_ncentral_relationships(
+                company_id,
+                [
+                    item["record"]
+                    for item in preview["items"]
+                    if isinstance(item.get("record"), dict)
+                ],
+                preview["appliedPolicy"],
+                actor_id,
+                before_persist=require_relationship_persistence_permission,
+                provider_company_id=provider_company_id,
+                expected_connection_revision=expected_connection_revision,
+            )
+        else:
+            relationship_summary = _ncentral_relationship_summary(
+                skipped_stale_policy=True,
+                message=relationship_skip_message,
+            )
     renew_policy_lease(force=True)
     counts = preview["counts"]
+    relationship_detail = (
+        str(relationship_summary.get("message") or "") + " "
+        if relationship_summary.get("skippedStalePolicy")
+        else (
+            f"Refreshed {relationship_summary['observed']} relationship evidence item(s) and "
+            f"automatically approved {relationship_summary['autoApproved']} under the saved "
+            "policy. "
+        )
+    )
     message = (
         f"Read {preview['discovered']} N-central devices for "
         f"{preview['providerCompanyName']}; the saved policy included {preview['included']} and "
         f"excluded {preview['excluded']}: {counts['create']} new, {counts['update']} changed, "
         f"{counts['link']} identity links, {counts['unchanged']} unchanged and "
-        f"{counts['conflict']} requiring review. No CMDB or N-central records were changed."
+        f"{counts['conflict']} requiring review. "
+        + relationship_detail
+        + "No devices were imported and N-central was not changed."
     )
     run = {
         "id": str(uuid.uuid4()),
@@ -6149,9 +9412,17 @@ def _execute_ncentral_device_preview(
             "providerCompanyId": provider_company_id,
             "policyId": policy_id,
             "policyRevision": preview["appliedPolicy"].get("revision", 0),
+            "connectionRevision": expected_connection_revision,
             "providerFilterId": preview["appliedPolicy"].get("providerFilterId", ""),
             "included": preview["included"],
             "excluded": preview["excluded"],
+            "relationshipCandidates": relationship_summary["observed"],
+            "relationshipAutoApproved": relationship_summary["autoApproved"],
+            "relationshipReviewRequired": relationship_summary["reviewRequired"],
+            "relationshipErrors": relationship_summary["errors"],
+            "relationshipSkippedStalePolicy": bool(relationship_summary.get("skippedStalePolicy")),
+            "enrichment": deepcopy(preview.get("enrichment") or {}),
+            "presenceSummary": deepcopy(preview.get("presenceSummary") or {}),
             "readOnly": True,
         },
     }
@@ -6164,6 +9435,7 @@ def _execute_ncentral_device_preview(
             run,
             preview["items"],
             actor_id,
+            presence_snapshot=presence_snapshot,
         )
     if not published:
         raise _IntegrationPreviewLeaseLost("N-central preview lease expired before publication")
@@ -6182,6 +9454,7 @@ def _execute_ncentral_device_preview(
         "message": message,
         "syncRunId": stored_run["id"],
         "queueSummary": queue_summary,
+        "relationshipSummary": relationship_summary,
     }
 
 
@@ -6308,13 +9581,38 @@ def update_ncentral_device_policy(payload: NcentralDevicePolicyRequest, request:
     _require_role(user, {"platform_admin"}, "Platform administrator access required")
     _company_for_user(payload.companyId, user, require_manage=True)
     _ncentral_mapped_company(payload.companyId, payload.providerCompanyId)
+    allowed_automatic_relationship_types = {"hosts", "member_of", "stored_on"}
+    invalid_automatic_types = sorted(
+        set(payload.relationshipAutoApproveTypes) - allowed_automatic_relationship_types
+    )
+    if invalid_automatic_types:
+        raise HTTPException(
+            400,
+            "Automatic relationship approval supports only hosts, member_of and stored_on",
+        )
+    existing_policy = REPOSITORY.get_ci_sync_policy(
+        "ncentral", payload.companyId, payload.providerCompanyId
+    )
+    policy_payload = {
+        **existing_policy,
+        **payload.model_dump(exclude={"graphqlOrganizationIds"}),
+    }
+    if payload.graphqlOrganizationIds is not None:
+        try:
+            policy_payload["graphqlOrganizationIds"] = (
+                normalize_customer_scope(payload.graphqlOrganizationIds)
+                if payload.graphqlOrganizationIds
+                else []
+            )
+        except NableGraphqlConfigurationError as error:
+            raise HTTPException(400, str(error)) from error
     try:
         with core.LOCK:
             return REPOSITORY.update_ci_sync_policy(
                 "ncentral",
                 payload.companyId,
                 payload.providerCompanyId,
-                normalize_ci_policy(payload.model_dump()),
+                normalize_ci_policy(policy_payload),
                 payload.expectedRevision,
                 user["id"],
             )
@@ -6380,7 +9678,13 @@ def queue_ncentral_device_preview(
                 policy["id"],
                 "manual_preview",
                 user["id"],
-                policy,
+                {
+                    **policy,
+                    "connectionRevision": int(
+                        (REPOSITORY.get_integration_connection("ncentral") or {}).get("revision")
+                        or 0
+                    ),
+                },
             )
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
@@ -6424,7 +9728,13 @@ def queue_ncentral_device_policy_preview(
                 policy["id"],
                 "manual_sync",
                 user["id"],
-                policy,
+                {
+                    **policy,
+                    "connectionRevision": int(
+                        (REPOSITORY.get_integration_connection("ncentral") or {}).get("revision")
+                        or 0
+                    ),
+                },
             )
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
@@ -6672,6 +9982,457 @@ def _provider_field_sources(metadata: dict, fields: list[str], provider: str) ->
     return stored
 
 
+def _provider_import_preflight(
+    provider: str,
+    company_id: str,
+    provider_parent_id: str,
+    items_by_id: dict[str, dict],
+    selected_ids: set[str],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Classify every selected identity before the batch mutates canonical assets.
+
+    Retired immutable mappings remain governed by the missing-device workflow.
+    They are deliberately left unresolved in the review queue so an administrator
+    can restore the source link before attempting the import again.
+    """
+
+    allowed: list[str] = []
+    skipped: list[dict[str, Any]] = []
+    for external_id in sorted(selected_ids):
+        item = items_by_id[external_id]
+        record = item["record"]
+        decision = REPOSITORY.classify_provider_ci_mapping_import(
+            provider,
+            company_id,
+            external_id,
+            provider_parent_id,
+        )
+        classification = str(decision.get("decision") or "blocked")
+        company_matches = decision.get("companyMatches") is not False
+        parent_matches = decision.get("providerParentMatches") is not False
+        if classification == "allow" and company_matches and parent_matches:
+            allowed.append(external_id)
+            continue
+        if classification == "scope_conflict" or not company_matches or not parent_matches:
+            action = "scope_conflict"
+            reason = (
+                "This immutable provider identity belongs to another customer or provider "
+                "parent scope and cannot be moved by import."
+            )
+        elif classification == "restore_required":
+            action = "restore_required"
+            reason = str(
+                decision.get("reason") or "Restore this provider mapping before importing it again."
+            )
+        else:
+            action = "inactive_mapping"
+            reason = str(
+                decision.get("reason")
+                or "This inactive provider identity requires administrator remediation."
+            )
+        skipped.append(
+            {
+                "externalId": external_id,
+                "externalName": str(record.get("name") or item.get("name") or external_id),
+                "action": action,
+                "mappingId": decision.get("mappingId"),
+                "reason": reason,
+            }
+        )
+    return allowed, skipped
+
+
+def _require_provider_link_preflight(
+    provider: str,
+    company_id: str,
+    provider_parent_id: str,
+    external_id: str,
+) -> dict[str, Any]:
+    """Fail closed before an explicit link can move a governed provider identity."""
+
+    decision = REPOSITORY.classify_provider_ci_mapping_import(
+        provider,
+        company_id,
+        external_id,
+        provider_parent_id,
+    )
+    classification = str(decision.get("decision") or "blocked")
+    if (
+        classification == "scope_conflict"
+        or decision.get("companyMatches") is False
+        or decision.get("providerParentMatches") is False
+    ):
+        raise HTTPException(
+            409,
+            "This immutable provider identity is already scoped elsewhere. Review its existing "
+            "customer and provider-parent mapping before linking.",
+        )
+    if classification == "restore_required":
+        raise HTTPException(
+            409,
+            "This provider mapping is retired. Restore it from Missing devices before linking.",
+        )
+    if classification == "inactive_mapping":
+        raise HTTPException(
+            409,
+            "This provider identity mapping is inactive without a governed restore action. "
+            "An administrator must review it before linking.",
+        )
+    if classification != "allow":
+        raise HTTPException(
+            409,
+            "This provider identity mapping requires administrator review before linking.",
+        )
+    return decision
+
+
+def _require_current_review_generation(
+    provider: str,
+    company_id: str,
+    provider_parent_id: str,
+    item: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], int]:
+    """Require an exact, current provider-preview generation for an explicit link.
+
+    A review row is evidence, not authority by itself. Its source run must match
+    the currently active policy, integration revision and provider-customer
+    mapping. Legacy rows without that provenance are intentionally fail closed.
+    """
+
+    stale_detail = (
+        "The reviewed provider snapshot is stale or was created by an older release. "
+        "Run preview again before linking."
+    )
+    if (
+        not item
+        or item.get("state") != "pending"
+        or not item.get("id")
+        or not item.get("contentHash")
+        or not item.get("lastRunId")
+        or str(item.get("companyId") or "") != company_id
+        or str(item.get("providerParentId") or "") != provider_parent_id
+    ):
+        raise HTTPException(409, stale_detail)
+    run = REPOSITORY.get_sync_run(str(item["lastRunId"]), {company_id})
+    attributes = run.get("attributes") if isinstance(run, dict) else None
+    run_attributes: dict[str, Any] = attributes if isinstance(attributes, dict) else {}
+    policy = REPOSITORY.get_ci_sync_policy(provider, company_id, provider_parent_id)
+    connection = REPOSITORY.get_integration_connection(provider)
+    provider_company = next(
+        (
+            row
+            for row in REPOSITORY.list_provider_companies(provider)
+            if str(row.get("externalId") or "") == provider_parent_id
+        ),
+        None,
+    )
+    try:
+        run_policy_revision = int(run_attributes.get("policyRevision") or 0)
+        run_connection_revision = int(run_attributes.get("connectionRevision") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(409, stale_detail) from None
+    if (
+        not run
+        or run.get("status") not in {"success", "review_required"}
+        or str(run.get("type") or "") != provider
+        or str(run.get("providerCompanyId") or "") != provider_parent_id
+        or str(run.get("policyId") or "") != str(item.get("policyId") or "")
+        or not policy
+        or str(policy.get("id") or "") != str(item.get("policyId") or "")
+        or int(policy.get("revision") or 0) != run_policy_revision
+        or not connection
+        or not connection.get("enabled")
+        or connection.get("lifecycleStatus", "active") != "active"
+        or int(connection.get("revision") or 0) != run_connection_revision
+        or not provider_company
+        or not provider_company.get("active", True)
+        or str(provider_company.get("mappedCompanyId") or "") != company_id
+    ):
+        raise HTTPException(409, stale_detail)
+    return item, policy, run_connection_revision
+
+
+def _provider_last_seen(record: dict) -> str:
+    """Return a validated provider observation timestamp or the import time."""
+
+    raw_fields = record.get("fields")
+    fields: dict[str, Any] = raw_fields if isinstance(raw_fields, dict) else {}
+    raw_monitoring = fields.get("monitoring")
+    monitoring: dict[str, Any] = raw_monitoring if isinstance(raw_monitoring, dict) else {}
+    raw_source_evidence = fields.get("sourceEvidence")
+    source_evidence: dict[str, Any] = (
+        raw_source_evidence if isinstance(raw_source_evidence, dict) else {}
+    )
+    candidate = str(
+        record.get("providerObservedAt")
+        or monitoring.get("lastAgentCheckIn")
+        or fields.get("lastAgentCheckIn")
+        or source_evidence.get("observedAt")
+        or ""
+    ).strip()
+    if candidate:
+        try:
+            parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            LOGGER.warning("Ignoring invalid provider observation timestamp for N-central record")
+    return core.now()
+
+
+def _ncentral_relationship_summary(
+    *,
+    skipped_stale_policy: bool = False,
+    message: str = "",
+) -> dict[str, Any]:
+    """Return the stable aggregate contract for one topology observation pass."""
+
+    return {
+        "observed": 0,
+        "evaluated": 0,
+        "autoApproved": 0,
+        "reviewRequired": 0,
+        "errors": 0,
+        "skippedStalePolicy": skipped_stale_policy,
+        "message": message,
+    }
+
+
+class _NcentralRelationshipContextChanged(RuntimeError):
+    """Stop topology writes when their reviewed policy or connection becomes stale."""
+
+
+def _ncentral_relationship_context_status(
+    company_id: str,
+    provider_company_id: str,
+    applied_policy: dict,
+    expected_connection_revision: int,
+) -> tuple[bool, str]:
+    """Validate policy, connection and provider-customer scope before topology writes."""
+
+    current = REPOSITORY.get_ci_sync_policy(
+        "ncentral",
+        company_id,
+        provider_company_id,
+    )
+    if not current or int(current.get("revision") or 0) != int(applied_policy.get("revision") or 0):
+        return (
+            False,
+            "Relationship evidence was skipped because the saved N-central policy changed "
+            "during this preview.",
+        )
+    connection = REPOSITORY.get_integration_connection("ncentral")
+    if (
+        not connection
+        or connection.get("lifecycleStatus", "active") != "active"
+        or not connection.get("enabled")
+    ):
+        return (
+            False,
+            "Relationship evidence was skipped because the N-central connection was disabled "
+            "or removed during this preview.",
+        )
+    if int(connection.get("revision") or 0) != int(expected_connection_revision):
+        return (
+            False,
+            "Relationship evidence was skipped because the N-central connection changed "
+            "during this preview.",
+        )
+    provider_company = next(
+        (
+            item
+            for item in REPOSITORY.list_provider_companies("ncentral")
+            if str(item.get("externalId") or "") == provider_company_id
+        ),
+        None,
+    )
+    if (
+        not provider_company
+        or not provider_company.get("active", True)
+        or str(provider_company.get("mappedCompanyId") or "") != company_id
+    ):
+        return (
+            False,
+            "Relationship evidence was skipped because the N-central customer mapping changed "
+            "during this preview.",
+        )
+    return True, ""
+
+
+def _require_ncentral_relationship_context(
+    company_id: str,
+    provider_company_id: str,
+    applied_policy: dict,
+    expected_connection_revision: int,
+) -> None:
+    """Raise a stable signal when topology evidence no longer has current authority."""
+
+    current, message = _ncentral_relationship_context_status(
+        company_id,
+        provider_company_id,
+        applied_policy,
+        expected_connection_revision,
+    )
+    if not current:
+        raise _NcentralRelationshipContextChanged(message)
+
+
+def _observe_ncentral_relationships(
+    company_id: str,
+    records: list[dict],
+    policy: dict,
+    actor_id: str | None,
+    *,
+    before_persist: Callable[[], None] | None = None,
+    provider_company_id: str | None = None,
+    expected_connection_revision: int | None = None,
+) -> dict[str, Any]:
+    """Refresh explainable N-central topology evidence and apply an opt-in policy.
+
+    Candidate generation resolves endpoints only through immutable provider-ID
+    mappings. Automatic approval is separately guarded by detector allow-list,
+    relationship type, confidence, repeated observations and evidence freshness.
+    Preview workers supply a fresh ownership/cancellation guard immediately
+    before every candidate or relationship mutation.
+    Individual candidate failures remain in review and never fail device sync.
+    """
+
+    summary = _ncentral_relationship_summary()
+    if not records:
+        return summary
+    mappings = REPOSITORY.list_provider_ci_mappings("ncentral", company_id)
+    mapping_by_external_id = {
+        str(item.get("externalId") or ""): item
+        for item in mappings
+        if item.get("active", True) and item.get("externalId")
+    }
+    assets = [
+        asset
+        for asset in REPOSITORY.list_assets()
+        if asset.get("companyId") == company_id and not asset.get("retiredAt")
+    ]
+    enriched_records = add_ncentral_network_dependency_hints(records, mappings, assets)
+    candidate_groups = build_relationship_candidates(
+        provider="ncentral",
+        company_id=company_id,
+        records=enriched_records,
+        mappings=mappings,
+        existing_relationships=REPOSITORY.list_relationships(),
+    )
+    touched_mapping_ids: set[str] = set()
+    context_supplied = bool(
+        provider_company_id
+        and expected_connection_revision is not None
+        and policy.get("id")
+        and policy.get("revision") is not None
+    )
+    relationship_policy_id = str(policy.get("id") or "") if context_supplied else None
+    relationship_policy_revision = int(policy.get("revision") or 0) if context_supplied else None
+    relationship_connection_revision = (
+        int(expected_connection_revision or 0) if context_supplied else None
+    )
+    relationship_provider_parent_id = provider_company_id if context_supplied else None
+
+    def stale_context(error: ValueError) -> bool:
+        """Convert repository generation conflicts into the stable skipped contract."""
+
+        message = str(error)
+        if not message.startswith("Provider relationship context is stale:"):
+            return False
+        summary.update(
+            skippedStalePolicy=True,
+            message=(
+                "Relationship evidence was skipped because its N-central policy, connection "
+                "or customer mapping changed during processing."
+            ),
+        )
+        return True
+
+    for record in enriched_records:
+        external_id = str(record.get("externalId") or "")
+        mapping = mapping_by_external_id.get(external_id)
+        candidates = candidate_groups.get(external_id, [])
+        if not mapping or not candidates:
+            continue
+        try:
+            if before_persist:
+                before_persist()
+            REPOSITORY.upsert_relationship_candidates(
+                "ncentral",
+                company_id,
+                str(mapping["id"]),
+                candidates,
+                observed_at=_provider_last_seen(record),
+                policy_id=relationship_policy_id,
+                expected_policy_revision=relationship_policy_revision,
+                expected_connection_revision=relationship_connection_revision,
+                provider_parent_id=relationship_provider_parent_id,
+            )
+            touched_mapping_ids.add(str(mapping["id"]))
+            summary["observed"] += len(candidates)
+        except _NcentralRelationshipContextChanged as error:
+            summary.update(skippedStalePolicy=True, message=str(error))
+            return summary
+        except ValueError as error:
+            if stale_context(error):
+                return summary
+            summary["errors"] += 1
+            LOGGER.exception("Could not persist N-central relationship candidate evidence")
+        except TypeError:
+            summary["errors"] += 1
+            LOGGER.exception("Could not persist N-central relationship candidate evidence")
+
+    if not touched_mapping_ids:
+        return summary
+    pending = [
+        item
+        for item in REPOSITORY.list_relationship_candidates(
+            company_id,
+            state="pending",
+            provider="ncentral",
+            include_retired=False,
+            limit=1_000,
+        )
+        if str(item.get("sourceMappingId") or "") in touched_mapping_ids
+    ]
+    summary["evaluated"] = len(pending)
+    for candidate in pending:
+        decision = relationship_auto_approval_decision(candidate, policy)
+        if not decision["eligible"]:
+            summary["reviewRequired"] += 1
+            continue
+        try:
+            if before_persist:
+                before_persist()
+            REPOSITORY.approve_relationship_candidate(
+                company_id,
+                str(candidate["id"]),
+                actor_id,
+                "Automatically approved from repeated explicit N-central identity evidence.",
+                expected_revision=int(candidate.get("revision") or 1),
+                policy_id=relationship_policy_id,
+                expected_policy_revision=relationship_policy_revision,
+                expected_connection_revision=relationship_connection_revision,
+                provider_parent_id=relationship_provider_parent_id,
+            )
+            summary["autoApproved"] += 1
+        except _NcentralRelationshipContextChanged as error:
+            summary.update(skippedStalePolicy=True, message=str(error))
+            return summary
+        except ValueError as error:
+            if stale_context(error):
+                return summary
+            summary["errors"] += 1
+            summary["reviewRequired"] += 1
+            LOGGER.exception("Could not auto-approve an eligible relationship candidate")
+        except TypeError:
+            summary["errors"] += 1
+            summary["reviewRequired"] += 1
+            LOGGER.exception("Could not auto-approve an eligible relationship candidate")
+    return summary
+
+
 @api.post("/api/integrations/ncentral/devices/import", tags=["integrations"])
 def import_ncentral_devices(payload: NcentralDeviceImportRequest, request: Request) -> dict:
     """Re-read and apply only selected, non-conflicting N-central devices."""
@@ -6682,8 +10443,14 @@ def import_ncentral_devices(payload: NcentralDeviceImportRequest, request: Reque
     if len(selected_ids) != len(payload.externalIds):
         raise HTTPException(400, "Device selections must be unique and non-empty")
     started_at = core.now()
+    presence_snapshot: dict[str, Any] | None = None
     try:
-        preview = _ncentral_device_preview(payload.companyId, payload.providerCompanyId)
+        preview = _ncentral_device_preview(
+            payload.companyId,
+            payload.providerCompanyId,
+            priority_external_ids=selected_ids,
+        )
+        presence_snapshot = preview.pop("_presenceSnapshot", None)
     except (NcentralConfigurationError, NcentralRequestError) as error:
         raise HTTPException(
             502, _ncentral_public_failure(error, "device import preview")
@@ -6704,12 +10471,50 @@ def import_ncentral_devices(payload: NcentralDeviceImportRequest, request: Reque
     created = 0
     updated = 0
     linked = 0
+    skipped_items: list[dict[str, Any]] = []
+    inventory_warnings = 0
+    relationship_candidate_count = 0
+    mapped_records: list[tuple[dict, dict]] = []
+    policy_id = str(preview["appliedPolicy"].get("id") or "")
+    expected_policy_revision = int(preview["appliedPolicy"].get("revision") or 0)
+    expected_connection_revision = int(
+        (presence_snapshot or {}).get("connectionRevision")
+        or (preview.get("presenceSummary") or {}).get("connectionRevision")
+        or 0
+    )
     with core.LOCK:
-        for external_id in selected_ids:
+        importable_ids, skipped_items = _provider_import_preflight(
+            "ncentral",
+            payload.companyId,
+            payload.providerCompanyId,
+            items_by_id,
+            selected_ids,
+        )
+        imported_ids: set[str] = set()
+        for external_id in importable_ids:
             item = items_by_id[external_id]
             record = item["record"]
+            review_item = REPOSITORY.get_ci_review_item_by_identity(
+                "ncentral",
+                payload.companyId,
+                payload.providerCompanyId,
+                external_id,
+                "pending",
+            )
+            guarded_review = bool(
+                review_item
+                and review_item.get("policyId") == policy_id
+                and review_item.get("id")
+                and review_item.get("contentHash")
+            )
+            review_item_id = str((review_item or {}).get("id") or "") if guarded_review else None
+            review_content_hash = (
+                str((review_item or {}).get("contentHash") or "") if guarded_review else None
+            )
             asset_id = item.get("assetId")
             applied_fields = item.get("appliedFields") or item.get("changedFields") or []
+            asset: dict | None = None
+            changes: dict | None = None
             if item["action"] == "create":
                 asset = {
                     "id": str(uuid.uuid4()),
@@ -6719,7 +10524,7 @@ def import_ncentral_devices(payload: NcentralDeviceImportRequest, request: Reque
                     "status": record["status"],
                     "source": "ncentral",
                     "externalId": record["externalId"],
-                    "lastSeen": core.now(),
+                    "lastSeen": _provider_last_seen(record),
                     "fields": record.get("fields") or {},
                     "metadata": _provider_field_sources(
                         core.normalise_metadata(record.get("metadata") or {}, record["status"]),
@@ -6727,14 +10532,12 @@ def import_ncentral_devices(payload: NcentralDeviceImportRequest, request: Reque
                         "ncentral",
                     ),
                 }
-                asset_id = REPOSITORY.create_asset(asset, user["id"])["id"]
-                created += 1
             elif item["action"] == "update":
                 changes = {
                     **item["changes"],
                     "source": "ncentral",
                     "externalId": record["externalId"],
-                    "lastSeen": core.now(),
+                    "lastSeen": _provider_last_seen(record),
                 }
                 current_asset = next(
                     (asset for asset in REPOSITORY.list_assets() if asset["id"] == asset_id),
@@ -6749,25 +10552,130 @@ def import_ncentral_devices(payload: NcentralDeviceImportRequest, request: Reque
                     applied_fields,
                     "ncentral",
                 )
-                if not asset_id or not REPOSITORY.update_asset(asset_id, changes, user["id"]):
-                    raise HTTPException(409, "A selected device changed during import")
+            try:
+                applied = REPOSITORY.apply_reviewed_provider_ci_import(
+                    "ncentral",
+                    payload.companyId,
+                    record,
+                    item["action"],
+                    asset_id=asset_id,
+                    asset=asset,
+                    changes=changes,
+                    actor_id=user["id"],
+                    provider_parent_id=payload.providerCompanyId,
+                    policy_id=policy_id or None,
+                    expected_policy_revision=expected_policy_revision,
+                    expected_connection_revision=expected_connection_revision,
+                    review_item_id=review_item_id,
+                    review_content_hash=review_content_hash,
+                )
+            except ValueError as error:
+                _still_allowed, raced_skips = _provider_import_preflight(
+                    "ncentral",
+                    payload.companyId,
+                    payload.providerCompanyId,
+                    items_by_id,
+                    {external_id},
+                )
+                if raced_skips:
+                    skipped_items.extend(raced_skips)
+                    continue
+                raise HTTPException(
+                    409,
+                    "A selected N-central device or mapping changed during import. Refresh the "
+                    "review queue before retrying.",
+                ) from error
+            asset_id = str(applied["asset"]["id"])
+            mapping = applied["mapping"]
+            imported_ids.add(external_id)
+            if item["action"] == "create":
+                created += 1
+            elif item["action"] == "update":
                 updated += 1
             else:
                 linked += 1
-            if not asset_id:
-                raise HTTPException(409, "A selected device has no canonical target")
-            REPOSITORY.record_provider_ci_mapping(
-                "ncentral", payload.companyId, record, asset_id, user["id"]
+            mapped_records.append((record, mapping))
+            collections = technical_inventory_collections(record)
+            if collections:
+                try:
+                    REPOSITORY.replace_ci_inventory(
+                        "ncentral",
+                        payload.companyId,
+                        asset_id,
+                        mapping["id"],
+                        collections,
+                        observed_at=_provider_last_seen(record),
+                    )
+                except (TypeError, ValueError):
+                    inventory_warnings += 1
+                    LOGGER.exception("Could not persist bounded N-central technical inventory")
+        restore_required = [item for item in skipped_items if item["action"] == "restore_required"]
+        scope_conflicts = [
+            item
+            for item in skipped_items
+            if item["action"] in {"scope_conflict", "inactive_mapping"}
+        ]
+        relationship_context_current, relationship_skip_message = (
+            _ncentral_relationship_context_status(
+                payload.companyId,
+                payload.providerCompanyId,
+                preview["appliedPolicy"],
+                expected_connection_revision,
             )
+        )
+        if relationship_context_current:
+            relationship_summary = _observe_ncentral_relationships(
+                payload.companyId,
+                [record for record, _mapping in mapped_records],
+                preview["appliedPolicy"],
+                user["id"],
+                before_persist=lambda: _require_ncentral_relationship_context(
+                    payload.companyId,
+                    payload.providerCompanyId,
+                    preview["appliedPolicy"],
+                    expected_connection_revision,
+                ),
+                provider_company_id=payload.providerCompanyId,
+                expected_connection_revision=expected_connection_revision,
+            )
+        else:
+            relationship_summary = _ncentral_relationship_summary(
+                skipped_stale_policy=True,
+                message=relationship_skip_message,
+            )
+        relationship_candidate_count = relationship_summary["observed"]
+        inventory_warnings += relationship_summary["errors"]
         remaining_review = sum(
             item["action"] in {"create", "update", "link", "conflict"}
-            and item["externalId"] not in selected_ids
+            and item["externalId"] not in imported_ids
             for item in preview["items"]
         )
         message = (
             f"Imported {created} new, updated {updated} and linked {linked} N-central devices "
             f"for {preview['companyName']}. {remaining_review} remain for review. "
-            "No data was written to N-central."
+            + (
+                f"Skipped {len(skipped_items)} governed identity mapping(s); restore retired "
+                "sources from Missing devices and resolve source-scope conflicts before retrying. "
+                if skipped_items
+                else ""
+            )
+            + (
+                str(relationship_summary.get("message") or "") + " "
+                if relationship_summary.get("skippedStalePolicy")
+                else f"Queued {relationship_candidate_count} relationship candidate(s). "
+            )
+            + (
+                f"Automatically approved {relationship_summary['autoApproved']} repeatedly "
+                "verified relationship(s). "
+                if relationship_summary["autoApproved"]
+                else ""
+            )
+            + (
+                f"{inventory_warnings} enrichment warning(s) require review. "
+                if inventory_warnings
+                else ""
+            )
+            + "No data was written to N-central."
         )
         run = REPOSITORY.record_sync_run(
             "ncentral",
@@ -6788,15 +10696,36 @@ def import_ncentral_devices(payload: NcentralDeviceImportRequest, request: Reque
                     "providerCompanyId": payload.providerCompanyId,
                     "writesProvider": False,
                     "decisionNotes": payload.decisionNotes.strip(),
+                    "inventoryWarnings": inventory_warnings,
+                    "skipped": len(skipped_items),
+                    "restoreRequired": len(restore_required),
+                    "scopeConflicts": len(scope_conflicts),
+                    "relationshipCandidates": relationship_candidate_count,
+                    "relationshipAutoApproved": relationship_summary["autoApproved"],
+                    "relationshipReviewRequired": relationship_summary["reviewRequired"],
+                    "relationshipSkippedStalePolicy": bool(
+                        relationship_summary.get("skippedStalePolicy")
+                    ),
                 },
             },
             True,
             user["id"],
         )
-        policy_id = str(preview["appliedPolicy"].get("id") or "")
-        if policy_id:
-            REPOSITORY.resolve_ci_review_items(policy_id, sorted(selected_ids), user["id"])
-    return {**run, "created": created, "updated": updated, "linked": linked}
+    return {
+        **run,
+        "created": created,
+        "updated": updated,
+        "linked": linked,
+        "skipped": len(skipped_items),
+        "skippedItems": skipped_items,
+        "restoreRequired": restore_required,
+        "scopeConflicts": scope_conflicts,
+        "inventoryWarnings": inventory_warnings,
+        "relationshipCandidates": relationship_candidate_count,
+        "relationshipAutoApproved": relationship_summary["autoApproved"],
+        "relationshipReviewRequired": relationship_summary["reviewRequired"],
+        "relationshipSummary": relationship_summary,
+    }
 
 
 @api.post("/api/integrations/ncentral/devices/link", tags=["integrations"])
@@ -6809,6 +10738,12 @@ def link_ncentral_device(payload: NcentralDeviceLinkRequest, request: Request) -
     if target["companyId"] != payload.companyId:
         raise HTTPException(409, "The target CI belongs to another customer")
     _ncentral_mapped_company(payload.companyId, payload.providerCompanyId)
+    _require_provider_link_preflight(
+        "ncentral",
+        payload.companyId,
+        payload.providerCompanyId,
+        payload.externalId,
+    )
     item = REPOSITORY.get_ci_review_item_by_identity(
         "ncentral",
         payload.companyId,
@@ -6822,13 +10757,131 @@ def link_ncentral_device(payload: NcentralDeviceLinkRequest, request: Request) -
             409,
             "The reviewed N-central device is unavailable. Run preview again before linking.",
         )
-    with core.LOCK:
-        mapping = REPOSITORY.record_provider_ci_mapping(
-            "ncentral", payload.companyId, record, target["id"], user["id"]
+    item, policy, expected_connection_revision = _require_current_review_generation(
+        "ncentral",
+        payload.companyId,
+        payload.providerCompanyId,
+        item,
+    )
+    cached_assets, graphql_diagnostics = _ncentral_graphql_enrichment_context(
+        payload.companyId,
+        payload.providerCompanyId,
+        policy,
+        rest_device_count=1,
+        refresh_when_due=False,
+    )
+    graphql_server_id = str(_ncentral_graphql_connection_public().get("graphqlServerId") or "")
+    graphql_evidence_status = _ncentral_reviewed_graphql_evidence_status(
+        record,
+        cached_assets,
+        server_id=graphql_server_id,
+        organization_ids=set(policy.get("graphqlOrganizationIds") or []),
+    )
+    if graphql_evidence_status == "unverified":
+        raise HTTPException(
+            409,
+            (
+                "The reviewed device contains GraphQL enrichment that is no longer "
+                "validated by the current published cache. Run preview again before linking."
+            ),
         )
-        policy_id = str(item.get("policyId") or "")
-        if policy_id:
-            REPOSITORY.resolve_ci_review_items(policy_id, [payload.externalId], user["id"])
+    if cached_assets and graphql_server_id and graphql_evidence_status == "absent":
+        record = merge_graphql_enrichment(
+            [record],
+            cached_assets,
+            server_id=graphql_server_id,
+        )[0]
+    change_plan = provider_change_plan(
+        record,
+        target,
+        provider="ncentral",
+        field_authority=REPOSITORY.list_field_authority(payload.companyId),
+    )
+    enrichment_warnings: list[str] = []
+    inventory_collections = 0
+    relationship_candidate_count = 0
+    policy_id = str(item.get("policyId") or "")
+    with core.LOCK:
+        _require_provider_link_preflight(
+            "ncentral",
+            payload.companyId,
+            payload.providerCompanyId,
+            payload.externalId,
+        )
+        canonical_changes = change_plan.get("changes") or {}
+        try:
+            applied = REPOSITORY.apply_reviewed_provider_ci_import(
+                "ncentral",
+                payload.companyId,
+                record,
+                "link",
+                asset_id=target["id"],
+                changes=canonical_changes,
+                actor_id=user["id"],
+                provider_parent_id=payload.providerCompanyId,
+                policy_id=policy_id or None,
+                expected_policy_revision=int(policy.get("revision") or 0),
+                expected_connection_revision=expected_connection_revision,
+                review_item_id=str(item["id"]),
+                review_content_hash=str(item["contentHash"]),
+            )
+        except ValueError as error:
+            raise HTTPException(
+                409,
+                "The provider identity mapping changed during review. Refresh the queue and "
+                "review Missing devices before linking.",
+            ) from error
+        mapping = applied["mapping"]
+        collections = technical_inventory_collections(record)
+        if collections:
+            try:
+                REPOSITORY.replace_ci_inventory(
+                    "ncentral",
+                    payload.companyId,
+                    target["id"],
+                    mapping["id"],
+                    collections,
+                    observed_at=_provider_last_seen(record),
+                )
+                inventory_collections = len(collections)
+            except (TypeError, ValueError):
+                LOGGER.exception("Could not persist linked N-central technical inventory")
+                enrichment_warnings.append(
+                    "The identity was linked, but technical inventory requires another sync."
+                )
+        relationship_context_current, relationship_skip_message = (
+            _ncentral_relationship_context_status(
+                payload.companyId,
+                payload.providerCompanyId,
+                policy,
+                expected_connection_revision,
+            )
+        )
+        if relationship_context_current:
+            relationship_summary = _observe_ncentral_relationships(
+                payload.companyId,
+                [record],
+                policy,
+                user["id"],
+                before_persist=lambda: _require_ncentral_relationship_context(
+                    payload.companyId,
+                    payload.providerCompanyId,
+                    policy,
+                    expected_connection_revision,
+                ),
+                provider_company_id=payload.providerCompanyId,
+                expected_connection_revision=expected_connection_revision,
+            )
+        else:
+            relationship_summary = _ncentral_relationship_summary(
+                skipped_stale_policy=True,
+                message=relationship_skip_message,
+            )
+        relationship_candidate_count = relationship_summary["observed"]
+        if relationship_summary["errors"]:
+            enrichment_warnings.append(
+                "The identity was linked, but relationship evidence requires another sync."
+            )
     return {
         "linked": True,
         "externalId": payload.externalId,
@@ -6836,9 +10889,19 @@ def link_ncentral_device(payload: NcentralDeviceLinkRequest, request: Request) -
         "assetName": target["name"],
         "mapping": mapping,
         "reviewItemId": item["id"],
+        "inventoryCollections": inventory_collections,
+        "updatedFields": list(change_plan.get("appliedFields") or []),
+        "blockedFields": list(change_plan.get("blockedFields") or []),
+        "graphqlEnrichment": graphql_diagnostics,
+        "relationshipCandidates": relationship_candidate_count,
+        "relationshipAutoApproved": relationship_summary["autoApproved"],
+        "relationshipReviewRequired": relationship_summary["reviewRequired"],
+        "relationshipSummary": relationship_summary,
+        "warnings": enrichment_warnings,
         "message": (
             f"{item['externalName']} was linked to {target['name']} by immutable N-central "
-            "device ID. No provider request or provider write was made."
+            "device ID and its available technical inventory was retained. "
+            "No provider request or provider write was made."
         ),
     }
 
@@ -7123,18 +11186,21 @@ def _connectwise_configuration_context(
     provider_company_id: str,
     *,
     lease_heartbeat: Callable[[], None] | None = None,
-) -> tuple[dict, list[dict], str, dict]:
+) -> tuple[dict, list[dict], str, dict, int]:
     """Validate a company mapping and read its sanitized provider configurations."""
 
     mapped = _connectwise_mapped_company(company_id, provider_company_id)
     configuration, source = _connectwise_effective_configuration()
     if lease_heartbeat:
         lease_heartbeat()
+    connection_revision = int(
+        (REPOSITORY.get_integration_connection("connectwise") or {}).get("revision") or 0
+    )
     records = _connectwise_client(configuration).discover_configurations(provider_company_id)
     if lease_heartbeat:
         lease_heartbeat()
     policy = REPOSITORY.get_ci_sync_policy("connectwise", company_id, provider_company_id)
-    return mapped, records, source, policy
+    return mapped, records, source, policy, connection_revision
 
 
 def _connectwise_configuration_preview(
@@ -7145,7 +11211,7 @@ def _connectwise_configuration_preview(
 ) -> dict[str, Any]:
     """Read, filter and classify CIs for one explicit customer mapping."""
 
-    mapped, records, source, policy = _connectwise_configuration_context(
+    mapped, records, source, policy, connection_revision = _connectwise_configuration_context(
         company_id,
         provider_company_id,
         lease_heartbeat=lease_heartbeat,
@@ -7185,6 +11251,7 @@ def _connectwise_configuration_preview(
         "availableStatuses": catalogue["statuses"],
         "typeMappingSummary": type_mapping_summary,
         "appliedPolicy": policy,
+        "connectionRevision": connection_revision,
         "counts": counts,
         "items": items,
     }
@@ -7248,6 +11315,7 @@ def _execute_connectwise_ci_preview(
             "providerCompanyId": provider_company_id,
             "policyId": policy_id,
             "policyRevision": preview["appliedPolicy"].get("revision", 0),
+            "connectionRevision": int(preview.get("connectionRevision") or 0),
             "included": preview["included"],
             "excluded": preview["excluded"],
             "readOnly": True,
@@ -7365,10 +11433,21 @@ def _record_connectwise_ci_preview_failure(
     return stored_run
 
 
-def _queued_ncentral_preview_message(preview: dict[str, Any]) -> str:
+def _queued_ncentral_preview_message(
+    preview: dict[str, Any], relationship_summary: dict[str, Any]
+) -> str:
     """Describe a completed read-only preview using aggregate evidence only."""
 
     counts = preview["counts"]
+    relationship_detail = (
+        str(relationship_summary.get("message") or "") + " "
+        if relationship_summary.get("skippedStalePolicy")
+        else (
+            f"Refreshed {relationship_summary['observed']} relationship evidence item(s) and "
+            f"automatically approved {relationship_summary['autoApproved']} under the saved "
+            "policy. "
+        )
+    )
     return (
         f"Read {preview['discovered']} N-central devices for "
         f"{preview['providerCompanyName']}; the saved policy included "
@@ -7376,7 +11455,8 @@ def _queued_ncentral_preview_message(preview: dict[str, Any]) -> str:
         f"{counts['create']} new, {counts['update']} changed, "
         f"{counts['link']} identity links, {counts['unchanged']} unchanged and "
         f"{counts['conflict']} requiring review. "
-        "No CMDB or N-central records were changed."
+        + relationship_detail
+        + "No devices were imported and N-central was not changed."
     )
 
 
@@ -7392,10 +11472,10 @@ def _execute_queued_ncentral_preview(run: dict[str, Any], worker_id: str) -> Non
     cancel_checked_at = 0.0
     cached_cancelled = False
 
-    def cancel_requested() -> bool:
+    def cancel_requested(*, force: bool = False) -> bool:
         nonlocal cancel_checked_at, cached_cancelled
         now = time.monotonic()
-        if now - cancel_checked_at >= 0.35:
+        if force or now - cancel_checked_at >= 0.35:
             with core.LOCK:
                 cached_cancelled = REPOSITORY.is_sync_run_cancel_requested(
                     run_id,
@@ -7459,22 +11539,102 @@ def _execute_queued_ncentral_preview(run: dict[str, Any], worker_id: str) -> Non
             run.get("policySnapshot") if isinstance(run.get("policySnapshot"), dict) else None
         ),
     )
-    if cancel_requested():
+    presence_snapshot = preview.pop("_presenceSnapshot", None)
+    expected_connection_revision = int(
+        (presence_snapshot or {}).get("connectionRevision")
+        or (preview.get("presenceSummary") or {}).get("connectionRevision")
+        or 0
+    )
+    if cancel_requested(force=True):
         raise NcentralOperationCancelled("N-central preview was cancelled")
-    message = _queued_ncentral_preview_message(preview)
+    publish_progress(
+        {
+            "phase": "persisting",
+            "current": preview["discovered"],
+            "total": preview["discovered"],
+            "discovered": preview["discovered"],
+            "reviewed": sum(
+                preview["counts"].get(action, 0)
+                for action in ("create", "update", "link", "conflict")
+            ),
+        },
+        force=True,
+    )
     with core.LOCK:
+
+        def require_preview_persistence_permission() -> None:
+            """Reject preview writes after cancellation or lease loss."""
+
+            if REPOSITORY.is_sync_run_cancel_requested(run_id, worker_id):
+                raise NcentralOperationCancelled("N-central preview was cancelled")
+            renewed = REPOSITORY.renew_ci_preview_run(
+                run_id,
+                worker_id,
+                {
+                    "phase": "persisting",
+                    "current": preview["discovered"],
+                    "total": preview["discovered"],
+                    "discovered": preview["discovered"],
+                },
+                "Publishing reviewable N-central observations.",
+            )
+            if not renewed:
+                raise _IntegrationPreviewLeaseLost("Preview lease is no longer owned")
+
+        def require_relationship_persistence_permission() -> None:
+            """Revalidate topology authority immediately before each mutation."""
+
+            _require_ncentral_relationship_context(
+                company_id,
+                provider_company_id,
+                preview["appliedPolicy"],
+                expected_connection_revision,
+            )
+            require_preview_persistence_permission()
+
+        relationship_context_current, relationship_skip_message = (
+            _ncentral_relationship_context_status(
+                company_id,
+                provider_company_id,
+                preview["appliedPolicy"],
+                expected_connection_revision,
+            )
+        )
+        if relationship_context_current:
+            relationship_summary = _observe_ncentral_relationships(
+                company_id,
+                [
+                    item["record"]
+                    for item in preview["items"]
+                    if isinstance(item.get("record"), dict)
+                ],
+                preview["appliedPolicy"],
+                actor_id,
+                before_persist=require_relationship_persistence_permission,
+                provider_company_id=provider_company_id,
+                expected_connection_revision=expected_connection_revision,
+            )
+        else:
+            relationship_summary = _ncentral_relationship_summary(
+                skipped_stale_policy=True,
+                message=relationship_skip_message,
+            )
+        require_preview_persistence_permission()
+        message = _queued_ncentral_preview_message(preview, relationship_summary)
         summary = {
             key: deepcopy(value)
             for key, value in preview.items()
             if key not in {"items", "credentialSource"}
         }
         summary["message"] = message
+        summary["relationshipSummary"] = relationship_summary
         completed = REPOSITORY.publish_and_complete_ci_preview_run(
             run_id,
             worker_id,
             preview["items"],
             summary,
             actor_id,
+            presence_snapshot=presence_snapshot,
         )
         if not completed:
             raise _IntegrationPreviewLeaseLost("Preview lease expired before completion")
@@ -7676,7 +11836,7 @@ def get_connectwise_ci_options(
     _require_role(user, {"platform_admin", "msp_operator"}, "MSP access required")
     _company_for_user(payload.companyId, user)
     try:
-        mapped, records, source, policy = _connectwise_configuration_context(
+        mapped, records, source, policy, _connection_revision = _connectwise_configuration_context(
             payload.companyId, payload.providerCompanyId
         )
     except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
@@ -7975,11 +12135,41 @@ def import_connectwise_configurations(
         stored["fieldSources"] = field_sources
         return stored
 
+    policy_id = str(preview["appliedPolicy"].get("id") or "")
+    expected_policy_revision = int(preview["appliedPolicy"].get("revision") or 0)
+    expected_connection_revision = int(preview.get("connectionRevision") or 0)
     with core.LOCK:
-        for external_id in selected_ids:
+        importable_ids, skipped_items = _provider_import_preflight(
+            "connectwise",
+            payload.companyId,
+            payload.providerCompanyId,
+            items_by_id,
+            selected_ids,
+        )
+        imported_ids: set[str] = set()
+        for external_id in importable_ids:
             item = items_by_id[external_id]
             record = item["record"]
+            review_item = REPOSITORY.get_ci_review_item_by_identity(
+                "connectwise",
+                payload.companyId,
+                payload.providerCompanyId,
+                external_id,
+                "pending",
+            )
+            guarded_review = bool(
+                review_item
+                and review_item.get("policyId") == policy_id
+                and review_item.get("id")
+                and review_item.get("contentHash")
+            )
+            review_item_id = str((review_item or {}).get("id") or "") if guarded_review else None
+            review_content_hash = (
+                str((review_item or {}).get("contentHash") or "") if guarded_review else None
+            )
             asset_id = item.get("assetId")
+            asset: dict | None = None
+            changes: dict | None = None
             if item["action"] == "create":
                 asset = {
                     "id": str(uuid.uuid4()),
@@ -7996,8 +12186,6 @@ def import_connectwise_configurations(
                         item.get("appliedFields") or item.get("changedFields") or [],
                     ),
                 }
-                asset_id = REPOSITORY.create_asset(asset, user["id"])["id"]
-                created += 1
             elif item["action"] == "update":
                 changes = {
                     **item["changes"],
@@ -8018,26 +12206,68 @@ def import_connectwise_configurations(
                     changes.get("metadata") or current_metadata,
                     item.get("appliedFields") or item.get("changedFields") or [],
                 )
-                if not asset_id or not REPOSITORY.update_asset(asset_id, changes, user["id"]):
-                    raise HTTPException(409, "A selected configuration item changed during import")
+            try:
+                REPOSITORY.apply_reviewed_provider_ci_import(
+                    "connectwise",
+                    payload.companyId,
+                    record,
+                    item["action"],
+                    asset_id=asset_id,
+                    asset=asset,
+                    changes=changes,
+                    actor_id=user["id"],
+                    provider_parent_id=payload.providerCompanyId,
+                    policy_id=policy_id or None,
+                    expected_policy_revision=expected_policy_revision,
+                    expected_connection_revision=expected_connection_revision,
+                    review_item_id=review_item_id,
+                    review_content_hash=review_content_hash,
+                )
+            except ValueError as error:
+                _still_allowed, raced_skips = _provider_import_preflight(
+                    "connectwise",
+                    payload.companyId,
+                    payload.providerCompanyId,
+                    items_by_id,
+                    {external_id},
+                )
+                if raced_skips:
+                    skipped_items.extend(raced_skips)
+                    continue
+                raise HTTPException(
+                    409,
+                    "A selected ConnectWise configuration or mapping changed during import. "
+                    "Refresh the review queue before retrying.",
+                ) from error
+            imported_ids.add(external_id)
+            if item["action"] == "create":
+                created += 1
+            elif item["action"] == "update":
                 updated += 1
             else:
                 linked += 1
-            if not asset_id:
-                raise HTTPException(409, "A selected configuration item has no canonical target")
-            REPOSITORY.record_provider_ci_mapping(
-                "connectwise", payload.companyId, record, asset_id, user["id"]
-            )
 
+        restore_required = [item for item in skipped_items if item["action"] == "restore_required"]
+        scope_conflicts = [
+            item
+            for item in skipped_items
+            if item["action"] in {"scope_conflict", "inactive_mapping"}
+        ]
         remaining_review = sum(
             item["action"] in {"create", "update", "link", "conflict"}
-            and item["externalId"] not in selected_ids
+            and item["externalId"] not in imported_ids
             for item in preview["items"]
         )
         message = (
             f"Imported {created} new, updated {updated} and linked {linked} ConnectWise "
             f"configuration items for {preview['companyName']}. {remaining_review} remain for review. "
-            "No data was written to ConnectWise."
+            + (
+                f"Skipped {len(skipped_items)} governed identity mapping(s); restore retired "
+                "sources from Missing devices and resolve source-scope conflicts before retrying. "
+                if skipped_items
+                else ""
+            )
+            + "No data was written to ConnectWise."
         )
         run = REPOSITORY.record_sync_run(
             "connectwise",
@@ -8058,15 +12288,24 @@ def import_connectwise_configurations(
                     "providerCompanyId": payload.providerCompanyId,
                     "writesProvider": False,
                     "decisionNotes": payload.decisionNotes.strip(),
+                    "skipped": len(skipped_items),
+                    "restoreRequired": len(restore_required),
+                    "scopeConflicts": len(scope_conflicts),
                 },
             },
             True,
             user["id"],
         )
-        policy_id = str(preview["appliedPolicy"].get("id") or "")
-        if policy_id:
-            REPOSITORY.resolve_ci_review_items(policy_id, sorted(selected_ids), user["id"])
-    return {**run, "created": created, "updated": updated, "linked": linked}
+    return {
+        **run,
+        "created": created,
+        "updated": updated,
+        "linked": linked,
+        "skipped": len(skipped_items),
+        "skippedItems": skipped_items,
+        "restoreRequired": restore_required,
+        "scopeConflicts": scope_conflicts,
+    }
 
 
 @api.post("/api/integrations/connectwise/configurations/link", tags=["integrations"])
@@ -8080,32 +12319,62 @@ def link_connectwise_configuration(
     target = _asset_for_user(payload.assetId, user, require_manage=True)
     if target["companyId"] != payload.companyId:
         raise HTTPException(409, "The target CI belongs to another customer")
-    try:
-        preview = _connectwise_configuration_preview(payload.companyId, payload.providerCompanyId)
-    except (ConnectWiseConfigurationError, ConnectWiseRequestError) as error:
-        raise HTTPException(
-            502, _connectwise_public_failure(error, "configuration link preview")
-        ) from error
-    item = next(
-        (row for row in preview["items"] if row["externalId"] == payload.externalId),
-        None,
+    _require_provider_link_preflight(
+        "connectwise",
+        payload.companyId,
+        payload.providerCompanyId,
+        payload.externalId,
     )
-    if not item:
+    item = REPOSITORY.get_ci_review_item_by_identity(
+        "connectwise",
+        payload.companyId,
+        payload.providerCompanyId,
+        payload.externalId,
+        "pending",
+    )
+    record = item.get("providerRecord") if item else None
+    if not item or not isinstance(record, dict) or record.get("externalId") != payload.externalId:
         raise HTTPException(
             409,
-            "The provider CI is no longer included by the saved policy; refresh the preview",
+            "The reviewed ConnectWise configuration is unavailable. Run preview again before "
+            "linking.",
         )
+    item, policy, _connection_revision = _require_current_review_generation(
+        "connectwise",
+        payload.companyId,
+        payload.providerCompanyId,
+        item,
+    )
+    policy_id = str(policy.get("id") or "")
     with core.LOCK:
-        mapping = REPOSITORY.record_provider_ci_mapping(
+        _require_provider_link_preflight(
             "connectwise",
             payload.companyId,
-            item["record"],
-            target["id"],
-            user["id"],
+            payload.providerCompanyId,
+            payload.externalId,
         )
-        policy_id = str(preview["appliedPolicy"].get("id") or "")
-        if policy_id:
-            REPOSITORY.resolve_ci_review_items(policy_id, [payload.externalId], user["id"])
+        try:
+            applied = REPOSITORY.apply_reviewed_provider_ci_import(
+                "connectwise",
+                payload.companyId,
+                record,
+                "link",
+                asset_id=target["id"],
+                actor_id=user["id"],
+                provider_parent_id=payload.providerCompanyId,
+                policy_id=policy_id or None,
+                expected_policy_revision=int(policy.get("revision") or 0),
+                expected_connection_revision=_connection_revision,
+                review_item_id=str(item["id"]),
+                review_content_hash=str(item["contentHash"]),
+            )
+        except ValueError as error:
+            raise HTTPException(
+                409,
+                "The provider identity mapping changed during review. Refresh the queue and "
+                "review Missing devices before linking.",
+            ) from error
+        mapping = applied["mapping"]
     return {
         "linked": True,
         "externalId": payload.externalId,
@@ -8113,7 +12382,7 @@ def link_connectwise_configuration(
         "assetName": target["name"],
         "mapping": mapping,
         "message": (
-            f"Linked ConnectWise configuration {item['name']} to {target['name']} using its "
+            f"Linked ConnectWise configuration {item['externalName']} to {target['name']} using its "
             "immutable provider ID. No data was written to ConnectWise."
         ),
     }

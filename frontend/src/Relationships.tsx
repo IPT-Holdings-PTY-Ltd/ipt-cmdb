@@ -11,12 +11,13 @@ import LockOpenOutlined from '@mui/icons-material/LockOpenOutlined';
 import LockOutlined from '@mui/icons-material/LockOutlined';
 import PersonOutlined from '@mui/icons-material/PersonOutlined';
 import PostAddOutlined from '@mui/icons-material/PostAddOutlined';
+import RateReviewOutlined from '@mui/icons-material/RateReviewOutlined';
 import RouterOutlined from '@mui/icons-material/RouterOutlined';
 import SearchOutlined from '@mui/icons-material/SearchOutlined';
 import StorageOutlined from '@mui/icons-material/StorageOutlined';
 import BusinessCenterOutlined from '@mui/icons-material/BusinessCenterOutlined';
 import {
-  Alert, Autocomplete, Box, Button, Chip, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, Divider,
+  Alert, Autocomplete, Badge, Box, Button, Chip, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, Divider,
   FormControl, FormControlLabel, IconButton, InputAdornment, InputLabel, MenuItem, Paper, Select, Stack, Switch, TextField, Tooltip, Typography,
 } from '@mui/material';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -27,6 +28,14 @@ import {
 import '@xyflow/react/dist/style.css';
 import { useNavigate, useSearchParams } from 'react-router';
 import { createRelationshipSearchParams, readRelationshipRouteState } from './routeState';
+import {
+  candidateFreshness,
+  confidencePercent,
+  providerLabel,
+  RelationshipCandidateReviewDialog,
+  type RelationshipCandidate,
+  type RelationshipCandidateDecision,
+} from './RelationshipCandidateReview';
 import { apiFetch, getSession } from './session';
 import { Title } from './ui';
 import { displayLayer, displayLayerLabels, displayLayerOrder, traverseImpact as traverse, type DisplayLayer } from './topology';
@@ -212,6 +221,42 @@ function makeEdges(relationships: Relationship[]): Edge[] {
   });
 }
 
+export function makeSuggestedEdges(candidates: RelationshipCandidate[]): Edge[] {
+  return candidates.flatMap(candidate => {
+    if (!candidate.fromCiId || !candidate.toCiId) return [];
+    const type = relationshipType(candidate.relationshipType);
+    const config = relationshipTypes[type];
+    const source = config.reverseForImpact ? candidate.toCiId : candidate.fromCiId;
+    const target = config.reverseForImpact ? candidate.fromCiId : candidate.toCiId;
+    const color = '#f6b94d';
+    return [{
+      id: `suggestion:${candidate.id}`,
+      source,
+      target,
+      label: `Suggested · ${confidencePercent(candidate.confidence)}%`,
+      type: 'smoothstep',
+      selectable: true,
+      data: {
+        candidate,
+        candidateId: candidate.id,
+        relationshipType: type,
+        proposed: true,
+      },
+      style: {
+        stroke: color,
+        strokeWidth: 2,
+        strokeDasharray: '7 6',
+        opacity: 0.58,
+      },
+      labelStyle: { fill: '#f8d28b', fontSize: 10, fontWeight: 800 },
+      labelBgStyle: { fill: '#21180b', fillOpacity: 0.9 },
+      markerEnd: config.directed
+        ? { type: MarkerType.ArrowClosed, color, width: 15, height: 15 }
+        : undefined,
+    } satisfies Edge];
+  });
+}
+
 function layoutStorageKey(companyId: string, view: TopologyView) {
   return `cmdb.relationship.positions.${companyId}.${view.toLowerCase()}`;
 }
@@ -323,6 +368,7 @@ export function Relationships() {
   const requestedTopologyView = perspectiveFromQuery(routeState.view);
   const role = getSession()?.user.role;
   const canEdit = !workspace.isRoot && ['platform_admin', 'msp_operator'].includes(role || '');
+  const canReviewSuggestions = ['platform_admin', 'msp_operator'].includes(role || '');
   const workspaceKey = workspace.isRoot ? '__root__' : workspace.companyId;
   const [assets, setAssets] = useState<Asset[]>([]);
   const [relationships, setRelationships] = useState<Relationship[]>([]);
@@ -349,6 +395,12 @@ export function Relationships() {
   const [pendingImpactPolicy, setPendingImpactPolicy] = useState<ImpactPolicy>('required');
   const [savingRelationship, setSavingRelationship] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [relationshipCandidates, setRelationshipCandidates] = useState<RelationshipCandidate[]>([]);
+  const [candidateLoading, setCandidateLoading] = useState(false);
+  const [candidateError, setCandidateError] = useState('');
+  const [candidateReviewOpen, setCandidateReviewOpen] = useState(false);
+  const [showRelationshipSuggestions, setShowRelationshipSuggestions] = useState(false);
+  const [selectedCandidateId, setSelectedCandidateId] = useState('');
   const syncRelationshipQuery = useCallback((
     view: TopologyView,
     businessAppId: string,
@@ -363,6 +415,70 @@ export function Relationships() {
     relationshipsRef.current = records;
     setRelationships(records); setEdges(makeEdges(records));
   }, [workspace.companyId, workspace.isRoot, setEdges]);
+
+  const reloadRelationshipCandidates = useCallback(async () => {
+    if (!workspace.isRoot && !workspace.companyId) {
+      setRelationshipCandidates([]);
+      setCandidateError('');
+      return;
+    }
+    // Clear the previous tenant's evidence before beginning a scoped request.
+    setRelationshipCandidates([]);
+    setCandidateLoading(true);
+    setCandidateError('');
+    try {
+      const parameters = new URLSearchParams({
+        state: 'pending',
+        limit: '1000',
+      });
+      if (!workspace.isRoot) parameters.set('companyId', workspace.companyId);
+      const records = await apiFetch<RelationshipCandidate[]>(
+        `/api/relationship-candidates?${parameters.toString()}`,
+      );
+      setRelationshipCandidates(records);
+      setSelectedCandidateId(current => records.some(item => item.id === current) ? current : '');
+    } catch (value) {
+      setCandidateError(
+        value instanceof Error ? value.message : 'Relationship suggestions could not be loaded.',
+      );
+    } finally {
+      setCandidateLoading(false);
+    }
+  }, [workspace.companyId, workspace.isRoot]);
+
+  const decideRelationshipCandidate = async (
+    candidate: RelationshipCandidate,
+    decision: RelationshipCandidateDecision,
+    notes: string,
+  ) => {
+    await apiFetch(`/api/relationship-candidates/${encodeURIComponent(candidate.id)}/decision`, {
+      method: 'POST',
+      body: JSON.stringify({
+        decision,
+        notes,
+        expectedRevision: candidate.revision || 1,
+      }),
+    });
+    await reloadRelationshipCandidates();
+    if (decision === 'approve') {
+      try {
+        await reloadRelationships();
+      } catch (value) {
+        setError(
+          value instanceof Error
+            ? value.message
+            : 'The suggestion was approved, but the topology could not be refreshed.',
+        );
+      }
+    }
+  };
+
+  useEffect(() => {
+    setCandidateReviewOpen(false);
+    setShowRelationshipSuggestions(false);
+    setSelectedCandidateId('');
+    void reloadRelationshipCandidates();
+  }, [reloadRelationshipCandidates]);
 
   // Remote topology data changes with the workspace, not with the selected
   // perspective or layout direction.
@@ -419,6 +535,11 @@ export function Relationships() {
   const assetById = useMemo(() => new Map(assets.map(asset => [asset.id, asset])), [assets]);
   const selectedAsset = assetById.get(selectedAssetId);
   const selectedRelationship = relationships.find(item => item.id === selectedRelationshipId);
+  const selectedCandidate = relationshipCandidates.find(item => item.id === selectedCandidateId);
+  const suggestionEdges = useMemo(
+    () => makeSuggestedEdges(relationshipCandidates),
+    [relationshipCandidates],
+  );
   const downstream = useMemo(() => selectedAssetId ? traverse(selectedAssetId, relationships) : new Set<string>(), [selectedAssetId, relationships]);
   const upstream = useMemo(() => selectedAssetId ? traverse(selectedAssetId, relationships, true) : new Set<string>(), [selectedAssetId, relationships]);
   const relatedIds = useMemo(() => new Set([selectedAssetId, ...upstream, ...downstream].filter(Boolean)), [selectedAssetId, upstream, downstream]);
@@ -518,6 +639,7 @@ export function Relationships() {
     setFocusedBusinessSystemId(routeState.businessAppId);
     setShowSharedImpact(routeState.showSharedImpact);
     setSelectedRelationshipId('');
+    setSelectedCandidateId('');
   }, [requestedTopologyView, routeState.businessAppId, routeState.showSharedImpact]);
   useEffect(() => {
     if (!loading && focusedBusinessSystemId && !focusedBusinessSystem) {
@@ -533,17 +655,17 @@ export function Relationships() {
     const layoutAssets = focusedBusinessSystem ? assets.filter(asset => businessScopeIds.has(asset.id)) : assets;
     const defaults = perspectiveDefaultPositions(layoutAssets, view);
     setNodes(current => current.map(node => ({ ...node, position: stored[node.id] || defaults[node.id] || node.position })));
-    setTopologyView(view); setSelectedAssetId(''); setSelectedRelationshipId('');
+    setTopologyView(view); setSelectedAssetId(''); setSelectedRelationshipId(''); setSelectedCandidateId('');
     syncRelationshipQuery(view, focusedBusinessSystemId, showSharedImpact);
     window.setTimeout(() => void flow?.fitView({ padding: view === 'STACK' ? 0.12 : 0.22, duration: 350 }), 30);
   };
   const changeBusinessApplication = (businessAppId: string) => {
-    setFocusedBusinessSystemId(businessAppId); setShowSharedImpact(false); setSelectedAssetId(''); setSelectedRelationshipId('');
+    setFocusedBusinessSystemId(businessAppId); setShowSharedImpact(false); setSelectedAssetId(''); setSelectedRelationshipId(''); setSelectedCandidateId('');
     syncRelationshipQuery(topologyView, businessAppId, false);
     window.setTimeout(() => void flow?.fitView({ padding: topologyView === 'STACK' ? 0.12 : 0.22, duration: 350 }), 30);
   };
   const changeSharedImpact = (enabled: boolean) => {
-    setShowSharedImpact(enabled); setSelectedAssetId(''); setSelectedRelationshipId('');
+    setShowSharedImpact(enabled); setSelectedAssetId(''); setSelectedRelationshipId(''); setSelectedCandidateId('');
     syncRelationshipQuery(topologyView, focusedBusinessSystemId, enabled);
     window.setTimeout(() => void flow?.fitView({ padding: topologyView === 'STACK' ? 0.12 : 0.22, duration: 350 }), 30);
   };
@@ -553,7 +675,7 @@ export function Relationships() {
       syncRelationshipQuery(topologyView, node.id, false);
       window.setTimeout(() => void flow?.fitView({ padding: topologyView === 'STACK' ? 0.12 : 0.22, duration: 350 }), 30);
     }
-    setSelectedAssetId(node.id); setSelectedRelationshipId('');
+    setSelectedAssetId(node.id); setSelectedRelationshipId(''); setSelectedCandidateId('');
   };
 
   const shownNodes = useMemo(() => {
@@ -572,11 +694,25 @@ export function Relationships() {
     });
   }, [nodes, search, selectedAssetId, upstream, downstream, relatedIds, canEdit, connecting, topologyView, perspectiveVisibleIds, clusterMemberships, expandedClusters, sharedBusinessAppCounts]);
 
-  const shownEdges = useMemo(() => edges.filter(edge => visibleTypes.has(relationshipType(String(edge.data?.relationshipType || 'related_to'))) && perspectiveVisibleIds.has(edge.source) && perspectiveVisibleIds.has(edge.target) && (topologyView !== 'VIRTUALIZATION' || ((!clusterMemberships.get(edge.source) || expandedClusters.has(clusterMemberships.get(edge.source)!)) && (!clusterMemberships.get(edge.target) || expandedClusters.has(clusterMemberships.get(edge.target)!))))).map(edge => {
-    const inImpact = !selectedAssetId || (relatedIds.has(edge.source) && relatedIds.has(edge.target));
-    const selected = edge.id === selectedRelationshipId;
-    return { ...edge, label: topologyView === 'STACK' ? undefined : edge.label, animated: selected, style: { ...edge.style, opacity: inImpact ? 0.95 : 0.13, strokeWidth: selected ? 4 : 2 } };
-  }), [edges, visibleTypes, selectedAssetId, selectedRelationshipId, relatedIds, topologyView, perspectiveVisibleIds, clusterMemberships, expandedClusters]);
+  const edgeVisibleInPerspective = useCallback((edge: Edge) => visibleTypes.has(relationshipType(String(edge.data?.relationshipType || 'related_to'))) && perspectiveVisibleIds.has(edge.source) && perspectiveVisibleIds.has(edge.target) && (topologyView !== 'VIRTUALIZATION' || ((!clusterMemberships.get(edge.source) || expandedClusters.has(clusterMemberships.get(edge.source)!)) && (!clusterMemberships.get(edge.target) || expandedClusters.has(clusterMemberships.get(edge.target)!)))), [visibleTypes, perspectiveVisibleIds, topologyView, clusterMemberships, expandedClusters]);
+  const shownEdges = useMemo(() => {
+    const canonicalEdges = edges.filter(edgeVisibleInPerspective).map(edge => {
+      const inImpact = !selectedAssetId || (relatedIds.has(edge.source) && relatedIds.has(edge.target));
+      const selected = edge.id === selectedRelationshipId;
+      return { ...edge, label: topologyView === 'STACK' ? undefined : edge.label, animated: selected, style: { ...edge.style, opacity: inImpact ? 0.95 : 0.13, strokeWidth: selected ? 4 : 2 } };
+    });
+    if (!showRelationshipSuggestions) return canonicalEdges;
+    const proposedEdges = suggestionEdges.filter(edgeVisibleInPerspective).map(edge => {
+      const selected = String(edge.data?.candidateId || '') === selectedCandidateId;
+      return {
+        ...edge,
+        label: topologyView === 'STACK' ? undefined : edge.label,
+        animated: selected,
+        style: { ...edge.style, opacity: selected ? 1 : 0.58, strokeWidth: selected ? 3.5 : 2 },
+      };
+    });
+    return [...canonicalEdges, ...proposedEdges];
+  }, [edges, edgeVisibleInPerspective, selectedAssetId, selectedRelationshipId, relatedIds, topologyView, showRelationshipSuggestions, suggestionEdges, selectedCandidateId]);
 
   const applyAutoLayout = useCallback(async () => {
     setLayoutBusy(true);
@@ -665,6 +801,20 @@ export function Relationships() {
     } catch (value) { setError(value instanceof Error ? value.message : 'The relationship could not be disconnected.'); }
   };
 
+  const focusRelationshipCandidate = (candidate: RelationshipCandidate) => {
+    const endpointIds = [candidate.fromCiId, candidate.toCiId].filter(Boolean) as string[];
+    if (endpointIds.some(id => !perspectiveVisibleIds.has(id))) changePerspective('TECHNICAL');
+    setShowRelationshipSuggestions(true);
+    setSelectedCandidateId(candidate.id);
+    setSelectedAssetId('');
+    setSelectedRelationshipId('');
+    setCandidateReviewOpen(false);
+    window.setTimeout(() => {
+      const endpointNodes = nodes.filter(node => endpointIds.includes(node.id));
+      if (endpointNodes.length) void flow?.fitView({ nodes: endpointNodes, padding: 0.75, duration: 350 });
+    }, 50);
+  };
+
   const pendingSource = pendingConnection?.source ? assetById.get(pendingConnection.source) : undefined;
   const pendingTarget = pendingConnection?.target ? assetById.get(pendingConnection.target) : undefined;
   const pendingSentence = pendingSource && pendingTarget
@@ -672,6 +822,13 @@ export function Relationships() {
       ? `${pendingTarget.name} ${relationshipTypes[pendingType].label} ${pendingSource.name}`
       : `${pendingSource.name} ${relationshipTypes[pendingType].label} ${pendingTarget.name}`
     : '';
+  const inspectorRelationshipType = relationshipType(
+    selectedCandidate?.relationshipType || selectedRelationship?.type || 'related_to',
+  );
+  const selectedRelationshipMessages = selectedRelationship?.evidence?.messages || [];
+  const selectedRelationshipProvider = selectedRelationship?.evidence?.provider
+    ? providerLabel(selectedRelationship.evidence.provider)
+    : selectedRelationship?.provenance === 'provider' ? 'Connected provider' : 'Manual';
 
   return (
     <Box>
@@ -705,6 +862,36 @@ export function Relationships() {
         <Button variant="outlined" startIcon={<FitScreenOutlined />} disabled={!nodes.length} onClick={() => void flow?.fitView({ padding: 0.22, duration: 300 })}>Fit</Button>
         <Button variant="outlined" startIcon={locked ? <LockOutlined /> : <LockOpenOutlined />} onClick={() => setLocked(value => !value)}>{locked ? 'Unlock' : 'Lock'}</Button>
         <Button color="inherit" onClick={() => void resetLayout()}>Reset layout</Button>
+        <FormControlLabel
+          control={(
+            <Switch
+              checked={showRelationshipSuggestions}
+              disabled={!relationshipCandidates.length}
+              onChange={event => {
+                setShowRelationshipSuggestions(event.target.checked);
+                if (!event.target.checked) setSelectedCandidateId('');
+              }}
+              slotProps={{ input: { 'aria-label': 'Show proposed relationships on map' } }}
+            />
+          )}
+          label="Show proposed"
+        />
+        <Badge
+          color="warning"
+          badgeContent={relationshipCandidates.length}
+          invisible={!relationshipCandidates.length}
+        >
+          <Button
+            size="small"
+            variant={relationshipCandidates.length ? 'contained' : 'outlined'}
+            color={candidateError ? 'error' : relationshipCandidates.length ? 'warning' : 'inherit'}
+            startIcon={candidateLoading ? <CircularProgress size={15} /> : <RateReviewOutlined />}
+            aria-label={`Review ${relationshipCandidates.length} pending relationship suggestion${relationshipCandidates.length === 1 ? '' : 's'}`}
+            onClick={() => setCandidateReviewOpen(true)}
+          >
+            Suggestions
+          </Button>
+        </Badge>
       </Paper>
 
       {focusedBusinessSystem && <Paper className="business-application-scope" variant="outlined">
@@ -758,8 +945,16 @@ export function Relationships() {
             color: "text.secondary",
             alignSelf: 'center',
             mr: 0.5
-          }}>Relationship lines</Typography>
+        }}>Relationship lines</Typography>
         {allRelationshipTypes.map(type => <Chip key={type} size="small" clickable variant={visibleTypes.has(type) ? 'filled' : 'outlined'} label={relationshipTypes[type].impactLabel} onClick={() => toggleRelationshipType(type)} sx={{ borderColor: relationshipTypes[type].color, color: visibleTypes.has(type) ? '#07131d' : relationshipTypes[type].color, bgcolor: visibleTypes.has(type) ? relationshipTypes[type].color : 'transparent' }} />)}
+        {showRelationshipSuggestions && (
+          <Chip
+            size="small"
+            variant="outlined"
+            label="Dashed amber · proposed only"
+            sx={{ ml: 0.5, borderColor: '#f6b94d', color: '#f8d28b', borderStyle: 'dashed' }}
+          />
+        )}
       </Stack>
 
       {loading ? <Box className="relationship-loading"><CircularProgress /><Typography>Arranging configuration items…</Typography></Box> : !assets.length ? <Alert severity="info">No configuration items are visible in this workspace.</Alert> : <Box className={`relationship-canvas view-${topologyView.toLowerCase()}`}>
@@ -774,8 +969,18 @@ export function Relationships() {
           onNodeDragStop={saveDragPosition}
           onNodeClick={(_event, node) => inspectNode(node)}
           onNodeDoubleClick={(_event, node) => { if (node.data.asset.type === 'Virtualization cluster') toggleCluster(node.id); }}
-          onEdgeClick={(_event, edge) => { setSelectedRelationshipId(edge.id); setSelectedAssetId(''); }}
-          onPaneClick={() => { setSelectedAssetId(''); setSelectedRelationshipId(''); }}
+          onEdgeClick={(_event, edge) => {
+            const candidateId = String(edge.data?.candidateId || '');
+            setSelectedAssetId('');
+            if (candidateId) {
+              setSelectedCandidateId(candidateId);
+              setSelectedRelationshipId('');
+            } else {
+              setSelectedRelationshipId(edge.id);
+              setSelectedCandidateId('');
+            }
+          }}
+          onPaneClick={() => { setSelectedAssetId(''); setSelectedRelationshipId(''); setSelectedCandidateId(''); }}
           onConnectStart={() => { if (canEdit) { setConnecting(true); setError(''); } }}
           onConnect={connection => { if (canEdit) { setError(''); setPendingConnection(connection); } }}
           onConnectEnd={finishConnection}
@@ -802,13 +1007,13 @@ export function Relationships() {
           }}><Typography variant="caption">{displayLayerLabels[layer]}</Typography><Chip size="small" label={focusedBusinessSystem ? (scopeLayerCounts.get(layer) || 0) : assets.filter(asset => displayLayer(asset) === layer).length} /></Stack>)}</Paper></Panel>}
           {!canEdit && <Panel position="bottom-left"><Chip size="small" icon={<LockOutlined />} label="Read-only relationships" /></Panel>}
           {canEdit && <Panel position="bottom-left"><Chip className="relationship-connect-help" size="small" label="Drag or click a connector dot, then choose another CI" /></Panel>}
-          {(selectedAsset || selectedRelationship) && <Panel position="top-right"><Paper className="relationship-inspector" elevation={8}>
+          {(selectedAsset || selectedRelationship || selectedCandidate) && <Panel position="top-right"><Paper className="relationship-inspector" elevation={8}>
             <Stack
               direction="row"
               sx={{
                 justifyContent: "space-between",
                 alignItems: "flex-start"
-              }}><Box><Typography variant="overline" color="primary">{selectedAsset ? 'Impact inspection' : 'Relationship'}</Typography><Typography variant="h6">{selectedAsset?.name || relationshipTypes[relationshipType(selectedRelationship!.type)].label}</Typography></Box><IconButton size="small" aria-label="Close inspector" onClick={() => { setSelectedAssetId(''); setSelectedRelationshipId(''); }}><CloseOutlined /></IconButton></Stack>
+              }}><Box><Typography variant="overline" color="primary">{selectedAsset ? 'Impact inspection' : selectedCandidate ? 'Proposed relationship' : 'Relationship'}</Typography><Typography variant="h6">{selectedAsset?.name || relationshipTypes[inspectorRelationshipType].label}</Typography></Box><IconButton size="small" aria-label="Close inspector" onClick={() => { setSelectedAssetId(''); setSelectedRelationshipId(''); setSelectedCandidateId(''); }}><CloseOutlined /></IconButton></Stack>
             {selectedAsset && <><Typography variant="body2" sx={{
               color: "text.secondary"
             }}>{selectedAsset.type} · {selectedAsset.metadata?.criticality || 'medium'} criticality · {selectedAsset.metadata?.operationalStatus || 'unknown'}</Typography><Typography
@@ -829,11 +1034,94 @@ export function Relationships() {
             }}>{[...upstream].map(id => assetById.get(id)?.name || id).join(', ')}</Typography></Box>}{downstream.size > 0 && <Box sx={{ mt: 2 }}><Typography variant="subtitle2">Downstream impact</Typography><Typography variant="body2" sx={{
               color: "text.secondary"
             }}>{[...downstream].map(id => assetById.get(id)?.name || id).join(', ')}</Typography></Box>}<Divider sx={{ my: 2 }} /><Typography variant="subtitle2">Direct relationships</Typography><Stack spacing={1} sx={{ mt: 1 }}>{relationships.filter(item => item.fromId === selectedAsset.id || item.toId === selectedAsset.id).map(item => <Paper variant="outlined" key={item.id} sx={{ p: 1 }}><Typography variant="caption">{assetById.get(item.fromId)?.name || item.fromId} {relationshipTypes[relationshipType(item.type)].label} {assetById.get(item.toId)?.name || item.toId}</Typography><Chip size="small" sx={{ ml: 1 }} label={item.impactPolicy || 'required'} />{canEdit && <Button color="error" size="small" startIcon={<DeleteOutlined />} onClick={() => void disconnectRelationship(item)}>Disconnect</Button>}</Paper>)}</Stack></>}
-            {selectedRelationship && <><Typography
-              sx={{
-                color: "text.secondary",
-                mt: 1
-              }}>{assetById.get(selectedRelationship.fromId)?.name || selectedRelationship.fromId} {relationshipTypes[relationshipType(selectedRelationship.type)].label} {assetById.get(selectedRelationship.toId)?.name || selectedRelationship.toId}</Typography><Chip size="small" sx={{ mt: 1 }} label={`${selectedRelationship.impactPolicy || 'required'} impact`} /><Typography variant="body2" sx={{ mt: 2 }}>{relationshipTypes[relationshipType(selectedRelationship.type)].description}</Typography>{canEdit && <Button fullWidth color="error" variant="outlined" sx={{ mt: 2 }} startIcon={<DeleteOutlined />} onClick={() => void disconnectRelationship(selectedRelationship)}>Disconnect relationship</Button>}</>}
+            {selectedRelationship && <>
+              <Typography sx={{ color: 'text.secondary', mt: 1 }}>
+                {assetById.get(selectedRelationship.fromId)?.name || selectedRelationship.fromId}{' '}
+                {relationshipTypes[relationshipType(selectedRelationship.type)].label}{' '}
+                {assetById.get(selectedRelationship.toId)?.name || selectedRelationship.toId}
+              </Typography>
+              <Stack direction="row" spacing={0.75} useFlexGap sx={{ mt: 1, flexWrap: 'wrap' }}>
+                <Chip size="small" label={`${selectedRelationship.impactPolicy || 'required'} impact`} />
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  color={selectedRelationship.provenance === 'provider' ? 'info' : 'default'}
+                  label={selectedRelationshipProvider}
+                />
+                {selectedRelationship.confidence !== undefined && (
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`${confidencePercent(selectedRelationship.confidence)}% evidence confidence`}
+                  />
+                )}
+              </Stack>
+              <Typography variant="body2" sx={{ mt: 2 }}>
+                {relationshipTypes[relationshipType(selectedRelationship.type)].description}
+              </Typography>
+              {selectedRelationshipMessages.length > 0 && <Box sx={{ mt: 2 }}>
+                <Typography variant="subtitle2">Provider evidence</Typography>
+                <Box component="ul" sx={{ mt: 0.75, mb: 0, pl: 2.25 }}>
+                  {selectedRelationshipMessages.map((message, index) => (
+                    <Typography component="li" variant="caption" key={`${selectedRelationship.id}-evidence-${index}`}>
+                      {message}
+                    </Typography>
+                  ))}
+                </Box>
+                {(selectedRelationship.evidence?.observedAt || selectedRelationship.evidence?.freshness) && (
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+                    Last provider evidence: {candidateFreshness({
+                      id: selectedRelationship.id,
+                      companyId: '',
+                      provider: String(selectedRelationship.evidence?.provider || ''),
+                      fromName: '',
+                      toName: '',
+                      relationshipType: selectedRelationship.type,
+                      confidence: selectedRelationship.confidence || 0,
+                      state: 'approved',
+                      evidence: selectedRelationship.evidence,
+                    })}
+                  </Typography>
+                )}
+              </Box>}
+              {canEdit && <Button fullWidth color="error" variant="outlined" sx={{ mt: 2 }} startIcon={<DeleteOutlined />} onClick={() => void disconnectRelationship(selectedRelationship)}>Disconnect relationship</Button>}
+            </>}
+            {selectedCandidate && <>
+              <Typography sx={{ color: 'text.secondary', mt: 1 }}>
+                {selectedCandidate.fromName || selectedCandidate.fromCiId}{' '}
+                {relationshipTypes[relationshipType(selectedCandidate.relationshipType)].label}{' '}
+                {selectedCandidate.toName || selectedCandidate.toCiId}
+              </Typography>
+              <Stack direction="row" spacing={0.75} useFlexGap sx={{ mt: 1, flexWrap: 'wrap' }}>
+                <Chip size="small" color="warning" label="Suggested only" />
+                <Chip size="small" variant="outlined" label={providerLabel(selectedCandidate.provider)} />
+                <Chip size="small" variant="outlined" label={`${confidencePercent(selectedCandidate.confidence)}% confidence`} />
+              </Stack>
+              {workspace.isRoot && <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+                Customer: {selectedCandidate.companyName || selectedCandidate.companyId}
+              </Typography>}
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+                Last observed: {candidateFreshness(selectedCandidate)}
+              </Typography>
+              <Box sx={{ mt: 2 }}>
+                <Typography variant="subtitle2">Provider evidence</Typography>
+                {selectedCandidate.evidence?.messages?.length ? (
+                  <Box component="ul" sx={{ mt: 0.75, mb: 0, pl: 2.25 }}>
+                    {selectedCandidate.evidence.messages.map((message, index) => (
+                      <Typography component="li" variant="caption" key={`${selectedCandidate.id}-evidence-${index}`}>
+                        {message}
+                      </Typography>
+                    ))}
+                  </Box>
+                ) : <Typography variant="caption" color="text.secondary">No supporting explanation supplied.</Typography>}
+              </Box>
+              <Alert severity="warning" icon={false} sx={{ mt: 2 }}>
+                This line is visual evidence only. It is excluded from layout and impact calculations until approved.
+              </Alert>
+              <Button fullWidth variant="contained" color="warning" sx={{ mt: 2 }} startIcon={<RateReviewOutlined />} onClick={() => setCandidateReviewOpen(true)}>
+                Review suggestion
+              </Button>
+            </>}
           </Paper></Panel>}
         </ReactFlow>
       </Box>}
@@ -847,6 +1135,18 @@ export function Relationships() {
           }}>The connection is drawn in outage-impact direction: from the supporting CI to the affected CI.</Typography><Stack spacing={2}><FormControl fullWidth><InputLabel>Relationship type</InputLabel><Select label="Relationship type" value={pendingType} onChange={event => setPendingType(event.target.value as RelationshipType)}>{allRelationshipTypes.map(type => <MenuItem key={type} value={type}>{relationshipTypes[type].label}</MenuItem>)}</Select></FormControl><FormControl fullWidth><InputLabel>Failure impact</InputLabel><Select label="Failure impact" value={pendingImpactPolicy} onChange={event => setPendingImpactPolicy(event.target.value as ImpactPolicy)}><MenuItem value="required">Required — dependent system is unavailable</MenuItem><MenuItem value="degraded">Degraded — reduced function or performance</MenuItem><MenuItem value="redundant">Redundant — alternate component should carry service</MenuItem><MenuItem value="informational">Informational — do not propagate outage impact</MenuItem></Select></FormControl></Stack>{pendingSentence && <Alert severity="info" sx={{ mt: 2 }}>{pendingSentence}</Alert>}</DialogContent>
         <DialogActions><Button onClick={() => setPendingConnection(null)}>Cancel</Button><Button variant="contained" disabled={savingRelationship} onClick={() => void createRelationship()}>{savingRelationship ? 'Saving…' : 'Create relationship'}</Button></DialogActions>
       </Dialog>
+      <RelationshipCandidateReviewDialog
+        open={candidateReviewOpen}
+        candidates={relationshipCandidates}
+        loading={candidateLoading}
+        error={candidateError}
+        canManage={canReviewSuggestions}
+        showCompany={workspace.isRoot}
+        onClose={() => setCandidateReviewOpen(false)}
+        onRefresh={reloadRelationshipCandidates}
+        onFocusCandidate={focusRelationshipCandidate}
+        onDecision={decideRelationshipCandidate}
+      />
     </Box>
   );
 }

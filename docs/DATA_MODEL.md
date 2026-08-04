@@ -15,7 +15,15 @@ Related tables provide:
 - `ci_source_observations`: time-stamped provider evidence and payload hashes;
 - `ci_field_authority`: source precedence for canonical fields;
 - `ci_relationships`: directed topology edges and impact policy;
+- `ci_inventory_snapshots`: bounded, content-addressed technical collection history;
+- `ci_network_interfaces`: current and retired provider-observed interfaces;
+- `ci_relationship_candidates`: review-only, provider-evidenced topology proposals;
 - `reconciliation_candidates`: ambiguous identity decisions requiring review.
+
+Technical inventory is separate from the canonical CI attributes so large software,
+disk and interface collections do not make routine asset reads expensive. Each snapshot
+records the source mapping, fingerprint, item count, first/last observation time and
+supersession state. Provider timestamps cannot roll back a newer current snapshot.
 
 ## CI layers
 
@@ -61,6 +69,10 @@ A business system is a first-class CI that describes the service recognised by b
 | `licensed_to`, `used_by`, `related_to` | Association according to the recorded context |
 
 Dependency cycles and duplicate symmetric relationships are rejected by the API.
+Manual relationships default to `provenance=manual`. A provider-evidenced relationship
+retains its source mapping, confidence and bounded evidence, and can only be materialized
+from an explicitly approved candidate. Refreshing or retiring a candidate never deletes
+the canonical edge.
 
 ## Impact policies
 

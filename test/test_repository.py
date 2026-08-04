@@ -77,6 +77,126 @@ class RepositoryTests(unittest.TestCase):
             StateRepository._postgres_update_change,
         )
 
+    def test_enrichment_generation_replacement_is_tenant_and_scope_bounded(self):
+        self.state["integrationEnrichmentPreviews"] = [
+            {
+                "id": "current",
+                "provider": "ncentral",
+                "companyId": "acme",
+                "providerParentId": "101",
+                "sourceServerId": "server-a",
+                "summary": {"cacheGenerationId": "generation-2"},
+            },
+            {
+                "id": "superseded",
+                "provider": "ncentral",
+                "companyId": "acme",
+                "providerParentId": "101",
+                "sourceServerId": "server-a",
+                "summary": {"cacheGenerationId": "generation-1"},
+            },
+            {
+                "id": "other-customer-scope",
+                "provider": "ncentral",
+                "companyId": "acme",
+                "providerParentId": "202",
+                "sourceServerId": "server-a",
+                "summary": {"cacheGenerationId": "generation-1"},
+            },
+        ]
+
+        removed = self.repository.replace_integration_enrichment_generation(
+            "ncentral", "acme", "101", "server-a", "generation-2"
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(
+            {item["id"] for item in self.state["integrationEnrichmentPreviews"]},
+            {"current", "other-customer-scope"},
+        )
+        removed_current = self.repository.delete_integration_enrichment_generation(
+            "ncentral", "acme", "101", "server-a", "generation-2"
+        )
+        self.assertEqual(removed_current, 1)
+        self.assertEqual(
+            [item["id"] for item in self.state["integrationEnrichmentPreviews"]],
+            ["other-customer-scope"],
+        )
+
+    def test_postgres_enrichment_generation_replacement_uses_exact_scope(self):
+        cursor = MagicMock()
+        cursor.rowcount = 2
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connection_factory = MagicMock()
+        connection_factory.return_value.__enter__.return_value = connection
+        repository = PostgresCmdbRepository({}, lambda _state: None, connection_factory)
+
+        removed = repository.replace_integration_enrichment_generation(
+            "ncentral", "acme", "101", "server-a", "generation-2"
+        )
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(
+            cursor.execute.call_args.args[1],
+            (
+                "ncentral",
+                "acme",
+                "101",
+                "server-a",
+                "generation-2",
+                "generation-2",
+            ),
+        )
+
+    def test_postgres_enrichment_scope_lock_uses_a_stable_advisory_key(self):
+        cursor = MagicMock()
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connection_factory = MagicMock()
+        connection_factory.return_value.__enter__.return_value = connection
+        repository = PostgresCmdbRepository({}, lambda _state: None, connection_factory)
+
+        with repository.integration_enrichment_scope_lock("ncentral", "acme", "101", "server-a"):
+            pass
+
+        query, parameters = cursor.execute.call_args.args
+        self.assertIn("pg_advisory_xact_lock", query)
+        self.assertEqual(parameters, ("ncentral:acme:101:server-a",))
+
+    def test_enrichment_prune_removes_an_expired_generation_atomically(self):
+        self.state["integrationEnrichmentPreviews"] = [
+            {
+                "id": "expired-device",
+                "provider": "ncentral",
+                "expiresAt": "2000-01-01T00:00:00Z",
+                "summary": {"cacheGenerationId": "generation-1"},
+            },
+            {
+                "id": "fresh-marker",
+                "provider": "ncentral",
+                "expiresAt": "2099-01-01T00:00:00Z",
+                "summary": {
+                    "cacheGenerationId": "generation-1",
+                    "cachePublished": True,
+                },
+            },
+            {
+                "id": "other-generation",
+                "provider": "ncentral",
+                "expiresAt": "2099-01-01T00:00:00Z",
+                "summary": {"cacheGenerationId": "generation-2"},
+            },
+        ]
+
+        removed = self.repository.prune_integration_enrichment_previews("ncentral")
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(
+            [item["id"] for item in self.state["integrationEnrichmentPreviews"]],
+            ["other-generation"],
+        )
+
     def test_password_hash_verifies_without_storing_plaintext(self):
         encoded = hash_password("VerySecret!42")
         self.assertNotIn("VerySecret!42", encoded)
@@ -435,6 +555,11 @@ class RepositoryTests(unittest.TestCase):
                 "blockUnmappedTypes": True,
                 "statusMode": "selected",
                 "includedStatusIds": ["3"],
+                "relationshipAutomationMode": "auto_explicit",
+                "relationshipAutoApproveTypes": ["hosts"],
+                "relationshipMinConfidence": 0.99,
+                "relationshipMinObservations": 3,
+                "relationshipMaxEvidenceAgeHours": 24,
                 "syncMode": "continuous_preview",
                 "intervalMinutes": 120,
                 "enabled": True,
@@ -446,6 +571,11 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(saved_policy["includedTypeIds"], ["11"])
         self.assertEqual(saved_policy["typeMappings"], {"11": "Server"})
         self.assertTrue(saved_policy["blockUnmappedTypes"])
+        self.assertEqual(saved_policy["relationshipAutomationMode"], "auto_explicit")
+        self.assertEqual(saved_policy["relationshipAutoApproveTypes"], ["hosts"])
+        self.assertEqual(saved_policy["relationshipMinConfidence"], 0.99)
+        self.assertEqual(saved_policy["relationshipMinObservations"], 3)
+        self.assertEqual(saved_policy["relationshipMaxEvidenceAgeHours"], 24)
         with self.assertRaisesRegex(ValueError, "reload"):
             self.repository.update_ci_sync_policy(
                 "connectwise", "acme", "42", {}, expected_revision=0

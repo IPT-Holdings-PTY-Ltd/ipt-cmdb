@@ -18,6 +18,19 @@ body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradie
 .asset-name-button .MuiTypography-root { line-height: 1.3; }
 .asset-detail { width: 100%; padding: 8px 4px 20px; }
 .asset-detail-card { height: 100%; min-height: 225px; padding: 17px; background: linear-gradient(145deg, #132139, #101a2c) !important; }
+.inventory-navigation { margin-bottom: 16px; overflow: hidden; background: linear-gradient(135deg, #132139, #101a2c) !important; }
+.inventory-navigation .MuiLinearProgress-root { height: 6px; border-radius: 6px; background: #243553; }
+.inventory-navigation .MuiTabs-root { min-height: 47px; margin-top: 10px; padding: 0 8px; border-top: 1px solid #263956; background: #0f192b; }
+.inventory-navigation .MuiTab-root { min-height: 47px; font-weight: 750; text-transform: none; }
+.inventory-tab-panel { min-height: 225px; }
+.inventory-section { padding: 18px; overflow: hidden; background: linear-gradient(145deg, #132139, #101a2c) !important; }
+.inventory-section > .MuiTypography-h5 { margin: 1px 0 3px; }
+.inventory-fact { height: 100%; min-height: 72px; padding: 10px 12px; background: #0d1829 !important; }
+.inventory-fact .MuiTypography-body2 { margin-top: 2px; overflow-wrap: anywhere; font-weight: 700; }
+.inventory-collection + .inventory-collection { margin-top: 19px; padding-top: 18px; border-top: 1px solid #263956; }
+.inventory-table { min-width: 680px; }
+.inventory-table .MuiTableCell-head { color: #aebbd0; font-size: .7rem; font-weight: 850; letter-spacing: .045em; text-transform: uppercase; background: #111c2f; }
+.inventory-table .MuiTableCell-root { max-width: 360px; border-color: #263956; overflow-wrap: anywhere; vertical-align: top; }
 .relationship-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px; margin-bottom: 10px; background: #101a2d !important; }
 .relationship-toolbar .MuiTextField-root { min-width: 220px; flex: 1; }
 .relationship-toolbar .business-application-filter { min-width: 270px; flex: 1.2; }
@@ -25,6 +38,7 @@ body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradie
 .business-application-scope-icon { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 11px; color: #07131d; background: #f1d372; box-shadow: 0 8px 20px #0005; }
 .ci-shared-app-chip { margin-top: 7px; max-width: 100%; }
 .relationship-filter-row { margin: 0 0 12px; }
+.relationship-suggestion-filters { display: grid; grid-template-columns: minmax(240px, 1.5fr) repeat(4, minmax(155px, 1fr)) auto; gap: 10px; align-items: center; padding: 12px; margin-bottom: 14px; background: #101a2d !important; }
 .relationship-loading { min-height: 360px; display: grid; place-items: center; align-content: center; gap: 16px; color: #9eacc2; }
 .relationship-canvas { width: 100%; height: calc(100vh - 330px); min-height: 660px; overflow: hidden; border: 1px solid #2b3d5d; border-radius: 12px; background: #0a1323; }
 .relationship-canvas.view-stack { height: max(760px, calc(100vh - 300px)); min-height: 760px; background: repeating-linear-gradient(to bottom, #0d1829 0, #0d1829 89px, #0a1424 90px, #0a1424 179px, #253754 180px); }
@@ -98,5 +112,5 @@ body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradie
 .reconciliation-filter { display: grid; grid-template-columns: minmax(260px, 1.5fr) repeat(3, minmax(165px, 1fr)) auto auto auto; gap: 10px; align-items: center; padding: 12px; border-top: 1px solid #263956; border-bottom: 1px solid #263956; background: #101a2d; }
 .reconciliation-filter + .MuiTableContainer-root .MuiTable-root { min-width: 1320px; }
 @media (max-width: 1250px) { .asset-filter-toolbar { grid-template-columns: repeat(3, minmax(180px, 1fr)); } }
-@media (max-width: 1100px) { .governance-filter,.reconciliation-filter { grid-template-columns: repeat(3, minmax(170px, 1fr)); } }
-@media (max-width: 900px) { .relationship-canvas { height: 680px; } .relationship-toolbar .MuiTextField-root { flex-basis: 100%; } .asset-filter-toolbar,.governance-filter,.quality-filter,.reconciliation-filter { grid-template-columns: 1fr; } .report-catalog { position: static; } }
+@media (max-width: 1100px) { .governance-filter,.reconciliation-filter,.relationship-suggestion-filters { grid-template-columns: repeat(3, minmax(170px, 1fr)); } }
+@media (max-width: 900px) { .relationship-canvas { height: 680px; } .relationship-toolbar .MuiTextField-root { flex-basis: 100%; } .asset-filter-toolbar,.governance-filter,.quality-filter,.reconciliation-filter,.relationship-suggestion-filters { grid-template-columns: 1fr; } .report-catalog { position: static; } }

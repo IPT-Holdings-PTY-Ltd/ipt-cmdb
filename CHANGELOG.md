@@ -55,6 +55,23 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ### Fixed
 
+- Modelled direct provider inventory objects separately from persisted snapshot arrays,
+  preserving nested OS, software and monitoring collections and avoiding false snapshot
+  detection for ordinary rows that happen to contain a `payload` field.
+- Consolidated separator- and case-insensitive credential detection across inventory,
+  audit, cache and runtime-log boundaries, including nested arrays, credential-bearing
+  URLs and private-key blocks, with fail-closed repository validation.
+- Converted the remaining function-only relationship and technical-inventory tests to
+  `unittest.TestCase` so the documented CI and pre-push command actually executes them.
+- Made balanced N-central detail enrichment retain its bounded rotation cursor, so
+  larger estates advance beyond the first 25 devices on successive successful previews.
+- Prevented partial N-central and GraphQL reads from replacing previously collected
+  inventory with authoritative empty snapshots when a source section was not read.
+- Separated N-central OS capability properties from genuine Windows Server roles and
+  features, and added explainable Hyper-V host classification from host-side virtual
+  switch adapter evidence without inventing guest relationships.
+- Corrected selected-device N-central capability checks for the documented nested
+  `data` response envelope and aligned GraphQL-derived counts with stored collections.
 - Made Linux file-backed Compose secrets readable by the non-root CMDB and worker
   processes while retaining private `0700` directories, `0600` environment files and
   read-only `0444` secret files.
@@ -78,6 +95,11 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ### Security
 
+- Upgraded `cryptography` to 50.x, which removes the PKCS7 decryption oracle tracked
+  as CVE-2026-69247 while retaining the supported AES-GCM configuration encryption API.
+- Consolidated credential-field detection across audit, integration-cache and technical
+  inventory boundaries; recursively strips separator/casing variants and strong secret
+  scalar formats, while repository persistence now rejects unsanitized inventory data.
 - Stopped trusting caller-supplied `X-Forwarded-For` values unless the immediate peer
   is an explicitly configured proxy.
 - Added dummy PBKDF2 work for unknown, disabled and non-local identities to reduce

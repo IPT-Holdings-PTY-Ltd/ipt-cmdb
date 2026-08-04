@@ -7,22 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-SENSITIVE_PARTS = (
-    "password",
-    "secret",
-    "token",
-    "authorization",
-    "cookie",
-    "credential",
-    "privatekey",
-    "private_key",
-    "connectionstring",
-    "connection_string",
-    "databaseurl",
-    "database_url",
-    "logodataurl",
-    "logo_data_url",
-)
+from src.cmdb.sensitive import is_sensitive_field_name, is_sensitive_scalar
 
 
 @dataclass(frozen=True)
@@ -57,14 +42,9 @@ def current_audit_context() -> AuditContext:
     return _context.get() or AuditContext()
 
 
-def _sensitive(key: str) -> bool:
-    normalized = key.casefold().replace("-", "").replace(" ", "")
-    return any(part.replace("_", "") in normalized for part in SENSITIVE_PARTS)
-
-
 def sanitize_audit_value(value: Any, key: str = "", depth: int = 0) -> Any:
     """Redact credentials and bound audit payload size without mutating input."""
-    if _sensitive(key):
+    if is_sensitive_field_name(key):
         return "[redacted]"
     if depth > 8:
         return "[maximum depth reached]"
@@ -76,6 +56,8 @@ def sanitize_audit_value(value: Any, key: str = "", depth: int = 0) -> Any:
     if isinstance(value, (list, tuple)):
         return [sanitize_audit_value(item, key, depth + 1) for item in list(value)[:250]]
     if isinstance(value, str):
+        if is_sensitive_scalar(value):
+            return "[redacted]"
         return value if len(value) <= 4000 else f"{value[:4000]}… [truncated]"
     if value is None or isinstance(value, (bool, int, float)):
         return value
