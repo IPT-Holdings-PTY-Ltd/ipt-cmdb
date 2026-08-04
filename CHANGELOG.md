@@ -95,6 +95,8 @@ All notable changes to IPT CMDB are documented here. The project follows [Keep a
 
 ### Security
 
+- Upgraded `cryptography` to 50.x, which removes the PKCS7 decryption oracle tracked
+  as CVE-2026-69247 while retaining the supported AES-GCM configuration encryption API.
 - Consolidated credential-field detection across audit, integration-cache and technical
   inventory boundaries; recursively strips separator/casing variants and strong secret
   scalar formats, while repository persistence now rejects unsanitized inventory data.

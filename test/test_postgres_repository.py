@@ -625,9 +625,34 @@ class PostgresRepositoryContractTests(unittest.TestCase):
         relationship_count = len(repository.list_relationships())
         current_connection = repository.get_integration_connection("connectwise")
         assert current_connection is not None
+        candidate_values = [
+            {
+                "fromCiId": sql01["id"],
+                "toCiId": sage["id"],
+                "relationshipType": "hosts",
+                "confidence": 0.95,
+                "evidence": {"rule": "contract_test"},
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "CI policy changed"):
+            repository.upsert_relationship_candidates(
+                "connectwise",
+                "acme",
+                source_mapping["id"],
+                candidate_values,
+                observed_at="2026-07-31T08:30:00Z",
+                policy_id=ci_policy["id"],
+                expected_policy_revision=ci_policy["revision"],
+                expected_connection_revision=current_connection["revision"],
+                provider_parent_id="42",
+            )
+        current_policy = repository.get_ci_sync_policy("connectwise", "acme", "42")
+        assert current_policy is not None
+        self.assertEqual(current_policy["id"], ci_policy["id"])
+        self.assertGreater(current_policy["revision"], ci_policy["revision"])
         relationship_context = {
-            "policy_id": ci_policy["id"],
-            "expected_policy_revision": ci_policy["revision"],
+            "policy_id": current_policy["id"],
+            "expected_policy_revision": current_policy["revision"],
             "expected_connection_revision": current_connection["revision"],
             "provider_parent_id": "42",
         }
@@ -635,15 +660,7 @@ class PostgresRepositoryContractTests(unittest.TestCase):
             "connectwise",
             "acme",
             source_mapping["id"],
-            [
-                {
-                    "fromCiId": sql01["id"],
-                    "toCiId": sage["id"],
-                    "relationshipType": "hosts",
-                    "confidence": 0.95,
-                    "evidence": {"rule": "contract_test"},
-                }
-            ],
+            candidate_values,
             observed_at="2026-07-31T09:00:00Z",
             **relationship_context,
         )[0]
@@ -654,15 +671,7 @@ class PostgresRepositoryContractTests(unittest.TestCase):
             "connectwise",
             "acme",
             source_mapping["id"],
-            [
-                {
-                    "fromCiId": sql01["id"],
-                    "toCiId": sage["id"],
-                    "relationshipType": "hosts",
-                    "confidence": 0.95,
-                    "evidence": {"rule": "contract_test"},
-                }
-            ],
+            candidate_values,
             observed_at="2026-07-31T09:30:00Z",
             **relationship_context,
         )[0]
