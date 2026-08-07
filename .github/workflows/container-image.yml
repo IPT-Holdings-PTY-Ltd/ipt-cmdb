@@ -140,7 +140,7 @@ jobs:
           sbom: true
 
       - name: Attest published image
-        uses: actions/attest@v4.2.0
+        uses: actions/attest@v4.2.2
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
